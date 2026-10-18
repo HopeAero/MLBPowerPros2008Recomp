@@ -1,8 +1,8 @@
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index dee842d..0dacb8b 100644
+index dee842d..542fae1 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
-@@ -399,6 +399,15 @@ add_test(NAME mkw_stick_response_tests COMMAND mkw_stick_response_tests)
+@@ -399,6 +399,19 @@ add_test(NAME mkw_stick_response_tests COMMAND mkw_stick_response_tests)
  add_executable(mkw_auto_mips_tests "${CMAKE_CURRENT_LIST_DIR}/tests/auto_mips_tests.cpp")
  target_compile_features(mkw_auto_mips_tests PRIVATE cxx_std_20)
  add_test(NAME mkw_auto_mips_tests COMMAND mkw_auto_mips_tests)
@@ -15,9 +15,71 @@ index dee842d..0dacb8b 100644
 +target_compile_features(mkw_game_camera_tests PRIVATE cxx_std_20)
 +target_include_directories(mkw_game_camera_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 +add_test(NAME mkw_game_camera_tests COMMAND mkw_game_camera_tests)
++add_executable(mkw_free_camera_tests "${CMAKE_CURRENT_LIST_DIR}/tests/free_camera_tests.cpp")
++target_compile_features(mkw_free_camera_tests PRIVATE cxx_std_20)
++target_include_directories(mkw_free_camera_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
++add_test(NAME mkw_free_camera_tests COMMAND mkw_free_camera_tests)
  
  add_executable(mkw_nand_save_tests "${CMAKE_CURRENT_LIST_DIR}/tests/nand_save_tests.cpp")
  target_include_directories(mkw_nand_save_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+diff --git a/runtime/include/free_camera.h b/runtime/include/free_camera.h
+new file mode 100644
+index 0000000..8e345f3
+--- /dev/null
++++ b/runtime/include/free_camera.h
+@@ -0,0 +1,52 @@
++#pragma once
++// Free camera of the stadium viewer: Blender/Unreal-style fly controls over a CameraPose (game frame,
++// decimetres). Header-only and free of runtime dependencies so tests/free_camera_tests.cpp can check it.
++#include <algorithm>
++#include <cmath>
++
++#include "stadium_viewer.h"
++
++namespace stadium_viewer {
++
++struct FreeCameraInput {
++    bool forward = false, back = false, left = false, right = false, up = false, down = false, fast = false, look = false;
++    float mouseDx = 0, mouseDy = 0, wheel = 0, dt = 0;
++};
++
++class FreeCamera {
++public:
++    static constexpr float kStartSpeed = 100.0f;  // dm/s (10 m/s)
++    static constexpr float kMinSpeed = 10.0f, kMaxSpeed = 2000.0f, kFastFactor = 4.0f, kWheelFactor = 1.25f;
++    static constexpr float kMouseRadiansPerPixel = 0.0035f, kMaxDt = 0.1f;
++    static constexpr float kMaxPitch = 89.0f * 3.14159265f / 180.0f;
++
++    explicit FreeCamera(const CameraPose& start) : pose_(start) { pose_.pitch = std::clamp(pose_.pitch, -kMaxPitch, kMaxPitch); }
++
++    void Update(const FreeCameraInput& in) {
++        if (in.wheel != 0 && std::isfinite(in.wheel))
++            speed_ = std::clamp(speed_ * std::pow(kWheelFactor, std::clamp(in.wheel, -100.0f, 100.0f)), kMinSpeed, kMaxSpeed);
++        if (in.look && std::isfinite(in.mouseDx) && std::isfinite(in.mouseDy)) {
++            pose_.yaw = std::remainder(pose_.yaw + in.mouseDx * kMouseRadiansPerPixel, 2.0f * 3.14159265f);
++            pose_.pitch = std::clamp(pose_.pitch - in.mouseDy * kMouseRadiansPerPixel, -kMaxPitch, kMaxPitch);
++        }
++        const float dt = std::clamp(in.dt, 0.0f, kMaxDt);
++        const float step = speed_ * (in.fast ? kFastFactor : 1.0f) * dt;
++        const float c = std::cos(pose_.pitch);
++        const float forward[3] = {std::sin(pose_.yaw) * c, std::sin(pose_.pitch), -std::cos(pose_.yaw) * c};
++        const float right[3] = {std::cos(pose_.yaw), 0.0f, std::sin(pose_.yaw)};
++        const float f = static_cast<float>(in.forward) - static_cast<float>(in.back);
++        const float r = static_cast<float>(in.right) - static_cast<float>(in.left);
++        const float u = static_cast<float>(in.up) - static_cast<float>(in.down);
++        for (int i = 0; i < 3; ++i) pose_.eye[i] += (forward[i] * f + right[i] * r) * step;
++        pose_.eye[1] += u * step;
++    }
++
++    const CameraPose& Pose() const { return pose_; }
++    float Speed() const { return speed_; }
++
++private:
++    CameraPose pose_;
++    float speed_ = kStartSpeed;
++};
++
++}  // namespace stadium_viewer
 diff --git a/runtime/include/mlb_camera.h b/runtime/include/mlb_camera.h
 new file mode 100644
 index 0000000..f2f4483
@@ -97,10 +159,10 @@ index d2c1dd3..4cda53f 100644
      std::vector<std::string> lines;
 diff --git a/runtime/include/stadium_viewer.h b/runtime/include/stadium_viewer.h
 new file mode 100644
-index 0000000..e5ef1ab
+index 0000000..a0a362e
 --- /dev/null
 +++ b/runtime/include/stadium_viewer.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,38 @@
 +#pragma once
 +// Stadium viewer: the Blender add-on's "View in game" opens the game straight into the stadium being
 +// made, from a one-run preview mod, with a free camera. Enabled by environment variables:
@@ -135,6 +197,8 @@ index 0000000..e5ef1ab
 +const std::optional<Config>& Active();  // read once from the environment
 +bool Enabled();
 +bool StadiumReady();  // the preview stadium is on screen (match_benchmark.cpp)
++void OnHostFrame();   // controls, once per presented frame (stadium_viewer_input.cpp)
++void DrawHelp();      // the keys, in the corner
 +
 +}  // namespace stadium_viewer
 diff --git a/runtime/src/hle/mlb/game_camera.cpp b/runtime/src/hle/mlb/game_camera.cpp
@@ -427,10 +491,10 @@ index 477d140..a0c0166 100644
              if (base != 0) cpu->gpr[3] = base;
              std::fprintf(stderr, "[match-bench] new stadium \"%s\": %s\n", code,
 diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
-index 1213519..47fb1be 100644
+index 1213519..280cfd6 100644
 --- a/runtime/src/match_benchmark_overlay.inc
 +++ b/runtime/src/match_benchmark_overlay.inc
-@@ -93,6 +93,21 @@ BenchUsage& BenchmarkUsage() {
+@@ -93,6 +93,22 @@ BenchUsage& BenchmarkUsage() {
  
  void DrawMatchBenchmark() {
      if (!match_benchmark::Enabled()) return;
@@ -447,6 +511,7 @@ index 1213519..47fb1be 100644
 +            }
 +            ImGui::End();
 +        }
++        stadium_viewer::DrawHelp();
 +        return;
 +    }
      using BenchClock = std::chrono::steady_clock;
@@ -542,7 +607,7 @@ index eee0718..cb9402b 100644
      }
      if (textureRoots.empty()) return;
 diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
-index dba114e..9a242d5 100644
+index dba114e..760ea75 100644
 --- a/runtime/src/settings_overlay.cpp
 +++ b/runtime/src/settings_overlay.cpp
 @@ -1,5 +1,6 @@
@@ -561,6 +626,14 @@ index dba114e..9a242d5 100644
          return;
      }
  
+@@ -1703,6 +1704,7 @@ void Draw() noexcept {
+     // and started the next ImGui frame, so all overlay callers can now safely issue ImGui commands.
+     aurora_wait_for_frame_worker();
+     match_benchmark::OnHostFrame();
++    stadium_viewer::OnHostFrame();
+     // Also drive the Wii Remote rescan from here: PADRead runs it too, but this
+     // runs once per presented frame whatever the game is doing (e.g. sitting in
+     // its "communications interrupted" prompt without polling pads). Same guest
 diff --git a/runtime/src/stadium_viewer.cpp b/runtime/src/stadium_viewer.cpp
 new file mode 100644
 index 0000000..6a8d088
@@ -634,6 +707,201 @@ index 0000000..6a8d088
 +bool Enabled() { return Active().has_value(); }
 +
 +}  // namespace stadium_viewer
+diff --git a/runtime/src/stadium_viewer_input.cpp b/runtime/src/stadium_viewer_input.cpp
+new file mode 100644
+index 0000000..1826c71
+--- /dev/null
++++ b/runtime/src/stadium_viewer_input.cpp
+@@ -0,0 +1,97 @@
++// Stadium viewer controls (host thread, once per presented frame): the free camera and the game's match
++// shots. Keys: W/A/S/D move, Q down, E up, Shift fast, right mouse button + mouse to look, wheel for
++// speed; 1 batter, 2 play, 3 wide (the game's own cameras); F back to the free camera; H hides the help.
++#include <SDL3/SDL.h>
++#include <imgui.h>
++
++#include <optional>
++
++#include "free_camera.h"
++#include "mlb_camera.h"
++#include "power_pros_ui.h"
++#include "runtime_config.h"
++#include "stadium_viewer.h"
++
++namespace stadium_viewer {
++namespace {
++
++std::optional<FreeCamera> g_free;  // set while the free camera drives the view
++bool g_started = false;
++bool g_help = true;
++bool g_previous[SDL_SCANCODE_COUNT] = {};
++
++bool Pressed(const bool* keys, SDL_Scancode key) {  // went down this frame
++    const bool down = keys[key];
++    const bool edge = down && !g_previous[key];
++    g_previous[key] = down;
++    return edge;
++}
++
++void StartFree(const CameraPose& from) {
++    g_free.emplace(from);
++    game_camera::SetOverride(g_free->Pose());
++}
++
++}  // namespace
++
++void OnHostFrame() {
++    if (!Enabled() || !StadiumReady()) return;
++    if (!g_started) {
++        g_started = true;
++        if (Active()->camera) StartFree(*Active()->camera);  // where the Blender view was
++        else game_camera::ShowMatchView(game_camera::MatchView::Batter);
++    }
++    const bool* keys = SDL_GetKeyboardState(nullptr);
++    const ImGuiIO& io = ImGui::GetIO();
++    if (Pressed(keys, SDL_SCANCODE_H)) g_help = !g_help;
++    const SDL_Scancode viewKeys[3] = {SDL_SCANCODE_1, SDL_SCANCODE_2, SDL_SCANCODE_3};
++    for (int i = 0; i < 3; ++i) {
++        if (Pressed(keys, viewKeys[i]) && game_camera::ShowMatchView(static_cast<game_camera::MatchView>(i))) g_free.reset();
++    }
++    FreeCameraInput in;
++    in.forward = keys[SDL_SCANCODE_W];
++    in.back = keys[SDL_SCANCODE_S];
++    in.left = keys[SDL_SCANCODE_A];
++    in.right = keys[SDL_SCANCODE_D];
++    in.down = keys[SDL_SCANCODE_Q];
++    in.up = keys[SDL_SCANCODE_E];
++    in.fast = keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT];
++    in.look = ImGui::IsMouseDown(ImGuiMouseButton_Right);
++    in.mouseDx = io.MouseDelta.x;
++    in.mouseDy = io.MouseDelta.y;
++    in.wheel = io.MouseWheel;
++    in.dt = io.DeltaTime;
++    const bool moving = in.forward || in.back || in.left || in.right || in.up || in.down ||
++                        (in.look && (in.mouseDx != 0 || in.mouseDy != 0));
++    // F, or moving while a match shot is shown, takes the free camera from where the game's camera is.
++    if (!g_free && (Pressed(keys, SDL_SCANCODE_F) || moving)) {
++        if (const auto pose = game_camera::CurrentPose()) StartFree(*pose);
++    } else {
++        Pressed(keys, SDL_SCANCODE_F);  // keep the edge state current
++    }
++    if (g_free) {
++        g_free->Update(in);
++        game_camera::SetOverride(g_free->Pose());
++    }
++}
++
++void DrawHelp() {
++    if (!Enabled() || !StadiumReady() || !g_help) return;
++    using power_pros_ui::Lang;
++    const Lang lang = power_pros_ui::LangFromSetting(RuntimeConfigFile::UiLanguage("auto"));
++    const bool en = lang == Lang::En;
++    ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
++    ImGui::SetNextWindowBgAlpha(0.55f);
++    if (ImGui::Begin("##viewer-help", nullptr,
++                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
++                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing)) {
++        ImGui::TextUnformatted(en ? "Stadium preview" : "Vista previa del estadio");
++        ImGui::TextDisabled(en ? "WASD move  Q/E down/up  Shift fast  right mouse look  wheel speed"
++                               : "WASD mover  Q/E bajar/subir  Shift rapido  clic derecho mirar  rueda velocidad");
++        ImGui::TextDisabled(en ? "1 batter  2 play  3 wide  F free camera  H hide"
++                               : "1 bateador  2 jugada  3 lejana  F camara libre  H ocultar");
++    }
++    ImGui::End();
++}
++
++}  // namespace stadium_viewer
+diff --git a/runtime/tests/free_camera_tests.cpp b/runtime/tests/free_camera_tests.cpp
+new file mode 100644
+index 0000000..8517fb1
+--- /dev/null
++++ b/runtime/tests/free_camera_tests.cpp
+@@ -0,0 +1,86 @@
++#include "free_camera.h"
++#include <cmath>
++#include <cstdlib>
++int main() {
++    const auto require = [](bool ok) { if (!ok) std::abort(); };
++    const auto near = [](float a, float b) { return std::fabs(a - b) < 1e-3f; };
++    using namespace stadium_viewer;
++    const CameraPose origin{{0, 0, 0}, 0, 0, 45};
++    // Simulated time in 0.05 s frames (Update clamps a frame to 0.1 s); one-frame inputs use a short step.
++    const auto step = [](FreeCamera& cam, FreeCameraInput in, float seconds) {
++        for (float left = seconds; left > 1e-6f; left -= 0.05f) {
++            in.dt = left < 0.05f ? left : 0.05f;
++            cam.Update(in);
++            in.wheel = 0;  // a wheel notch counts once
++            in.mouseDx = in.mouseDy = 0;
++        }
++    };
++
++    {  // forward 1 s at yaw 0: 100 dm towards second base (-Z), nothing in Y
++        FreeCamera cam(origin);
++        FreeCameraInput in{};
++        in.forward = true;
++        step(cam, in, 1.0f);
++        require(near(cam.Pose().eye[0], 0) && near(cam.Pose().eye[1], 0) && near(cam.Pose().eye[2], -100));
++    }
++    {  // right 1 s: towards first base (+X), the way positive yaw turns
++        FreeCamera cam(origin);
++        FreeCameraInput in{};
++        in.right = true;
++        step(cam, in, 1.0f);
++        require(near(cam.Pose().eye[0], 100) && near(cam.Pose().eye[2], 0));
++    }
++    {  // up 0.5 s: +50 in world Y; fast + forward 1 s: 400 dm
++        FreeCamera cam(origin);
++        FreeCameraInput in{};
++        in.up = true;
++        step(cam, in, 0.5f);
++        require(near(cam.Pose().eye[1], 50));
++        FreeCamera fast(origin);
++        FreeCameraInput f{};
++        f.forward = f.fast = true;
++        step(fast, f, 1.0f);
++        require(near(fast.Pose().eye[2], -400));
++    }
++    {  // mouse looks only while `look`; pitch stops at +89 degrees
++        FreeCamera cam(origin);
++        FreeCameraInput in{};
++        in.mouseDy = -100000;
++        step(cam, in, 0.016f);
++        require(near(cam.Pose().pitch, 0));
++        in.look = true;
++        step(cam, in, 0.016f);
++        require(near(cam.Pose().pitch, 89.0f * 3.14159265f / 180.0f));
++    }
++    {  // wheel scales the speed within [10, 2000] dm/s
++        FreeCamera cam(origin);
++        FreeCameraInput in{};
++        in.wheel = 100;
++        step(cam, in, 0.016f);
++        require(near(cam.Speed(), 2000));
++        in.wheel = -100;
++        step(cam, in, 0.016f);
++        require(near(cam.Speed(), 10));
++    }
++    {  // a single long frame moves like 0.1 s
++        FreeCamera cam(origin);
++        FreeCameraInput in{};
++        in.forward = true;
++        in.dt = 5.0f;
++        cam.Update(in);
++        require(near(cam.Pose().eye[2], -10));
++    }
++    {  // extreme positions and pitch: never NaN or infinity
++        FreeCamera cam({{1e6f, -1e6f, 1e6f}, 0, 0, 45});
++        FreeCameraInput in{};
++        in.look = in.forward = in.left = in.up = true;
++        for (int i = 0; i < 100; ++i) {
++            in.mouseDx = (i % 2 ? 1e5f : -1e5f);
++            in.mouseDy = (i % 3 ? 1e5f : -1e5f);
++            step(cam, in, 0.05f);
++        }
++        const auto& p = cam.Pose();
++        require(std::isfinite(p.eye[0]) && std::isfinite(p.eye[1]) && std::isfinite(p.eye[2]));
++        require(std::isfinite(p.yaw) && std::isfinite(p.pitch) && std::fabs(p.pitch) <= 89.0f * 3.14159265f / 180.0f + 1e-4f);
++    }
++}
 diff --git a/runtime/tests/game_camera_tests.cpp b/runtime/tests/game_camera_tests.cpp
 new file mode 100644
 index 0000000..063f62c
