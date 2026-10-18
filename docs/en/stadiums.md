@@ -70,7 +70,7 @@ What exporting does:
 - **Collision:** if you changed the "Collision" mesh (moving it, editing its faces or changing its surface), it writes it in full and rebuilds the game's collision tree.
   - The **surface** of each face comes from the final number in its material's name: "Surface 9" («Superficie 9») is a fence. To change a face's type, assign it another "Surface N" material.
   - Each face's normal points to the side the ball hits: up on the ground and towards the field on fences.
-- **Size limit:** a 21 MB graphics pack loads in a game and a 31.5 MB one doesn't. The original weighs 1.1 MB. If you go over 20 MB, the exporter warns you.
+- **Size limit:** an 80 MB graphics pack loads in a game and a 96 MB one doesn't. The original weighs 1.1 MB. If you go over 80 MB, the exporter warns you. (On the Wii the cap was about 21 MB: the game reserves a fixed memory heap; the recomp enlarges it.) HD textures don't count: they go separately, outside the pack.
 
 Not yet: loose objects that didn't come from the game. The exporter ignores them: run them through **Convert objects to pieces** (**Convertir objetos en piezas**) first (below).
 

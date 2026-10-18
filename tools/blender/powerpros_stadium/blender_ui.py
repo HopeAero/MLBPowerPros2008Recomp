@@ -156,8 +156,8 @@ class PP_OT_export_stadium(bpy.types.Operator):
         if st["collision"]:
             msg += T(f", colisión nueva de {st['collision']} triángulos", f", new collision of {st['collision']} triangles")
         if st["over_budget"]:
-            self.report({"WARNING"}, msg + T(". Pasa de 20 MB: puede que el partido no cargue.",
-                                             ". Over 20 MB: the match may not load."))
+            self.report({"WARNING"}, msg + T(". Pasa de 80 MB: puede que el partido no cargue.",
+                                             ". Over 80 MB: the match may not load."))
         else:
             self.report({"INFO"}, msg + T(". Actívalo en MODS del launcher.", ". Enable it in MODS in the launcher."))
         return {"FINISHED"}

@@ -1,0 +1,75 @@
+diff --git a/runtime/src/hle/mlb/game_heaps.cpp b/runtime/src/hle/mlb/game_heaps.cpp
+new file mode 100644
+index 0000000..408f4cb
+--- /dev/null
++++ b/runtime/src/hle/mlb/game_heaps.cpp
+@@ -0,0 +1,69 @@
++// MLB Power Pros 2008 (RL8E54) game-specific native: the heap setup at 0x8005AF78.
++//
++// The game makes two heaps at boot. The MEM1 one takes the whole MEM1 arena, but the MEM2
++// one gets a fixed 0x033E0000 - 0x800 bytes from the MEM2 arena start: exactly the retail
++// MEM2 arena (0x90000800-0x933E0000), which the game fills completely on a Wii. The runtime
++// gives MEM2 128 MB, yet that constant kept the game at ~52 MB, and a stadium graphics pack
++// of ~31 MB no longer fit: the 32 MB allocation (0x8005A9DC, from 0x800434B8) returned NULL
++// forever and the match hung at "Preparando partido".
++//
++// This is the decompiled function with one change: the MEM2 heap takes the whole MEM2
++// arena, like on the console. With a retail-sized arena it keeps the original size.
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++
++#include "abi_bridge.h"
++#include "hle_stubs.h"
++#include "memory.h"
++
++namespace mlb_heaps {
++
++constexpr uint32_t kMem1Heap = 0x802B57A8, kMem2Heap = 0x802B57C8;
++constexpr uint32_t kHeapCreate = 0x8005AE60, kArenaAlloc = 0x8005E6C8;
++constexpr uint32_t kMem1ArenaLoFixed = 0x8032EAE0;  // the game forces its MEM1 arena start here
++constexpr uint32_t kRetailMem2HeapSize = 0x033E0000 - 0x800;
++// OS arena variables (r13-relative, read by OSGet*ArenaHi/Lo).
++constexpr int32_t kMem1Hi = -28248, kMem1Lo = -31424, kMem2Hi = -28244, kMem2Lo = -31420;
++
++uint32_t Call(CpuContext* cpu, uint32_t target, uint32_t a, uint32_t b = 0, uint32_t c = 0) {
++    cpu->gpr[3] = a;
++    cpu->gpr[4] = b;
++    cpu->gpr[5] = c;
++    InvokeIndirectCpu(target, cpu);
++    return cpu->gpr[3];
++}
++
++uint32_t Setup(CpuContext* cpu) {
++    const uint32_t sda = cpu->gpr[13];
++    const auto get = [&](int32_t var) { return Memory::Read32(sda + var); };
++    const auto set = [&](int32_t var, uint32_t v) { Memory::Write32(sda + var, v); };
++
++    set(kMem1Lo, kMem1ArenaLoFixed);
++    Memory::Write32(sda - 32320, Call(cpu, kArenaAlloc, 0xA1A60));
++    const uint32_t lo1 = get(kMem1Lo);
++    const uint32_t size1 = std::min(get(kMem1Hi), 0x81800000u) - lo1;
++    Call(cpu, kHeapCreate, kMem1Heap, lo1, size1);
++    set(kMem1Lo, lo1 + size1);
++
++    const uint32_t lo2 = (get(kMem2Lo) + 31) & ~31u;
++    const uint32_t arena2 = (get(kMem2Hi) - lo2) & ~31u;
++    const uint32_t size2 = std::max(arena2, kRetailMem2HeapSize);
++    set(kMem2Lo, (lo2 + size2 + 31) & ~31u);
++    Call(cpu, kHeapCreate, kMem2Heap, lo2, size2);
++    std::fprintf(stderr, "[mlb] MEM2 heap 0x%08x, %.1f MB (retail %.1f MB)\n", lo2, size2 / 1048576.0,
++                 kRetailMem2HeapSize / 1048576.0);
++    return 1;
++}
++
++}  // namespace mlb_heaps
++
++extern "C" void MLB_SetupHeaps_8005AF78(CpuContext* ctx) {
++    const uint32_t savedSp = ctx->gpr[1];
++    ctx->gpr[1] = savedSp - 0x30;  // the original's frame size
++    Memory::Write32(ctx->gpr[1], savedSp);
++    const uint32_t result = mlb_heaps::Setup(ctx);
++    ctx->gpr[1] = savedSp;
++    ctx->gpr[3] = result;
++}
++PPC_NATIVE_OVERRIDE_VOID(8005AF78, MLB_SetupHeaps_8005AF78, (CpuContext* ctx), (ctx));

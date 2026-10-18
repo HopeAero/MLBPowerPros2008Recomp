@@ -64,6 +64,11 @@ El juego es un DOL pequeño y un módulo REL grande con casi todo el juego.
 | `+0x0C` / `+0x10` | enlaces de la lista libre |
 | `+0x14` / `+0x18` | bloque anterior / siguiente en memoria |
 
+- **Montones del juego** (los crea `0x8005AF78` al arrancar; asignan con `0x8005A804` desde la cabeza, `0x8005A9DC` desde la cola y liberan con `0x8005ABAC`, el handle en `r3`):
+  - `0x802B57A8`, MEM1: toda la arena de MEM1 (a partir de `0x8032EAE0`, que el juego fija) hasta `0x81800000`.
+  - `0x802B57C8`, MEM2: un tamaño **fijo** de `0x033E0000 - 0x800` bytes desde el inicio de la arena de MEM2, es decir `0x90000800`–`0x933E0000`, la arena retail entera. No mira el tope de la arena.
+  - En la cola de MEM2 van, entre otros, búferes de 1 y 2 MB (`0x800329A4`) y el pack de gráficos del estadio (`0x800434B8`). Si una reserva falla, `0x800434B8` la repite sin fin: es el cuelgue en «Preparando partido» con un pack de 32 MB (comprobado con trazas el 18 de octubre de 2026).
+  - El recomp sustituye `0x8005AF78` por una versión nativa (`hle/mlb/game_heaps.cpp`, parche `wiicompiled-mlb-mem2-heap`) que da al montón de MEM2 toda la arena: 125,7 MB con los 128 MB de MEM2 del runtime.
 - **Objetos únicos del juego**, punteros dentro del BSS del REL:
   - `0x81033268`: gestor de escenas (sección 7)
   - `0x8104E1D8`: configuración del partido
@@ -488,7 +493,7 @@ Verificado (14 de octubre de 2026):
 
 **Escribir estadios** (comprobado en partidos de Coors Field, 14 de octubre de 2026):
 - **Datos nuevos al final del pack:** los acepta, con punteros nuevos (`0x40000000 | posición`). Una malla repuntada a una display list nueva de triángulos sueltos (`0x90`) en vez de strips, y a arrays nuevos, se dibuja bien. No hay tabla de reubicación que actualizar.
-- **Tamaño:** un `stadium_col.pack` de 9,5 MB y uno de 21 MB cargan y el partido se juega. Uno de 31,5 MB o de 43 MB se queda en «Preparando partido».
+- **Tamaño:** un `stadium_col.pack` de 9,5 MB y uno de 21 MB cargan y el partido se juega. Uno de 31,5 MB o de 43 MB se queda en «Preparando partido»: no cabe en el montón de MEM2 (sección 1). Con el montón ampliado (parche `wiicompiled-mlb-mem2-heap`), uno de 32 MB y uno de 80 MB cargan y el partido se juega; con 96 MB el pack se lee, pero el partido no empieza.
 - **Tablas de texturas y paletas:** acaban con una entrada de 8 bytes a cero, en los 82 modelos de Coors Field. El juego las recorre hasta esa entrada: al copiarlas a otro sitio sin ella, las texturas con paleta del modelo salen blancas. Ampliar el array de texmaps o el de materiales (que usan su contador de la escena) funciona.
 - **Lista de texturas del `tbl`:** entradas {→ textura, → paleta, u32, u32}. Los dos u32 (`0xAC800`, `0xB2540`…) parecen direcciones de TMEM: texturas precargadas. Sin comprobar.
 

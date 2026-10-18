@@ -792,3 +792,12 @@ Patch `wiicompiled-auto-mipmaps` (aurora and runtime). Launcher VIDEO tab (page 
 - **Checked in the test match** (Coors Field, RX 5500, Direct3D 12, 1.5x, 16x filtering): the crowd and distant stands look clean, signs stay readable. GPU 4.78 ms with and without mipmaps; each texture's memory grows by a third.
 - **MSAA:** aurora already supported it (`AuroraConfig::msaa`); it now comes from `[video] msaa`. MSAA 4x draws correctly, EFB copies included, and smooths railings and lines, but raises the GPU from 4.78 to 9.11 ms. That is why it ships off. It needs a game restart.
 - **Test:** `runtime/tests/auto_mips_tests.cpp` (checkerboard to grey, red edge not darkened, sparse crowd that doesn't vanish).
+
+## Enlarged MEM2 heap: stadium packs up to 80 MB (18 October 2026)
+
+Patch `wiicompiled-mlb-mem2-heap` (runtime).
+
+- **Cause of the ~21 MB cap:** `0x8005AF78` creates the MEM2 heap with a fixed size, the retail arena (51.9 MB), although the runtime gives 128 MB of MEM2. The stadium pack is allocated from its tail (`0x8005A9DC` from `0x800434B8`); at 32 MB the allocation returns NULL and the game retries it forever. Found with a temporary wrapper around the allocators in the generated shards and the `WIICOMPILED_DEBUG_DVD` trace: the 20 MB pack is read at `0x913FC3E0`; the 32 MB one is never read.
+- **Fix:** `hle/mlb/game_heaps.cpp` reproduces `0x8005AF78` and gives the MEM2 heap the whole arena, as on the Wii: 125.7 MB.
+- **Measured in the test match** (Coors Field, zero-padded packs): 32 MB and 80 MB load and the match goes on; at 96 MB the pack is read at `0x911DC3E0`, but another allocation fails afterwards. The normal match with the user's mods is unchanged.
+- **More headroom:** raising `Memory::kMem2Size` (128 MB today, inherited from Mario Kart's NDEV mode) would give more; not needed yet.

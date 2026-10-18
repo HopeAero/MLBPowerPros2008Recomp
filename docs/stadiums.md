@@ -70,7 +70,7 @@ Qué hace al exportar:
 - **Colisión:** si cambiaste la malla «Colisión» (moverla, editar sus caras o cambiar su superficie), la escribe entera y rehace el árbol de colisión del juego.
   - La **superficie** de cada cara sale del número final del nombre de su material: «Superficie 9» es valla. Para cambiar una cara de tipo, asígnale otro material «Superficie N».
   - La normal de cada cara apunta al lado que golpea la pelota: arriba en el suelo y hacia el campo en las vallas.
-- **Límite de tamaño:** un pack de gráficos de 21 MB carga en un partido y uno de 31,5 MB no. El original pesa 1,1 MB. Si pasas de 20 MB, el exportador avisa.
+- **Límite de tamaño:** un pack de gráficos de 80 MB carga en un partido y uno de 96 MB no. El original pesa 1,1 MB. Si pasas de 80 MB, el exportador avisa. (En el Wii el tope era de unos 21 MB: el juego reserva un montón de memoria fijo; el recomp lo amplía.) Las texturas HD no cuentan: van aparte, fuera del pack.
 
 Aún no: objetos sueltos que no vinieron del juego. El exportador los ignora: pásalos antes por **Convertir objetos en piezas** (abajo).
 

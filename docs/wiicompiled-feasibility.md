@@ -792,3 +792,12 @@ Parche `wiicompiled-auto-mipmaps` (aurora y runtime). Pestaña VIDEO del launche
 - **Comprobado en el partido de prueba** (Coors Field, RX 5500, Direct3D 12, 1,5x, filtrado 16x): el público y las gradas lejanas se ven limpios, los carteles siguen legibles. GPU 4,78 ms con y sin mipmaps; la memoria de cada textura crece un tercio.
 - **MSAA:** aurora ya lo soportaba (`AuroraConfig::msaa`); ahora llega desde `[video] msaa`. MSAA 4x se dibuja bien, copias del EFB incluidas, y suaviza barandillas y líneas, pero sube la GPU de 4,78 a 9,11 ms. Por eso viene desactivado. Necesita reiniciar el juego.
 - **Prueba:** `runtime/tests/auto_mips_tests.cpp` (tablero de ajedrez a gris, borde rojo sin oscurecer, público disperso que no desaparece).
+
+## Montón de MEM2 ampliado: packs de estadio de hasta 80 MB (18 de octubre de 2026)
+
+Parche `wiicompiled-mlb-mem2-heap` (runtime).
+
+- **Causa del tope de ~21 MB:** `0x8005AF78` crea el montón de MEM2 con un tamaño fijo, la arena retail (51,9 MB), aunque el runtime da 128 MB de MEM2. El pack del estadio se reserva desde su cola (`0x8005A9DC` desde `0x800434B8`); con 32 MB la reserva devuelve NULL y el juego la repite sin fin. Encontrado con un envoltorio temporal de los asignadores en los shards generados y la traza `WIICOMPILED_DEBUG_DVD`: el pack de 20 MB se lee en `0x913FC3E0`; el de 32 MB nunca se lee.
+- **Arreglo:** `hle/mlb/game_heaps.cpp` reproduce `0x8005AF78` y da al montón de MEM2 toda la arena, como en el Wii: 125,7 MB.
+- **Medido en el partido de prueba** (Coors Field, packs rellenados con ceros): 32 MB y 80 MB cargan y el partido avanza; con 96 MB el pack se lee en `0x911DC3E0`, pero luego falla otra reserva. El partido normal con los mods del usuario sigue igual.
+- **Más margen:** ampliar `Memory::kMem2Size` (hoy 128 MB, heredado del modo NDEV de Mario Kart) daría más; no hace falta todavía.

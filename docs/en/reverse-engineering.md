@@ -63,6 +63,11 @@ The game is a small DOL and a large REL module with almost the whole game.
 | `+0x0C` / `+0x10` | free-list links |
 | `+0x14` / `+0x18` | previous / next block in memory |
 
+- **Game heaps** (created by `0x8005AF78` at boot; allocate with `0x8005A804` from the head, `0x8005A9DC` from the tail and free with `0x8005ABAC`, handle in `r3`):
+  - `0x802B57A8`, MEM1: the whole MEM1 arena (from `0x8032EAE0`, which the game forces) up to `0x81800000`.
+  - `0x802B57C8`, MEM2: a **fixed** `0x033E0000 - 0x800` bytes from the MEM2 arena start, i.e. `0x90000800`–`0x933E0000`, the whole retail arena. It ignores the arena top.
+  - The MEM2 tail holds, among others, 1 and 2 MB buffers (`0x800329A4`) and the stadium graphics pack (`0x800434B8`). When an allocation fails, `0x800434B8` retries it forever: that is the hang on "Preparando partido" with a 32 MB pack (traced on 18 October 2026).
+  - The recomp replaces `0x8005AF78` with a native version (`hle/mlb/game_heaps.cpp`, patch `wiicompiled-mlb-mem2-heap`) that gives the MEM2 heap the whole arena: 125.7 MB with the runtime's 128 MB of MEM2.
 - **Game singleton objects**, pointers inside the REL BSS:
   - `0x81033268`: scene manager (section 7)
   - `0x8104E1D8`: match configuration
@@ -487,7 +492,7 @@ Verified (October 14, 2026):
 
 **Writing stadiums** (verified in Coors Field matches, October 14, 2026):
 - **New data at the end of the pack:** it accepts it, with new pointers (`0x40000000 | position`). A mesh repointed to a new display list of separate triangles (`0x90`) instead of strips, and to new arrays, draws fine. There is no relocation table to update.
-- **Size:** a 9.5 MB and a 21 MB `stadium_col.pack` load and the match plays. A 31.5 MB or a 43 MB one gets stuck on "Preparando partido" (Preparing match).
+- **Size:** a 9.5 MB and a 21 MB `stadium_col.pack` load and the match plays. A 31.5 MB or a 43 MB one gets stuck on "Preparando partido" (Preparing match): it does not fit in the MEM2 heap (section 1). With the enlarged heap (patch `wiicompiled-mlb-mem2-heap`), a 32 MB and an 80 MB one load and the match plays; at 96 MB the pack is read but the match does not start.
 - **Texture and palette tables:** they end with an 8-byte zero entry, in the 82 models of Coors Field. The game walks them up to that entry: when copying them elsewhere without it, the model's palette textures come out white. Enlarging the texmap array or the material array (which use their count from the scene) works.
 - **`tbl` texture list:** entries {→ texture, → palette, u32, u32}. The two u32 (`0xAC800`, `0xB2540`…) look like TMEM addresses: preloaded textures. Unchecked.
 

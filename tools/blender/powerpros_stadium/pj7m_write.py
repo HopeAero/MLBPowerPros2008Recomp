@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from . import pj7m
 
 P = 0x40000000
-BUDGET = 20 * 1024 * 1024          # graphics pack size that is known to load in a match
+BUDGET = 80 * 1024 * 1024          # graphics pack size known to load in a match (recomp, patch wiicompiled-mlb-mem2-heap)
 MAX_INDEX = 0xFFFF
 # The game's own stadium meshes never exceed 24,768 display-list bytes, 573 vertices per draw and
 # 1,303 positions; a mesh far beyond that (500 KB, 58,000 vertices in one draw) is only partly
