@@ -490,6 +490,8 @@ Verificado (14 de octubre de 2026):
 - Poner azul el color de vértice de `DP_ground` vuelve azul la tierra del infield.
 - Pasar a rojo el segundo color del material de `DP_MIP_turf` no cambia nada: el estadio se dibuja sin la luz de los materiales.
 - Cambiar la traslación de las colocaciones de `DP_FLG_*` pone las banderas en fila sobre el césped del center field. El juego usa la tabla, aunque la caja y la esfera de la colocación sigan en el sitio viejo.
+- Las banderas (`0x500`) son tela que el juego anima desde la colocación, no desde la malla de la pieza: con la pieza vacía siguen ondeando en su sitio. Se dibujan sin prueba de profundidad: bajadas 100 m bajo el campo se veían a través del suelo. Con la escala de la colocación a `1e-4` desaparecen (18 de octubre de 2026).
+- **Pack de menú por estadio:** `env_stadium_menuNN.pack`, con NN el número del estadio (orden de `kStadiumCodes`, Coors Field = 27). Dos texturas C8 con paleta propia de 256 colores: la foto (512 × 256, píxeles en `0x60`) y «Home of…» (512 × 64). Un pack con el mismo tamaño y las dos texturas recodificadas funciona como menú de un estadio nuevo.
 
 **Escribir estadios** (comprobado en partidos de Coors Field, 14 de octubre de 2026):
 - **Datos nuevos al final del pack:** los acepta, con punteros nuevos (`0x40000000 | posición`). Una malla repuntada a una display list nueva de triángulos sueltos (`0x90`) en vez de strips, y a arrays nuevos, se dibuja bien. No hay tabla de reubicación que actualizar.

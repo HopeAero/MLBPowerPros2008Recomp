@@ -177,8 +177,10 @@ def convert(coll, sources, replace=True, bake_light=True):
 
     result = {}
     if replace:                                 # the rest of the original stadium goes too
+        # Pieces marked pp_keep stay as they are, and so do the game's own bases, plate and mound (BCL):
+        # the players stand on them, and a model's own (Mario Stadium's plate was 1.2 m) rarely match.
         for obj in [o for o in coll.all_objects if o.get("pp_kind") == "model" and o.name not in buckets
-                    and not o.get("pp_keep")]:                 # pieces marked pp_keep stay as they are
+                    and not o.get("pp_keep") and "BCL" not in o.name]:
             pieces.pop(obj.name, None)
             bpy.data.objects.remove(obj)
     for name, obj in pieces.items():

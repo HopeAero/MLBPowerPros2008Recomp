@@ -105,7 +105,17 @@ class PP_OT_export_stadium(bpy.types.Operator):
                                   description=T("Guarda además cada imagen nueva a su tamaño (hasta 2048 px) como "
                                                 "textura de reemplazo: el recomp la usa en vez de la de 256 px del pack",
                                                 "Also save each new image at its own size (up to 2048 px) as a "
-                                                "replacement texture: the recomp uses it instead of the pack's 256 px one")))
+                                                "replacement texture: the recomp uses it instead of the pack's 256 px one")),
+                  menu=BoolProperty(name=T("Foto del menú", "Menu photo"), default=True, translation_context=CONTEXT,
+                                    description=T("En la elección de estadio, muestra una foto renderizada de este "
+                                                  "estadio en vez de la del estadio base",
+                                                  "In the stadium select, show a rendered photo of this stadium "
+                                                  "instead of the base stadium's")),
+                  home_line=StringProperty(name=T("Línea bajo la foto", "Line under the photo"), default="",
+                                           translation_context=CONTEXT,
+                                           description=T("Por ejemplo «Home of the Miami Marlins». Vacía, no se "
+                                                         "muestra ninguna",
+                                                         "For example 'Home of the Miami Marlins'. Empty shows none")))
 
     @classmethod
     def poll(cls, context):
@@ -125,8 +135,11 @@ class PP_OT_export_stadium(bpy.types.Operator):
         if self.mode == "new":
             layout.prop(self, "new_code")
             layout.prop(self, "new_name")
-            layout.label(text=T("Usa los datos de juego (medidas, menú) del estadio importado.",
-                                "Uses the game data (size, menu) of the imported stadium."), translate=False)
+            layout.label(text=T("Usa los datos de juego (medidas, partidas) del estadio importado.",
+                                "Uses the game data (size, saves) of the imported stadium."), translate=False)
+            layout.prop(self, "menu")
+            if self.menu:
+                layout.prop(self, "home_line")
         else:
             layout.prop(self, "target")
         layout.prop(self, "hd")
@@ -145,7 +158,7 @@ class PP_OT_export_stadium(bpy.types.Operator):
             target, new_name = (coll["pp_stadium"] if self.target == "same" else self.target), None
         try:
             st = exporter.export_stadium(coll, bpy.path.abspath(self.mods_folder), self.mod_name.strip() or default_name,
-                                         target, new_name, self.hd)
+                                         target, new_name, self.hd, self.menu, self.home_line)
         except (exporter.ExportFailure, ValueError) as e:            # tbl_write.TreeError is a ValueError
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}

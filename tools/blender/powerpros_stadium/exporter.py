@@ -14,7 +14,8 @@ import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 
-from . import fingerprint, hd_textures, importer, names, packwii, pj7m, pj7m_write, stadium_tbl, tbl_write
+from . import (fingerprint, hd_textures, importer, menu_pack, menu_render, names, packwii, pj7m, pj7m_write,
+               stadium_tbl, tbl_write)
 from .i18n import T
 
 try:
@@ -223,6 +224,15 @@ class Exporter:
                                  (*lo, *hi), (*centre, radius))
         self.stats["moved"] += 1
 
+    def bury(self, record):
+        """Flags are cloth the game animates from the placement, not from the piece's meshes: an
+        emptied flag piece still waves in its old place. It is drawn without depth test (moved 100 m
+        under the field it showed through the ground), so the placement is shrunk to nothing instead."""
+        tiny = 1e-4
+        pj7m_write.set_placement(self.tbl, record.offset, record.translation, record.rotation, (tiny, tiny, tiny),
+                                 record.bbox, record.sphere)
+        self.stats["moved"] += 1
+
     def export(self, coll):
         present = {o.get("pp_model_offset"): o for o in coll.all_objects if o.get("pp_kind") == "model"}
         records = {p.model: p for p in self.table.placements} if self.table else {}
@@ -232,6 +242,8 @@ class Exporter:
             if obj is None:
                 self.w.set_meshes(model, [])
                 self.stats["emptied"] += 1
+                if "FLG" in model.name and off in records and self.tbl is not None:
+                    self.bury(records[off])
                 continue
             mesh_changed = (obj.get("pp_signature") != fingerprint.mesh_signature(obj) or bool(obj.modifiers)
                             or any(self.image_changed(image_of(s.material)) for s in obj.material_slots))
@@ -309,11 +321,13 @@ def add_stadium_to_toml(toml, code, name, base):
     toml.write_text(text.rstrip("\n") + "\n" + block, encoding="utf-8")
 
 
-def export_stadium(coll, mods_folder, mod_name, target_code, new_name=None, hd=True):
+def export_stadium(coll, mods_folder, mod_name, target_code, new_name=None, hd=True, menu=True, home_line=""):
     """Write the mod. target_code: the stadium the packs replace, or with new_name the code of a
     stadium the mod adds (files stadium_<code>.pack/tbl.pack, [[stadium]] in mod.toml, based on the
     imported one; the runtime shows it as an extra entry of the stadium select carousel).
-    hd: also write each new image at full size as a replacement texture (hd_textures)."""
+    hd: also write each new image at full size as a replacement texture (hd_textures).
+    menu (new stadiums): write env_stadium_menu_<code>.pack with a render of the stadium and home_line
+    as the «Home of» line (empty: none)."""
     code = coll.get("pp_stadium")
     project_bin = coll.get("pp_project_bin")
     if not code or not project_bin or not Path(project_bin).is_file():
@@ -350,6 +364,11 @@ def export_stadium(coll, mods_folder, mod_name, target_code, new_name=None, hd=T
         toml.write_text(f'name = "{mod_name}"\ndescription = "{description}"\n', encoding="utf-8")
     if new_name is not None:
         add_stadium_to_toml(toml, target_code, new_name, code)
+        # Stadium select menu: its own photo and «Home of» line instead of the base stadium's.
+        base_menu = archive.read(menu_pack.base_menu_name(code)) if code in menu_pack.CODES else None
+        if menu and base_menu:
+            (folder / "project" / f"env_stadium_menu_{target_code}.pack").write_bytes(
+                menu_pack.build(base_menu, menu_render.photo(coll), menu_render.line(home_line)))
     ex.stats["size"] = len(gfx_out)
     ex.stats["over_budget"] = len(gfx_out) > pj7m_write.BUDGET
     ex.stats["folder"] = str(folder)

@@ -71,6 +71,8 @@ Qué hace al exportar:
   - La **superficie** de cada cara sale del número final del nombre de su material: «Superficie 9» es valla. Para cambiar una cara de tipo, asígnale otro material «Superficie N».
   - La normal de cada cara apunta al lado que golpea la pelota: arriba en el suelo y hacia el campo en las vallas.
 - **Límite de tamaño:** un pack de gráficos de 80 MB carga en un partido y uno de 96 MB no. El original pesa 1,1 MB. Si pasas de 80 MB, el exportador avisa. (En el Wii el tope era de unos 21 MB: el juego reserva un montón de memoria fijo; el recomp lo amplía.) Las texturas HD no cuentan: van aparte, fuera del pack.
+- **Banderas:** si borras las banderas (`DP_FLG_*`) del estadio base, el exportador encoge su colocación hasta hacerlas invisibles. El juego las dibuja a partir de la colocación de la tabla, no de su malla, y sin prueba de profundidad: borradas o enterradas seguían viéndose.
+- **Menú de elección de estadio** (estadio nuevo): con **Foto del menú** (activado por defecto) el exportador renderiza tu estadio desde detrás del plato, con una vista cenital difuminada a la izquierda como las fotos del juego, y escribe `project\env_stadium_menu_<código>.pack`. **Línea bajo la foto** es el texto verde de debajo, por ejemplo «Home of the Miami Marlins»; vacía, no sale ninguna. Antes se veían la foto y la línea del estadio base.
 
 Aún no: objetos sueltos que no vinieron del juego. El exportador los ignora: pásalos antes por **Convertir objetos en piezas** (abajo).
 
@@ -95,6 +97,8 @@ Puedes llevar al juego un estadio que no existe en él.
    - Cada cara queda una sola vez y mirando al campo. De dos caras en el mismo sitio (las dos caras de una pared, como las exporta SketchUp) queda la que mira al campo.
    - Las superficies pegadas a menos de 25 cm de otra paralela, como ventanas o letreros, se separan hasta 25 cm, para que no parpadeen.
    - Con **Quitar el estadio original** (activado por defecto), las piezas del estadio base desaparecen y solo queda tu modelo. Las piezas con la propiedad `pp_keep` se conservan, por ejemplo una pieza de público en la que hayas puesto tu propio público.
+   - Las bases, el plato y el montículo del juego (piezas `BCL`) se conservan siempre: los jugadores se colocan sobre ellos, y los de un modelo rara vez coinciden (el plato del Mario Stadium medía 1,2 m).
+   - Cada pieza recibe como mucho 30 texturas: las del modelo se reparten entre las gradas del estadio base.
 5. Pulsa **Generar colisión**. Crea la malla «Colisión» de tu estadio:
    - el suelo (césped si es verde, tierra si no) y el montículo;
    - las vallas, siguiendo la pared más cercana al campo en todas direcciones;

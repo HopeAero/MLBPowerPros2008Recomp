@@ -74,9 +74,11 @@ for o in (field, infield, wall, stands):
 bpy.context.view_layer.objects.active = field
 pieces_before = sum(1 for o in stadium.all_objects if o.get("pp_kind") == "model")
 check(bpy.ops.object.powerpros_convert(replace=True, bake_light=True) == {"FINISHED"}, "convert finishes")
-pieces = [o for o in stadium.all_objects if o.get("pp_kind") == "model"]
+kept = [o.name for o in stadium.all_objects if o.get("pp_kind") == "model" and "BCL" in o.name]
+pieces = [o for o in stadium.all_objects if o.get("pp_kind") == "model" and "BCL" not in o.name]
 check(not any(n in bpy.data.objects for n in ("campo", "tierra", "valla", "gradas")), "source objects removed")
 check(len(pieces) == 2, f"the model is two pieces, field and the rest: {[o.name for o in pieces]}")
+check(len(kept) == 3, f"the game's bases, plate and mound stay: {kept}")
 ground = next((o for o in pieces if all(abs(v.co.z) < 0.1 for v in o.data.vertices)), None)
 check(ground is not None, "the field went to its own (ground) piece")
 greens = [c.color for c in ground.data.color_attributes["Color"].data]
@@ -120,6 +122,6 @@ for tree, lists, count in (("planes_a", "lists_a", len(table.placements)), ("pla
     leaves = [s[2] for _, h, l in nodes for s in (h, l) if s[0] == 0]
     check(reached == set(range(count)) and max(leaves) <= 127, f"{tree}: reaches all {count}, leaves <= 127 ({max(leaves)})")
 models = [pj7m.parse_model(gfx, off) for off in pj7m.find_models(gfx)]
-check(sum(1 for m in models if m.meshes) == len(pieces), f"{len(pieces)} pieces with geometry in the pack")
+check(sum(1 for m in models if m.meshes and "BCL" not in m.name) == len(pieces), f"{len(pieces)} pieces with geometry in the pack (plus the kept BCL ones)")
 print("RESULT:", "FAIL" if failures else "PASS")
 sys.exit(1 if failures else 0)

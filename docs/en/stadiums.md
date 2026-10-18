@@ -71,6 +71,8 @@ What exporting does:
   - The **surface** of each face comes from the final number in its material's name: "Surface 9" («Superficie 9») is a fence. To change a face's type, assign it another "Surface N" material.
   - Each face's normal points to the side the ball hits: up on the ground and towards the field on fences.
 - **Size limit:** an 80 MB graphics pack loads in a game and a 96 MB one doesn't. The original weighs 1.1 MB. If you go over 80 MB, the exporter warns you. (On the Wii the cap was about 21 MB: the game reserves a fixed memory heap; the recomp enlarges it.) HD textures don't count: they go separately, outside the pack.
+- **Flags:** if you delete the base stadium's flags (`DP_FLG_*`), the exporter shrinks their placement until they are invisible. The game draws them from the table placement, not from their mesh, and without depth test: deleted or buried they still showed.
+- **Stadium select menu** (new stadium): with **Menu photo** (on by default) the exporter renders your stadium from behind home plate, with a faded overhead view on the left like the game's photos, and writes `project\env_stadium_menu_<code>.pack`. **Line under the photo** is the green text below it, for example "Home of the Miami Marlins"; empty shows none. Before, the base stadium's photo and line showed.
 
 Not yet: loose objects that didn't come from the game. The exporter ignores them: run them through **Convert objects to pieces** (**Convertir objetos en piezas**) first (below).
 
@@ -95,6 +97,8 @@ You can bring a stadium that doesn't exist in the game into it.
    - Each face is kept only once and facing the field. Of two faces in the same place (the two sides of a wall, as SketchUp exports them) the one facing the field is kept.
    - Surfaces stuck less than 25 cm from another parallel one, such as windows or signs, are separated up to 25 cm, so they don't flicker.
    - With **Remove original stadium** (**Quitar el estadio original**) (on by default), the base stadium's pieces disappear and only your model remains. Pieces with the `pp_keep` property are kept, for example a crowd piece where you've put your own crowd.
+   - The game's bases, plate and mound (`BCL` pieces) always stay: the players stand on them, and a model's own rarely match (Mario Stadium's plate was 1.2 m).
+   - Each piece gets at most 30 textures: the model's are spread over the base stadium's stands.
 5. Press **Generate collision** (**Generar colisión**). It creates your stadium's "Collision" mesh:
    - the ground (grass if it's green, dirt if not) and the mound;
    - the fences, following the wall closest to the field in all directions;

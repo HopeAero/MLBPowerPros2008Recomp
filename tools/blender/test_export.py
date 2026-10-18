@@ -102,6 +102,22 @@ check((new_dir / "project" / "stadium_coors3.pack").read_bytes() == gfx, "new st
 check((new_dir / "project" / "stadium_coors3tbl.pack").is_file(), "new stadium tbl written")
 toml = (new_dir / "mod.toml").read_text(encoding="utf-8")
 check('[[stadium]]' in toml and 'code = "coors3"' in toml and 'base = "col"' in toml, "mod.toml declares the stadium")
+# Its stadium select menu: Coors Field's layout (env_stadium_menu27) with a rendered photo, no «Home of» line.
+menu = new_dir / "project" / "env_stadium_menu_coors3.pack"
+base_menu = archive.read("env_stadium_menu27.pack")
+packwii = importlib.import_module(pkg + ".packwii")
+if menu.is_file():
+    m = menu.read_bytes()
+    texs = sorted(packwii.find_textures(m), key=lambda t: -t["h"])
+    photo, line = (packwii.image_of(m, t) for t in texs)
+    check(len(m) == len(base_menu) and photo.shape == (256, 512, 4) and photo[..., :3].std() > 20,
+          "menu pack written with a rendered photo")
+    check(line[..., 3].max() == 0, "no «Home of» line when none is given")
+else:
+    check(False, "menu pack written")
+# A deleted flag is shrunk away: the game animates flags from the placement, not the piece's meshes.
+flag_place = place[offsets[flag]]
+check(max(flag_place.scale) < 0.01, f"deleted {flag} placement shrunk (scale {flag_place.scale[0]:g})")
 try:  # in background mode an operator's ERROR report raises
     refused = bpy.ops.export_scene.powerpros_stadium(mod_name="BlenderNuevo", mods_folder=mods_dir, mode="new",
                                                      new_code="nyy", new_name="x") == {"CANCELLED"}

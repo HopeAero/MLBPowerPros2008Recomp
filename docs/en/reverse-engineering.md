@@ -489,6 +489,8 @@ Verified (October 14, 2026):
 - Making the vertex color of `DP_ground` blue turns the infield dirt blue.
 - Changing the second color of the `DP_MIP_turf` material to red changes nothing: the stadium is drawn without material lighting.
 - Changing the translation of the `DP_FLG_*` placements puts the flags in a row on the center field grass. The game uses the table, even though the placement's box and sphere stay in the old place.
+- Flags (`0x500`) are cloth the game animates from the placement, not from the piece's mesh: with the piece emptied they keep waving in place. They are drawn without depth test: moved 100 m under the field they showed through the ground. With the placement scale at `1e-4` they disappear (18 October 2026).
+- **Per-stadium menu pack:** `env_stadium_menuNN.pack`, NN being the stadium number (`kStadiumCodes` order, Coors Field = 27). Two C8 textures with their own 256-colour palette: the photo (512 × 256, pixels at `0x60`) and "Home of…" (512 × 64). A pack of the same size with both textures re-encoded works as a new stadium's menu.
 
 **Writing stadiums** (verified in Coors Field matches, October 14, 2026):
 - **New data at the end of the pack:** it accepts it, with new pointers (`0x40000000 | position`). A mesh repointed to a new display list of separate triangles (`0x90`) instead of strips, and to new arrays, draws fine. There is no relocation table to update.
