@@ -10,7 +10,7 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
-from . import collision_gen, convert, exporter, importer, names
+from . import collision_gen, convert, exporter, importer, names, preview
 from .i18n import CONTEXT, T
 
 
@@ -176,6 +176,40 @@ class PP_OT_export_stadium(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class PP_OT_preview_in_game(bpy.types.Operator):
+    bl_idname = "view3d.powerpros_preview_in_game"
+    bl_translation_context = CONTEXT
+
+    @classmethod
+    def relabel(cls):
+        cls.bl_label = T("Ver en el juego", "View in game")
+        cls.bl_description = T("Abre el juego directamente en este estadio, con una cámara libre donde está esta vista "
+                               "(WASD, Q/E, botón derecho para mirar). No toca tus mods",
+                               "Open the game straight in this stadium, with a free camera where this view is "
+                               "(WASD, Q/E, right mouse button to look). Your mods are left alone")
+
+    @classmethod
+    def poll(cls, context):
+        return stadium_collection(context) is not None
+
+    def execute(self, context):
+        space = context.space_data
+        if space is not None and space.type == "VIEW_3D":
+            window = next((r for r in context.area.regions if r.type == "WINDOW"), None)
+            aspect = window.width / max(window.height, 1) if window is not None else 16 / 9
+            pose = preview.camera_pose(space.region_3d.view_matrix, space.lens, aspect=aspect)
+        else:
+            pose = (0.0, 150.0, 600.0, 0.0, -0.2, 45.0)     # behind home plate
+        try:
+            preview.launch(stadium_collection(context), pose)
+        except (exporter.ExportFailure, OSError) as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        self.report({"INFO"}, T("Abriendo el juego en el estadio (unos segundos)…",
+                                "Opening the game in the stadium (a few seconds)…"))
+        return {"FINISHED"}
+
+
 class PP_OT_convert_objects(bpy.types.Operator):
     bl_idname = "object.powerpros_convert"
     bl_options = {"REGISTER", "UNDO"}
@@ -272,6 +306,7 @@ class PP_PT_info(bpy.types.Panel):
         layout = self.layout
         layout.operator(PP_OT_import_stadium.bl_idname, icon="IMPORT")
         layout.operator(PP_OT_export_stadium.bl_idname, icon="EXPORT")
+        layout.operator(PP_OT_preview_in_game.bl_idname, icon="PLAY")
         layout.operator(PP_OT_convert_objects.bl_idname, icon="MESH_DATA")
         layout.operator(PP_OT_generate_collision.bl_idname, icon="MOD_PHYSICS")
         obj = context.active_object
@@ -309,7 +344,8 @@ def menu_export(self, context):
                          text=T("Mod de estadio de Power Pros 2008", "Power Pros 2008 stadium mod"), translate=False)
 
 
-CLASSES = (PP_OT_import_stadium, PP_OT_export_stadium, PP_OT_convert_objects, PP_OT_generate_collision, PP_PT_info)
+CLASSES = (PP_OT_import_stadium, PP_OT_export_stadium, PP_OT_preview_in_game, PP_OT_convert_objects,
+           PP_OT_generate_collision, PP_PT_info)
 
 
 def apply_language():
