@@ -23,6 +23,7 @@ TARGET = ("stand", "fence", "ground", "turf")
 SKIP = ("ALP", "ADD", "EVC", "NOUPCAM", "FLG", "Audience", "lumine", "LIGHT", "BCL", "ANT", "ZTEST",
         "score", "aurora", "board")
 SUN = Vector((0.35, -0.45, 0.82)).normalized()
+MAX_TEXMAPS = 30        # most textures one stadium piece has in the game; 82 overran a game table and crashed
 FIELD = Vector((0.0, 45.0))                          # a point of every field (home at the origin)
 
 
@@ -86,12 +87,28 @@ def convert(coll, sources, replace=True, bake_light=True):
     """Spread the faces of `sources` (mesh objects in the game's frame) over the stadium's pieces.
     replace: the pieces lose their own geometry and the pieces left without any are deleted.
     Returns {piece name: faces}. The source objects are removed."""
-    # The field to the ground piece, the rest to one stand piece (whose box then covers the stadium,
-    # so the game never culls it).
+    # The field to the ground piece, the rest to the stand pieces. A piece can't take more than
+    # MAX_TEXMAPS textures (its original ones stay in the pack), so each texture goes to the first
+    # stand piece, biggest first, that still has room.
     ground, others = targets(coll)
-    target = max(others or [ground], key=lambda o: len(o.data.polygons))
+    stands = sorted(others or [ground], key=lambda o: -len(o.data.polygons))
+    room = {o.name: MAX_TEXMAPS - len(o.data.materials) for o in [ground] + stands}
     pieces = {o.name: o for o in [ground] + others}
-    buckets, slots, plain, tex_mats = {}, {}, None, {}
+    buckets, slots, plain, tex_mats, home = {}, {}, None, {}, {}
+
+    def piece_for(gm, flat):
+        if flat:
+            return ground.name
+        if gm.name not in home:
+            name = next((o.name for o in stands if room[o.name] > 0), None)
+            if name is None:
+                raise ConvertFailure(T("El modelo tiene demasiadas texturas distintas para las piezas del estadio: "
+                                       "junta texturas o elige un estadio base con más gradas",
+                                       "The model has too many different textures for the stadium's pieces: "
+                                       "merge textures or pick a base stadium with more stands"))
+            room[name] -= 1
+            home[gm.name] = name
+        return home[gm.name]
 
     def bucket(name):
         if name not in buckets:
@@ -130,9 +147,9 @@ def convert(coll, sources, replace=True, bake_light=True):
             c = sum(vs, Vector()) / len(vs)
             n = (normal_mw @ p.normal).normalized()
             flat = abs(n.z) > 0.95 and c.z < 1.0 and c.xy.length < 160
-            name = ground.name if flat else target.name
-            bm = bucket(name)
             gm = game_material(img)
+            name = piece_for(gm, flat)
+            bm = bucket(name)
             if gm not in slots[name]:
                 slots[name].append(gm)
             uvs = [tuple(uv.data[li].uv) for li in p.loop_indices] if uv else [(0.0, 0.0)] * len(vs)

@@ -107,6 +107,7 @@ You can bring a stadium that doesn't exist in the game into it.
 
 Limits:
 - The collision can have up to 65,535 triangles.
+- Each piece takes up to 30 textures, counting its original ones; that is the most a piece has in the game's stadiums. «Convert objects into pieces» spreads the model's textures over the base stadium's stands to stay under it, and the exporter refuses to write a piece with more. With 82 in one piece the game read past a table, the stadium showed no fences and the match ended up closing.
 - In the pack, textures become RGB5A3 and powers of 2 up to 256 pixels. With **HD textures**, the game uses the image at its own size (up to 2048 pixels).
 - The collision generator assumes a normal baseball field: ground at height 0, the center of the field about 45 m in front of home plate and walls around it.
 

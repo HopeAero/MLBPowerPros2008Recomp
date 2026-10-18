@@ -53,6 +53,7 @@ def image_of(mat):
 
 
 MAX_TEXTURE = 256      # the game's stadium textures are 32-256 px: bigger ones (no mipmaps) shimmer far away
+MAX_TEXMAPS = 30       # most texmaps one piece has in the game's stadiums; 82 overran a game table (Mario Stadium probe)
 
 
 def pow2(n):
@@ -240,6 +241,12 @@ class Exporter:
             if mesh_changed:
                 meshes = self.mesh_groups(obj, model)
                 self.w.set_meshes(pj7m.parse_model(self.w.d, off), meshes, FIELD_CENTRE)
+                texmaps = len(pj7m.parse_model(self.w.d, off).texmaps)
+                if texmaps > MAX_TEXMAPS:      # the game indexes a fixed table with them and crashes
+                    raise ExportFailure(T(f"La pieza {obj.name} tendría {texmaps} texturas y el juego admite {MAX_TEXMAPS}: "
+                                          "pasa el modelo por «Convertir objetos en piezas» o usa menos texturas",
+                                          f"Piece {obj.name} would have {texmaps} textures and the game takes {MAX_TEXMAPS}: "
+                                          "run the model through «Convert objects into pieces» or use fewer textures"))
                 self.stats["pieces"] += 1
                 points = [p for m in meshes for p in m.positions]
             else:

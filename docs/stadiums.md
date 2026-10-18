@@ -107,6 +107,7 @@ Puedes llevar al juego un estadio que no existe en él.
 
 Límites:
 - La colisión puede tener hasta 65.535 triángulos.
+- Cada pieza admite hasta 30 texturas, contando las suyas originales; es lo máximo que tiene una pieza en los estadios del juego. «Convertir objetos en piezas» reparte las texturas del modelo entre las gradas del estadio base para no pasar de ahí, y el exportador se niega a escribir una pieza con más. Con 82 en una pieza el juego leía fuera de una tabla, el estadio salía sin vallas y el partido acababa cerrándose.
 - En el pack, las texturas pasan a RGB5A3 y potencias de 2 de hasta 256 píxeles. Con **Texturas HD**, el juego usa la imagen a su tamaño (hasta 2048 píxeles).
 - El generador de colisión supone un campo de béisbol normal: suelo a la altura 0, el centro del campo unos 45 m por delante del plato y paredes alrededor.
 
