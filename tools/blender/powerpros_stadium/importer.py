@@ -90,6 +90,14 @@ def make_material(gfx, model, index, images, cache):
         return cache[key]
     mat = bpy.data.materials.new(f"{model.name}_mat{index}")
     mat["pp_material"] = mat_data.raw.hex()
+    image, transparent = make_image(gfx, tex, images) if tex is not None else (None, False)
+    shade(mat, image, transparent, additive)
+    cache[key] = mat
+    return mat
+
+
+def shade(mat, image=None, transparent=False, additive=False):
+    """Nodes that show mat as the game draws it: unlit, the image (if any) times the vertex colours."""
     mat.use_nodes = True
     nt = mat.node_tree
     nt.nodes.clear()
@@ -98,10 +106,10 @@ def make_material(gfx, model, index, images, cache):
     vcol = nt.nodes.new("ShaderNodeVertexColor")
     vcol.layer_name = "Color"
     vcol.location = (-600, -100)
-    color, alpha, transparent = vcol.outputs["Color"], vcol.outputs["Alpha"], False
-    if tex is not None:
+    color, alpha = vcol.outputs["Color"], vcol.outputs["Alpha"]
+    if image is not None:
         node = nt.nodes.new("ShaderNodeTexImage")
-        node.image, transparent = make_image(gfx, tex, images)
+        node.image = image
         node.location = (-600, 250)
         mix = nt.nodes.new("ShaderNodeMix")
         mix.data_type, mix.blend_type = "RGBA", "MULTIPLY"
@@ -135,8 +143,6 @@ def make_material(gfx, model, index, images, cache):
     if transparent or additive:
         mat.surface_render_method = "BLENDED"
         mat.use_backface_culling = False
-    cache[key] = mat
-    return mat
 
 
 def build_mesh(gfx, model, images, materials):

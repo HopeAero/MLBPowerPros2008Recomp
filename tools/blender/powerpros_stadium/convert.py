@@ -15,6 +15,7 @@ import bmesh
 import bpy
 from mathutils import Vector
 
+from . import importer
 from .i18n import T
 
 # Pieces that receive the model: stands, fences and ground, never the special ones (alpha, additive,
@@ -123,12 +124,11 @@ def convert(coll, sources, replace=True, bake_light=True):
         if img is None:
             if plain is None:
                 plain = bpy.data.materials.new("pp_color")       # untextured: colour in the vertices
-                plain.use_nodes = True
+                importer.shade(plain)
             return plain
         if img.name not in tex_mats:
             m = bpy.data.materials.new("pp_" + img.name)
-            m.use_nodes = True
-            m.node_tree.nodes.new("ShaderNodeTexImage").image = img
+            importer.shade(m, img)
             tex_mats[img.name] = m
         return tex_mats[img.name]
 
@@ -194,6 +194,7 @@ def convert(coll, sources, replace=True, bake_light=True):
         if replace:
             me = bpy.data.meshes.new(name)
             bm.to_mesh(me)
+            me.color_attributes.active_color_name = "Color"     # Solid view, Attribute colour: as in the game
             obj.data = me
             for m in slots[name]:
                 me.materials.append(m)
@@ -205,6 +206,7 @@ def convert(coll, sources, replace=True, bake_light=True):
                 obj.data.materials.append(m)
             _append(old, bm, offset)
             old.to_mesh(obj.data)
+            obj.data.color_attributes.active_color_name = "Color"
             old.free()
         bm.free()
         result[name] = len(obj.data.polygons)

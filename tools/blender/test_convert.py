@@ -83,6 +83,11 @@ ground = next((o for o in pieces if all(abs(v.co.z) < 0.1 for v in o.data.vertic
 check(ground is not None, "the field went to its own (ground) piece")
 greens = [c.color for c in ground.data.color_attributes["Color"].data]
 check(any(c[1] > c[0] * 1.5 for c in greens), "material colour baked into the vertex colours")
+# Blender shows the pieces as the game draws them: vertex colour (times the texture), unlit.
+check(all(o.data.color_attributes.active_color_name == "Color" for o in pieces), "vertex colours are the active ones")
+for m in {m for o in pieces for m in o.data.materials}:
+    types = {n.type for n in m.node_tree.nodes}
+    check({"VERTEX_COLOR", "EMISSION"} <= types, f"{m.name} shows vertex colour, unlit")
 
 bpy.context.view_layer.objects.active = pieces[0]
 check(bpy.ops.object.powerpros_generate_collision() == {"FINISHED"}, "collision generated")
