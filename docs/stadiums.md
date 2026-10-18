@@ -78,6 +78,17 @@ Aún no: objetos sueltos que no vinieron del juego. El exportador los ignora: p�
 
 Un material nuevo con una imagen sí se exporta: se crea en la pieza con esa imagen como textura nueva.
 
+## Ver en el juego
+
+Lo que se ve bien en Blender puede verse distinto en el juego. **Ver en el juego** (panel **Power Pros** de la vista 3D, bajo «Exportar mod de estadio») abre el juego de verdad directamente en el estadio que estás haciendo, sin empezar un partido:
+
+- Exporta el estadio a una carpeta temporal como un mod aparte («Vista previa», estadio `pp_preview`). **No toca tu carpeta mods** ni tus ajustes.
+- El juego abre sin launcher y, unos 8 segundos después, muestra el estadio con la cámara **donde está tu vista de Blender**. Sin jugadores ni marcador: el partido queda quieto, pero el público y las banderas del estadio siguen moviéndose.
+- **Teclas:** W/A/S/D para moverte, Q/E para bajar y subir, Shift para ir rápido, botón derecho del ratón + ratón para mirar, rueda para la velocidad. **1**, **2** y **3** ponen las cámaras reales del partido (bateador, jugada, lejana; en ellas se ven los jugadores quietos); **F** vuelve a la cámara libre y **H** oculta la ayuda.
+- Pulsar el botón otra vez cierra el juego que abrió antes y lo abre con tus cambios.
+- Usa su propia caché (unos 400 MB en `UserData/Cache/preview`), así que no rehace la del juego normal. Solo carga el estadio que estás haciendo: tus otros mods no se activan.
+- Hace falta haber importado el estadio desde la carpeta del juego instalado (la que tiene `WiiCompiled.exe`); si no, el botón lo dice.
+
 ## Tu propio modelo (SketchUp, glTF, OBJ…)
 
 Puedes llevar al juego un estadio que no existe en él.

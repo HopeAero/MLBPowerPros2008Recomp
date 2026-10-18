@@ -801,3 +801,13 @@ Parche `wiicompiled-mlb-mem2-heap` (runtime).
 - **Arreglo:** `hle/mlb/game_heaps.cpp` reproduce `0x8005AF78` y da al montón de MEM2 toda la arena, como en el Wii: 125,7 MB.
 - **Medido en el partido de prueba** (Coors Field, packs rellenados con ceros): 32 MB y 80 MB cargan y el partido avanza; con 96 MB el pack se lee en `0x911DC3E0`, pero luego falla otra reserva. El partido normal con los mods del usuario sigue igual.
 - **Más margen:** ampliar `Memory::kMem2Size` (hoy 128 MB, heredado del modo NDEV de Mario Kart) daría más; no hace falta todavía.
+
+## Vista previa de estadios en el juego (18 de octubre de 2026)
+
+Parche `wiicompiled-stadium-viewer` (runtime y aurora) y complemento de Blender 0.7.0 (`preview.py`, botón «Ver en el juego»).
+
+- **Modo visor:** con `WIICOMPILED_STADIUM_VIEWER=<carpeta del mod>` el juego se salta el launcher, carga solo ese mod, usa la caché `UserData/Cache/preview`, no escribe `Config.toml` y entra en el partido de prueba en el estadio `pp_preview`. A pulsa sola en la pantalla de inicio: estadio en pantalla a los **7,7–8,4 s** de lanzar (medido varias veces).
+- **Partido quieto:** `0x808816C8` (actualización del partido por fotograma) es nativa; en el visor, con el estadio ya en pantalla, se salta el árbol de estados `0x808661BC`. Jugadores, pelota y jugada se paran; el público del estadio original sigue animado. 2 minutos sin accesos fuera de memoria; el partido normal sigue jugando.
+- **Sin HUD:** aurora deja fuera los dibujos ortográficos que no muestran una copia del EFB (`AURORA_DRAW_FILTER_HUD`). Efecto secundario: el modelo del bateador, que se compone con esas pasadas, saldría negro (en el visor no aparece).
+- **Cámara:** cámara libre (WASD, Q/E, Shift, ratón, rueda) sobre `0x80055D24`, y las tomas reales del partido aprendidas en el director `0x80C779D4`. La primera vista aplica antes la toma del bateador: sin eso, el vuelo de presentación de la cámara seguía moviendo la imagen. En cámara libre, las cámaras de las tomas miran a otro lado para sacar de pantalla jugadores y cursor; se reponen al elegir una toma.
+- **De punta a punta desde Blender** (Coors Field, carpeta temporal con espacios y paréntesis): el juego abre en la vista de Blender sin jugadores ni HUD; la segunda pulsación cierra el primer proceso y muestra la pieza movida; `Config.toml` y la caché del juego normal no cambian; el partido normal con los mods del usuario sigue igual (HUD, jugadores, marcador).

@@ -78,6 +78,17 @@ Not yet: loose objects that didn't come from the game. The exporter ignores them
 
 A new material with an image does get exported: it is created in the piece with that image as a new texture.
 
+## View in game
+
+What looks right in Blender may look different in the game. **View in game** (the **Power Pros** panel of the 3D view, under «Export stadium mod») opens the real game straight in the stadium you are making, without starting a match:
+
+- It exports the stadium to a temp folder as a separate mod («Vista previa», stadium `pp_preview`). **Your mods folder** and your settings **are left alone**.
+- The game opens without the launcher and, about 8 seconds later, shows the stadium with the camera **where your Blender view is**. No players or scoreboard: the match stands still, but the stadium's crowd and flags keep moving.
+- **Keys:** W/A/S/D to move, Q/E down and up, Shift to go fast, right mouse button + mouse to look, wheel for speed. **1**, **2** and **3** show the match's real cameras (batter, play, wide; the players show in them, standing still); **F** goes back to the free camera and **H** hides the help.
+- Pressing the button again closes the game it opened before and opens it with your changes.
+- It uses its own cache (about 400 MB in `UserData/Cache/preview`), so the normal game's cache is not rebuilt. It loads only the stadium you are making: your other mods are not enabled.
+- The stadium must have been imported from the installed game folder (the one with `WiiCompiled.exe`); otherwise the button says so.
+
 ## Your own model (SketchUp, glTF, OBJ…)
 
 You can bring a stadium that doesn't exist in the game into it.

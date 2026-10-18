@@ -166,10 +166,10 @@ index 0000000..8e345f3
 +}  // namespace stadium_viewer
 diff --git a/runtime/include/mlb_camera.h b/runtime/include/mlb_camera.h
 new file mode 100644
-index 0000000..f2f4483
+index 0000000..d1c3341
 --- /dev/null
 +++ b/runtime/include/mlb_camera.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,49 @@
 +#pragma once
 +// The game's camera (MLB Power Pros 2008), for the stadium viewer's free camera.
 +// Reverse engineering: docs/ingenieria-inversa.md, "Cámara del partido".
@@ -194,6 +194,8 @@ index 0000000..f2f4483
 +// Asks for the game's own camera of that view (applied on the next guest frame); false while the match
 +// camera is not known yet.
 +bool ShowMatchView(MatchView view);
++// True from ShowMatchView until the guest frame that applies it.
++bool MatchViewPending();
 +// Guest-thread hook (once per frame, viewer only): applies a pending ShowMatchView.
 +void OnGuestFrame(CpuContext* cpu);
 +// The camera the game drew the last frame with.
@@ -287,10 +289,10 @@ index 0000000..a0a362e
 +}  // namespace stadium_viewer
 diff --git a/runtime/src/hle/mlb/game_camera.cpp b/runtime/src/hle/mlb/game_camera.cpp
 new file mode 100644
-index 0000000..bbbd185
+index 0000000..8e3ceda
 --- /dev/null
 +++ b/runtime/src/hle/mlb/game_camera.cpp
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,246 @@
 +// MLB Power Pros 2008 (RL8E54) game-specific natives: the match camera, for the stadium viewer's free
 +// camera and match views (docs/ingenieria-inversa.md, "Cámara del partido").
 +//
@@ -483,6 +485,8 @@ index 0000000..bbbd185
 +void ClearOverride() { mlb_camera_native::g_override.store(false, std::memory_order_release); }
 +
 +bool OverrideActive() { return mlb_camera_native::g_override.load(std::memory_order_acquire); }
++
++bool MatchViewPending() { return mlb_camera_native::g_request.load() >= 0; }
 +
 +bool ShowMatchView(MatchView view) {
 +    if (mlb_camera_native::g_director.load() == 0) return false;
@@ -885,10 +889,10 @@ index 0000000..6a8d088
 +}  // namespace stadium_viewer
 diff --git a/runtime/src/stadium_viewer_input.cpp b/runtime/src/stadium_viewer_input.cpp
 new file mode 100644
-index 0000000..ffd26e7
+index 0000000..94abd76
 --- /dev/null
 +++ b/runtime/src/stadium_viewer_input.cpp
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,111 @@
 +// Stadium viewer controls (host thread, once per presented frame): the free camera and the game's match
 +// shots. Keys: W/A/S/D move, Q down, E up, Shift fast, right mouse button + mouse to look, wheel for
 +// speed; 1 batter, 2 play, 3 wide (the game's own cameras); F back to the free camera; H hides the help.
@@ -909,6 +913,7 @@ index 0000000..ffd26e7
 +
 +std::optional<FreeCamera> g_free;  // set while the free camera drives the view
 +bool g_started = false;
++bool g_initialFree = false;  // the Blender view, once the batter shot is in
 +bool g_help = true;
 +bool g_previous[SDL_SCANCODE_COUNT] = {};
 +
@@ -932,8 +937,18 @@ index 0000000..ffd26e7
 +        g_started = true;
 +        // Only the stadium: no 2D HUD.
 +        aurora_set_draw_filter(AURORA_DRAW_FILTER_HUD);
-+        if (Active()->camera) StartFree(*Active()->camera);  // where the Blender view was
-+        else game_camera::ShowMatchView(game_camera::MatchView::Batter);
++        // The batter shot first: applying a shot ends the camera's opening fly-over, which would
++        // otherwise keep moving the view under the free camera.
++        const bool shown = game_camera::ShowMatchView(game_camera::MatchView::Batter);
++        g_initialFree = Active()->camera.has_value();
++        if (g_initialFree && !shown) {
++            StartFree(*Active()->camera);
++            g_initialFree = false;
++        }
++    }
++    if (g_initialFree && !game_camera::MatchViewPending()) {
++        StartFree(*Active()->camera);  // where the Blender view was
++        g_initialFree = false;
 +    }
 +    const bool* keys = SDL_GetKeyboardState(nullptr);
 +    const ImGuiIO& io = ImGui::GetIO();

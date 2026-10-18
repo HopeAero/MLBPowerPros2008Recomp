@@ -801,3 +801,13 @@ Patch `wiicompiled-mlb-mem2-heap` (runtime).
 - **Fix:** `hle/mlb/game_heaps.cpp` reproduces `0x8005AF78` and gives the MEM2 heap the whole arena, as on the Wii: 125.7 MB.
 - **Measured in the test match** (Coors Field, zero-padded packs): 32 MB and 80 MB load and the match goes on; at 96 MB the pack is read at `0x911DC3E0`, but another allocation fails afterwards. The normal match with the user's mods is unchanged.
 - **More headroom:** raising `Memory::kMem2Size` (128 MB today, inherited from Mario Kart's NDEV mode) would give more; not needed yet.
+
+## In-game stadium preview (18 October 2026)
+
+Patch `wiicompiled-stadium-viewer` (runtime and aurora) and Blender add-on 0.7.0 (`preview.py`, «View in game» button).
+
+- **Viewer mode:** with `WIICOMPILED_STADIUM_VIEWER=<mod folder>` the game skips the launcher, loads only that mod, uses the `UserData/Cache/preview` cache, does not write `Config.toml` and enters the test match in stadium `pp_preview`. A is pressed by itself on the title screen: stadium on screen **7.7–8.4 s** after launch (measured several times).
+- **Still match:** `0x808816C8` (the match's per-frame update) is native; in the viewer, once the stadium is on screen, the state tree `0x808661BC` is skipped. Players, ball and play stop; the original stadium's crowd keeps animating. 2 minutes without out-of-memory accesses; the normal match keeps playing.
+- **No HUD:** aurora leaves out orthographic draws that do not show an EFB copy (`AURORA_DRAW_FILTER_HUD`). Side effect: the batter model, composed with those passes, would come out black (it does not show in the viewer).
+- **Camera:** free camera (WASD, Q/E, Shift, mouse, wheel) on top of `0x80055D24`, and the match's real shots learned in the director `0x80C779D4`. The first view applies the batter shot first: without it, the camera's opening fly-over kept moving the image. In the free camera, the shot cameras look away to take players and cursor off screen; they are put back when a shot is chosen.
+- **End to end from Blender** (Coors Field, temp folder with spaces and parentheses): the game opens at the Blender view with no players or HUD; the second press closes the first process and shows the moved piece; `Config.toml` and the normal game's cache do not change; the normal match with the user's mods is unchanged (HUD, players, scoreboard).

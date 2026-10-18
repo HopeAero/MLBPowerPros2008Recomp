@@ -66,6 +66,8 @@ check(env.get("WIICOMPILED_STADIUM_VIEWER_CODE") == preview.PREVIEW_CODE, "viewe
 cam = [float(v) for v in env.get("WIICOMPILED_STADIUM_VIEWER_CAMERA", "").split(",")]
 check(len(cam) == 6 and all(abs(a - b) < 1e-3 for a, b in zip(cam, pose)), f"camera variable {cam}")
 check(list((game / "mods").iterdir()) == [], "the game's mods folder is untouched")
+next(o for o in coll.all_objects if o.name == "DP_score").location.z += 20.0     # moved from a script
+check(preview.launch(coll, pose, dry_run=True)["stats"]["moved"] == 1, "a piece moved just before is exported")
 
 # 3. No game executable: the error names the folder.
 (game / "WiiCompiled.exe").unlink()

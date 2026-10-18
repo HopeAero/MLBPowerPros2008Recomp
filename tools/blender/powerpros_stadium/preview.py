@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import bpy
 from mathutils import Vector
 
 from . import exporter, importer
@@ -55,6 +56,7 @@ def launch(coll, pose, *, dry_run=False):
         raise exporter.ExportFailure(T(f"No encuentro WiiCompiled.exe en {game}: importa el estadio desde la carpeta del juego",
                                        f"WiiCompiled.exe not found in {game}: import the stadium from the game folder"))
     shutil.rmtree(preview_folder(), ignore_errors=True)
+    bpy.context.view_layer.update()     # matrix_world of what was just moved, when called from a script
     stats = exporter.export_stadium(coll, preview_folder(), PREVIEW_MOD, PREVIEW_CODE, PREVIEW_MOD,
                                     hd=True, menu=False, home_line="")
     mod_dir = preview_folder() / PREVIEW_MOD
