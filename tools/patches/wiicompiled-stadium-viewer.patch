@@ -1,0 +1,243 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index dee842d..c298f93 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -399,6 +399,11 @@ add_test(NAME mkw_stick_response_tests COMMAND mkw_stick_response_tests)
+ add_executable(mkw_auto_mips_tests "${CMAKE_CURRENT_LIST_DIR}/tests/auto_mips_tests.cpp")
+ target_compile_features(mkw_auto_mips_tests PRIVATE cxx_std_20)
+ add_test(NAME mkw_auto_mips_tests COMMAND mkw_auto_mips_tests)
++add_executable(mkw_stadium_viewer_tests "${CMAKE_CURRENT_LIST_DIR}/tests/stadium_viewer_tests.cpp"
++                                        "${CMAKE_CURRENT_LIST_DIR}/src/stadium_viewer.cpp")
++target_compile_features(mkw_stadium_viewer_tests PRIVATE cxx_std_20)
++target_include_directories(mkw_stadium_viewer_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
++add_test(NAME mkw_stadium_viewer_tests COMMAND mkw_stadium_viewer_tests)
+ 
+ add_executable(mkw_nand_save_tests "${CMAKE_CURRENT_LIST_DIR}/tests/nand_save_tests.cpp")
+ target_include_directories(mkw_nand_save_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+diff --git a/runtime/include/stadium_viewer.h b/runtime/include/stadium_viewer.h
+new file mode 100644
+index 0000000..707600b
+--- /dev/null
++++ b/runtime/include/stadium_viewer.h
+@@ -0,0 +1,35 @@
++#pragma once
++// Stadium viewer: the Blender add-on's "View in game" opens the game straight into the stadium being
++// made, from a one-run preview mod, with a free camera. Enabled by environment variables:
++//   WIICOMPILED_STADIUM_VIEWER        the preview mod's folder (the only mod loaded in that run)
++//   WIICOMPILED_STADIUM_VIEWER_CODE   the stadium code it declares (default pp_preview)
++//   WIICOMPILED_STADIUM_VIEWER_CAMERA "x,y,z,yaw,pitch,fov": initial free camera
++// Spec: docs/superpowers/specs/2026-10-18-stadium-preview-design.md
++#include <filesystem>
++#include <optional>
++#include <string>
++
++namespace stadium_viewer {
++
++// Game frame: decimetres, Y up, home plate at the origin, second base towards -Z. yaw in radians,
++// 0 = looking towards second base, positive towards first base; pitch in radians, positive up;
++// fovY in degrees.
++struct CameraPose {
++    float eye[3];
++    float yaw;
++    float pitch;
++    float fovY;
++};
++
++struct Config {
++    std::filesystem::path modDir;
++    std::string code;
++    std::optional<CameraPose> camera;
++};
++
++// Empty modDir: no viewer. Empty code: "pp_preview". A malformed camera is dropped.
++std::optional<Config> ParseConfig(const std::wstring& modDir, const std::wstring& code, const std::wstring& camera);
++const std::optional<Config>& Active();  // read once from the environment
++bool Enabled();
++
++}  // namespace stadium_viewer
+diff --git a/runtime/src/mods.cpp b/runtime/src/mods.cpp
+index eee0718..cb9402b 100644
+--- a/runtime/src/mods.cpp
++++ b/runtime/src/mods.cpp
+@@ -3,6 +3,7 @@
+ #include "recomp_mod_loader.h"
+ #include "runtime_config.h"
+ #include "runtime_log.h"
++#include "stadium_viewer.h"
+ 
+ #include <aurora/aurora.h>
+ 
+@@ -193,13 +194,26 @@ std::filesystem::path Directory() {
+ 
+ std::vector<Mod> Discover() {
+     std::vector<Mod> found;
+-    const auto enabled = RuntimeConfigFile::EnabledMods();
+     std::error_code ec;
+-    for (const auto& entry : std::filesystem::directory_iterator(Directory(), ec)) {
+-        if (!entry.is_directory(ec)) continue;
++    // The stadium viewer loads its preview mod alone, enabled for this run only: the user's mods and
++    // their [mods] enabled list are neither read nor written.
++    std::vector<std::filesystem::path> folders;
++    std::vector<std::string> enabled;
++    if (const auto& viewer = stadium_viewer::Active()) {
++        folders.push_back(viewer->modDir);
++        enabled.push_back(Utf8(viewer->modDir.filename()));
++        RT_LOG(RT_TAG_RUNTIME) << "[viewer] mod \"" << Utf8(viewer->modDir) << "\" (code " << viewer->code << ")"
++                               << std::endl;
++    } else {
++        enabled = RuntimeConfigFile::EnabledMods();
++        for (const auto& entry : std::filesystem::directory_iterator(Directory(), ec)) {
++            if (entry.is_directory(ec)) folders.push_back(entry.path());
++        }
++    }
++    for (const auto& folder : folders) {
+         Mod mod;
+-        mod.root = entry.path();
+-        mod.id = Utf8(entry.path().filename());
++        mod.root = folder;
++        mod.id = Utf8(folder.filename());
+         mod.name = mod.id;
+         const auto manifest = mod.root / "mod.toml";
+         if (std::filesystem::is_regular_file(manifest, ec)) {
+@@ -678,6 +692,15 @@ void Apply(AuroraConfig& config) {
+     static std::vector<const char*> texturePointers;
+     std::map<std::string, std::filesystem::path> packs;  // first enabled mod (by name) wins
+     const std::vector<Mod> all = Discover();
++    // The stadium viewer keeps its merged PROJECT.BIN, rosters and banners apart, so a preview never
++    // invalidates (or locks) the copy normal games use.
++    static std::string previewCache;
++    const char* cache = config.cachePath;
++    if (stadium_viewer::Enabled()) {
++        previewCache = Utf8((cache != nullptr ? std::filesystem::path(reinterpret_cast<const char8_t*>(cache))
++                                              : Directory().parent_path()) / "preview");
++        cache = previewCache.c_str();
++    }
+     g_saveDirectory = SaveDirectoryFor(all);
+     if (!g_saveDirectory.empty()) {
+         RT_LOG(RT_TAG_RUNTIME) << "mods: saves go to " << Utf8(g_saveDirectory) << std::endl;
+@@ -689,7 +712,7 @@ void Apply(AuroraConfig& config) {
+         if (mod.disc) RecompMod::RegisterDvdOverlayRoot(Utf8(mod.root / "disc"));
+         if (mod.textures) textureRoots.push_back(Utf8(mod.root / "textures"));
+         if (mod.roster) {  // before project/: a roster .dat wins over the same mod's game_data.pack
+-            if (const auto pack = ApplyRoster(mod, config.cachePath); !pack.empty()) {
++            if (const auto pack = ApplyRoster(mod, cache); !pack.empty()) {
+                 packs.try_emplace("game_data.pack", pack);
+             }
+         }
+@@ -709,8 +732,8 @@ void Apply(AuroraConfig& config) {
+             std::string key;
+             for (const unsigned char c : decl.name) key += std::isalnum(c) ? static_cast<char>(c) : '_';
+             const std::filesystem::path banner =
+-                (config.cachePath != nullptr ? std::filesystem::path(reinterpret_cast<const char8_t*>(config.cachePath))
+-                                             : Directory().parent_path()) /
++                (cache != nullptr ? std::filesystem::path(reinterpret_cast<const char8_t*>(cache))
++                                  : Directory().parent_path()) /
+                 "mods" / "banners" / (decl.code + "-" + key + "-v4.pack");
+             std::error_code ec;
+             if (std::filesystem::is_regular_file(banner, ec) || WriteStadiumNameBanner(banner, decl.name)) {
+@@ -740,7 +763,7 @@ void Apply(AuroraConfig& config) {
+         } else {
+             replaced = packs;
+         }
+-        ApplyProjectPacks(replaced, g_newFiles, config.cachePath);
++        ApplyProjectPacks(replaced, g_newFiles, cache);
+         RegisterNewStadiums(all);
+     }
+     if (textureRoots.empty()) return;
+diff --git a/runtime/src/stadium_viewer.cpp b/runtime/src/stadium_viewer.cpp
+new file mode 100644
+index 0000000..816abca
+--- /dev/null
++++ b/runtime/src/stadium_viewer.cpp
+@@ -0,0 +1,55 @@
++#include "stadium_viewer.h"
++
++#include <cstdlib>
++#include <cwchar>
++#include <sstream>
++#include <vector>
++
++namespace stadium_viewer {
++namespace {
++
++std::wstring Env(const wchar_t* name) {
++#if defined(_WIN32)
++    const wchar_t* value = _wgetenv(name);  // UTF-16: paths with accents survive
++    return value ? value : L"";
++#else
++    std::string narrow(name, name + std::wcslen(name));
++    const char* value = std::getenv(narrow.c_str());
++    return value ? std::filesystem::path(value).wstring() : L"";  // UTF-8 on these systems
++#endif
++}
++
++std::optional<CameraPose> ParseCamera(const std::wstring& text) {
++    std::vector<float> values;
++    std::wstringstream in(text);
++    std::wstring field;
++    while (std::getline(in, field, L',')) {
++        wchar_t* end = nullptr;
++        const float v = std::wcstof(field.c_str(), &end);
++        if (field.empty() || end != field.c_str() + field.size()) return std::nullopt;
++        values.push_back(v);
++    }
++    if (values.size() != 6) return std::nullopt;
++    return CameraPose{{values[0], values[1], values[2]}, values[3], values[4], values[5]};
++}
++
++}  // namespace
++
++std::optional<Config> ParseConfig(const std::wstring& modDir, const std::wstring& code, const std::wstring& camera) {
++    if (modDir.empty()) return std::nullopt;
++    Config config;
++    config.modDir = std::filesystem::path(modDir);
++    config.code = code.empty() ? "pp_preview" : std::filesystem::path(code).string();
++    if (!camera.empty()) config.camera = ParseCamera(camera);
++    return config;
++}
++
++const std::optional<Config>& Active() {
++    static const std::optional<Config> active = ParseConfig(
++        Env(L"WIICOMPILED_STADIUM_VIEWER"), Env(L"WIICOMPILED_STADIUM_VIEWER_CODE"), Env(L"WIICOMPILED_STADIUM_VIEWER_CAMERA"));
++    return active;
++}
++
++bool Enabled() { return Active().has_value(); }
++
++}  // namespace stadium_viewer
+diff --git a/runtime/tests/stadium_viewer_tests.cpp b/runtime/tests/stadium_viewer_tests.cpp
+new file mode 100644
+index 0000000..e2f9974
+--- /dev/null
++++ b/runtime/tests/stadium_viewer_tests.cpp
+@@ -0,0 +1,30 @@
++#include "stadium_viewer.h"
++#include <cmath>
++#include <cstdlib>
++int main() {
++    const auto require = [](bool ok) { if (!ok) std::abort(); };
++    const auto near = [](float a, float b) { return std::fabs(a - b) < 1e-4f; };
++    using stadium_viewer::ParseConfig;
++
++    require(!ParseConfig(L"", L"", L"").has_value());
++
++    // Spaces, parentheses and accents survive (the env is read as UTF-16).
++    auto c = ParseConfig(L"C:\\Temp\\Vista previa (Jos\u00e9)", L"", L"");
++    require(c.has_value());
++    require(c->modDir == std::filesystem::path(L"C:\\Temp\\Vista previa (Jos\u00e9)"));
++    require(c->code == "pp_preview");
++    require(!c->camera.has_value());
++
++    c = ParseConfig(L"D:\\m", L"mario", L"12.5,30,-400,0.5,-0.25,45");
++    require(c && c->code == "mario" && c->camera.has_value());
++    require(near(c->camera->eye[0], 12.5f) && near(c->camera->eye[1], 30.0f) && near(c->camera->eye[2], -400.0f));
++    require(near(c->camera->yaw, 0.5f) && near(c->camera->pitch, -0.25f) && near(c->camera->fovY, 45.0f));
++
++    // A malformed camera is dropped; the rest of the config stays.
++    c = ParseConfig(L"D:\\m", L"", L"1,2,3");
++    require(c && !c->camera.has_value());
++    c = ParseConfig(L"D:\\m", L"", L"1,2,3,x,0,45");
++    require(c && !c->camera.has_value());
++    c = ParseConfig(L"D:\\m", L"", L"1,2,3,0,0,45,7");
++    require(c && !c->camera.has_value());
++}
