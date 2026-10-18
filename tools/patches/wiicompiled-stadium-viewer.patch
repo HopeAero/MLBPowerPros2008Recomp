@@ -14,12 +14,36 @@ index dee842d..c298f93 100644
  
  add_executable(mkw_nand_save_tests "${CMAKE_CURRENT_LIST_DIR}/tests/nand_save_tests.cpp")
  target_include_directories(mkw_nand_save_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index d2c1dd3..4cda53f 100644
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -611,10 +611,18 @@ inline const std::optional<std::string>& ControllerButton(size_t index) {
+ 
+ // Update one TOML value without discarding comments, unrelated settings, or
+ // user-specific paths. This is used by the in-game F10 settings bar.
+-inline bool WriteSetting(std::string_view section, std::string_view key, std::string_view value) {
++// The match benchmark and the stadium viewer (the Blender add-on's preview) run with temporary
++// settings: neither may rewrite the player's Config.toml.
++inline bool ConfigWritesSuspended() {
+ #if defined(WIICOMPILED_GAME_RL8E54)
+     if (const char* bench = std::getenv("WIICOMPILED_MATCH_BENCH"); bench && std::string_view(bench) == "1") return true;
++    if (const char* viewer = std::getenv("WIICOMPILED_STADIUM_VIEWER"); viewer && *viewer != '\0') return true;
+ #endif
++    return false;
++}
++
++inline bool WriteSetting(std::string_view section, std::string_view key, std::string_view value) {
++    if (ConfigWritesSuspended()) return true;
+     const auto path = ResolveConfigPath();
+     std::ifstream input(path);
+     std::vector<std::string> lines;
 diff --git a/runtime/include/stadium_viewer.h b/runtime/include/stadium_viewer.h
 new file mode 100644
-index 0000000..707600b
+index 0000000..e5ef1ab
 --- /dev/null
 +++ b/runtime/include/stadium_viewer.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,36 @@
 +#pragma once
 +// Stadium viewer: the Blender add-on's "View in game" opens the game straight into the stadium being
 +// made, from a one-run preview mod, with a free camera. Enabled by environment variables:
@@ -53,8 +77,116 @@ index 0000000..707600b
 +std::optional<Config> ParseConfig(const std::wstring& modDir, const std::wstring& code, const std::wstring& camera);
 +const std::optional<Config>& Active();  // read once from the environment
 +bool Enabled();
++bool StadiumReady();  // the preview stadium is on screen (match_benchmark.cpp)
 +
 +}  // namespace stadium_viewer
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 8142267..a87651c 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -73,7 +73,7 @@ constexpr std::array<uint32_t, 4> kMsaaSamples{1, 2, 4, 8};           // ANTIALI
+ constexpr std::array<uint32_t, 3> kInterpolationFps{0, 120, 180};     // INTERPOLACIÓN choices
+ 
+ bool AutomatedRun() {
+-    for (const char* env : {"WIICOMPILED_MATCH_BENCH", "WIICOMPILED_SKIP_LAUNCHER", "WIICOMPILED_BENCH", "WIICOMPILED_PAD_SCRIPT",
++    for (const char* env : {"WIICOMPILED_MATCH_BENCH", "WIICOMPILED_STADIUM_VIEWER", "WIICOMPILED_SKIP_LAUNCHER", "WIICOMPILED_BENCH", "WIICOMPILED_PAD_SCRIPT",
+                             "WIICOMPILED_KPAD_SCRIPT"}) {
+         const char* value = std::getenv(env);
+         if (value != nullptr && *value != '\0') return true;
+diff --git a/runtime/src/match_benchmark.cpp b/runtime/src/match_benchmark.cpp
+index 477d140..8373411 100644
+--- a/runtime/src/match_benchmark.cpp
++++ b/runtime/src/match_benchmark.cpp
+@@ -1,4 +1,6 @@
+ #include "match_benchmark.h"
++#include "stadium_viewer.h"
++#include <chrono>
+ #include "memory.h"
+ #include "ppc_runtime.h"
+ #include <cstdlib>
+@@ -15,7 +17,11 @@ namespace new_stadiums {
+ uint32_t ForceForMatch(const char* code);  // hle/mlb/new_stadiums.cpp
+ }
+ #endif
++namespace stadium_viewer {
++bool StadiumReady() { return match_benchmark::GameplayReady(); }
++}
+ namespace match_benchmark {
++static const auto kProcessStart = std::chrono::steady_clock::now();  // static init: about process start
+ static std::atomic<uint32_t> currentScene{0};
+ static std::atomic<bool> gameplayReady{false};
+ uint32_t Scene() { return currentScene.load(); }
+@@ -38,7 +44,16 @@ void OnHostFrame() {
+                     std::fprintf(stderr, "[match-bench] gameplay phase=%u status=%u\n", phase, Memory::Read32(match + 80));
+                     lastPhase = phase;
+                 }
+-                if (phase >= 4 && phase <= 15 && Memory::Read32(match + 80) == 2) gameplayReady.store(true);
++                if (phase >= 4 && phase <= 15 && Memory::Read32(match + 80) == 2) {
++                    if (!gameplayReady.exchange(true) && stadium_viewer::Enabled()) {
++                        static bool logged = false;
++                        if (!logged) {
++                            logged = true;
++                            std::fprintf(stderr, "[viewer] stadium ready at %.1f s\n",
++                                         std::chrono::duration<double>(std::chrono::steady_clock::now() - kProcessStart).count());
++                        }
++                    }
++                }
+             }
+         }
+     } else gameplayReady.store(false);
+@@ -48,7 +63,11 @@ void OnHostFrame() {
+ }
+ bool Enabled() {
+ #if defined(WIICOMPILED_GAME_RL8E54)
+-    static const bool enabled = [] { const char* v = std::getenv("WIICOMPILED_MATCH_BENCH"); return v && *v == '1'; }();
++    // The stadium viewer rides the same path: it loads the preview stadium exactly as a match does.
++    static const bool enabled = [] {
++        const char* v = std::getenv("WIICOMPILED_MATCH_BENCH");
++        return (v && *v == '1') || stadium_viewer::Enabled();
++    }();
+     return enabled;
+ #else
+     return false;
+@@ -111,8 +130,11 @@ void OnGuestFrame(CpuContext* cpu) {
+         }
+         cpu->gpr[3] = 27;
+         func_807A8BE8(cpu);
+-        // WIICOMPILED_MATCH_BENCH_STADIUM=<code>: play in a stadium added by an enabled mod.
+-        if (const char* code = std::getenv("WIICOMPILED_MATCH_BENCH_STADIUM"); code != nullptr && *code != '\0') {
++        // WIICOMPILED_MATCH_BENCH_STADIUM=<code>: play in a stadium added by an enabled mod; the viewer's
++        // preview stadium wins over it.
++        const char* code = std::getenv("WIICOMPILED_MATCH_BENCH_STADIUM");
++        if (const auto& viewer = stadium_viewer::Active()) code = viewer->code.c_str();
++        if (code != nullptr && *code != '\0') {
+             const uint32_t base = new_stadiums::ForceForMatch(code);
+             if (base != 0) cpu->gpr[3] = base;
+             std::fprintf(stderr, "[match-bench] new stadium \"%s\": %s\n", code,
+diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
+index 1213519..47fb1be 100644
+--- a/runtime/src/match_benchmark_overlay.inc
++++ b/runtime/src/match_benchmark_overlay.inc
+@@ -93,6 +93,21 @@ BenchUsage& BenchmarkUsage() {
+ 
+ void DrawMatchBenchmark() {
+     if (!match_benchmark::Enabled()) return;
++    if (stadium_viewer::Enabled()) {  // the viewer shows the stadium only: no benchmark panel
++        if (!match_benchmark::GameplayReady()) {
++            const auto* viewport = ImGui::GetMainViewport();
++            ImGui::SetNextWindowPos(viewport->Pos);
++            ImGui::SetNextWindowSize(viewport->Size);
++            ImGui::SetNextWindowBgAlpha(1.0f);
++            if (ImGui::Begin("Cargando estadio", nullptr,
++                             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings)) {
++                ImGui::SetCursorPos(ImVec2(viewport->Size.x * .40f, viewport->Size.y * .48f));
++                ImGui::TextUnformatted("Cargando estadio... / Loading stadium...");
++            }
++            ImGui::End();
++        }
++        return;
++    }
+     using BenchClock = std::chrono::steady_clock;
+     static const auto launched = BenchClock::now();
+     static const unsigned autoSeconds = [] {
 diff --git a/runtime/src/mods.cpp b/runtime/src/mods.cpp
 index eee0718..cb9402b 100644
 --- a/runtime/src/mods.cpp
@@ -144,12 +276,32 @@ index eee0718..cb9402b 100644
          RegisterNewStadiums(all);
      }
      if (textureRoots.empty()) return;
+diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
+index dba114e..9a242d5 100644
+--- a/runtime/src/settings_overlay.cpp
++++ b/runtime/src/settings_overlay.cpp
+@@ -1,5 +1,6 @@
+ #include "settings_overlay.h"
+ #include "match_benchmark.h"
++#include "stadium_viewer.h"
+ #include "audio_backend.h"
+ #include "aurora_events.h"
+ #include "controller_button_names.h"
+@@ -1302,7 +1303,7 @@ void DrawFpsOverlay() {
+     RunBenchmarkFrame();
+     AuroraPresentTiming presentTiming{};
+     aurora_get_present_timing(&presentTiming);
+-    if (!g_showFps) {
++    if (!g_showFps || stadium_viewer::Enabled()) {
+         return;
+     }
+ 
 diff --git a/runtime/src/stadium_viewer.cpp b/runtime/src/stadium_viewer.cpp
 new file mode 100644
-index 0000000..816abca
+index 0000000..6a8d088
 --- /dev/null
 +++ b/runtime/src/stadium_viewer.cpp
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,67 @@
 +#include "stadium_viewer.h"
 +
 +#include <cstdlib>
@@ -197,14 +349,48 @@ index 0000000..816abca
 +}
 +
 +const std::optional<Config>& Active() {
-+    static const std::optional<Config> active = ParseConfig(
-+        Env(L"WIICOMPILED_STADIUM_VIEWER"), Env(L"WIICOMPILED_STADIUM_VIEWER_CODE"), Env(L"WIICOMPILED_STADIUM_VIEWER_CAMERA"));
++    static const std::optional<Config> active = [] {
++        auto config = ParseConfig(Env(L"WIICOMPILED_STADIUM_VIEWER"), Env(L"WIICOMPILED_STADIUM_VIEWER_CODE"),
++                                  Env(L"WIICOMPILED_STADIUM_VIEWER_CAMERA"));
++        // The Wii Remote strap warning waits 21 s for A: press it twice, before the pad script is read
++        // (first PADRead). Measured: the stadium is then on screen about 8 s after launch.
++        if (config && Env(L"WIICOMPILED_PAD_SCRIPT").empty()) {
++#if defined(_WIN32)
++            _wputenv(L"WIICOMPILED_PAD_SCRIPT=2500-2700:100,3500-3700:100");
++#else
++            setenv("WIICOMPILED_PAD_SCRIPT", "2500-2700:100,3500-3700:100", 1);
++#endif
++        }
++        return config;
++    }();
 +    return active;
 +}
 +
 +bool Enabled() { return Active().has_value(); }
 +
 +}  // namespace stadium_viewer
+diff --git a/runtime/tests/runtime_config_tests.cpp b/runtime/tests/runtime_config_tests.cpp
+index 337d40a..ab135ed 100644
+--- a/runtime/tests/runtime_config_tests.cpp
++++ b/runtime/tests/runtime_config_tests.cpp
+@@ -31,5 +31,17 @@ int main() {
+         const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "invalid.toml");
+         if (!Require(!config.metalFxSpatialUpscaling, "invalid MetalFX setting was accepted")) return 1;
+     }
++    {
++        // The match benchmark and the stadium viewer must leave the player's Config.toml alone.
++        _putenv("WIICOMPILED_MATCH_BENCH=");
++        _putenv("WIICOMPILED_STADIUM_VIEWER=");
++        if (!Require(!RuntimeConfigFile::ConfigWritesSuspended(), "config writes suspended in a normal run")) return 1;
++        _putenv("WIICOMPILED_STADIUM_VIEWER=C:\\preview");
++        if (!Require(RuntimeConfigFile::ConfigWritesSuspended(), "the stadium viewer may write Config.toml")) return 1;
++        _putenv("WIICOMPILED_STADIUM_VIEWER=");
++        _putenv("WIICOMPILED_MATCH_BENCH=1");
++        if (!Require(RuntimeConfigFile::ConfigWritesSuspended(), "the match benchmark may write Config.toml")) return 1;
++        _putenv("WIICOMPILED_MATCH_BENCH=");
++    }
+     return 0;
+ }
 diff --git a/runtime/tests/stadium_viewer_tests.cpp b/runtime/tests/stadium_viewer_tests.cpp
 new file mode 100644
 index 0000000..e2f9974
