@@ -77,6 +77,18 @@ check(len(emptied.meshes) == 0, f"deleted {flag} has no meshes")
 ground = pj7m.parse_model(gfx, offsets["DP_ground"])
 new_tex = [t for t in ground.textures if t.offset >= len(orig)]
 check(len(new_tex) >= 1 and new_tex[0].fmt == 5, "DP_ground uses a new RGB5A3 texture")
+# Its HD copy: named after the pack texels as the runtime hashes them, full size, tinted.
+hd_mod = importlib.import_module(pkg + ".hd_textures")
+t = new_tex[0]
+texels = gfx[t.pixels:t.pixels + t.width * t.height * 2]
+hd_file = Path(mods_dir) / "BlenderTest" / "textures" / "stadium_col" / hd_mod.replacement_name(texels, t.width, t.height)
+hd_png = bpy.data.images.load(str(hd_file)) if hd_file.is_file() else None
+check(hd_png is not None and tuple(hd_png.size) == tuple(ground_img.size), f"HD texture {hd_file.name} at the image's size")
+if hd_png is not None:
+    hp = np.empty(len(hd_png.pixels), np.float32)
+    hd_png.pixels.foreach_get(hp)
+    hp = hp.reshape(-1, 4)
+    check(hp[:, 2].mean() > hp[:, 0].mean(), "HD texture keeps the blue tint")
 untouched = pj7m.parse_model(gfx, offsets["DP_MIP_turf"])
 check(all(m.dl < len(orig) for m in untouched.meshes), "untouched DP_MIP_turf still points at the original data")
 check(gfx[:len(orig)].count(b"PJ7M") == orig.count(b"PJ7M"), "original model headers kept in place")

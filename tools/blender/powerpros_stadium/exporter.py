@@ -14,7 +14,7 @@ import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 
-from . import fingerprint, importer, names, packwii, pj7m, pj7m_write, stadium_tbl, tbl_write
+from . import fingerprint, hd_textures, importer, names, packwii, pj7m, pj7m_write, stadium_tbl, tbl_write
 from .i18n import T
 
 try:
@@ -60,7 +60,9 @@ def pow2(n):
 
 
 class Exporter:
-    def __init__(self, gfx, tbl):
+    def __init__(self, gfx, tbl, hd=True):
+        self.hd = hd
+        self.hd_images = {}         # replacement file name -> (h, w, 4) image
         self.w = pj7m_write.PackWriter(gfx)
         self.tbl = bytearray(tbl) if tbl else None
         self.table = stadium_tbl.parse_table(self.tbl) if tbl else None
@@ -87,7 +89,8 @@ class Exporter:
                 raise ExportFailure(T(f"La imagen {img.name} está vacía", f"The image {img.name} is empty"))
             px = np.empty(w * h * 4, np.float32)
             img.pixels.foreach_get(px)
-            rgba = (px.reshape(h, w, 4)[::-1] * 255 + 0.5).astype(np.uint8)        # top row first
+            full = (px.reshape(h, w, 4)[::-1] * 255 + 0.5).astype(np.uint8)        # top row first
+            rgba = full
             tw, th = pow2(w), pow2(h)
             if (tw, th) != (w, h):
                 ys = (np.arange(th) * h // th)
@@ -96,6 +99,8 @@ class Exporter:
             texels = packwii.tile(packwii.to_rgb5a3(rgba), 5).astype(">u2").tobytes()
             self.new_textures[img.name] = self.w.add_texture_rgb5a3(texels, tw, th)
             self.stats["textures"] += 1
+            if self.hd:          # full size and 8 bits per channel, keyed to the small RGB5A3 texture
+                self.hd_images[hd_textures.replacement_name(texels, tw, th)] = hd_textures.fit(full)
         return self.new_textures[img.name], None
 
     def image_changed(self, img):
@@ -297,10 +302,11 @@ def add_stadium_to_toml(toml, code, name, base):
     toml.write_text(text.rstrip("\n") + "\n" + block, encoding="utf-8")
 
 
-def export_stadium(coll, mods_folder, mod_name, target_code, new_name=None):
+def export_stadium(coll, mods_folder, mod_name, target_code, new_name=None, hd=True):
     """Write the mod. target_code: the stadium the packs replace, or with new_name the code of a
     stadium the mod adds (files stadium_<code>.pack/tbl.pack, [[stadium]] in mod.toml, based on the
-    imported one; the runtime shows it as an extra entry of the stadium select carousel)."""
+    imported one; the runtime shows it as an extra entry of the stadium select carousel).
+    hd: also write each new image at full size as a replacement texture (hd_textures)."""
     code = coll.get("pp_stadium")
     project_bin = coll.get("pp_project_bin")
     if not code or not project_bin or not Path(project_bin).is_file():
@@ -315,13 +321,22 @@ def export_stadium(coll, mods_folder, mod_name, target_code, new_name=None):
                                   f"'{target_code}' is already a stadium of the game: pick another code"))
     archive = projectbin.Archive(project_bin)
     gfx, tbl = archive.read(f"stadium_{code}.pack"), archive.read(f"stadium_{code}tbl.pack")
-    ex = Exporter(gfx, tbl)
+    ex = Exporter(gfx, tbl, hd)
     gfx_out, tbl_out = ex.export(coll)
     folder = Path(mods_folder) / mod_name
     (folder / "project").mkdir(parents=True, exist_ok=True)
     (folder / "project" / f"stadium_{target_code}.pack").write_bytes(gfx_out)
     if tbl_out is not None:
         (folder / "project" / f"stadium_{target_code}tbl.pack").write_bytes(tbl_out)
+    # This folder belongs to the export: images from an earlier export of the same stadium go first.
+    hd_folder = folder / "textures" / f"stadium_{target_code}"
+    for old in hd_folder.glob("tex1_*.png") if hd_folder.is_dir() else ():
+        old.unlink()
+    if ex.hd_images:
+        hd_folder.mkdir(parents=True, exist_ok=True)
+        for name, rgba in ex.hd_images.items():
+            (hd_folder / name).write_bytes(hd_textures.png_bytes(rgba))
+    ex.stats["hd"] = len(ex.hd_images)
     toml = folder / "mod.toml"
     if not toml.exists():
         description = T("Estadio hecho con el complemento de Blender", "Stadium made with the Blender add-on")

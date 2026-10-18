@@ -64,7 +64,8 @@ Qué hace al exportar:
 - Escribe `mods\<nombre>\project\stadium_<código>.pack` y `stadium_<código>tbl.pack`, más un `mod.toml`.
 - **Solo reescribe las piezas que cambiaste**; el resto queda idéntico al original. Lo nuevo se añade al final del pack.
 - Una pieza borrada se queda sin geometría.
-- Una imagen editada o nueva se guarda como textura RGB5A3. Si sus lados no son potencias de 2, se reescala a la más cercana, de 4 a 256 píxeles: como las del juego, que no tiene mipmaps en los estadios y a distancia una textura grande se ve ruidosa.
+- Una imagen editada o nueva se guarda en el pack como textura RGB5A3. Si sus lados no son potencias de 2, se reescala a la más cercana, de 4 a 256 píxeles, como las del juego.
+- **Texturas HD** (activado por defecto en el diálogo): además, la imagen se guarda a su tamaño, hasta 2048 píxeles y con 8 bits por color, en `mods\<nombre>\textures\stadium_<código>\`. El juego la usa en lugar de la del pack y le crea mipmaps, así que una imagen grande se ve nítida de cerca y limpia de lejos. La de 256 del pack queda para cuando no hay texturas de reemplazo.
 - Si mueves una pieza, actualiza su caja y su esfera en la tabla, para que el juego no la oculte cuando entra en cámara, y rehace el árbol con el que el juego reparte las piezas.
 - **Colisión:** si cambiaste la malla «Colisión» (moverla, editar sus caras o cambiar su superficie), la escribe entera y rehace el árbol de colisión del juego.
   - La **superficie** de cada cara sale del número final del nombre de su material: «Superficie 9» es valla. Para cambiar una cara de tipo, asígnale otro material «Superficie N».
@@ -106,7 +107,7 @@ Puedes llevar al juego un estadio que no existe en él.
 
 Límites:
 - La colisión puede tener hasta 65.535 triángulos.
-- Las texturas pasan a RGB5A3 y potencias de 2 de hasta 256 píxeles.
+- En el pack, las texturas pasan a RGB5A3 y potencias de 2 de hasta 256 píxeles. Con **Texturas HD**, el juego usa la imagen a su tamaño (hasta 2048 píxeles).
 - El generador de colisión supone un campo de béisbol normal: suelo a la altura 0, el centro del campo unos 45 m por delante del plato y paredes alrededor.
 
 ## Cómo hacer un modelo que funcione bien en el juego
@@ -117,9 +118,9 @@ Lo aprendido al meter el Polo Grounds, un modelo de SketchUp descargado (14 y 15
 - **El campo en su sitio:** plato en el origen, bases a 90 pies, goma a 60 pies 6 pulgadas y montículo con el centro a 18,51 m. El juego pone a los jugadores siempre ahí; tu modelo no lo cambia.
 - **Escala real en metros.** Las vallas quedan donde estén en tu modelo: si el modelo está a otra escala, las distancias cambian.
 - **Colores en el color de los vértices o en texturas:** el juego no ilumina los estadios. El color de un material sin textura solo llega si el convertidor lo guarda en los vértices.
-- **Nada de superficies pegadas:** dos caras paralelas a menos de unos centímetros (una ventana sobre una pared, un letrero, una textura de asientos sobre la grada) parpadean a 100–150 m. El búfer de profundidad del juego es mucho menos preciso que el de Blender. Deja al menos 25 cm o haz el detalle con textura.
+- **Nada de superficies pegadas:** dos caras paralelas a menos de unos centímetros (una ventana sobre una pared, un letrero, una textura de asientos sobre la grada) parpadean a 100–150 m. Dos caras en el mismo plano parpadean siempre; las separadas unos centímetros no deberían en el recomp, que usa profundidad de 32 bits, pero se vio con el Polo Grounds y no está aislado. Deja al menos 25 cm o haz el detalle con textura.
 - **Una cara por superficie:** sin caras dobles en el mismo sitio. En SketchUp, pinta solo la cara delantera.
-- **Texturas pequeñas:** de 32 a 256 píxeles, como las del juego. Una textura grande, como una foto de asientos de 512 px, se ve ruidosa a distancia porque los estadios no tienen mipmaps.
+- **Texturas:** con **Texturas HD** puedes usar imágenes de hasta 2048 píxeles: el juego les crea mipmaps y no se ven ruidosas a distancia. Sin texturas HD, quédate en 32 a 256 píxeles, como las del juego.
 - **Sin geometría fina:** filas de sillas, barandillas o mástiles de pocos cm miden menos de un píxel a distancia y salen rotos. Los asientos son una rampa con textura de asientos, y los mástiles deben tener al menos unos 30 cm.
 - **Pocos triángulos:** un estadio del juego tiene unos 10.000. Uno de 40.000 funciona en PC, pero cuesta más dibujarlo y que se vea limpio.
 
@@ -155,7 +156,7 @@ Los `.blend` con estadios importados contienen modelos y texturas del juego. Ús
 - **Exportación de ida y vuelta** (`tools/blender/test_export.py`, mismos argumentos con la carpeta de mods al final):
   1. importa Coors Field y le hace cuatro cambios: sube `DP_stand_C` 15 m, sube la geometría de `DP_score` 10 m, borra una bandera y tiñe la imagen de `DP_ground`;
   2. exporta el mod `BlenderTest`;
-  3. relee los packs y comprueba cada cambio.
+  3. relee los packs y comprueba cada cambio, también que la imagen teñida sale como textura HD con el nombre que busca el juego.
 
   El mod resultante, cargado en un partido, muestra los cuatro cambios.
   4. vuelve a importar Coors Field con colisión, sube sus vallas (superficie 9) 3 m, cambia una cara a poste de foul y comprueba la tabla escrita: superficies, sentido de las caras y los dos árboles.

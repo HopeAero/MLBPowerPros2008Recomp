@@ -230,6 +230,37 @@ index 4c1d4cc..4f3ecc0 100644
  
    TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
               wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
+diff --git a/aurora-main/lib/gfx/texture_replacement.cpp b/aurora-main/lib/gfx/texture_replacement.cpp
+index 7a9d91d..8b55612 100644
+--- a/aurora-main/lib/gfx/texture_replacement.cpp
++++ b/aurora-main/lib/gfx/texture_replacement.cpp
+@@ -3,6 +3,7 @@
+ #include "../internal.hpp"
+ #include "../gx/gx.hpp"
+ #include "../webgpu/gpu.hpp"
++#include "auto_mips.hpp"
+ #include "dds_io.hpp"
+ #include "texture_convert.hpp"
+ 
+@@ -437,6 +438,18 @@ std::optional<ConvertedTexture> load_replacement(const ReplacementIndexEntry& en
+   }
+ 
+   if (more.empty()) {
++    // A lone RGBA image (a PNG, typically an HD stadium texture) gets its chain built here.
++    if (base->format == wgpu::TextureFormat::RGBA8Unorm && base->mips == 1 &&
++        base->data.size() >= static_cast<size_t>(base->width) * base->height * 4 &&
++        webgpu::g_autoMipmaps.load(std::memory_order_relaxed)) {
++      auto chain = auto_mips::build_chain(base->data.data(), base->width, base->height);
++      if (!chain.empty()) {
++        ByteBuffer blob{chain.size()};
++        std::memcpy(blob.data(), chain.data(), chain.size());
++        base->mips = auto_mips::level_count(base->width, base->height);
++        base->data = std::move(blob);
++      }
++    }
+     return base;
+   }
+ 
 diff --git a/aurora-main/lib/gx/gx.cpp b/aurora-main/lib/gx/gx.cpp
 index 14bbd16..f3c6de6 100644
 --- a/aurora-main/lib/gx/gx.cpp

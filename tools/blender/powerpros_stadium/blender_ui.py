@@ -100,7 +100,12 @@ class PP_OT_export_stadium(bpy.types.Operator):
                                           translation_context=CONTEXT),
                   target=EnumProperty(name=T("Reemplaza a", "Replaces"), translation_context=CONTEXT,
                                       items=[("same", T("El mismo estadio", "The same stadium"), "")] +
-                                      [(c, n, "") for c, n in names.stadiums()]))
+                                      [(c, n, "") for c, n in names.stadiums()]),
+                  hd=BoolProperty(name=T("Texturas HD", "HD textures"), default=True, translation_context=CONTEXT,
+                                  description=T("Guarda además cada imagen nueva a su tamaño (hasta 2048 px) como "
+                                                "textura de reemplazo: el recomp la usa en vez de la de 256 px del pack",
+                                                "Also save each new image at its own size (up to 2048 px) as a "
+                                                "replacement texture: the recomp uses it instead of the pack's 256 px one")))
 
     @classmethod
     def poll(cls, context):
@@ -124,6 +129,7 @@ class PP_OT_export_stadium(bpy.types.Operator):
                                 "Uses the game data (size, menu) of the imported stadium."), translate=False)
         else:
             layout.prop(self, "target")
+        layout.prop(self, "hd")
         layout.label(text=T("Solo se reescriben las piezas que cambiaste.", "Only the pieces you changed are rewritten."),
                      translate=False)
 
@@ -139,14 +145,14 @@ class PP_OT_export_stadium(bpy.types.Operator):
             target, new_name = (coll["pp_stadium"] if self.target == "same" else self.target), None
         try:
             st = exporter.export_stadium(coll, bpy.path.abspath(self.mods_folder), self.mod_name.strip() or default_name,
-                                         target, new_name)
+                                         target, new_name, self.hd)
         except (exporter.ExportFailure, ValueError) as e:            # tbl_write.TreeError is a ValueError
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
         msg = T(f"Mod en {st['folder']}: {st['pieces']} piezas reescritas, {st['moved']} movidas, "
-                f"{st['emptied']} quitadas, {st['textures']} texturas nuevas, {st['size'] / 1048576:.1f} MB",
+                f"{st['emptied']} quitadas, {st['textures']} texturas nuevas ({st['hd']} HD), {st['size'] / 1048576:.1f} MB",
                 f"Mod in {st['folder']}: {st['pieces']} pieces rewritten, {st['moved']} moved, "
-                f"{st['emptied']} removed, {st['textures']} new textures, {st['size'] / 1048576:.1f} MB")
+                f"{st['emptied']} removed, {st['textures']} new textures ({st['hd']} HD), {st['size'] / 1048576:.1f} MB")
         if st["collision"]:
             msg += T(f", colisión nueva de {st['collision']} triángulos", f", new collision of {st['collision']} triangles")
         if st["over_budget"]:

@@ -64,7 +64,8 @@ What exporting does:
 - It writes `mods\<name>\project\stadium_<code>.pack` and `stadium_<code>tbl.pack`, plus a `mod.toml`.
 - **It only rewrites the pieces you changed**; the rest stays identical to the original. New things are added at the end of the pack.
 - A deleted piece is left without geometry.
-- An edited or new image is saved as an RGB5A3 texture. If its sides are not powers of 2, it is rescaled to the nearest one, from 4 to 256 pixels: like the game's, which has no mipmaps in stadiums, and at a distance a large texture looks noisy.
+- An edited or new image is saved in the pack as an RGB5A3 texture. If its sides are not powers of 2, it is rescaled to the nearest one, from 4 to 256 pixels, like the game's.
+- **HD textures** (on by default in the dialog): the image is also saved at its own size, up to 2048 pixels and 8 bits per channel, in `mods\<name>\textures\stadium_<code>\`. The game uses it instead of the pack's and builds its mipmaps, so a large image looks sharp up close and clean from afar. The pack's 256 px one remains for when there are no replacement textures.
 - If you move a piece, it updates its box and sphere in the table, so the game doesn't hide it when it comes into the camera's view, and rebuilds the tree the game uses to sort the pieces.
 - **Collision:** if you changed the "Collision" mesh (moving it, editing its faces or changing its surface), it writes it in full and rebuilds the game's collision tree.
   - The **surface** of each face comes from the final number in its material's name: "Surface 9" («Superficie 9») is a fence. To change a face's type, assign it another "Surface N" material.
@@ -106,7 +107,7 @@ You can bring a stadium that doesn't exist in the game into it.
 
 Limits:
 - The collision can have up to 65,535 triangles.
-- Textures become RGB5A3 and powers of 2 up to 256 pixels.
+- In the pack, textures become RGB5A3 and powers of 2 up to 256 pixels. With **HD textures**, the game uses the image at its own size (up to 2048 pixels).
 - The collision generator assumes a normal baseball field: ground at height 0, the center of the field about 45 m in front of home plate and walls around it.
 
 ## How to make a model that works well in the game
@@ -117,9 +118,9 @@ What we learned bringing in the Polo Grounds, a downloaded SketchUp model (Octob
 - **The field in its place:** home plate at the origin, bases at 90 feet, pitcher's rubber at 60 feet 6 inches and the mound centered at 18.51 m. The game always puts the players there; your model doesn't change that.
 - **Real scale in meters.** The fences stay wherever they are in your model: if the model is at a different scale, the distances change.
 - **Colors in the vertex color or in textures:** the game doesn't light stadiums. The color of a material without a texture only gets through if the converter stores it in the vertices.
-- **No stuck-together surfaces:** two parallel faces less than a few centimeters apart (a window on a wall, a sign, a seat texture over the stands) flicker at 100–150 m. The game's depth buffer is much less precise than Blender's. Leave at least 25 cm or make the detail with a texture.
+- **No stuck-together surfaces:** two parallel faces less than a few centimeters apart (a window on a wall, a sign, a seat texture over the stands) flicker at 100–150 m. Two faces in the same plane always flicker; ones a few centimeters apart should not in the recomp, which uses 32-bit depth, but it was seen with the Polo Grounds and has not been isolated. Leave at least 25 cm or make the detail with a texture.
 - **One face per surface:** no double faces in the same place. In SketchUp, paint only the front face.
-- **Small textures:** 32 to 256 pixels, like the game's. A large texture, such as a 512 px photo of seats, looks noisy at a distance because stadiums have no mipmaps.
+- **Textures:** with **HD textures** you can use images up to 2048 pixels: the game builds their mipmaps and they don't look noisy at a distance. Without HD textures, stay at 32 to 256 pixels, like the game's.
 - **No thin geometry:** rows of chairs, railings or flagpoles a few cm thick are less than a pixel at a distance and come out broken. Seats are a ramp with a seat texture, and flagpoles should be at least about 30 cm.
 - **Few triangles:** a game stadium has about 10,000. One with 40,000 works on PC, but it costs more to draw and to look clean.
 
@@ -155,7 +156,7 @@ What we learned bringing in the Polo Grounds, a downloaded SketchUp model (Octob
 - **Round-trip export** (`tools/blender/test_export.py`, same arguments with the mods folder at the end):
   1. imports Coors Field and makes four changes to it: raises `DP_stand_C` 15 m, raises the geometry of `DP_score` 10 m, deletes a flag and tints the image of `DP_ground`;
   2. exports the `BlenderTest` mod;
-  3. rereads the packs and checks each change.
+  3. rereads the packs and checks each change, including that the tinted image comes out as an HD texture under the name the game looks for.
 
   The resulting mod, loaded in a game, shows the four changes.
   4. imports Coors Field again with collision, raises its fences (surface 9) 3 m, changes a face to foul pole and checks the written table: surfaces, face orientation and both trees.
