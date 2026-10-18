@@ -166,10 +166,10 @@ index 0000000..8e345f3
 +}  // namespace stadium_viewer
 diff --git a/runtime/include/mlb_camera.h b/runtime/include/mlb_camera.h
 new file mode 100644
-index 0000000..d1c3341
+index 0000000..81c637a
 --- /dev/null
 +++ b/runtime/include/mlb_camera.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,51 @@
 +#pragma once
 +// The game's camera (MLB Power Pros 2008), for the stadium viewer's free camera.
 +// Reverse engineering: docs/ingenieria-inversa.md, "Cámara del partido".
@@ -196,6 +196,8 @@ index 0000000..d1c3341
 +bool ShowMatchView(MatchView view);
 +// True from ShowMatchView until the guest frame that applies it.
 +bool MatchViewPending();
++// The match camera director has been seen applying a shot.
++bool DirectorKnown();
 +// Guest-thread hook (once per frame, viewer only): applies a pending ShowMatchView.
 +void OnGuestFrame(CpuContext* cpu);
 +// The camera the game drew the last frame with.
@@ -245,10 +247,10 @@ index d2c1dd3..4cda53f 100644
      std::vector<std::string> lines;
 diff --git a/runtime/include/stadium_viewer.h b/runtime/include/stadium_viewer.h
 new file mode 100644
-index 0000000..a0a362e
+index 0000000..2067d1c
 --- /dev/null
 +++ b/runtime/include/stadium_viewer.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,43 @@
 +#pragma once
 +// Stadium viewer: the Blender add-on's "View in game" opens the game straight into the stadium being
 +// made, from a one-run preview mod, with a free camera. Enabled by environment variables:
@@ -283,16 +285,21 @@ index 0000000..a0a362e
 +const std::optional<Config>& Active();  // read once from the environment
 +bool Enabled();
 +bool StadiumReady();  // the preview stadium is on screen (match_benchmark.cpp)
++// Whether the viewer stops the match this frame: once the stadium shows and the camera director has been
++// seen (the match views need it, and it runs inside what stops), or 300 frames (5 s) after the stadium shows.
++inline bool FreezeMatch(bool ready, bool directorKnown, unsigned framesSinceReady) {
++    return ready && (directorKnown || framesSinceReady >= 300);
++}
 +void OnHostFrame();   // controls, once per presented frame (stadium_viewer_input.cpp)
 +void DrawHelp();      // the keys, in the corner
 +
 +}  // namespace stadium_viewer
 diff --git a/runtime/src/hle/mlb/game_camera.cpp b/runtime/src/hle/mlb/game_camera.cpp
 new file mode 100644
-index 0000000..8e3ceda
+index 0000000..ebf6e37
 --- /dev/null
 +++ b/runtime/src/hle/mlb/game_camera.cpp
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,248 @@
 +// MLB Power Pros 2008 (RL8E54) game-specific natives: the match camera, for the stadium viewer's free
 +// camera and match views (docs/ingenieria-inversa.md, "Cámara del partido").
 +//
@@ -419,7 +426,7 @@ index 0000000..8e3ceda
 +
 +void UpdateView(CpuContext* cpu, uint32_t cam) {
 +    const uint32_t main = g_mainCamera.load(std::memory_order_acquire);
-+    if (g_override.load(std::memory_order_acquire) && (main == 0 || cam == main)) {
++    if (g_override.load(std::memory_order_acquire) && main != 0 && cam == main) {
 +        float eye[3], target[3];
 +        {
 +            std::lock_guard<std::mutex> lock(g_lock);
@@ -486,6 +493,8 @@ index 0000000..8e3ceda
 +
 +bool OverrideActive() { return mlb_camera_native::g_override.load(std::memory_order_acquire); }
 +
++bool DirectorKnown() { return mlb_camera_native::g_director.load() != 0; }
++
 +bool MatchViewPending() { return mlb_camera_native::g_request.load() >= 0; }
 +
 +bool ShowMatchView(MatchView view) {
@@ -541,10 +550,10 @@ index 0000000..8e3ceda
 +PPC_NATIVE_OVERRIDE_VOID(80C779D4, MLB_CameraDirector_80C779D4, (CpuContext* ctx), (ctx));
 diff --git a/runtime/src/hle/mlb/viewer_scene.cpp b/runtime/src/hle/mlb/viewer_scene.cpp
 new file mode 100644
-index 0000000..1314321
+index 0000000..0eeba3d
 --- /dev/null
 +++ b/runtime/src/hle/mlb/viewer_scene.cpp
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,40 @@
 +// MLB Power Pros 2008 (RL8E54) game-specific native: the match's per-frame update (0x808816C8), for the
 +// stadium viewer's still match.
 +//
@@ -558,6 +567,7 @@ index 0000000..1314321
 +#include "hle_stubs.h"
 +#include "memory.h"
 +#include "stadium_viewer.h"
++#include "mlb_camera.h"
 +
 +namespace viewer_scene {
 +
@@ -577,7 +587,10 @@ index 0000000..1314321
 +    ctx->gpr[1] = savedSp - 0x10;
 +    Memory::Write32(ctx->gpr[1], savedSp);
 +    Call(ctx, kMatchStep, match);
-+    if (!(stadium_viewer::Enabled() && stadium_viewer::StadiumReady())) Call(ctx, kStateTree, match);
++    static unsigned framesSinceReady = 0;
++    const bool ready = stadium_viewer::Enabled() && stadium_viewer::StadiumReady();
++    if (!stadium_viewer::FreezeMatch(ready, game_camera::DirectorKnown(), ready ? framesSinceReady++ : 0))
++        Call(ctx, kStateTree, match);
 +    ctx->gpr[1] = savedSp;
 +}
 +PPC_NATIVE_OVERRIDE_VOID(808816C8, MLB_MatchFrame_808816C8, (CpuContext* ctx), (ctx));
@@ -1163,10 +1176,10 @@ index 337d40a..ab135ed 100644
  }
 diff --git a/runtime/tests/stadium_viewer_tests.cpp b/runtime/tests/stadium_viewer_tests.cpp
 new file mode 100644
-index 0000000..e2f9974
+index 0000000..aeb3ccd
 --- /dev/null
 +++ b/runtime/tests/stadium_viewer_tests.cpp
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,37 @@
 +#include "stadium_viewer.h"
 +#include <cmath>
 +#include <cstdlib>
@@ -1196,4 +1209,11 @@ index 0000000..e2f9974
 +    require(c && !c->camera.has_value());
 +    c = ParseConfig(L"D:\\m", L"", L"1,2,3,0,0,45,7");
 +    require(c && !c->camera.has_value());
++
++    // The match stops once the stadium shows and the camera director has been seen (or after 5 s).
++    require(!stadium_viewer::FreezeMatch(false, true, 1000));
++    require(!stadium_viewer::FreezeMatch(true, false, 0));
++    require(!stadium_viewer::FreezeMatch(true, false, 299));
++    require(stadium_viewer::FreezeMatch(true, false, 300));
++    require(stadium_viewer::FreezeMatch(true, true, 0));
 +}
