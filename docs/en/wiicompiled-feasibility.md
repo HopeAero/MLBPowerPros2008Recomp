@@ -779,3 +779,16 @@ Patch `wiicompiled-graphics-options` (aurora and runtime). VIDEO tab of the laun
 - **Measured in a match** (RX 5500, Direct3D 12, 1920×1009 window): x1 2.88 ms of GPU (32%); x1 + FSR 1 + 16× 4.92 ms (40%); x2 + 16× 7.54 ms (51%).
 - **Ruled out: frame skipping.** MLB makes about 35 EFB copies per frame (it draws to textures it uses later); not drawing a frame would leave those textures stale or empty. FSR 1 with a low internal resolution gives the savings without that risk. Dropping to 30 FPS is not an option either: the game logic runs at 60 Hz and would go in slow motion.
 - **F10 menu:** "Disable bloom" was hidden outside Mario Kart Wii (it pointed to Mario Kart code that does not exist in MLB).
+
+## Generated mipmaps and antialiasing (18 October 2026)
+
+Patch `wiicompiled-auto-mipmaps` (aurora and runtime). Launcher VIDEO tab (page 2): **MIPMAPS** (Yes by default) and **ANTIALIASING** (No, MSAA 2x, 4x, 8x). Mipmaps also in F10.
+
+- **Problem:** stadium textures ship without mipmaps. The 47 packs hold 8,135 CI4, 3,130 CI8, 77 RGBA8 and 33 RGB5A3 textures, all single-level. From afar each screen pixel picks a lone texel: crowd and signs look noisy and shimmer when the camera moves. Forced anisotropy did not act on them either: aurora turns it off when sampling uses no mipmaps.
+- **Fix:** when aurora creates a static RGBA texture without mipmaps (palette textures too, which aurora already converts to RGBA on the CPU), it builds the full chain (`lib/gfx/auto_mips.hpp`) and samples it trilinearly if the game asked for `GX_LINEAR`; `GX_NEAR` stays unfiltered.
+  - Colour is averaged weighted by alpha, so transparent black texels don't darken edges.
+  - On cut-out textures (crowd, trees, flags: nearly all opaque or transparent) each level's alpha is rescaled to keep level 0's alpha-test coverage; without it the distant crowd thins out and disappears.
+  - LOD bias of -0.5 for those textures: with plain averaging the signs went soft.
+- **Checked in the test match** (Coors Field, RX 5500, Direct3D 12, 1.5x, 16x filtering): the crowd and distant stands look clean, signs stay readable. GPU 4.78 ms with and without mipmaps; each texture's memory grows by a third.
+- **MSAA:** aurora already supported it (`AuroraConfig::msaa`); it now comes from `[video] msaa`. MSAA 4x draws correctly, EFB copies included, and smooths railings and lines, but raises the GPU from 4.78 to 9.11 ms. That is why it ships off. It needs a game restart.
+- **Test:** `runtime/tests/auto_mips_tests.cpp` (checkerboard to grey, red edge not darkened, sparse crowd that doesn't vanish).

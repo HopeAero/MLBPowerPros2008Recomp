@@ -779,3 +779,16 @@ Parche `wiicompiled-graphics-options` (aurora y runtime). Pestaña VIDEO del lau
 - **Medido en partido** (RX 5500, Direct3D 12, ventana 1920×1009): x1 2,88 ms de GPU (32 %); x1 + FSR 1 + 16× 4,92 ms (40 %); x2 + 16× 7,54 ms (51 %).
 - **Descartado: saltar fotogramas.** MLB hace unas 35 copias del EFB por fotograma (dibuja a texturas que usa después); no dibujar un fotograma dejaría esas texturas viejas o vacías. FSR 1 con resolución interna baja da el ahorro sin ese riesgo. Bajar a 30 FPS tampoco vale: la lógica del juego va a 60 Hz e iría a cámara lenta.
 - **Menú F10:** «Disable bloom» se ocultó fuera de Mario Kart Wii (apuntaba a código de Mario Kart que no existe en MLB).
+
+## Mipmaps generados y antialiasing (18 de octubre de 2026)
+
+Parche `wiicompiled-auto-mipmaps` (aurora y runtime). Pestaña VIDEO del launcher (página 2): **MIPMAPS** (Sí por defecto) y **ANTIALIASING** (No, MSAA 2x, 4x, 8x). Mipmaps también en F10.
+
+- **Problema:** las texturas de los estadios no traen mipmaps. En los 47 packs hay 8.135 texturas CI4, 3.130 CI8, 77 RGBA8 y 33 RGB5A3, todas de un solo nivel. A distancia cada píxel de pantalla toma un texel suelto: público y carteles ruidosos y con parpadeo al mover la cámara. Además, el anisotrópico forzado no actuaba en ellas: aurora lo desactiva si el muestreo no usa mipmaps.
+- **Solución:** al crear una textura estática RGBA sin mipmaps (también las de paleta, que aurora ya convierte a RGBA en la CPU), aurora genera la cadena completa (`lib/gfx/auto_mips.hpp`) y la muestrea con filtrado trilineal si el juego pidió `GX_LINEAR`; `GX_NEAR` sigue sin filtrar.
+  - El color se promedia ponderado por alfa, para que los texels transparentes negros no oscurezcan los bordes.
+  - En texturas recortables (público, árboles, banderas: casi todo opaco o transparente) se reescala el alfa de cada nivel para mantener la cobertura de la prueba de alfa del nivel 0; sin eso, el público lejano adelgaza y desaparece.
+  - Sesgo de LOD de −0,5 para esas texturas: con el promedio simple los carteles quedaban blandos.
+- **Comprobado en el partido de prueba** (Coors Field, RX 5500, Direct3D 12, 1,5x, filtrado 16x): el público y las gradas lejanas se ven limpios, los carteles siguen legibles. GPU 4,78 ms con y sin mipmaps; la memoria de cada textura crece un tercio.
+- **MSAA:** aurora ya lo soportaba (`AuroraConfig::msaa`); ahora llega desde `[video] msaa`. MSAA 4x se dibuja bien, copias del EFB incluidas, y suaviza barandillas y líneas, pero sube la GPU de 4,78 a 9,11 ms. Por eso viene desactivado. Necesita reiniciar el juego.
+- **Prueba:** `runtime/tests/auto_mips_tests.cpp` (tablero de ajedrez a gris, borde rojo sin oscurecer, público disperso que no desaparece).

@@ -495,9 +495,9 @@ Verificado (14 de octubre de 2026):
 **Meter un modelo externo** (Polo Grounds de SketchUp, 14 y 15 de octubre de 2026; partidos del benchmark):
 - **Tamaños de los estadios del juego**, en los 47 packs:
   - como mucho 24.768 bytes de display list, 573 vértices por llamada de dibujo, 1.303 posiciones por malla y 29 mallas por modelo;
-  - texturas de 32 a 256 píxeles.
+  - texturas de 32 a 256 píxeles, de un solo nivel (sin mipmaps): 8.135 CI4, 3.130 CI8, 77 RGBA8 y 33 RGB5A3 (`tools/stadium_re.py stats`). El recomp les genera mipmaps al cargarlas (parche `wiicompiled-auto-mipmaps`).
   El exportador trocea las mallas a 600 triángulos, 1.300 posiciones y 570 vértices por llamada, y reduce las texturas nuevas a 256 píxeles. Sin trocear, lo que faltaba en pantalla se explicó luego por las superficies pegadas, no por el tamaño: el troceado es por prudencia.
-- **Profundidad:** superficies paralelas a 0–2 cm (ventanas sobre una pared, una textura de asientos sobre la grada, las dos caras de una pared) parpadean o se tapan a 100–150 m; en Blender se ven bien. Separarlas o dejar una sola cara lo arregla.
+- **Profundidad:** superficies paralelas a 0–2 cm (ventanas sobre una pared, una textura de asientos sobre la grada, las dos caras de una pared) parpadean o se tapan a 100–150 m; en Blender se ven bien. Separarlas o dejar una sola cara lo arregla. El recomp dibuja con profundidad `Depth32Float` y Z invertida (aurora, `UseReversedZ`), mucho más precisa que la de 24 bits del Wii: el parpadeo de las caras a 0 cm es inevitable, pero a 2 cm no debería darse. Sin comprobar con una prueba aislada.
 - **Caras traseras:** el modelo, con las dos caras de cada pared en el mismo sitio, mostraba la de atrás tapando la buena. Con una sola cara mirando al campo se ve bien. No está comprobado si el juego descarta caras traseras en los estadios.
 - **Texturas grandes** (512 px o más) a 100 m se ven ruidosas: los estadios no usan mipmaps.
 - **`0x80047874`** no dibuja modelos. Pone `GXSetZMode(1, GX_ALWAYS, …)`, cambia la escritura de color y alfa y dibuja un cuadrado: es un borrado de pantalla.
