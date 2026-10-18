@@ -18,8 +18,9 @@ Lo que se midió en un PC (Fedora 44, Ryzen 7 8840HS, Radeon 780M con RADV/Mesa 
 | Partido | el partido de prueba automático Yankees–Colorado (`WIICOMPILED_MATCH_BENCH=1`): 30 s a 2x, 16:9, Vulkan: **59,9 FPS**, tiempo de fotograma p99 17,0 ms, GPU 5,1 ms por fotograma |
 | Audio | un flujo de SDL suena por PipeWire (visto con `pactl list sink-inputs`); no se comprobó de oído |
 | Texture Studio | compila y pasa su autoprueba (`TextureStudio --selftest`: 204 comprobaciones); la ventana y la captura desde el juego no se probaron a mano |
-| Compilación portable (`--container`) | ver [Steam Deck](#steam-deck) |
-| **Sin probar** | una Steam Deck real; mandos en Linux (SDL3, el mismo código que en Windows); sesiones X11; GPU NVIDIA e Intel; los modos temporada, liga y MLB Life |
+| Compilación portable (`--container`) | funciona en este PC (59,9 FPS en el mismo partido) y en una Steam Deck (ver abajo); necesita glibc 2.35 y no depende de libstdc++ |
+| Steam Deck (LCD, SteamOS 3.8.28, glibc 2.41) | la compilación portable, copiada desde el PC: se resuelven todas las bibliotecas; el partido de prueba en modo escritorio a 2x, 16:9, Vulkan (RADV VANGOGH): **59,9 FPS**, tiempo de fotograma p50 16,7 ms, p99 24,4 ms, GPU 6,6 ms por fotograma |
+| **Sin probar** | el modo juego (gamescope) y Steam Input en la Deck; compilar en la Deck; mandos en Linux (SDL3, el mismo código que en Windows); sesiones X11; GPU NVIDIA e Intel; los modos temporada, liga y MLB Life |
 | Sin portar | el editor de rosters (PowerUp+, que solo se compila para Windows): el launcher no ofrece EDITAR ROSTER en Linux. Los mods de roster los convierte el propio juego (`mods/<mod>/roster/`), con el mismo código que en Windows, así que los rosters hechos con PowerUp+ en Windows deberían cargar; no se probó. Los contadores de CPU/GPU/RAM de la prueba dicen "n/d" (vienen de los contadores de rendimiento de Windows) |
 
 ## Compilar en un PC con Linux
@@ -76,7 +77,7 @@ tools/linux/build.sh --container --disc '/run/media/<tarjeta SD>/MLB Power Pros 
 
 **Añadirlo al modo juego:** en el modo escritorio abre Steam → *Juegos* → *Añadir un juego que no es de Steam a mi biblioteca* → *Examinar* → `~/Games/MLBPowerPros2008/MLBPowerPros2008`. En sus *Propiedades*, comprueba que *Iniciar en* sea esa carpeta (`~/Games/MLBPowerPros2008/`). **No** elijas una herramienta de compatibilidad (Proton): es un programa nativo de Linux. De vuelta en el modo juego arranca a pantalla completa bajo gamescope. Los controles de la Deck llegan al juego como un mando estándar a través de Steam Input; el launcher se maneja con mando.
 
-En la propia Deck **no se probó**: la compilación, los FPS, el consumo de batería, la suspensión y los valores por defecto de Steam Input. La GPU de la Deck usa el mismo driver Vulkan que el PC de prueba (RADV), y su APU tiene las instrucciones x86-64-v3 que exige la compilación. La 780M del PC de prueba es más rápida que la GPU de la Deck: baja la resolución interna (1x o 2x) si caen los FPS.
+**Medido en una Steam Deck** (modelo LCD, SteamOS 3.8.28, 18 de octubre), con la compilación portable de la opción A: el partido de prueba automático en modo escritorio a 2x, 16:9, Vulkan fue a 59,9 FPS (p50 16,7 ms, p99 24,4 ms; GPU 6,6 ms de los 16,7 ms del fotograma), así que 2x es un valor seguro. El p99 es más alto que en el PC (17,0 ms): algunos fotogramas largos, quizá la compilación de shaders la primera vez (la caché queda en `UserData/Cache`); no se investigó. **Sin probar en la Deck:** el modo juego con gamescope, Steam Input y los controles integrados, el sonido de oído, 3x y 4x, el consumo de batería, la suspensión y compilar en la Deck (opción B).
 
 ## Qué cambió para Linux
 

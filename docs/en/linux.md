@@ -18,8 +18,9 @@ What was measured on one PC (Fedora 44, Ryzen 7 8840HS, Radeon 780M with RADV/Me
 | Match | the automated Yankees–Colorado test match (`WIICOMPILED_MATCH_BENCH=1`): 30 s at 2x, 16:9, Vulkan: **59.9 FPS**, frame time p99 17.0 ms, GPU 5.1 ms per frame |
 | Audio | an SDL stream plays through PipeWire (seen with `pactl list sink-inputs`); not checked by ear |
 | Texture Studio | builds and passes its self-test (`TextureStudio --selftest`: 204 checks); the window and in-game capture were not tried by hand |
-| Portable build (`--container`) | see [Steam Deck](#steam-deck) |
-| **Not tested** | a real Steam Deck; controllers on Linux (SDL3, the same code as on Windows); X11 sessions; NVIDIA and Intel GPUs; season, league and MLB Life modes |
+| Portable build (`--container`) | runs on this PC (59.9 FPS in the same match) and on a Steam Deck (see below); needs glibc 2.35 and no libstdc++ |
+| Steam Deck (LCD, SteamOS 3.8.28, glibc 2.41) | the portable build, copied from the PC: every library resolves; the test match in Desktop Mode at 2x, 16:9, Vulkan (RADV VANGOGH): **59.9 FPS**, frame time p50 16.7 ms, p99 24.4 ms, GPU 6.6 ms per frame |
+| **Not tested** | Game Mode (gamescope) and Steam Input on the Deck; building on the Deck; controllers on Linux (SDL3, the same code as on Windows); X11 sessions; NVIDIA and Intel GPUs; season, league and MLB Life modes |
 | Not ported | the roster editor (PowerUp+, a Windows-only build): the launcher does not offer EDIT ROSTER on Linux. Roster mods are converted by the game itself (`mods/<mod>/roster/`), the same code as on Windows, so rosters made with PowerUp+ on Windows should load; not tried. The benchmark's CPU/GPU/RAM counters read "n/d" (they come from Windows performance counters) |
 
 ## Building on a Linux PC
@@ -76,7 +77,7 @@ tools/linux/build.sh --container --disc '/run/media/<SD card>/MLB Power Pros 200
 
 **Adding it to Game Mode:** in Desktop Mode open Steam → *Games* → *Add a Non-Steam Game to My Library* → *Browse* → `~/Games/MLBPowerPros2008/MLBPowerPros2008`. In its *Properties*, check that *Start In* is that folder (`~/Games/MLBPowerPros2008/`). Do **not** set a compatibility tool (Proton): this is a native Linux program. Back in Game Mode it starts fullscreen under gamescope. The Deck's controls reach the game as a standard gamepad through Steam Input; the launcher is controller-friendly.
 
-On the Deck itself, these were **not tested**: the build, the frame rate, battery use, suspend and resume, and Steam Input defaults. The Deck's GPU uses the same Vulkan driver as the test PC (RADV), and the APU supports the x86-64-v3 instructions the build requires. The test PC's 780M is faster than the Deck's GPU, so lower the internal resolution (1x or 2x) if the frame rate drops.
+**Measured on a Steam Deck** (LCD model, SteamOS 3.8.28, October 18), with the portable build from option A: the automated test match in Desktop Mode at 2x, 16:9, Vulkan ran at 59.9 FPS (p50 16.7 ms, p99 24.4 ms; GPU 6.6 ms of the 16.7 ms frame), so 2x is a safe default. The p99 is higher than on the PC (17.0 ms): a few long frames, possibly first-run shader compilation (the cache is kept in `UserData/Cache`); not investigated. **Not tested on the Deck:** Game Mode under gamescope, Steam Input and the built-in controls, sound by ear, 3x and 4x, battery use, suspend and resume, and building on the Deck (option B).
 
 ## What changed for Linux
 

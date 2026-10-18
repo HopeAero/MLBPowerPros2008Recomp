@@ -31,7 +31,7 @@ Una **recompilación estática** de *MLB Power Pros 2008* (Wii, USA, `RL8E54`) a
 | Código traducido | 48.219 funciones de `main.dol` y `ovl_main.rel`, ninguna sin soporte; 314 funciones del sistema enlazadas a código nativo |
 | Idiomas | launcher, Setup, Texture Studio y complemento de Blender en español e inglés (según el sistema, o a elegir); documentación en los dos idiomas |
 | Discord Rich Presence | inactivo hasta tener un ID de aplicación propio (ver [Configuración](#configuración)) |
-| Linux | compila y se juega en un PC con Fedora (Vulkan, 60 FPS en el partido de prueba) con `tools/linux/build.sh`; Steam Deck con una compilación portable, aún sin probar en una Deck. Sin editor de rosters. Ver [docs/linux.md](docs/linux.md) |
+| Linux | compila y se juega en un PC con Fedora (Vulkan, 60 FPS en el partido de prueba) con `tools/linux/build.sh`; Steam Deck con una compilación portable: 60 FPS a 2x en el partido de prueba en una Deck (modo escritorio; el modo juego aún sin probar). Sin editor de rosters. Ver [docs/linux.md](docs/linux.md) |
 | Switch (homebrew) | planeado, sin empezar |
 
 ### Problemas conocidos
