@@ -784,8 +784,11 @@ Encontrada el 18 de octubre de 2026 para la vista previa de estadios (`runtime/s
 | `0x808962AC` | presentación (al empezar) | (0, 50, 0) → (0, 699, −1200) |
 
   No apareció una cámara aparte para lanzar: con la IA, el lanzamiento se ve desde la del bateador.
-- **Lo que no sigue a esta cámara:** los jugadores, la pelota y el HUD se dibujaron con la vista anterior al forzar la cámara: usan otro camino (sin localizar). El estadio, el público y las banderas sí la siguen.
+- **Lo que no sigue a esta cámara:** los jugadores, la pelota y el cursor de la zona de strike se dibujan con la matriz de vista (`+0x154`) de las cámaras fuente, no con la de la principal; el HUD es ortográfico. El estadio, el público y las banderas sí siguen a la principal.
+- **Actualización del partido por fotograma:** `0x808816C8(partido)` llama a `0x8088175C(partido)` (máquina de estados propia vía `0x80882E84`) y después a `0x808661BC(partido)`, que salta a `0x80866EA4`: el árbol de estados del partido. Es una máquina de estados jerárquica: `0x8086C980(nodo, ptmf, evento)` apila el estado (`[nodo+16]` es la profundidad; `+4`, `+20`, `+32` y `+44` por nivel) y llama al manejador con `0x80129758` (llamada a puntero a miembro). Del árbol cuelgan el lanzamiento, el bateo, la defensa y el director de cámaras: la pila de una toma de bateador es `0x80CC5BE8` ← `0x80CAD398` ← `0x80867A74` ← `0x8086C980` ← … ← `0x80866EA4` ← `0x808816C8` ← `0x80022438`. El público animado y las banderas del estadio se actualizan fuera de ese árbol: sin él siguen moviéndose (comprobado en el estadio original).
+  El slot `+0x18` (`0x808816FC`) del vtable `0x80E5E350` no se llamó ni en 60 s de partido normal: no es esta actualización.
 - **El recomp** sustituye `0x80055D24` y `0x80C779D4` por versiones nativas idénticas. Con la vista previa activa, la primera escribe el ojo y el objetivo de la cámara libre en la cámara principal antes del `LookAt`, y la segunda aprende cada cámara fuente por quién la aplica, para mostrar esas tomas. Partido normal comprobado sin cambios: mismas tomas en el mismo orden.
+  Con la cámara libre, las cámaras fuente miran a otro lado (desde 10 km bajo el campo) para sacar de pantalla jugadores, pelota y cursor; su ojo, objetivo y vector arriba se guardan y se reponen al elegir una toma. `0x808816C8` también es nativa: en la vista previa, con el estadio ya en pantalla, se salta `0x808661BC` y el partido queda quieto (2 minutos sin accesos fuera de memoria; el partido normal sigue jugando).
 
 ## 9. Mandos
 

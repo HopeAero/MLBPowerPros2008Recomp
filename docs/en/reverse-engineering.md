@@ -783,8 +783,11 @@ Found on 18 October 2026 for the stadium preview (`runtime/src/hle/mlb/game_came
 | `0x808962AC` | introduction (at the start) | (0, 50, 0) → (0, 699, −1200) |
 
   No separate pitching camera showed up: with the AI, pitches are seen from the batter's.
-- **What does not follow this camera:** players, ball and HUD were drawn with the previous view when the camera was forced: they use another path (not located). The stadium, crowd and flags do follow it.
+- **What does not follow this camera:** players, ball and the strike zone cursor are drawn with the source cameras' view matrix (`+0x154`), not the main camera's; the HUD is orthographic. The stadium, crowd and flags do follow the main one.
+- **Per-frame match update:** `0x808816C8(match)` calls `0x8088175C(match)` (its own state machine through `0x80882E84`) and then `0x808661BC(match)`, which jumps to `0x80866EA4`: the match's state tree. It is a hierarchical state machine: `0x8086C980(node, ptmf, event)` pushes the state (`[node+16]` is the depth; `+4`, `+20`, `+32` and `+44` per level) and calls the handler through `0x80129758` (pointer-to-member call). Pitching, batting, fielding and the camera director hang from the tree: the stack of a batter shot is `0x80CC5BE8` ← `0x80CAD398` ← `0x80867A74` ← `0x8086C980` ← … ← `0x80866EA4` ← `0x808816C8` ← `0x80022438`. The stadium's animated crowd and flags update outside that tree: without it they keep moving (checked in the original stadium).
+  Slot `+0x18` (`0x808816FC`) of vtable `0x80E5E350` was not called even in 60 s of a normal match: it is not this update.
 - **The recomp** replaces `0x80055D24` and `0x80C779D4` with identical native versions. With the preview on, the first writes the free camera's eye and target into the main camera before the `LookAt`, and the second learns each source camera by its caller, to show those shots. Normal match checked unchanged: same shots in the same order.
+  With the free camera, the source cameras look away (from 10 km under the field) to take players, ball and cursor off screen; their eye, target and up vector are saved and put back when a shot is chosen. `0x808816C8` is native too: in the preview, once the stadium is on screen, `0x808661BC` is skipped and the match stands still (2 minutes without out-of-memory accesses; the normal match keeps playing).
 
 ## 9. Controllers
 
