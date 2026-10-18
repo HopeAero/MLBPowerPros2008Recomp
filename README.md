@@ -2,7 +2,7 @@
 
 *Versión en español: [README.es.md](README.es.md)*
 
-A **static recompilation** of *MLB Power Pros 2008* (Wii, USA, `RL8E54`) into a native Windows x64 program, built on the translator and runtime of [Wiicompiled](https://github.com/patchzyy/Wiicompiled), with its own launcher, mods and tools to edit textures, rosters and stadiums.
+A **static recompilation** of *MLB Power Pros 2008* (Wii, USA, `RL8E54`) into a native Windows x64 and Linux x86_64 program, built on the translator and runtime of [Wiicompiled](https://github.com/patchzyy/Wiicompiled), with its own launcher, mods and tools to edit textures, rosters and stadiums.
 
 **It is not an emulator:** there is no CPU interpreter and no JIT. The game's PowerPC code (`main.dol` and `ovl_main.rel`) is translated to C++ ahead of time and compiled for the PC; what the console provided (operating system, graphics, audio, disc, NAND memory, controllers) is re-implemented by the runtime.
 
@@ -16,7 +16,7 @@ A **static recompilation** of *MLB Power Pros 2008* (Wii, USA, `RL8E54`) into a 
 
 ## Status (October 2026)
 
-**Beta, Windows only.** What this table says was measured on the development PC; what was not checked, it says so.
+**Beta, Windows; Linux and Steam Deck experimental.** What this table says was measured on the development PC; what was not checked, it says so.
 
 | Area | State |
 |---|---|
@@ -31,7 +31,8 @@ A **static recompilation** of *MLB Power Pros 2008* (Wii, USA, `RL8E54`) into a 
 | Translated code | 48,219 functions from `main.dol` and `ovl_main.rel`, none unsupported; 314 system functions bound to native code |
 | Languages | launcher, Setup, Texture Studio and Blender add-on in Spanish and English (system language, or your choice); documentation in both languages |
 | Discord Rich Presence | inactive until it has its own application ID (see [Configuration](#configuration)) |
-| Linux, Switch (homebrew) | planned, not started |
+| Linux | builds and plays on one Fedora PC (Vulkan, 60 FPS in the test match) with `tools/linux/build.sh`; Steam Deck through a portable build, not yet tried on a Deck. No roster editor. See [docs/en/linux.md](docs/en/linux.md) |
+| Switch (homebrew) | planned, not started |
 
 ### Known issues
 
@@ -50,6 +51,15 @@ Requirements: Windows 10/11 64-bit, a GPU with Direct3D 12 or Vulkan, your copy 
 4. Press **PLAY** or use the desktop shortcut. The launcher opens before each session: graphics API, display, resolution, audio, controls, mods and tools.
 
 ![The Setup: choose your disc; no game files included](docs/media/setup-en.jpg)
+
+**Linux and Steam Deck** (experimental): no Setup window yet; one script does the same from a clone of this repository, then add the game to Steam as a non-Steam game:
+
+```sh
+tools/linux/build.sh --disc '<your copy>.rvz'               # this PC
+tools/linux/build.sh --container --disc '<your copy>.rvz'   # portable build for a Steam Deck / SteamOS
+```
+
+Requirements, the Steam Deck steps and what was tested: [docs/en/linux.md](docs/en/linux.md).
 
 ## How it works
 
@@ -133,6 +143,7 @@ For developers. Requirements: PowerShell 5.1, Git, the .NET 8 SDK and Python 3.1
 | [docs/en/roster-2008.md](docs/en/roster-2008.md) | 2008 rosters and the PowerUp+ editor |
 | [docs/en/texture-studio.md](docs/en/texture-studio.md) | Texture Studio |
 | [docs/en/stadiums.md](docs/en/stadiums.md) | Stadiums with Blender and how to make one from scratch |
+| [docs/en/linux.md](docs/en/linux.md) | Linux and Steam Deck: building, installing, what was tested |
 | [docs/en/reverse-engineering-tools.md](docs/en/reverse-engineering-tools.md) | Ghidra and dtk |
 
 The Spanish originals are in [docs/](docs/).

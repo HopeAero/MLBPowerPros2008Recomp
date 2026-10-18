@@ -19,9 +19,14 @@
 #include <backends/imgui_impl_sdl3.h>
 #include <backends/imgui_impl_sdlrenderer3.h>
 
+#if defined(_WIN32)
 #include <windows.h>
 #include <shellapi.h>
 #undef LoadImage  // windows.h macro; tstudio::LoadImage is ours
+#else
+#include <spawn.h>
+extern char** environ;
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -320,19 +325,29 @@ void Refilter(App& a) {
         a.selected = a.visible.empty() ? -1 : a.visible[0];
 }
 
-std::vector<std::string> WideArgs() {
+std::vector<std::string> WideArgs([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     std::vector<std::string> out;
+#if defined(_WIN32)
     int count = 0;
     if (LPWSTR* args = CommandLineToArgvW(GetCommandLineW(), &count)) {
         for (int i = 1; i < count; ++i) out.push_back(Utf8(fs::path(args[i])));
         LocalFree(args);
     }
+#else
+    for (int i = 1; i < argc; ++i) out.emplace_back(argv[i]);  // already UTF-8
+#endif
     return out;
 }
 
 Paths ResolvePaths(const std::vector<std::string>& args, bool* gameMissing) {
     const fs::path base = PathFromUtf8(SDL_GetBasePath());
-    Paths p{base / "UserData" / "Config.toml", base / "UserData", base / "mods", base / "MLBPowerPros2008.exe", {}};
+    Paths p{base / "UserData" / "Config.toml", base / "UserData", base / "mods",
+#if defined(_WIN32)
+            base / "MLBPowerPros2008.exe",
+#else
+            base / "MLBPowerPros2008",
+#endif
+            {}};
     for (size_t i = 0; i + 1 < args.size(); ++i) {
         if (args[i] == "--config") p.config = PathFromUtf8(args[++i]);
         else if (args[i] == "--userdata") p.userData = PathFromUtf8(args[++i]);
@@ -371,7 +386,14 @@ void SetLanguage(App& a, power_pros_ui::Lang lang) {
 }
 
 void OpenInExplorer(const fs::path& target) {
+#if defined(_WIN32)
     ShellExecuteW(nullptr, L"open", target.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+    const std::string path = target.string();
+    char* argv[] = {const_cast<char*>("xdg-open"), const_cast<char*>(path.c_str()), nullptr};
+    pid_t pid = 0;
+    posix_spawnp(&pid, "xdg-open", nullptr, nullptr, argv, environ);
+#endif
 }
 
 // ---- Drawing ----------------------------------------------------------------------------------------
@@ -961,13 +983,15 @@ void ApplyStyle() {
 
 } // namespace
 
-int main(int, char**) {
-    const std::vector<std::string> args = WideArgs();
+int main(int argc, char** argv) {
+    const std::vector<std::string> args = WideArgs(argc, argv);
     for (const auto& arg : args)
         if (arg == "--selftest") return RunSelftest();
     if (const int dev = DevMode(args); dev >= 0) return dev;
 
+#if defined(_WIN32)
     SetProcessDPIAware();
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
     SDL_Window* window = SDL_CreateWindow("Power Pros Wii 2008 Texture Studio", 1400, 860,
                                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);

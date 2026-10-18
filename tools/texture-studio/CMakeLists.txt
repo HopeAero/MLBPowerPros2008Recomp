@@ -17,7 +17,7 @@ foreach(subsystem AUDIO CAMERA HAPTIC SENSOR POWER JOYSTICK)
 endforeach()
 add_subdirectory("${SDL_SOURCE_DIR}" sdl EXCLUDE_FROM_ALL)
 
-add_executable(TextureStudio WIN32
+add_executable(TextureStudio
     studio.cpp selftest.cpp gx.cpp pack.cpp projectbin.cpp names.cpp images.cpp categories.cpp catalog.cpp config.cpp modfolder.cpp transfer.cpp capture.cpp
     "${IMGUI_SOURCE_DIR}/imgui.cpp"
     "${IMGUI_SOURCE_DIR}/imgui_draw.cpp"
@@ -29,4 +29,7 @@ target_include_directories(TextureStudio PRIVATE "${IMGUI_SOURCE_DIR}" "${UI_INC
 target_compile_features(TextureStudio PRIVATE cxx_std_20)
 target_compile_definitions(TextureStudio PRIVATE UNICODE _UNICODE)
 target_link_libraries(TextureStudio PRIVATE SDL3::SDL3-static)
-target_link_options(TextureStudio PRIVATE -static)
+if(WIN32)
+    set_target_properties(TextureStudio PROPERTIES WIN32_EXECUTABLE ON)
+    target_link_options(TextureStudio PRIVATE -static)
+endif()

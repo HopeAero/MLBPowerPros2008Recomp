@@ -6,7 +6,15 @@
 #include "core.h"
 #include "lang.h"
 
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <cstring>
+extern char** environ;
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -28,6 +36,30 @@ void Capture::SeedForTest(const std::filesystem::path& dumpsDir) {
 
 bool Capture::Start(const std::filesystem::path& gameExe, const std::filesystem::path& dumpsDir, std::string* error) {
     SeedForTest(dumpsDir);
+#if !defined(_WIN32)
+    // The game reads its paths relative to its own directory (portable.txt), so start it there.
+    std::vector<std::string> env{"WIICOMPILED_TEXTURE_DUMPS=1", "WIICOMPILED_SKIP_LAUNCHER=1"};
+    for (char** e = environ; *e != nullptr; ++e)
+        if (std::strncmp(*e, "WIICOMPILED_TEXTURE_DUMPS=", 26) != 0 && std::strncmp(*e, "WIICOMPILED_SKIP_LAUNCHER=", 26) != 0)
+            env.emplace_back(*e);
+    std::vector<char*> envp;
+    for (auto& entry : env) envp.push_back(entry.data());
+    envp.push_back(nullptr);
+    std::string exe = gameExe.string();
+    char* argv[] = {exe.data(), nullptr};
+    std::error_code ec;
+    const auto previous = std::filesystem::current_path(ec);
+    std::filesystem::current_path(gameExe.parent_path(), ec);
+    pid_t pid = 0;
+    const int rc = posix_spawn(&pid, exe.c_str(), nullptr, nullptr, argv, envp.data());
+    std::filesystem::current_path(previous, ec);
+    if (rc != 0) {
+        if (error) *error = Tr("No se pudo abrir el juego para capturar (", "Could not start the game to capture (") + std::string(std::strerror(rc)) + ").";
+        return false;
+    }
+    pid_ = pid;
+    return true;
+#else
     std::wstring command = L"\"" + gameExe.wstring() + L"\"";
     SetEnvironmentVariableW(L"WIICOMPILED_TEXTURE_DUMPS", L"1");
     SetEnvironmentVariableW(L"WIICOMPILED_SKIP_LAUNCHER", L"1");
@@ -45,17 +77,34 @@ bool Capture::Start(const std::filesystem::path& gameExe, const std::filesystem:
     CloseHandle(pi.hThread);
     process_ = pi.hProcess;
     return true;
+#endif
 }
 
 bool Capture::Running() const {
+#if defined(_WIN32)
     return process_ != nullptr && WaitForSingleObject(static_cast<HANDLE>(process_), 0) == WAIT_TIMEOUT;
+#else
+    if (pid_ <= 0) return false;
+    int status = 0;
+    if (waitpid(static_cast<pid_t>(pid_), &status, WNOHANG) == 0) return true;
+    pid_ = 0;  // reaped
+    return false;
+#endif
 }
 
 std::pair<int, std::vector<std::filesystem::path>> Capture::Collect(const std::filesystem::path& capturesDir) {
+#if defined(_WIN32)
     if (process_) {
         CloseHandle(static_cast<HANDLE>(process_));
         process_ = nullptr;
     }
+#else
+    if (pid_ > 0) {
+        int status = 0;
+        waitpid(static_cast<pid_t>(pid_), &status, WNOHANG);
+        pid_ = 0;
+    }
+#endif
     std::vector<std::filesystem::path> fresh;
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(dumps_, ec))
