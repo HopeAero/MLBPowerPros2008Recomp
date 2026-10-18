@@ -1,8 +1,8 @@
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index dee842d..c298f93 100644
+index dee842d..0dacb8b 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
-@@ -399,6 +399,11 @@ add_test(NAME mkw_stick_response_tests COMMAND mkw_stick_response_tests)
+@@ -399,6 +399,15 @@ add_test(NAME mkw_stick_response_tests COMMAND mkw_stick_response_tests)
  add_executable(mkw_auto_mips_tests "${CMAKE_CURRENT_LIST_DIR}/tests/auto_mips_tests.cpp")
  target_compile_features(mkw_auto_mips_tests PRIVATE cxx_std_20)
  add_test(NAME mkw_auto_mips_tests COMMAND mkw_auto_mips_tests)
@@ -11,9 +11,66 @@ index dee842d..c298f93 100644
 +target_compile_features(mkw_stadium_viewer_tests PRIVATE cxx_std_20)
 +target_include_directories(mkw_stadium_viewer_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 +add_test(NAME mkw_stadium_viewer_tests COMMAND mkw_stadium_viewer_tests)
++add_executable(mkw_game_camera_tests "${CMAKE_CURRENT_LIST_DIR}/tests/game_camera_tests.cpp")
++target_compile_features(mkw_game_camera_tests PRIVATE cxx_std_20)
++target_include_directories(mkw_game_camera_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
++add_test(NAME mkw_game_camera_tests COMMAND mkw_game_camera_tests)
  
  add_executable(mkw_nand_save_tests "${CMAKE_CURRENT_LIST_DIR}/tests/nand_save_tests.cpp")
  target_include_directories(mkw_nand_save_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+diff --git a/runtime/include/mlb_camera.h b/runtime/include/mlb_camera.h
+new file mode 100644
+index 0000000..f2f4483
+--- /dev/null
++++ b/runtime/include/mlb_camera.h
+@@ -0,0 +1,47 @@
++#pragma once
++// The game's camera (MLB Power Pros 2008), for the stadium viewer's free camera.
++// Reverse engineering: docs/ingenieria-inversa.md, "Cámara del partido".
++#include <cmath>
++#include <optional>
++
++#include "stadium_viewer.h"
++
++struct CpuContext;
++
++namespace game_camera {
++
++// The game's real match shots: behind the batter, the play camera (high and to the side after contact)
++// and a wide one. There is no separate pitcher camera: the AI match pitches from the batter's.
++enum class MatchView { Batter, Play, Wide };
++
++// From the next frame on the game draws with this camera (position and orientation; the game keeps its
++// own projection). ClearOverride gives the camera back to the game.
++void SetOverride(const stadium_viewer::CameraPose& pose);
++void ClearOverride();
++bool OverrideActive();
++// Asks for the game's own camera of that view (applied on the next guest frame); false while the match
++// camera is not known yet.
++bool ShowMatchView(MatchView view);
++// Guest-thread hook (once per frame, viewer only): applies a pending ShowMatchView.
++void OnGuestFrame(CpuContext* cpu);
++// The camera the game drew the last frame with.
++std::optional<stadium_viewer::CameraPose> CurrentPose();
++
++// Pure conversions (tested): CameraPose <-> eye/target in the game frame (target 100 dm ahead).
++// yaw 0 looks towards second base (-Z), positive yaw towards first base (+X); pitch positive up.
++inline void PoseToEyeTarget(const stadium_viewer::CameraPose& pose, float eye[3], float target[3]) {
++    const float c = std::cos(pose.pitch);
++    const float dir[3] = {std::sin(pose.yaw) * c, std::sin(pose.pitch), -std::cos(pose.yaw) * c};
++    for (int i = 0; i < 3; ++i) {
++        eye[i] = pose.eye[i];
++        target[i] = pose.eye[i] + dir[i] * 100.0f;
++    }
++}
++
++inline stadium_viewer::CameraPose EyeTargetToPose(const float eye[3], const float target[3], float fovY) {
++    const float d[3] = {target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]};
++    const float flat = std::sqrt(d[0] * d[0] + d[2] * d[2]);
++    return {{eye[0], eye[1], eye[2]}, std::atan2(d[0], -d[2]), std::atan2(d[1], flat), fovY};
++}
++
++}  // namespace game_camera
 diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
 index d2c1dd3..4cda53f 100644
 --- a/runtime/include/runtime_config.h
@@ -80,6 +137,205 @@ index 0000000..e5ef1ab
 +bool StadiumReady();  // the preview stadium is on screen (match_benchmark.cpp)
 +
 +}  // namespace stadium_viewer
+diff --git a/runtime/src/hle/mlb/game_camera.cpp b/runtime/src/hle/mlb/game_camera.cpp
+new file mode 100644
+index 0000000..7c390ab
+--- /dev/null
++++ b/runtime/src/hle/mlb/game_camera.cpp
+@@ -0,0 +1,193 @@
++// MLB Power Pros 2008 (RL8E54) game-specific natives: the match camera, for the stadium viewer's free
++// camera and match views (docs/ingenieria-inversa.md, "Cámara del partido").
++//
++// Camera objects (vtable 0x801568AC) keep eye (+0x40), target (+0x60) and up (+0x70) as (x, y, z, 1) in
++// game units (decimetres, Y up, second base towards -Z), the projection's cot(fovY/2) at +0x94 and the
++// view matrix at +0x154.
++// - 0x80055D24 rebuilds the view every frame: LookAt (0x80055620) into +0x154, then the viewing
++//   direction (target - eye, 0x8006327C) through 0x80060588 into +0x184. Decompiled here; while the
++//   viewer overrides the camera, eye, target and up are written into the main camera first.
++// - 0x80C779D4 is the match camera director: it copies a source camera (one per shot, kept up to date by
++//   its own controller) into the main camera with 0x80055300. Decompiled here; it also records the main
++//   camera and each source camera by the caller that applies it, so the viewer can show those shots.
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <mutex>
++
++#include "abi_bridge.h"
++#include "hle_stubs.h"
++#include "memory.h"
++#include "mlb_camera.h"
++
++namespace mlb_camera_native {
++
++constexpr uint32_t kLookAt = 0x80055620, kVecSub = 0x8006327C, kSetDirection = 0x80060588;
++constexpr uint32_t kFindCamera = 0x80061CF8, kCopyCamera = 0x80055300, kSceneNotify = 0x80C6217C;
++constexpr uint32_t kEye = 0x40, kTarget = 0x60, kUp = 0x70, kView = 0x154, kDirection = 0x184, kCot = 0x94;
++// Callers of the director, one per shot (seen in a 2-minute AI match on 18 October 2026).
++constexpr uint32_t kBatterCaller = 0x80CC5BE8, kPlayCaller = 0x808F1CD8, kWideCaller = 0x80AA0BA4;
++// The eye/target the game used for the play and wide shots, for when the director has not used them yet.
++constexpr float kPlayEye[3] = {328.6f, 184.8f, 102.7f}, kPlayTarget[3] = {0.0f, 0.0f, -120.1f};
++constexpr float kWideEye[3] = {-570.5f, 200.0f, -560.5f}, kWideTarget[3] = {-4.8f, 5.0f, -189.1f};
++
++std::mutex g_lock;
++std::atomic<bool> g_override{false};
++stadium_viewer::CameraPose g_pose{};
++std::optional<stadium_viewer::CameraPose> g_current;
++std::atomic<uint32_t> g_mainCamera{0}, g_director{0};
++std::array<std::atomic<uint32_t>, 3> g_sources{};  // by MatchView
++std::atomic<int> g_request{-1};
++
++float ReadF(uint32_t a) {
++    const uint32_t v = Memory::Read32(a);
++    float f;
++    std::memcpy(&f, &v, 4);
++    return f;
++}
++void WriteF(uint32_t a, float f) {
++    uint32_t v;
++    std::memcpy(&v, &f, 4);
++    Memory::Write32(a, v);
++}
++void WriteVec(uint32_t a, const float v[3]) {
++    for (int i = 0; i < 3; ++i) WriteF(a + 4 * i, v[i]);
++    WriteF(a + 12, 1.0f);
++}
++
++void Call(CpuContext* cpu, uint32_t target, uint32_t a, uint32_t b = 0, uint32_t c = 0, uint32_t d = 0) {
++    cpu->gpr[3] = a;
++    cpu->gpr[4] = b;
++    cpu->gpr[5] = c;
++    cpu->gpr[6] = d;
++    InvokeIndirectCpu(target, cpu);
++}
++
++// Runs `body` with a fresh 16-byte-aligned guest stack frame (scratch at sp+16), like the originals.
++template <typename Body>
++void WithFrame(CpuContext* cpu, uint32_t size, Body body) {
++    const uint32_t savedSp = cpu->gpr[1];
++    cpu->gpr[1] = (savedSp - size) & ~0xFu;
++    Memory::Write32(cpu->gpr[1], savedSp);
++    body();
++    cpu->gpr[1] = savedSp;
++}
++
++void UpdateView(CpuContext* cpu, uint32_t cam) {
++    const uint32_t main = g_mainCamera.load(std::memory_order_acquire);
++    if (g_override.load(std::memory_order_acquire) && (main == 0 || cam == main)) {
++        float eye[3], target[3];
++        {
++            std::lock_guard<std::mutex> lock(g_lock);
++            game_camera::PoseToEyeTarget(g_pose, eye, target);
++        }
++        const float up[3] = {0.0f, 1.0f, 0.0f};
++        WriteVec(cam + kEye, eye);
++        WriteVec(cam + kTarget, target);
++        WriteVec(cam + kUp, up);
++    }
++    Call(cpu, kLookAt, cam + kView, cam + kEye, cam + kUp, cam + kTarget);
++    const uint32_t dir = cpu->gpr[1] + 16;
++    Call(cpu, kVecSub, dir, cam + kEye, cam + kTarget);
++    cpu->fpr[1].d = ReadF(dir);
++    cpu->fpr[2].d = ReadF(dir + 4);
++    cpu->fpr[3].d = ReadF(dir + 8);
++    Call(cpu, kSetDirection, cam + kDirection);
++
++    if (main != 0 && cam != main) return;
++    const float eye[3] = {ReadF(cam + kEye), ReadF(cam + kEye + 4), ReadF(cam + kEye + 8)};
++    const float target[3] = {ReadF(cam + kTarget), ReadF(cam + kTarget + 4), ReadF(cam + kTarget + 8)};
++    const float cot = ReadF(cam + kCot);
++    const float fovY = cot > 0.0f ? 2.0f * std::atan(1.0f / cot) * 57.29578f : 45.0f;
++    std::lock_guard<std::mutex> lock(g_lock);
++    g_current = game_camera::EyeTargetToPose(eye, target, fovY);
++}
++
++// The director's body: copy `source` into the main camera and let the scene know.
++void ApplySource(CpuContext* cpu, uint32_t director, uint32_t source) {
++    if (static_cast<int32_t>(Memory::Read32(director + 64)) != 5 || source == 0) return;
++    const uint32_t scene = Memory::Read32(director + 60);
++    if (scene == 0) return;
++    Call(cpu, kFindCamera, Memory::Read32(scene + 732), 0);
++    const uint32_t main = cpu->gpr[3];
++    if (main == 0) return;
++    g_mainCamera.store(main, std::memory_order_release);
++    Call(cpu, kCopyCamera, main, source);
++    Memory::Write8(main + 128, Memory::Read8(main + 128) | 2);
++    Call(cpu, Memory::Read32(Memory::Read32(main) + 24), main);  // virtual, slot 24
++    Call(cpu, kSceneNotify, Memory::Read32(director + 60) + 64);
++    const uint32_t sceneNow = Memory::Read32(director + 60);
++    Call(cpu, Memory::Read32(Memory::Read32(sceneNow) + 116), sceneNow);  // virtual, slot 116
++}
++
++int ViewOfCaller(uint32_t lr) {
++    if (lr == kBatterCaller) return static_cast<int>(game_camera::MatchView::Batter);
++    if (lr == kPlayCaller) return static_cast<int>(game_camera::MatchView::Play);
++    if (lr == kWideCaller) return static_cast<int>(game_camera::MatchView::Wide);
++    return -1;
++}
++
++}  // namespace mlb_camera_native
++
++namespace game_camera {
++
++void SetOverride(const stadium_viewer::CameraPose& pose) {
++    std::lock_guard<std::mutex> lock(mlb_camera_native::g_lock);
++    mlb_camera_native::g_pose = pose;
++    mlb_camera_native::g_override.store(true, std::memory_order_release);
++}
++
++void ClearOverride() { mlb_camera_native::g_override.store(false, std::memory_order_release); }
++
++bool OverrideActive() { return mlb_camera_native::g_override.load(std::memory_order_acquire); }
++
++bool ShowMatchView(MatchView view) {
++    if (mlb_camera_native::g_director.load() == 0) return false;
++    mlb_camera_native::g_request.store(static_cast<int>(view));
++    return true;
++}
++
++void OnGuestFrame(CpuContext* cpu) {
++    using namespace mlb_camera_native;
++    const int view = g_request.exchange(-1);
++    if (view < 0 || cpu == nullptr) return;
++    const uint32_t director = g_director.load(), source = g_sources[static_cast<size_t>(view)].load();
++    if (source != 0) {  // the game's own camera for that shot
++        ClearOverride();
++        WithFrame(cpu, 0x40, [&] { ApplySource(cpu, director, source); });
++        return;
++    }
++    if (view == static_cast<int>(MatchView::Batter)) return;  // always known once the match shows
++    const bool play = view == static_cast<int>(MatchView::Play);
++    const auto current = CurrentPose();
++    SetOverride(EyeTargetToPose(play ? kPlayEye : kWideEye, play ? kPlayTarget : kWideTarget,
++                                current ? current->fovY : 45.0f));
++}
++
++std::optional<stadium_viewer::CameraPose> CurrentPose() {
++    std::lock_guard<std::mutex> lock(mlb_camera_native::g_lock);
++    return mlb_camera_native::g_current;
++}
++
++}  // namespace game_camera
++
++extern "C" void MLB_CameraUpdateView_80055D24(CpuContext* ctx) {
++    const uint32_t cam = ctx->gpr[3];
++    mlb_camera_native::WithFrame(ctx, 0x40, [&] { mlb_camera_native::UpdateView(ctx, cam); });
++}
++PPC_NATIVE_OVERRIDE_VOID(80055D24, MLB_CameraUpdateView_80055D24, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_CameraDirector_80C779D4(CpuContext* ctx) {
++    using namespace mlb_camera_native;
++    const uint32_t director = ctx->gpr[3], source = ctx->gpr[4];
++    if (const int view = ViewOfCaller(ctx->lr); view >= 0 && source != 0) {
++        g_sources[static_cast<size_t>(view)].store(source);
++        g_director.store(director);
++    }
++    // While the viewer holds a shot, the game's director keeps its hands off the main camera.
++    if (game_camera::OverrideActive()) return;
++    WithFrame(ctx, 0x20, [&] { ApplySource(ctx, director, source); });
++}
++PPC_NATIVE_OVERRIDE_VOID(80C779D4, MLB_CameraDirector_80C779D4, (CpuContext* ctx), (ctx));
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
 index 8142267..a87651c 100644
 --- a/runtime/src/launcher.cpp
@@ -94,17 +350,18 @@ index 8142267..a87651c 100644
          const char* value = std::getenv(env);
          if (value != nullptr && *value != '\0') return true;
 diff --git a/runtime/src/match_benchmark.cpp b/runtime/src/match_benchmark.cpp
-index 477d140..8373411 100644
+index 477d140..a0c0166 100644
 --- a/runtime/src/match_benchmark.cpp
 +++ b/runtime/src/match_benchmark.cpp
-@@ -1,4 +1,6 @@
+@@ -1,4 +1,7 @@
  #include "match_benchmark.h"
 +#include "stadium_viewer.h"
++#include "mlb_camera.h"
 +#include <chrono>
  #include "memory.h"
  #include "ppc_runtime.h"
  #include <cstdlib>
-@@ -15,7 +17,11 @@ namespace new_stadiums {
+@@ -15,7 +18,11 @@ namespace new_stadiums {
  uint32_t ForceForMatch(const char* code);  // hle/mlb/new_stadiums.cpp
  }
  #endif
@@ -116,7 +373,7 @@ index 477d140..8373411 100644
  static std::atomic<uint32_t> currentScene{0};
  static std::atomic<bool> gameplayReady{false};
  uint32_t Scene() { return currentScene.load(); }
-@@ -38,7 +44,16 @@ void OnHostFrame() {
+@@ -38,7 +45,16 @@ void OnHostFrame() {
                      std::fprintf(stderr, "[match-bench] gameplay phase=%u status=%u\n", phase, Memory::Read32(match + 80));
                      lastPhase = phase;
                  }
@@ -134,7 +391,7 @@ index 477d140..8373411 100644
              }
          }
      } else gameplayReady.store(false);
-@@ -48,7 +63,11 @@ void OnHostFrame() {
+@@ -48,7 +64,11 @@ void OnHostFrame() {
  }
  bool Enabled() {
  #if defined(WIICOMPILED_GAME_RL8E54)
@@ -147,7 +404,15 @@ index 477d140..8373411 100644
      return enabled;
  #else
      return false;
-@@ -111,8 +130,11 @@ void OnGuestFrame(CpuContext* cpu) {
+@@ -57,6 +77,7 @@ bool Enabled() {
+ void OnGuestFrame(CpuContext* cpu) {
+ #if defined(WIICOMPILED_GAME_RL8E54)
+     if (!Enabled() || !cpu || cpu->gpr[13] != 0x80322060u) return;
++    if (stadium_viewer::Enabled()) game_camera::OnGuestFrame(cpu);
+     const uint32_t manager = Memory::Read32(0x81033268u);
+     if (!manager || !Memory::Contains(manager, 1100) || Memory::Read32(manager) != 0x80D4EB88u) return;
+     const uint32_t mode = Memory::Read32(manager + 1032);
+@@ -111,8 +132,11 @@ void OnGuestFrame(CpuContext* cpu) {
          }
          cpu->gpr[3] = 27;
          func_807A8BE8(cpu);
@@ -369,6 +634,49 @@ index 0000000..6a8d088
 +bool Enabled() { return Active().has_value(); }
 +
 +}  // namespace stadium_viewer
+diff --git a/runtime/tests/game_camera_tests.cpp b/runtime/tests/game_camera_tests.cpp
+new file mode 100644
+index 0000000..063f62c
+--- /dev/null
++++ b/runtime/tests/game_camera_tests.cpp
+@@ -0,0 +1,37 @@
++#include "mlb_camera.h"
++#include <cmath>
++#include <cstdlib>
++int main() {
++    const auto require = [](bool ok) { if (!ok) std::abort(); };
++    const auto near = [](float a, float b) { return std::fabs(a - b) < 1e-3f; };
++    using namespace game_camera;
++    float eye[3], target[3];
++
++    // yaw 0, pitch 0: looking towards second base (-Z), target 100 dm ahead.
++    PoseToEyeTarget({{0, 30, 90}, 0, 0, 45}, eye, target);
++    require(near(eye[0], 0) && near(eye[1], 30) && near(eye[2], 90));
++    require(near(target[0], 0) && near(target[1], 30) && near(target[2], -10));
++
++    // Positive yaw turns towards first base (+X).
++    PoseToEyeTarget({{0, 0, 0}, 1.5707963f, 0, 45}, eye, target);
++    require(near(target[0], 100) && near(target[2], 0));
++
++    // Positive pitch looks up.
++    PoseToEyeTarget({{0, 0, 0}, 0, 0.5f, 45}, eye, target);
++    require(target[1] > 40 && target[2] < 0);
++
++    // Round trip, including the game's own batter view (eye behind home, target past the mound).
++    const float gameEye[3] = {2.0869f, 15.5095f, 59.5611f}, gameTarget[3] = {-8.9952f, -1.7186f, -229.0464f};
++    const auto pose = EyeTargetToPose(gameEye, gameTarget, 48.8f);
++    require(near(pose.eye[0], gameEye[0]) && near(pose.eye[2], gameEye[2]) && near(pose.fovY, 48.8f));
++    require(pose.yaw < 0 && pose.pitch < 0);  // slightly towards third base and down
++    PoseToEyeTarget(pose, eye, target);
++    const float dx = gameTarget[0] - gameEye[0], dy = gameTarget[1] - gameEye[1], dz = gameTarget[2] - gameEye[2];
++    const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
++    require(near(target[0] - eye[0], dx / len * 100) && near(target[1] - eye[1], dy / len * 100) &&
++            near(target[2] - eye[2], dz / len * 100));
++
++    // Eye and target at the same point: no NaN.
++    const auto same = EyeTargetToPose(gameEye, gameEye, 45);
++    require(std::isfinite(same.yaw) && std::isfinite(same.pitch));
++}
 diff --git a/runtime/tests/runtime_config_tests.cpp b/runtime/tests/runtime_config_tests.cpp
 index 337d40a..ab135ed 100644
 --- a/runtime/tests/runtime_config_tests.cpp

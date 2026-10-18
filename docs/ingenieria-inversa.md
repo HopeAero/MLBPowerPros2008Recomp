@@ -755,6 +755,38 @@ Fuentes: `wiicompiled-match-benchmark.patch` (`match_benchmark.cpp`), `docs/wiic
 
 Fuentes: `config/wiicompiled/rl8e54-data.csv`, `docs/wiicompiled-feasibility.md`, `wiicompiled-aurora-partial-efb-copy.patch`, `wiicompiled-tlut-reinit-cache.patch`.
 
+### Cámara del partido
+
+Encontrada el 18 de octubre de 2026 para la vista previa de estadios (`runtime/src/hle/mlb/game_camera.cpp`, parche `wiicompiled-stadium-viewer`). Métodos: volcados de MEM1 cada 3 s (`WIICOMPILED_DEBUG_MEM1`) buscando pares ojo/objetivo plausibles; watchpoint de escritura sobre el ojo (`WIICOMPILED_DEBUG_WATCH`) resuelto con `llvm-nm`; envoltorios temporales en los shards.
+
+- **Objeto cámara** (clase del DOL, vtable `0x801568AC`, bloques de `0x2C0` bytes en el montón de MEM1; su dirección cambia entre ejecuciones):
+
+| Offset | Campo |
+|---|---|
+| `+0x40` | ojo (x, y, z, 1), en decímetros, Y arriba, segunda base hacia −Z |
+| `+0x60` | objetivo (x, y, z, 1) |
+| `+0x70` | vector arriba (0, 1, 0, 1) |
+| `+0x8C` | puntero a su función de vista (`0x80055D24`) |
+| `+0x90` | puntero a su función de proyección (`0x80054B1C`) |
+| `+0x94` | cot(fovY/2) de la proyección: 2,206 en la vista del bateador (≈ 48,8°) |
+| `+0x154` | matriz de vista 3×4 |
+| `+0x184` | dirección de la vista |
+
+- **`0x80055D24`** reconstruye la vista en cada fotograma: `LookAt` propio del juego (`0x80055620`, firma como `C_MTXLookAt`: matriz, ojo, arriba, objetivo) en `+0x154`; luego `objetivo − ojo` (`0x8006327C`) guardado con `0x80060588` en `+0x184`. El partido **no** usa `C_MTXLookAt` del SDK (`0x800A8DC4`); sí lo usa el render de Miis (`0x80090AF8`).
+- **Director de cámaras** del partido: objeto apuntado desde `0x81050810` (BSS). `0x80C779D4(director, fuente)` copia una cámara fuente en la principal con `0x80055300` (copia de cámara, 633 bytes desde `+0x40`); la principal la da `0x80061CF8([[director+60]+732], 0)`; después marca el bit 1 del byte `+128`, llama al virtual `+24` de la cámara, a `0x80C6217C([director+60]+64)` y al virtual `+116` de `[director+60]`. Solo actúa con `[director+64] == 5`.
+- **Tomas** (cámaras fuente, una por toma, cada una con su propio controlador; vistas en 2 minutos de partido automático):
+
+| Quién llama al director | Toma | Ojo → objetivo de muestra |
+|---|---|---|
+| `0x80CC5BE8` | detrás del bateador (cambia de lado con la mano del bateador) | (±2,1, 15,5, 59,6) → (∓9, −1,7, −229) |
+| `0x808F1CD8` | jugada, alta y lateral tras el batazo (cot 3,51 ≈ 31,8°) | (±328,6, 184,8, 102,7) → (0, 0, −120,1) |
+| `0x80AA0BA4` | lejana; varía: (−570,5, 200, −560,5) → (−4,8, 5, −189,1) o (0, 51,3, 154) | — |
+| `0x808962AC` | presentación (al empezar) | (0, 50, 0) → (0, 699, −1200) |
+
+  No apareció una cámara aparte para lanzar: con la IA, el lanzamiento se ve desde la del bateador.
+- **Lo que no sigue a esta cámara:** los jugadores, la pelota y el HUD se dibujaron con la vista anterior al forzar la cámara: usan otro camino (sin localizar). El estadio, el público y las banderas sí la siguen.
+- **El recomp** sustituye `0x80055D24` y `0x80C779D4` por versiones nativas idénticas. Con la vista previa activa, la primera escribe el ojo y el objetivo de la cámara libre en la cámara principal antes del `LookAt`, y la segunda aprende cada cámara fuente por quién la aplica, para mostrar esas tomas. Partido normal comprobado sin cambios: mismas tomas en el mismo orden.
+
 ## 9. Mandos
 
 - **Mando de GameCube:**

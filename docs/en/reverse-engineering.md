@@ -754,6 +754,38 @@ Sources: `wiicompiled-match-benchmark.patch` (`match_benchmark.cpp`), `docs/en/w
 
 Sources: `config/wiicompiled/rl8e54-data.csv`, `docs/en/wiicompiled-feasibility.md`, `wiicompiled-aurora-partial-efb-copy.patch`, `wiicompiled-tlut-reinit-cache.patch`.
 
+### Match camera
+
+Found on 18 October 2026 for the stadium preview (`runtime/src/hle/mlb/game_camera.cpp`, patch `wiicompiled-stadium-viewer`). Methods: MEM1 dumps every 3 s (`WIICOMPILED_DEBUG_MEM1`) searched for plausible eye/target pairs; a write watchpoint on the eye (`WIICOMPILED_DEBUG_WATCH`) resolved with `llvm-nm`; temporary wrappers in the shards.
+
+- **Camera object** (DOL class, vtable `0x801568AC`, `0x2C0`-byte blocks in the MEM1 heap; its address changes between runs):
+
+| Offset | Field |
+|---|---|
+| `+0x40` | eye (x, y, z, 1), in decimetres, Y up, second base towards −Z |
+| `+0x60` | target (x, y, z, 1) |
+| `+0x70` | up vector (0, 1, 0, 1) |
+| `+0x8C` | pointer to its view function (`0x80055D24`) |
+| `+0x90` | pointer to its projection function (`0x80054B1C`) |
+| `+0x94` | the projection's cot(fovY/2): 2.206 in the batter view (≈ 48.8°) |
+| `+0x154` | 3×4 view matrix |
+| `+0x184` | viewing direction |
+
+- **`0x80055D24`** rebuilds the view every frame: the game's own `LookAt` (`0x80055620`, signature like `C_MTXLookAt`: matrix, eye, up, target) into `+0x154`; then `target − eye` (`0x8006327C`) stored through `0x80060588` into `+0x184`. The match does **not** use the SDK's `C_MTXLookAt` (`0x800A8DC4`); the Mii renderer does (`0x80090AF8`).
+- **Match camera director:** object pointed to from `0x81050810` (BSS). `0x80C779D4(director, source)` copies a source camera into the main one with `0x80055300` (camera copy, 633 bytes from `+0x40`); the main camera comes from `0x80061CF8([[director+60]+732], 0)`; it then sets bit 1 of byte `+128`, calls the camera's virtual `+24`, `0x80C6217C([director+60]+64)` and the virtual `+116` of `[director+60]`. It only acts when `[director+64] == 5`.
+- **Shots** (source cameras, one per shot, each with its own controller; seen in 2 minutes of an automatic match):
+
+| Caller of the director | Shot | Sample eye → target |
+|---|---|---|
+| `0x80CC5BE8` | behind the batter (switches side with the batter's hand) | (±2.1, 15.5, 59.6) → (∓9, −1.7, −229) |
+| `0x808F1CD8` | play, high and to the side after contact (cot 3.51 ≈ 31.8°) | (±328.6, 184.8, 102.7) → (0, 0, −120.1) |
+| `0x80AA0BA4` | wide; varies: (−570.5, 200, −560.5) → (−4.8, 5, −189.1) or (0, 51.3, 154) | — |
+| `0x808962AC` | introduction (at the start) | (0, 50, 0) → (0, 699, −1200) |
+
+  No separate pitching camera showed up: with the AI, pitches are seen from the batter's.
+- **What does not follow this camera:** players, ball and HUD were drawn with the previous view when the camera was forced: they use another path (not located). The stadium, crowd and flags do follow it.
+- **The recomp** replaces `0x80055D24` and `0x80C779D4` with identical native versions. With the preview on, the first writes the free camera's eye and target into the main camera before the `LookAt`, and the second learns each source camera by its caller, to show those shots. Normal match checked unchanged: same shots in the same order.
+
 ## 9. Controllers
 
 - **GameCube controller:**
