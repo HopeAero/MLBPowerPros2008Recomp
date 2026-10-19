@@ -50,6 +50,43 @@ def twins(first_away, textured_first):
     return kept
 
 
+def test_prepare_and_image_texture():
+    """convert.prepare: the faces of some objects in one bmesh, one material index per image, colours
+    baked, twins dropped (a textured face over a plain one). exporter.image_texture: RGB5A3 + HD."""
+    exporter = importlib.import_module(pkg + ".exporter")
+    img = bpy.data.images.new("prep_tex", 8, 8)
+    img.pixels.foreach_set([0.2, 0.6, 0.2, 1.0] * 64)
+    plain = bpy.data.materials.new("prep_plain")
+    plain.use_nodes = True
+    textured = bpy.data.materials.new("prep_textured")
+    textured.use_nodes = True
+    textured.node_tree.nodes.new("ShaderNodeTexImage").image = img
+    quad = [(-5.0, 80.0, 0.0), (5.0, 80.0, 0.0), (5.0, 80.0, 5.0), (-5.0, 80.0, 5.0)]
+    objs = []
+    for name, mat in (("prep_a", plain), ("prep_b", textured)):
+        me = bpy.data.meshes.new(name)
+        me.from_pydata(quad, [], [(0, 1, 2, 3)])
+        me.materials.append(mat)
+        o = bpy.data.objects.new(name, me)
+        bpy.context.scene.collection.objects.link(o)
+        objs.append(o)
+    bm, images = convert.prepare(objs)
+    faces = list(bm.faces)
+    check(len(faces) == 1 and images[faces[0].material_index] is img,
+          f"prepare: twins over two objects keep the textured face ({len(bm.faces)} faces, images {images})")
+    check("Color" in bm.loops.layers.float_color and "UVMap" in bm.loops.layers.uv, "prepare: colour and UV layers")
+    bm.free()
+    tex, hd_name, hd_rgba = exporter.image_texture(img, True)
+    check((tex.fmt, tex.width, tex.height, len(tex.pixels)) == (5, 8, 8, 128), "image_texture: 8x8 RGB5A3")
+    check(hd_name and hd_name.endswith("_5.png") and hd_rgba is not None, f"image_texture: HD replacement {hd_name}")
+    check(exporter.image_texture(img, False)[1] is None, "image_texture without HD")
+    for o in objs:
+        bpy.data.objects.remove(o)
+
+
+test_prepare_and_image_texture()
+
+
 # A texture drawn over a plain face (SketchUp exports both): the textured one stays, facing the field.
 check(twins(first_away=False, textured_first=False) == [(1, -1.0)], "twins facing the field: the textured one stays")
 check(twins(first_away=True, textured_first=True) == [(1, -1.0)], "a textured twin facing away is kept, turned to the field")

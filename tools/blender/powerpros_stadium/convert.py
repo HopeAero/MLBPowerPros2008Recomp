@@ -84,6 +84,68 @@ def box_centre(o):
     return sum(pts, Vector()) / 8
 
 
+def face_copies(sources, bake_light=True):
+    """Each face of `sources` (mesh objects in the game's frame) as the game will get it: yields
+    (image or None, flat ground face, corners, UVs, vertex colour). One copy per face, turned to the
+    field: two coplanar faces (a two-sided face drawn twice, or the front and back faces SketchUp
+    exporters write) fight in the game, and the one facing away can win (the stadium showed the green
+    backs of its stands). The material colour and a soft sun go into the vertex colour."""
+    info = {}
+    for src in sources:
+        me = src.data
+        mw = src.matrix_world
+        normal_mw = mw.to_3x3().inverted().transposed()
+        uv = me.uv_layers.active
+        for p in me.polygons:
+            mat = src.material_slots[p.material_index].material if p.material_index < len(src.material_slots) else None
+            if mat not in info:
+                info[mat] = material_info(mat)
+            img, colour = info[mat]
+            vs = [mw @ me.vertices[i].co for i in p.vertices]
+            c = sum(vs, Vector()) / len(vs)
+            n = (normal_mw @ p.normal).normalized()
+            flat = abs(n.z) > 0.95 and c.z < 1.0 and c.xy.length < 160
+            uvs = [tuple(uv.data[li].uv) for li in p.loop_indices] if uv else [(0.0, 0.0)] * len(vs)
+            double = mat is not None and not mat.use_backface_culling
+            towards = (n.z > 0) if flat else (n.xy.dot(FIELD - c.xy) > 0)
+            sides = [not towards] if double else ([False] if towards or not flat else [])
+            for flip in sides:
+                normal = -n if flip else n
+                light = 0.55 + 0.45 * max(0.0, normal.dot(SUN)) if bake_light else 1.0
+                col = (*(min(1.0, v * light) for v in colour), 1.0)
+                order = list(range(len(vs)))[::-1] if flip else list(range(len(vs)))
+                yield img, flat, [vs[i] for i in order], [uvs[i] for i in order], col
+
+
+def _add_face(bm, corners, uvs, col, material_index):
+    try:
+        f = bm.faces.new([bm.verts.new(v) for v in corners])
+    except ValueError:
+        return
+    f.material_index = material_index
+    for loop, uv in zip(f.loops, uvs):
+        loop[bm.loops.layers.uv["UVMap"]].uv = uv
+        loop[bm.loops.layers.float_color["Color"]] = col
+
+
+def prepare(sources, bake_light=True, separate=True):
+    """The faces of `sources` in one bmesh, ready for the game (face_copies), with twins dropped (a
+    textured face wins over a plain one with the same corners) and, with `separate`, stacked layers
+    pulled apart. Returns (bmesh, images): face.material_index indexes images (None: untextured)."""
+    bm = bmesh.new()
+    bm.loops.layers.uv.new("UVMap")
+    bm.loops.layers.float_color.new("Color")
+    images = []
+    for img, _, corners, uvs, col in face_copies(sources, bake_light):
+        if img not in images:
+            images.append(img)
+        _add_face(bm, corners, uvs, col, images.index(img))
+    drop_back_twins(bm, {i for i, img in enumerate(images) if img is not None})
+    if separate:
+        separate_layers(bm)
+    return bm, images
+
+
 def convert(coll, sources, replace=True, bake_light=True):
     """Spread the faces of `sources` (mesh objects in the game's frame) over the stadium's pieces.
     replace: the pieces lose their own geometry and the pieces left without any are deleted.
@@ -132,46 +194,13 @@ def convert(coll, sources, replace=True, bake_light=True):
             tex_mats[img.name] = m
         return tex_mats[img.name]
 
-    info = {}
-    for src in sources:
-        me = src.data
-        mw = src.matrix_world
-        normal_mw = mw.to_3x3().inverted().transposed()
-        uv = me.uv_layers.active
-        for p in me.polygons:
-            mat = src.material_slots[p.material_index].material if p.material_index < len(src.material_slots) else None
-            if mat not in info:
-                info[mat] = material_info(mat)
-            img, colour = info[mat]
-            vs = [mw @ me.vertices[i].co for i in p.vertices]
-            c = sum(vs, Vector()) / len(vs)
-            n = (normal_mw @ p.normal).normalized()
-            flat = abs(n.z) > 0.95 and c.z < 1.0 and c.xy.length < 160
-            gm = game_material(img)
-            name = piece_for(gm, flat)
-            bm = bucket(name)
-            if gm not in slots[name]:
-                slots[name].append(gm)
-            uvs = [tuple(uv.data[li].uv) for li in p.loop_indices] if uv else [(0.0, 0.0)] * len(vs)
-            # One copy per face, turned to the field: two coplanar faces (a two-sided face drawn twice,
-            # or the front and back faces SketchUp exporters write) fight in the game, and the one
-            # facing away can win (the stadium showed the green backs of its stands).
-            double = mat is not None and not mat.use_backface_culling
-            towards = (n.z > 0) if flat else (n.xy.dot(FIELD - c.xy) > 0)
-            sides = [not towards] if double else ([False] if towards or not flat else [])
-            for flip in sides:
-                normal = -n if flip else n
-                light = 0.55 + 0.45 * max(0.0, normal.dot(SUN)) if bake_light else 1.0
-                col = (*(min(1.0, v * light) for v in colour), 1.0)
-                order = list(range(len(vs)))[::-1] if flip else list(range(len(vs)))
-                try:
-                    f = bm.faces.new([bm.verts.new(vs[i]) for i in order])
-                except ValueError:
-                    continue
-                f.material_index = slots[name].index(gm)
-                for loop, i in zip(f.loops, order):
-                    loop[bm.loops.layers.uv["UVMap"]].uv = uvs[i]
-                    loop[bm.loops.layers.float_color["Color"]] = col
+    for img, flat, corners, uvs, col in face_copies(sources, bake_light):
+        gm = game_material(img)
+        name = piece_for(gm, flat)
+        bm = bucket(name)
+        if gm not in slots[name]:
+            slots[name].append(gm)
+        _add_face(bm, corners, uvs, col, slots[name].index(gm))
     if not buckets:
         raise ConvertFailure(T("Los objetos elegidos no tienen caras", "The selected objects have no faces"))
 

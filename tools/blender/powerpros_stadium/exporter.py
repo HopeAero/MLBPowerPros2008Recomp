@@ -15,7 +15,7 @@ import numpy as np
 from mathutils import Matrix, Vector
 
 from . import (fingerprint, hd_textures, importer, menu_pack, menu_render, names, packwii, pj7m, pj7m_write,
-               stadium_tbl, tbl_write)
+               stadium_model, stadium_tbl, tbl_write)
 from .i18n import T
 from .names import valid_code
 
@@ -62,6 +62,26 @@ def pow2(n):
     return 1 << max(2, min(MAX_TEXTURE.bit_length() - 1, round(math.log2(max(n, 1)))))
 
 
+def image_texture(img, hd):
+    """A Blender image as the pack's texture: (stadium_model.Texture in RGB5A3, powers of 2 up to
+    MAX_TEXTURE; with `hd`, the name of its full-size replacement PNG and that image, else None, None)."""
+    w, h = img.size
+    if w == 0 or h == 0:
+        raise ExportFailure(T(f"La imagen {img.name} está vacía", f"The image {img.name} is empty"))
+    px = np.empty(w * h * 4, np.float32)
+    img.pixels.foreach_get(px)
+    full = (px.reshape(h, w, 4)[::-1] * 255 + 0.5).astype(np.uint8)        # top row first
+    rgba = full
+    tw, th = pow2(w), pow2(h)
+    if (tw, th) != (w, h):
+        rgba = rgba[np.arange(th) * h // th][:, np.arange(tw) * w // tw]
+    texels = packwii.tile(packwii.to_rgb5a3(rgba), 5).astype(">u2").tobytes()
+    tex = stadium_model.Texture(5, tw, th, texels)
+    if not hd:              # full size and 8 bits per channel, keyed to the small RGB5A3 texture
+        return tex, None, None
+    return tex, hd_textures.replacement_name(texels, tw, th), hd_textures.fit(full)
+
+
 class Exporter:
     def __init__(self, gfx, tbl, hd=True):
         self.hd = hd
@@ -87,23 +107,11 @@ class Exporter:
         if off is not None and img.get("pp_pixels_hash") == fingerprint.image_hash(img) and off in self.textures:
             return off, self._palette_header(off)
         if img.name not in self.new_textures:
-            w, h = img.size
-            if w == 0 or h == 0:
-                raise ExportFailure(T(f"La imagen {img.name} está vacía", f"The image {img.name} is empty"))
-            px = np.empty(w * h * 4, np.float32)
-            img.pixels.foreach_get(px)
-            full = (px.reshape(h, w, 4)[::-1] * 255 + 0.5).astype(np.uint8)        # top row first
-            rgba = full
-            tw, th = pow2(w), pow2(h)
-            if (tw, th) != (w, h):
-                ys = (np.arange(th) * h // th)
-                xs = (np.arange(tw) * w // tw)
-                rgba = rgba[ys][:, xs]
-            texels = packwii.tile(packwii.to_rgb5a3(rgba), 5).astype(">u2").tobytes()
-            self.new_textures[img.name] = self.w.add_texture_rgb5a3(texels, tw, th)
+            tex, hd_name, hd_rgba = image_texture(img, self.hd)
+            self.new_textures[img.name] = self.w.add_texture_rgb5a3(tex.pixels, tex.width, tex.height)
             self.stats["textures"] += 1
-            if self.hd:          # full size and 8 bits per channel, keyed to the small RGB5A3 texture
-                self.hd_images[hd_textures.replacement_name(texels, tw, th)] = hd_textures.fit(full)
+            if hd_name:
+                self.hd_images[hd_name] = hd_rgba
         return self.new_textures[img.name], None
 
     def image_changed(self, img):

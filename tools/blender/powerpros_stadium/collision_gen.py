@@ -289,8 +289,10 @@ def make_object(tris, collection):
 
 
 def generate(coll):
-    """Replace the stadium's collision with one generated from its pieces. Returns the object or None."""
-    pieces = [o for o in coll.all_objects if o.get("pp_kind") == "model" and o.type == "MESH"]
+    """Replace the stadium's collision with one generated from its pieces (in a from-scratch collection,
+    all its meshes). Returns the object or None."""
+    pieces = [o for o in coll.all_objects if o.type == "MESH" and (o.get("pp_kind") == "model" or
+              (coll.get("pp_scratch") and o.get("pp_kind") != "collision"))]
     tris = build(pieces)
     if tris is None:
         return None
