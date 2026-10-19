@@ -2,7 +2,7 @@
 
 *English version: [../../en/superpowers/specs/2026-10-19-season-archive-design.md](../../en/superpowers/specs/2026-10-19-season-archive-design.md)*
 
-Fecha: 19 de octubre de 2026. Estado: pendiente de aprobación del usuario (preguntas del revisor contestadas el 19 de octubre).
+Fecha: 19 de octubre de 2026. Estado: aprobado por el usuario el 19 de octubre de 2026 («adelante»).
 
 ## Por qué
 

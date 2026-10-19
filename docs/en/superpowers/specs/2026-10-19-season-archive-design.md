@@ -2,7 +2,7 @@
 
 *Versión en español: [../../../superpowers/specs/2026-10-19-season-archive-design.md](../../../superpowers/specs/2026-10-19-season-archive-design.md)*
 
-Date: October 19, 2026. Status: awaiting the user's approval (reviewer questions answered on October 19).
+Date: October 19, 2026. Status: approved by the user on October 19, 2026 ("adelante").
 
 ## Why
 
