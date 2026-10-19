@@ -44,7 +44,7 @@ Una **recompilación estática** de *MLB Power Pros 2008* (Wii, USA, `RL8E54`) a
 
 Requisitos: Windows 10/11 de 64 bits, una GPU con Direct3D 12 o Vulkan, tu copia de *MLB Power Pros 2008* para Wii (USA, `RL8E54`) y unos 2,5 GB libres (el Setup ocupa 900 MB y el juego instalado 1,5 GB).
 
-1. Descarga `MLB-Power-Pros-2008-Setup-v0.1.1.zip` de [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (la última: `v0.1.1` beta) y descomprímelo en una carpeta tuya (no en Archivos de programa).
+1. Descarga `MLB-Power-Pros-2008-Setup-v0.1.2.zip` de [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (la última: `v0.1.2` beta) y descomprímelo en una carpeta tuya (no en Archivos de programa).
 2. Abre `MLBPowerPros2008-Setup.exe`, pulsa **ELEGIR DISCO** y elige tu copia (ISO, NKit, RVZ, WBFS, WIA, GCZ o CISO).
 3. Pulsa **INSTALAR**. El Setup comprueba que sea un volcado limpio de `RL8E54`, lo extrae, traduce el código y lo compila en tu PC.
 4. Pulsa **JUGAR** o usa el acceso directo del escritorio. Antes de cada partida se abre el launcher: API gráfica, pantalla, resolución, audio, controles, mods y herramientas.
