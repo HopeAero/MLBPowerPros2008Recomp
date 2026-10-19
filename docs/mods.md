@@ -117,6 +117,7 @@ Una carrera de MLB Life, una temporada o una liga empezadas con un roster modifi
 - Los mods de texturas, uniformes (`project/` sin `game_data.pack`), `disc/` o Riivolution usan las partidas normales.
 - Si un mod Riivolution define su propio `<savegame>`, ese tiene prioridad.
 - Una combinación nueva empieza sin partidas.
+- **En el launcher** (MODS), la primera fila, **PARTIDAS EN USO**, dice qué partidas usará el juego («Normales» o los mods de roster activos) y al pulsarla abre su carpeta. Al activar o desactivar un mod de roster, avisa de que ese conjunto tiene sus propias partidas y de que las otras siguen guardadas. Parche `wiicompiled-launcher-saves`. Un jugador creyó que el juego no guardaba porque, al cambiar de mods, sus partidas «desaparecían».
 - Las partidas jugadas con un roster antes de este cambio quedaron en las normales.
 - Parche `wiicompiled-mod-saves`. Usa el mismo redireccionador que el `<savegame>` de Riivolution, pero toma la carpeta de datos del título de disco que aparece en la ruta: el código de juego en memoria baja no dura una vez que el juego corre, y `CurrentNandDataDir` vuelve a `RMCP`.
 - Verificado:

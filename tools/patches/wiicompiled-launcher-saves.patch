@@ -1,0 +1,168 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 84c82a3..ccc2a39 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -396,6 +396,10 @@ add_test(NAME mkw_match_benchmark_tests COMMAND mkw_match_benchmark_tests)
+ add_executable(mkw_stick_response_tests "${CMAKE_CURRENT_LIST_DIR}/tests/stick_response_tests.cpp")
+ target_compile_features(mkw_stick_response_tests PRIVATE cxx_std_20)
+ add_test(NAME mkw_stick_response_tests COMMAND mkw_stick_response_tests)
++add_executable(mkw_mod_saves_tests "${CMAKE_CURRENT_LIST_DIR}/tests/mod_saves_tests.cpp")
++target_compile_features(mkw_mod_saves_tests PRIVATE cxx_std_20)
++target_include_directories(mkw_mod_saves_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/../aurora-main/include")
++add_test(NAME mkw_mod_saves_tests COMMAND mkw_mod_saves_tests)
+ add_executable(mkw_auto_mips_tests "${CMAKE_CURRENT_LIST_DIR}/tests/auto_mips_tests.cpp")
+ target_compile_features(mkw_auto_mips_tests PRIVATE cxx_std_20)
+ add_test(NAME mkw_auto_mips_tests COMMAND mkw_auto_mips_tests)
+diff --git a/runtime/include/mods.h b/runtime/include/mods.h
+index 4add124..bf3b031 100644
+--- a/runtime/include/mods.h
++++ b/runtime/include/mods.h
+@@ -2,6 +2,7 @@
+ 
+ #include <aurora/aurora.h>
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <filesystem>
+ #include <string>
+@@ -93,5 +94,16 @@ void Apply(AuroraConfig& config);
+ // enabled data-changing mods, or empty for the normal saves. Valid after Apply.
+ std::filesystem::path SaveDirectory();
+ std::filesystem::path SaveDirectoryFor(const std::vector<Mod>& mods);
++// The enabled roster-changing mods whose saves are in use, by name in folder order ("Alpha + Zeta"),
++// or empty for the normal saves (the launcher shows it).
++inline std::string SaveSetName(const std::vector<Mod>& all) {
++    std::vector<const Mod*> on;
++    for (const Mod& mod : all)
++        if (mod.enabled && mod.changesRoster) on.push_back(&mod);
++    std::sort(on.begin(), on.end(), [](const Mod* a, const Mod* b) { return a->id < b->id; });
++    std::string name;
++    for (const Mod* mod : on) name += (name.empty() ? "" : " + ") + (mod->name.empty() ? mod->id : mod->name);
++    return name;
++}
+ 
+ } // namespace mods
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index a87651c..d2dd7e9 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -10,6 +10,7 @@
+ #include <aurora/gfx.h>
+ #include <dolphin/pad.h>
+ #include "mods.h"
++#include "nand_path.h"
+ #include "power_pros_ui.h"
+ 
+ #include "aurora_events.h"
+@@ -291,6 +292,7 @@ struct Option {
+ constexpr int kOpenModsFolder = -2;
+ constexpr int kOpenRosterEditor = -3;
+ constexpr int kOpenTextureStudio = -4;
++constexpr int kOpenSavesFolder = -5;
+ constexpr int kModsTab = 4;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ; HERRAMIENTAS follows it
+ 
+ constexpr Phrase kModsHelp{
+@@ -471,6 +473,18 @@ void OpenTextureStudio() {
+ #endif
+ }
+ 
++// The folder whose saves the game uses with these mods: <user data>\ModSaves\<mods> for roster mods,
++// else the NAND's own save folder.
++void OpenSavesFolder(const std::vector<mods::Mod>& all) {
++    std::filesystem::path dir = mods::SaveDirectoryFor(all);
++    if (dir.empty()) dir = RuntimeNandPath::DiscoverNandRootPath() / "title" / "00010000" / "524c3845" / "data";
++    std::error_code ec;
++    std::filesystem::create_directories(dir, ec);
++#if defined(_WIN32)
++    ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++#endif
++}
++
+ void OpenModsFolder() {
+     const std::filesystem::path dir = mods::Directory();
+     std::error_code ec;
+@@ -699,6 +713,23 @@ Result Run(int argc, char** argv) {
+                                      "No mods installed yet. Put them in the mods folder (TOOLS > "
+                                      "OPEN MODS FOLDER) or make a roster with EDIT ROSTER.")
+                                 : nullptr};
++    // The first row says whose saves the game will use; it follows the roster mods switched on here.
++    std::vector<mods::Mod> currentMods = installedMods;
++    std::string savesNotice;
++    auto saveSet = [&] {
++        const std::string set = mods::SaveSetName(currentMods);
++        return set.empty() ? std::string(Tr("Normales", "Normal")) : set;
++    };
++    modsTab.options.push_back({Tr("PARTIDAS EN USO", "SAVES IN USE"),
++                               Tr("Las partidas que usará el juego. Los mods que cambian el roster tienen partidas propias: "
++                                  "cada combinación guarda las suyas, y sin ellos se usan las normales. Al cambiar de mods "
++                                  "no se borra nada: las otras partidas siguen guardadas y vuelven al volver a esos mods.\n\n"
++                                  "Pulsa para abrir su carpeta.",
++                                  "The saves the game will use. Mods that change the roster have their own saves: each "
++                                  "combination keeps its own, and without them the normal ones are used. Switching mods "
++                                  "deletes nothing: the other saves stay and come back with those mods.\n\n"
++                                  "Press to open their folder."),
++                               {saveSet()}, 0, false, kOpenSavesFolder});
+     Tab toolsTab{Tr("HERRAMIENTAS", "TOOLS"), {}};
+     toolsTab.options.push_back({Tr("ABRIR CARPETA DE MODS", "OPEN MODS FOLDER"), kModsHelp, {Tr("Abrir", "Open")}, 0, false, kOpenModsFolder});
+     toolsTab.options.push_back({Tr("EDITAR ROSTER (PowerUp+)", "EDIT ROSTER (PowerUp+)"), kRosterEditorHelp, {Tr("Abrir", "Open")}, 0, false, kOpenRosterEditor});
+@@ -766,6 +797,10 @@ Result Run(int argc, char** argv) {
+             OpenModsFolder();
+             return;
+         }
++        if (o.mod == kOpenSavesFolder) {
++            OpenSavesFolder(currentMods);
++            return;
++        }
+         if (o.mod == kOpenRosterEditor) {
+             OpenRosterEditor();
+             return;
+@@ -775,8 +810,19 @@ Result Run(int argc, char** argv) {
+             return;
+         }
+         if (o.mod >= 0) {
+-            mods::SetEnabled(installedMods[static_cast<size_t>(o.mod)].id, o.value != 0);
++            mods::Mod& m = currentMods[static_cast<size_t>(o.mod)];
++            mods::SetEnabled(m.id, o.value != 0);
++            m.enabled = o.value != 0;
+             restart = true;
++            if (m.changesRoster) {
++                // A roster mod changes whose saves are used: say so where the player is looking.
++                const std::string set = saveSet();
++                option(kModsTab, 0).choices[0] = set;
++                savesNotice = std::string(Tr("Partidas en uso: ", "Saves in use: ")) + set +
++                              Tr(". Este conjunto de mods tiene sus propias partidas; las otras siguen guardadas.",
++                                 ". This set of mods has its own saves; the others stay saved.");
++                tabs[kModsTab].footer = savesNotice.c_str();
++            }
+             return;
+         }
+         const std::string label = o.label;
+diff --git a/runtime/tests/mod_saves_tests.cpp b/runtime/tests/mod_saves_tests.cpp
+new file mode 100644
+index 0000000..b82b2bc
+--- /dev/null
++++ b/runtime/tests/mod_saves_tests.cpp
+@@ -0,0 +1,23 @@
++#include "mods.h"
++#include <cstdlib>
++int main() {
++    const auto require = [](bool ok) { if (!ok) std::abort(); };
++    using mods::Mod;
++    auto mod = [](const char* id, const char* name, bool enabled, bool roster) {
++        Mod m;
++        m.id = id;
++        m.name = name;
++        m.enabled = enabled;
++        m.changesRoster = roster;
++        return m;
++    };
++    // No roster mod on: the normal saves.
++    require(mods::SaveSetName({}).empty());
++    require(mods::SaveSetName({mod("Tex", "HD textures", true, false), mod("R26", "2026 Rosters", false, true)}).empty());
++    // Roster mods on: their names, in the order of their folders (as SaveDirectoryFor sorts them).
++    require(mods::SaveSetName({mod("R26", "2026 Rosters", true, true)}) == "2026 Rosters");
++    require(mods::SaveSetName({mod("Zz", "Zeta", true, true), mod("Tex", "HD textures", true, false), mod("Aa", "Alpha", true, true)}) ==
++            "Alpha + Zeta");
++    // A mod with no name shows its folder.
++    require(mods::SaveSetName({mod("R26", "", true, true)}) == "R26");
++}

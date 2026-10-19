@@ -117,6 +117,7 @@ An MLB Life career, a season or a league started with a modified roster only mak
 - Texture mods, uniform mods (`project/` without `game_data.pack`), `disc/` or Riivolution mods use the normal saves.
 - If a Riivolution mod defines its own `<savegame>`, that one takes priority.
 - A new combination starts without saves.
+- **In the launcher** (MODS), the first row, **SAVES IN USE**, says which saves the game will use ("Normal" or the active roster mods) and opens their folder when pressed. Switching a roster mod on or off warns that this set has its own saves and that the others stay saved. Patch `wiicompiled-launcher-saves`. A player thought the game did not save because their saves "vanished" when switching mods.
 - Games played with a roster before this change stayed in the normal saves.
 - Patch `wiicompiled-mod-saves`. It uses the same redirector as Riivolution's `<savegame>`, but takes the data folder from the disc title that appears in the path: the game code in low memory doesn't last once the game is running, and `CurrentNandDataDir` goes back to `RMCP`.
 - Verified:
