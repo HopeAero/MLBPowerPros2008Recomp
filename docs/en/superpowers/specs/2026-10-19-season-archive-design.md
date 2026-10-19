@@ -74,6 +74,15 @@ The findings may change the screen's scope (sections that cannot be filled becau
 - **Archive and save in step:** the archive is written when the game writes the save, not at the season change. Each archived year carries its real year, so archiving a year again does not duplicate it (the last write wins), and if the player goes back to an older save, the archive years that save still has in its window are ignored (the save rules).
 - **Switch and other ports:** a design constraint (everything with the controller, save paths through the runtime), not a deliverable of this phase: there is no Switch build to test today.
 
+## Scope change after the research (October 19, 2026)
+
+The research ([findings](2026-10-19-season-archive-findings.md)) showed that almost every per-year table has room for 20 years; only the finances have 10. The user chose two steps:
+
+1. **Phase 2: raise the cap to 20 seasons** (2008–2027). No Archive screen: the game's own screens show the 20 years. The finances of years 11 to 20 go in the area at the end of the save that is always zero, if it is confirmed that nothing uses it.
+2. **Later: this design's window with archive and Archive screen**, to go past 20.
+
+The rest of this design (finished saves continue, real-year weekdays, no logos, everything with the controller) still applies to phase 2.
+
 ## Left to the builder
 
 - The archive's file format, as long as it is robust and allows adding years.

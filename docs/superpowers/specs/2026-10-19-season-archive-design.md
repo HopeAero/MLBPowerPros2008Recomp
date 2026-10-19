@@ -74,6 +74,15 @@ Lo que salga puede cambiar el alcance de la pantalla (secciones que no se puedan
 - **Archivo y partida al día:** el archivo se escribe cuando el juego escribe la partida, no al pasar de temporada. Cada año archivado lleva su año real, así que repetir un año no lo duplica (gana el último escrito), y si el jugador vuelve a una partida anterior, los años del archivo que esa partida aún tiene en su ventana se ignoran (manda la partida).
 - **Switch y otros ports:** es una condición del diseño (todo con el mando, rutas de partida a través del runtime), no una entrega de esta fase: hoy no hay versión de Switch que probar.
 
+## Cambio de alcance tras la investigación (19 de octubre de 2026)
+
+La investigación ([hallazgos](2026-10-19-season-archive-findings.md)) mostró que casi todas las tablas por año tienen sitio para 20 años; solo las finanzas tienen 10. El usuario eligió hacerlo en dos pasos:
+
+1. **Fase 2: subir el tope a 20 temporadas** (2008–2027). Sin pantalla Archive: las pantallas del juego muestran los 20 años. Las finanzas de los años 11 a 20 van en la zona del final de la partida que siempre está a cero, si se confirma que nadie la usa.
+2. **Más adelante: la ventana con archivo y la pantalla Archive** de este diseño, para pasar de 20.
+
+Lo demás de este diseño (partidas terminadas que siguen, días de la semana del año real, nada de logos, todo con el mando) sigue valiendo para la fase 2.
+
 ## Lo que queda al constructor
 
 - Formato del archivo (cómo se guarda cada año), mientras sea robusto y permita añadir años.
