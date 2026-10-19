@@ -297,10 +297,10 @@ index 0000000..5048840
 +}  // namespace stadium_collision
 diff --git a/runtime/include/stadium_viewer.h b/runtime/include/stadium_viewer.h
 new file mode 100644
-index 0000000..96fb460
+index 0000000..cf5ba38
 --- /dev/null
 +++ b/runtime/include/stadium_viewer.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,58 @@
 +#pragma once
 +// Stadium viewer: the Blender add-on's "View in game" opens the game straight into the stadium being
 +// made, from a one-run preview mod, with a free camera. Enabled by environment variables:
@@ -308,11 +308,14 @@ index 0000000..96fb460
 +//   WIICOMPILED_STADIUM_VIEWER_CODE   the stadium code it declares (default pp_preview)
 +//   WIICOMPILED_STADIUM_VIEWER_CAMERA "x,y,z,yaw,pitch,fov": initial free camera
 +//   WIICOMPILED_STADIUM_VIEWER_COLLISION 1: start with the collision shown (key C)
++//   WIICOMPILED_STADIUM_VIEWER_TOUR   "t,x,y,z,yaw,pitch,fov,collision;...": the free camera follows these keys
++//                                     (seconds from its start; collision 0/1), for recording videos
 +//   WIICOMPILED_STADIUM_VIEWER_SPIN   rad/s: the free camera turns by itself (tests of the collision lines)
 +// Spec: docs/superpowers/specs/2026-10-18-stadium-preview-design.md
 +#include <filesystem>
 +#include <optional>
 +#include <string>
++#include <vector>
 +
 +namespace stadium_viewer {
 +
@@ -336,6 +339,16 @@ index 0000000..96fb460
 +std::optional<Config> ParseConfig(const std::wstring& modDir, const std::wstring& code, const std::wstring& camera);
 +const std::optional<Config>& Active();  // read once from the environment
 +bool Enabled();
++
++struct TourKey {
++    float t;  // seconds since the free camera started
++    CameraPose pose;
++    bool collision;
++};
++std::vector<TourKey> ParseTour(const std::wstring& text);  // a malformed key empties the whole tour
++// The pose at time t, linear between keys (yaw the short way round), held before the first and after the
++// last; *collision is the last key passed (the first before it).
++CameraPose TourAt(const std::vector<TourKey>& tour, float t, bool* collision);
 +bool StadiumReady();  // the preview stadium is on screen (match_benchmark.cpp)
 +// Whether the viewer stops the match this frame: once the stadium shows and the camera director has been
 +// seen (the match views need it, and it runs inside what stops), or 300 frames (5 s) after the stadium shows.
@@ -1041,12 +1054,13 @@ index 0000000..756f7fc
 +}  // namespace stadium_collision
 diff --git a/runtime/src/stadium_viewer.cpp b/runtime/src/stadium_viewer.cpp
 new file mode 100644
-index 0000000..6a8d088
+index 0000000..3e9173c
 --- /dev/null
 +++ b/runtime/src/stadium_viewer.cpp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,111 @@
 +#include "stadium_viewer.h"
 +
++#include <cmath>
 +#include <cstdlib>
 +#include <cwchar>
 +#include <sstream>
@@ -1080,7 +1094,50 @@ index 0000000..6a8d088
 +    return CameraPose{{values[0], values[1], values[2]}, values[3], values[4], values[5]};
 +}
 +
++std::vector<float> Fields(const std::wstring& text) {
++    std::vector<float> values;
++    std::wstringstream in(text);
++    std::wstring field;
++    while (std::getline(in, field, L',')) {
++        wchar_t* end = nullptr;
++        const float v = std::wcstof(field.c_str(), &end);
++        if (field.empty() || end != field.c_str() + field.size()) return {};
++        values.push_back(v);
++    }
++    return values;
++}
++
 +}  // namespace
++
++std::vector<TourKey> ParseTour(const std::wstring& text) {
++    std::vector<TourKey> tour;
++    std::wstringstream in(text);
++    std::wstring key;
++    while (std::getline(in, key, L';')) {
++        const auto v = Fields(key);
++        if (v.size() != 8) return {};
++        tour.push_back({v[0], CameraPose{{v[1], v[2], v[3]}, v[4], v[5], v[6]}, v[7] != 0.0f});
++    }
++    return tour;
++}
++
++CameraPose TourAt(const std::vector<TourKey>& tour, float t, bool* collision) {
++    if (tour.empty()) return {};
++    size_t i = 0;
++    while (i + 1 < tour.size() && t >= tour[i + 1].t) ++i;
++    if (collision) *collision = tour[i].collision;
++    if (t <= tour[0].t || i + 1 >= tour.size()) return t <= tour[0].t ? tour[0].pose : tour.back().pose;
++    const TourKey& a = tour[i];
++    const TourKey& b = tour[i + 1];
++    const float u = b.t > a.t ? (t - a.t) / (b.t - a.t) : 1.0f;
++    const auto mix = [u](float x, float y) { return x + (y - x) * u; };
++    CameraPose p{};
++    for (int k = 0; k < 3; ++k) p.eye[k] = mix(a.pose.eye[k], b.pose.eye[k]);
++    p.yaw = a.pose.yaw + std::remainder(b.pose.yaw - a.pose.yaw, 2.0f * 3.14159265f) * u;
++    p.pitch = mix(a.pose.pitch, b.pose.pitch);
++    p.fovY = mix(a.pose.fovY, b.pose.fovY);
++    return p;
++}
 +
 +std::optional<Config> ParseConfig(const std::wstring& modDir, const std::wstring& code, const std::wstring& camera) {
 +    if (modDir.empty()) return std::nullopt;
@@ -1114,10 +1171,10 @@ index 0000000..6a8d088
 +}  // namespace stadium_viewer
 diff --git a/runtime/src/stadium_viewer_input.cpp b/runtime/src/stadium_viewer_input.cpp
 new file mode 100644
-index 0000000..e0bc15d
+index 0000000..a769964
 --- /dev/null
 +++ b/runtime/src/stadium_viewer_input.cpp
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,254 @@
 +// Stadium viewer controls (host thread, once per presented frame): the free camera and the game's match
 +// shots. Keys: W/A/S/D move, Q down, E up, Shift fast, right mouse button + mouse to look, wheel for
 +// speed; 1 batter, 2 play, 3 wide (the game's own cameras); F back to the free camera; C shows the
@@ -1129,6 +1186,7 @@ index 0000000..e0bc15d
 +#include <array>
 +#include <cmath>
 +#include <cstdio>
++#include <cstring>
 +#include <cstdlib>
 +#include <fstream>
 +#include <iterator>
@@ -1160,6 +1218,8 @@ index 0000000..e0bc15d
 +// on the stadium with the pose of the previous frame (ahead with the current one, behind with older ones).
 +constexpr size_t kOverlayDelay = 1;
 +float g_spin = 0.0f;  // rad/s; WIICOMPILED_STADIUM_VIEWER_SPIN turns the free camera (tests)
++std::vector<TourKey> g_tour;  // WIICOMPILED_STADIUM_VIEWER_TOUR: the free camera follows it (videos)
++float g_tourTime = -1.0f;     // seconds since the tour started; negative until the free camera is up
 +struct Collision {
 +    stadium_collision::Mesh mesh;
 +    std::vector<stadium_collision::Edge> edges;
@@ -1208,6 +1268,10 @@ index 0000000..e0bc15d
 +        const char* collision = std::getenv("WIICOMPILED_STADIUM_VIEWER_COLLISION");  // 1: start with it shown
 +        g_collision = collision && collision[0] == '1';
 +        if (const char* spin = std::getenv("WIICOMPILED_STADIUM_VIEWER_SPIN")) g_spin = std::strtof(spin, nullptr);
++        if (const char* tour = std::getenv("WIICOMPILED_STADIUM_VIEWER_TOUR")) {
++            g_tour = ParseTour(std::wstring(tour, tour + std::strlen(tour)));  // ASCII numbers
++            if (!g_tour.empty()) g_help = false;                              // a clean picture for the video
++        }
 +        // Only the stadium: no 2D HUD.
 +        aurora_set_draw_filter(AURORA_DRAW_FILTER_HUD);
 +        // The batter shot first: applying a shot ends the camera's opening fly-over, which would
@@ -1257,8 +1321,14 @@ index 0000000..e0bc15d
 +        in.mouseDx = g_spin * in.dt / FreeCamera::kMouseRadiansPerPixel;
 +        in.mouseDy = 0.0f;
 +    }
++    if (g_free && !g_tour.empty()) {
++        g_tourTime = g_tourTime < 0.0f ? 0.0f : g_tourTime + io.DeltaTime;
++        bool collision = g_collision;
++        g_free.emplace(TourAt(g_tour, g_tourTime, &collision));
++        g_collision = collision;
++    }
 +    if (g_free) {
-+        g_free->Update(in);
++        if (g_tour.empty()) g_free->Update(in);
 +        game_camera::SetOverride(g_free->Pose());
 +        std::copy_backward(g_poses.begin(), g_poses.end() - 1, g_poses.end());
 +        g_poses[0] = g_free->Pose();
@@ -1576,10 +1646,10 @@ index 0000000..8f3d064
 +}
 diff --git a/runtime/tests/stadium_viewer_tests.cpp b/runtime/tests/stadium_viewer_tests.cpp
 new file mode 100644
-index 0000000..a1fe190
+index 0000000..a1e70f7
 --- /dev/null
 +++ b/runtime/tests/stadium_viewer_tests.cpp
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,57 @@
 +#include "stadium_viewer.h"
 +#include <cmath>
 +#include <cstdlib>
@@ -1616,4 +1686,24 @@ index 0000000..a1fe190
 +    require(!stadium_viewer::FreezeMatch(true, false, 299));
 +    require(stadium_viewer::FreezeMatch(true, false, 300));
 +    require(stadium_viewer::FreezeMatch(true, true, 0));
++
++    // Camera tour: "t,x,y,z,yaw,pitch,fov,collision;..." keys, linear in between, held past the ends.
++    using stadium_viewer::ParseTour;
++    using stadium_viewer::TourAt;
++    require(ParseTour(L"").empty());
++    require(ParseTour(L"0,1,2,3,0,0,45").empty());                       // 7 fields: dropped
++    const auto tour = ParseTour(L"0,0,10,0,0,0,40,0;2,100,30,-50,1,-0.5,60,1");
++    require(tour.size() == 2 && near(tour[1].t, 2.0f) && tour[1].collision);
++    bool on = true;
++    auto p = TourAt(tour, 1.0f, &on);
++    require(near(p.eye[0], 50.0f) && near(p.eye[1], 20.0f) && near(p.eye[2], -25.0f));
++    require(near(p.yaw, 0.5f) && near(p.pitch, -0.25f) && near(p.fovY, 50.0f) && !on);  // collision of the last key passed
++    p = TourAt(tour, 5.0f, &on);
++    require(near(p.eye[0], 100.0f) && on);
++    p = TourAt(tour, -1.0f, &on);
++    require(near(p.eye[0], 0.0f) && !on);
++    // Yaw goes the short way round: from 3.0 to -3.0 rad passes through pi, not 0.
++    const auto wrap = ParseTour(L"0,0,0,0,3,0,45,0;1,0,0,0,-3,0,45,0");
++    p = TourAt(wrap, 0.5f, &on);
++    require(std::fabs(std::cos(p.yaw) + 1.0f) < 1e-3f);
 +}
