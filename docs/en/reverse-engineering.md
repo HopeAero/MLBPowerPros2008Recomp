@@ -518,20 +518,23 @@ Verified (October 14, 2026):
 
 **Field inventory for writing packs from scratch** (18 October 2026; a survey of the 43 graphics packs and 40 tables, field by field in 2- or 4-byte steps):
 - **`PJ7M` model:** everything that varies is a pointer, count or size, worked out when writing, except:
-  - the scene's second list `{1, → ?}`: it points to a `0x20`-byte block whose first field points 4 bytes before itself, almost all zeros, usually with `0x98000400` at `+0x1C`, the start of a display list; not decoded;
+  - the scene's second list `{1, → ?}`: it points to a pointer to the word `0x01000000`, the same in the 2,925 stadium models that have a table (what was read after it was zero padding and the start of a display list). Only one `stadium_common` model has another word and fields at `+0x10..+0x3C` of the root;
   - the material: `+0x00` is 3 (11,239) or 4 (6); the three RGBA8 colours at `+0x04` are almost always `000000FF`, `CCCCCCFF`/`FFFFFFFF` and `000000FF` (no visible effect seen); `+0x32` is 1 (7,567) or 0 (3,678), not decoded;
   - the texmap: besides index, size and repeats, all constant;
-  - the texture header: `+0x06` is `0x2000` for C4, `0x0000` for C8/RGBA8 and `0x6000` for RGB5A3.
+  - the texture header: `+0x06` is `0x2000` for C4, `0x0000` for C8/RGBA8 and `0x6000` for RGB5A3;
+  - the video board (`DP_auroravision`) uses an 8 × 8 RGB5A3 texture with a «placeholder» palette header: 0xFFFF entries, format `0x4000` and no colours (pointer 0); it looks like where the game puts the board's picture;
+  - unused textures: several packs carry texture headers (with their palette at `+0x24`) that nothing points at, neither the models nor the table;
+  - after the pixels of some textures there is more data: for Arizona's 32 × 64 C4 texture it is exactly the 16 × 32 and 8 × 16 levels, that is, mipmaps the game does not use (it reads a single level).
 - **The game's code does not look pieces up by name:** neither `main.dol` nor `ovl_main.rel` contains `DP_`, `Audience`, `FLG` or `auroravision`. Each piece's role comes from the **placement flags**.
 - **Placement flags by piece** (from the names of the models carrying them; hypotheses to check in the game):
   - **byte `0x0000FF00`, piece type:** `0x01` scoreboard, `0x02` video board (`auroravision`), `0x04` mound and lines (`BCL`), `0x05` flags (no depth test), `0x06` shadows, `0x08` lights (`lumine`), `0x09` lit floodlights, `0x0A` floodlight parasols, `0x11` fences, `0x12` backstop net, `0x15` crowd C, `0x16` crowd F (lying), `0x17` crowd S (upright), `0x18` fountains, `0x19` `MIP` turf, `0x1A` turf with alpha; `0x00` stands and the rest;
   - **byte `0x00FF0000`, how it is drawn:** `0x06` alpha (`ALP`), `0x0A`/`0x0F` additive (`ADD`), `0x81`/`0x87`/`0x90`/`0x93` ground, `0x20` `LOF`;
   - **high bits:** `0x40000000` upper decks behind home (`2F`), `0x20000000` `EVC`, `0x80000000` `NOUPCAM`; `0x04000000`/`0x08000000` go with ground and turf.
 - **Undecoded table blocks** (Coors Field):
-  - `unk_20`: `0x20`-byte records {2.0, 0.0, point A xyz, point B xyz}, with the points about 50 m up: they look like light towers and where they aim;
-  - `unk_24`: two lists of 7 `0x1C`-byte records {position xyz, scale xyz = 1, angle}, 24 m to each side of home and 0.64 m below ground: they look like the dugout seats;
+  - `unk_20`: `0x20`-byte groups {→ point list, u32 n, box min xyz, max xyz} closed by a zero group; each point is `0x18` bytes {position xyz, rotation xyz}. Coors Field has 4 groups (32, 50, 50 and 25 points) about 50 m up and Yankee Stadium 2 (150 and 144); Arizona, `bullpen`, `bullpen2` and `season`, none. From the counts and the rotation, it looks like crowd placed in 3D;
+  - `unk_24`: two pairs {→ list, u32 n} of `0x1C`-byte records {position xyz, scale xyz = 1, angle}; in Coors, 7 per list, 24 m to each side of home and 0.64 m below ground: they look like the dugout seats. `bullpen`, `bullpen2` and `season` have a single pair {0, 0} with the root right after it;
   - `textures` (pointer 10): `0x10`-byte entries {→ texture header, → palette, u32, u32}, the two u32 being TMEM addresses (preloaded textures);
-  - `unk_2c`: {u32 8, indices 0 to 7} followed by the texture list.
+  - `unk_2c`: {u32 n, n × u32 order} (always 8 and 0 to 7) followed by the texture list, which ends with an entry {0, 0, u32, 0}; that u32 goes from `0x692800` to `0x703280` depending on the stadium (not decoded). In `bullpen`, some entries point at no texture.
 
 **Game stadium list** (October 14, 2026, from the REL data; for adding stadiums):
 - **File numbers:** the game does not store file names. It requests `project.bin` entries by record number: Coors Field = 75, its table = 76. There are 4,681 records, of which 2,424 have a name: 2,256 remain free for new files.

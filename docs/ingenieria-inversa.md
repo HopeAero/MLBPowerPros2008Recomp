@@ -519,20 +519,23 @@ Verificado (14 de octubre de 2026):
 
 **Inventario de campos para escribir packs desde cero** (18 de octubre de 2026; recorrido de los 43 packs gráficos y 40 tablas por campo de 2 o 4 bytes):
 - **Modelo `PJ7M`:** todo lo que varía es puntero, contador o tamaño, que se calcula al escribir, salvo:
-  - la segunda lista de la escena `{1, → ?}`: apunta a un bloque de `0x20` bytes cuyo primer campo apunta 4 bytes antes de sí mismo, casi siempre ceros, que en su `+0x1C` suele llevar `0x98000400`, el comienzo de una display list; sin descifrar;
+  - la segunda lista de la escena `{1, → ?}`: apunta a un puntero a la palabra `0x01000000`, igual en los 2.925 modelos de estadio con tabla (lo que se leía detrás eran ceros de relleno y el comienzo de una display list). Solo un modelo de `stadium_common` lleva otra palabra y campos en `+0x10..+0x3C` de la raíz;
   - el material: `+0x00` vale 3 (11.239) o 4 (6); los tres colores RGBA8 de `+0x04` casi siempre son `000000FF`, `CCCCCCFF`/`FFFFFFFF` y `000000FF` (sin efecto visible comprobado); `+0x32` vale 1 (7.567) o 0 (3.678), sin descifrar;
   - el texmap: además del índice, el tamaño y las repeticiones, todo constante;
-  - la cabecera de textura: `+0x06` vale `0x2000` en C4, `0x0000` en C8/RGBA8 y `0x6000` en RGB5A3.
+  - la cabecera de textura: `+0x06` vale `0x2000` en C4, `0x0000` en C8/RGBA8 y `0x6000` en RGB5A3;
+  - la pantalla grande (`DP_auroravision`) usa una textura RGB5A3 de 8 × 8 con una cabecera de paleta «hueco»: 0xFFFF entradas, formato `0x4000` y sin colores (puntero 0); parece el sitio donde el juego pone la imagen de la pantalla;
+  - texturas sin usar: varios packs traen cabeceras de textura (con su paleta en `+0x24`) a las que no apunta nada, ni los modelos ni la tabla;
+  - detrás de los píxeles de algunas texturas hay más datos: en la textura C4 de 32 × 64 de Arizona son exactamente los niveles de 16 × 32 y 8 × 16, es decir, mipmaps que el juego no usa (lee un solo nivel).
 - **El código del juego no busca piezas por nombre:** ni `main.dol` ni `ovl_main.rel` contienen `DP_`, `Audience`, `FLG` o `auroravision`. El papel de cada pieza lo dan los **flags de colocación**.
 - **Flags de colocación según la pieza** (por los nombres de los modelos que los llevan; hipótesis por comprobar en el juego):
   - **byte `0x0000FF00`, tipo de pieza:** `0x01` marcador, `0x02` pantalla (`auroravision`), `0x04` montículo y líneas (`BCL`), `0x05` banderas (sin prueba de profundidad), `0x06` sombras, `0x08` luces (`lumine`), `0x09` focos encendidos, `0x0A` parasoles de focos, `0x11` vallas, `0x12` red de detrás del plato, `0x15` público C, `0x16` público F (tumbado), `0x17` público S (vertical), `0x18` fuentes, `0x19` césped `MIP`, `0x1A` césped con alfa; `0x00` gradas y resto;
   - **byte `0x00FF0000`, cómo se dibuja:** `0x06` con alfa (`ALP`), `0x0A`/`0x0F` aditivo (`ADD`), `0x81`/`0x87`/`0x90`/`0x93` suelo, `0x20` `LOF`;
   - **bits altos:** `0x40000000` gradas altas detrás del plato (`2F`), `0x20000000` `EVC`, `0x80000000` `NOUPCAM`; `0x04000000`/`0x08000000` acompañan al suelo y al césped.
 - **Bloques de la tabla sin descifrar** (Coors Field):
-  - `unk_20`: registros de `0x20` bytes {2.0, 0.0, punto A xyz, punto B xyz}, con los puntos a unos 50 m de altura: parecen torres de luz y hacia dónde apuntan;
-  - `unk_24`: dos listas de 7 registros de `0x1C` bytes {posición xyz, escala xyz = 1, ángulo}, a 24 m a cada lado del plato y 0,64 m bajo el suelo: parecen los asientos de los banquillos;
+  - `unk_20`: grupos de `0x20` bytes {→ lista de puntos, u32 n, caja mín. xyz, máx. xyz} terminados por un grupo a ceros; cada punto son `0x18` bytes {posición xyz, rotación xyz}. Coors Field tiene 4 grupos (32, 50, 50 y 25 puntos) a unos 50 m de altura y Yankee Stadium 2 (150 y 144); Arizona, `bullpen`, `bullpen2` y `season`, ninguno. Por la cantidad y la rotación, parece público colocado en 3D;
+  - `unk_24`: dos pares {→ lista, u32 n} de registros de `0x1C` bytes {posición xyz, escala xyz = 1, ángulo}; en Coors, 7 por lista, a 24 m a cada lado del plato y 0,64 m bajo el suelo: parecen los asientos de los banquillos. `bullpen`, `bullpen2` y `season` tienen un solo par {0, 0} y la raíz justo detrás;
   - `textures` (puntero 10): entradas de `0x10` bytes {→ cabecera de textura, → paleta, u32, u32}, con los dos u32 como direcciones de TMEM (texturas precargadas);
-  - `unk_2c`: {u32 8, índices 0 a 7} seguido de la lista de texturas.
+  - `unk_2c`: {u32 n, n × u32 orden} (siempre 8 y 0 a 7) seguido de la lista de texturas, que acaba con una entrada {0, 0, u32, 0}; ese u32 va de `0x692800` a `0x703280` según el estadio (sin descifrar). En `bullpen`, algunas entradas no apuntan a ninguna textura.
 
 **Lista de estadios del juego** (14 de octubre de 2026, por los datos del REL; para añadir estadios):
 - **Números de archivo:** el juego no guarda nombres de archivo. Pide las entradas de `project.bin` por número de registro: Coors Field = 75, su tabla = 76. Hay 4.681 registros, de los que 2.424 tienen nombre: quedan 2.256 libres para archivos nuevos.
