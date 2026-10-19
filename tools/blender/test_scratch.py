@@ -154,5 +154,65 @@ st3, _, w3 = scratch.build_stadium(big, game_bases=False)
 check(len(st3.placements) < 127 and all(len(m.texmaps) <= 30 for m in st3.models),
       f"300 boxes with 40 textures: {len(st3.placements)} pieces of at most 30 texmaps")
 
+# ---- Task 3: operators, export, View in game ----------------------------------------------------
+exporter = importlib.import_module(pkg + ".exporter")
+preview = importlib.import_module(pkg + ".preview")
+before = set(bpy.data.collections)
+check(bpy.ops.object.powerpros_new_scratch(filepath=project_bin, stadium="col") == {"FINISHED"}, "New stadium from scratch")
+made = [c for c in bpy.data.collections if c not in before]
+check(len(made) == 1 and made[0].get("pp_scratch") and made[0].get("pp_stadium") == "col"
+      and Path(made[0].get("pp_project_bin", "")).is_file(), f"the new collection is a from-scratch one ({[dict(c) for c in made]})")
+
+mods = Path(temp_dir) / "mods"
+bpy.context.view_layer.objects.active = bpy.data.objects["campo"]
+result = bpy.ops.export_scene.powerpros_stadium(mod_name="Desde cero", mods_folder=str(mods), mode="new",
+                                                new_code="desdecero", new_name="Desde cero")
+check(result == {"FINISHED"}, "export operator finishes")
+project = mods / "Desde cero" / "project"
+toml = (mods / "Desde cero" / "mod.toml").read_text(encoding="utf-8") if (mods / "Desde cero" / "mod.toml").is_file() else ""
+check((project / "stadium_desdecero.pack").is_file() and (project / "stadium_desdecerotbl.pack").is_file(),
+      "the two packs are written")
+check('code = "desdecero"' in toml and 'base = "col"' in toml, "mod.toml declares the new stadium on col")
+if (project / "stadium_desdecero.pack").is_file():
+    back = stadium_read.read_stadium((project / "stadium_desdecero.pack").read_bytes(),
+                                     (project / "stadium_desdecerotbl.pack").read_bytes())
+    check(back.models[0].name == "DP_ground_0", "the exported packs read back as the scratch stadium")
+
+game = Path(temp_dir) / "game"
+(game / "mods").mkdir(parents=True, exist_ok=True)
+(game / "WiiCompiled.exe").write_bytes(b"")
+coll["pp_game_folder"] = str(game)
+r = preview.launch(coll, (0.0, 150.0, 600.0, 0.0, -0.2, 45.0), dry_run=True)
+pv = Path(r["mod_dir"]) / "project" / f"stadium_{preview.PREVIEW_CODE}.pack"
+check(pv.is_file() and stadium_read.read_stadium(pv.read_bytes(), pv.with_name(pv.stem + "tbl.pack").read_bytes())
+      .models[0].name == "DP_ground_0", "View in game exports the from-scratch stadium")
+
+lost = scratch_collection("Sin juego")
+del lost["pp_project_bin"]
+mesh_object(lost, "suelo3", [(-60, -20, 0), (60, -20, 0), (60, 130, 0), (-60, 130, 0)], [(0, 1, 2, 3)], grass)
+try:
+    scratch.export_scratch(lost, str(mods), "x", "sinjuego", "x")
+    check(False, "a collection without project.bin is refused")
+except exporter.ExportFailure as e:
+    check("project.bin" in str(e), f"a collection without project.bin is refused: {e}")
+
+real = scratch.build_stadium
+
+
+def broken(c, *a, **k):
+    st_, hd_, w_ = real(c, *a, **k)
+    st_.models[0].texmaps = st_.models[0].texmaps * 31 or [scratch.TexMap(0, 1, 1)] * 31
+    return st_, hd_, w_
+
+
+scratch.build_stadium = broken
+try:
+    scratch.export_scratch(coll, str(mods), "Roto", "roto", "Roto")
+    check(False, "a description the writer refuses is reported")
+except exporter.ExportFailure as e:
+    check("DP_ground_0" in str(e), f"a description the writer refuses is reported naming the piece: {e}")
+finally:
+    scratch.build_stadium = real
+
 print("RESULT: " + ("FAIL" if failures else "PASS"))
 sys.exit(1 if failures else 0)

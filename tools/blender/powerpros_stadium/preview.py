@@ -57,8 +57,13 @@ def launch(coll, pose, *, dry_run=False):
                                        f"WiiCompiled.exe not found in {game}: import the stadium from the game folder"))
     shutil.rmtree(preview_folder(), ignore_errors=True)
     bpy.context.view_layer.update()     # matrix_world of what was just moved, when called from a script
-    stats = exporter.export_stadium(coll, preview_folder(), PREVIEW_MOD, PREVIEW_CODE, PREVIEW_MOD,
-                                    hd=True, menu=False, home_line="")
+    from . import scratch
+    if scratch.is_scratch(coll):
+        stats = scratch.export_scratch(coll, preview_folder(), PREVIEW_MOD, PREVIEW_CODE, PREVIEW_MOD,
+                                       hd=True, menu=False, home_line="")
+    else:
+        stats = exporter.export_stadium(coll, preview_folder(), PREVIEW_MOD, PREVIEW_CODE, PREVIEW_MOD,
+                                        hd=True, menu=False, home_line="")
     mod_dir = preview_folder() / PREVIEW_MOD
     env = environment(mod_dir, pose)
     result = {"exe": str(exe), "env": env, "mod_dir": str(mod_dir), "stats": stats}

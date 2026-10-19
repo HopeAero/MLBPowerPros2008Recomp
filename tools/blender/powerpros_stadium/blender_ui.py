@@ -131,6 +131,17 @@ class PP_OT_export_stadium(bpy.types.Operator):
         layout = self.layout
         layout.prop(self, "mod_name")
         layout.prop(self, "mods_folder")
+        if scratch.is_scratch(stadium_collection(context)):
+            layout.prop(self, "new_code")
+            layout.prop(self, "new_name")
+            layout.label(text=T("Estadio desde cero: se añade como estadio nuevo, con los datos de juego del estadio "
+                                "de datos.", "Stadium from scratch: added as a new stadium, with the game data of the "
+                                "data stadium."), translate=False)
+            layout.prop(self, "menu")
+            if self.menu:
+                layout.prop(self, "home_line")
+            layout.prop(self, "hd")
+            return
         layout.prop(self, "mode", expand=True)
         if self.mode == "new":
             layout.prop(self, "new_code")
@@ -152,6 +163,24 @@ class PP_OT_export_stadium(bpy.types.Operator):
             self.report({"ERROR"}, T("Elige la carpeta mods del juego", "Pick the game's mods folder"))
             return {"CANCELLED"}
         default_name = T("Mi estadio", "My stadium")
+        if scratch.is_scratch(coll):
+            try:
+                st = scratch.export_scratch(coll, bpy.path.abspath(self.mods_folder), self.mod_name.strip() or default_name,
+                                            self.new_code.strip().lower(), self.new_name.strip() or default_name,
+                                            self.hd, self.menu, self.home_line)
+            except exporter.ExportFailure as e:
+                self.report({"ERROR"}, str(e))
+                return {"CANCELLED"}
+            msg = T(f"Mod en {st['folder']}: {st['pieces']} piezas, {st['textures']} texturas ({st['hd']} HD), "
+                    f"colisión de {st['collision']} triángulos, {st['size'] / 1048576:.1f} MB",
+                    f"Mod in {st['folder']}: {st['pieces']} pieces, {st['textures']} textures ({st['hd']} HD), "
+                    f"collision of {st['collision']} triangles, {st['size'] / 1048576:.1f} MB")
+            for w in st["warnings"]:
+                self.report({"WARNING"}, w)
+            self.report({"WARNING"} if st["over_budget"] else {"INFO"},
+                        msg + (T(". Pasa de 80 MB: puede que el partido no cargue.", ". Over 80 MB: the match may not load.")
+                               if st["over_budget"] else T(". Actívalo en MODS del launcher.", ". Enable it in MODS in the launcher.")))
+            return {"FINISHED"}
         if self.mode == "new":
             target, new_name = self.new_code.strip().lower(), self.new_name.strip() or default_name
         else:
@@ -173,6 +202,51 @@ class PP_OT_export_stadium(bpy.types.Operator):
                                              ". Over 80 MB: the match may not load."))
         else:
             self.report({"INFO"}, msg + T(". Actívalo en MODS del launcher.", ". Enable it in MODS in the launcher."))
+        return {"FINISHED"}
+
+
+class PP_OT_new_scratch(bpy.types.Operator, ImportHelper):
+    bl_idname = "object.powerpros_new_scratch"
+    bl_options = {"REGISTER", "UNDO"}
+    bl_translation_context = CONTEXT
+
+    filename_ext = ""
+    filter_glob: StringProperty(default="*.bin;*.exe;*.toml", options={"HIDDEN"})
+
+    @classmethod
+    def relabel(cls):
+        cls.bl_label = T("Nuevo estadio desde cero", "New stadium from scratch")
+        cls.bl_description = T("Crea una colección vacía para modelar un estadio sin estadio base: a cada objeto le "
+                               "das su papel (suelo, grada, valla, público…) en este panel",
+                               "Create an empty collection to model a stadium with no base stadium: give each object "
+                               "its role (ground, stand, fence, crowd…) in this panel")
+        set_props(cls, stadium=EnumProperty(
+            name=T("Estadio de datos", "Data stadium"), items=[(c, n, "") for c, n in names.stadiums()], default="col",
+            translation_context=CONTEXT,
+            description=T("Sus partidas, menú, cielo y sonidos son los del estadio nuevo; sus piezas no se usan",
+                          "Its saves, menu, sky and sounds are the new stadium's; its pieces are not used")))
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text=T("Elige la carpeta del juego o files/project.bin", "Pick the game folder or files/project.bin"),
+                     translate=False)
+        layout.prop(self, "stadium")
+
+    def execute(self, context):
+        try:
+            project_bin, game_folder = importer.find_project_bin(self.filepath)
+        except importer.ImportFailure as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        coll = bpy.data.collections.new(T("Estadio desde cero", "Stadium from scratch"))
+        coll["pp_scratch"] = 1
+        coll["pp_stadium"] = self.stadium
+        coll["pp_project_bin"] = str(project_bin)
+        if game_folder is not None:
+            coll["pp_game_folder"] = str(game_folder)
+        context.scene.collection.children.link(coll)
+        self.report({"INFO"}, T(f"{coll.name}: mete aquí tus objetos y dales su papel en el panel Power Pros",
+                                f"{coll.name}: put your objects here and give them their role in the Power Pros panel"))
         return {"FINISHED"}
 
 
@@ -305,11 +379,22 @@ class PP_PT_info(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         layout.operator(PP_OT_import_stadium.bl_idname, icon="IMPORT")
+        layout.operator(PP_OT_new_scratch.bl_idname, icon="ADD")
         layout.operator(PP_OT_export_stadium.bl_idname, icon="EXPORT")
         layout.operator(PP_OT_preview_in_game.bl_idname, icon="PLAY")
         layout.operator(PP_OT_convert_objects.bl_idname, icon="MESH_DATA")
         layout.operator(PP_OT_generate_collision.bl_idname, icon="MOD_PHYSICS")
         obj = context.active_object
+        coll = stadium_collection(context)
+        if obj is not None and scratch.is_scratch(coll) and obj.name in coll.all_objects and obj.get("pp_kind") != "collision":
+            box = layout.box()
+            box.label(text=T("Pieza del estadio desde cero: ", "From-scratch stadium piece: ") + obj.name, translate=False)
+            box.prop(obj, "powerpros_role")
+            if obj.powerpros_role == "auto":
+                role = scratch.role_of(obj)
+                box.label(text=T("Ahora: ", "Now: ") + T(scratch.ROLES[role][1], scratch.ROLES[role][2]), translate=False)
+            box.prop(obj, "powerpros_hide_above")
+            return
         if obj is None or "pp_kind" not in obj:
             layout.label(text=T("Selecciona una pieza de un estadio importado", "Select a piece of an imported stadium"),
                          translate=False)
@@ -344,8 +429,8 @@ def menu_export(self, context):
                          text=T("Mod de estadio de Power Pros 2008", "Power Pros 2008 stadium mod"), translate=False)
 
 
-CLASSES = (PP_OT_import_stadium, PP_OT_export_stadium, PP_OT_preview_in_game, PP_OT_convert_objects,
-           PP_OT_generate_collision, PP_PT_info)
+CLASSES = (PP_OT_import_stadium, PP_OT_new_scratch, PP_OT_export_stadium, PP_OT_preview_in_game,
+           PP_OT_convert_objects, PP_OT_generate_collision, PP_PT_info)
 
 
 def apply_language():

@@ -244,3 +244,47 @@ def build_stadium(coll, game_bases=True, bake_light=True):
         warnings.append(T(f"{len(st.placements)} piezas: con más de {MAX_PIECES} el orden de dibujo no está asegurado",
                           f"{len(st.placements)} pieces: past {MAX_PIECES} the draw order is not guaranteed"))
     return st, hd_images, warnings
+
+
+def export_scratch(coll, mods_folder, mod_name, new_code, new_name, hd=True, menu=True, home_line=""):
+    """Write a from-scratch collection as a new-stadium mod: mods/<mod>/project/stadium_<code>.pack and
+    its table, textures/stadium_<code>/ (HD), [[stadium]] in mod.toml (base: the data stadium) and,
+    with `menu`, its stadium select picture. Errors come as exporter.ExportFailure."""
+    from . import menu_pack, menu_render, names, stadium_write, tbl_write
+    if not names.valid_code(new_code):
+        raise exporter.ExportFailure(T("El código del estadio nuevo debe tener de 2 a 16 letras minúsculas, números o _",
+                                       "The new stadium code must have 2 to 16 lowercase letters, digits or _"))
+    if new_code in names.CODES or new_code in ("common", "debug", "hanabi") or new_code.startswith("sky_"):
+        raise exporter.ExportFailure(T(f"«{new_code}» ya es un estadio del juego: elige otro código",
+                                       f"'{new_code}' is already a stadium of the game: pick another code"))
+    try:
+        st, hd_images, warnings = build_stadium(coll)
+        gfx, tbl = stadium_write.write_stadium(st)
+    except (ScratchFailure, stadium_write.StadiumWriteError, tbl_write.TreeError) as e:
+        raise exporter.ExportFailure(str(e)) from e
+    base = coll.get("pp_stadium", "col")
+    folder = Path(mods_folder) / mod_name
+    (folder / "project").mkdir(parents=True, exist_ok=True)
+    (folder / "project" / f"stadium_{new_code}.pack").write_bytes(gfx)
+    (folder / "project" / f"stadium_{new_code}tbl.pack").write_bytes(tbl)
+    hd_folder = folder / "textures" / f"stadium_{new_code}"
+    for old in hd_folder.glob("tex1_*.png") if hd_folder.is_dir() else ():
+        old.unlink()
+    if hd and hd_images:
+        from . import hd_textures
+        hd_folder.mkdir(parents=True, exist_ok=True)
+        for name, rgba in hd_images.items():
+            (hd_folder / name).write_bytes(hd_textures.png_bytes(rgba))
+    toml = folder / "mod.toml"
+    if not toml.exists():
+        description = T("Estadio hecho desde cero con el complemento de Blender", "Stadium made from scratch with the Blender add-on")
+        toml.write_text(f'name = "{mod_name}"\ndescription = "{description}"\n', encoding="utf-8")
+    exporter.add_stadium_to_toml(toml, new_code, new_name, base)
+    if menu and base in menu_pack.CODES:
+        base_menu = projectbin.Archive(coll["pp_project_bin"]).read(menu_pack.base_menu_name(base))
+        if base_menu:
+            (folder / "project" / f"env_stadium_menu_{new_code}.pack").write_bytes(
+                menu_pack.build(base_menu, menu_render.photo(coll), menu_render.line(home_line)))
+    return {"folder": str(folder), "pieces": len(st.placements), "textures": len(st.textures),
+            "hd": len(hd_images) if hd else 0, "collision": len(st.collision_triangles), "size": len(gfx),
+            "over_budget": len(gfx) > pj7m_write.BUDGET, "warnings": warnings}
