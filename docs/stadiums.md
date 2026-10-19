@@ -182,7 +182,7 @@ Desde el complemento 0.8.0, el pack del estadio se puede escribir entero desde t
 
 **El Polo Grounds desde cero** (19 de octubre de 2026): el modelo de SketchUp, tal cual (456 objetos, 45.000 triángulos), colocado con sus propias bases y con AT&T Park como estadio de datos, queda en 5 piezas y 6.953 triángulos de colisión. Se ve en el visor con sus texturas desde todas las cámaras y se juega un partido de 2 minutos a 60 FPS sin errores. Lo único que se hizo al modelo fue pasar las caras planas del campo a un objeto aparte.
 - **Consejo:** si el campo está unido a las gradas en un mismo objeto, sepáralo (modo edición, seleccionar el césped, P > Selección). Así «Automático» lo hace suelo y se dibuja como capa de fondo.
-- Las banderas y el público del modelo salen como geometría quieta. Para que se muevan, dales los papeles Banderas y Público.
+- Las banderas del modelo salen como geometría quieta: para que el viento las mueva, dales el papel Banderas. Las gradas salen vacías: el papel Público pone la gente animada del juego.
 
 **Límites**
 - El público no puede llevar imagen propia: el juego anima siempre sus personas.
