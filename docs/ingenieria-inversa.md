@@ -896,13 +896,30 @@ Fuentes: `wiicompiled-mlb-pad-stick-range.patch`, `config/wiicompiled/rl8e54-dat
   - ioctlv 27 `ES_DIGetTicketView`: `0xD8` bytes. `+0x0C` ID de consola, `+0x10`/`+0x14` ID de título, `+0x18` máscara de acceso `0xFFFF`.
 - **SYSCONF:** sección 2.
 
-- **Año de la temporada** (19 de octubre de 2026, por el código traducido; sin probar en el juego):
-  - El año es **2008 + un byte con signo** en `[[0x8104B5A8] + 8]`. `0x80B74BCC` lo lee, `0x80B4A888` devuelve el año (2008 + índice), `0x80B74BA4` lo fija y `0x80B74BB4` le suma 1. Este último solo aparece metido dentro de `0x80B4E564`, que es el paso a la temporada siguiente.
-  - El tope de 10 temporadas son comparaciones del índice con 9 (la última, 2017) o con 10: en `0x80BB4A40` (si es 9, un mensaje con id 141), `0x80BF24B4` (con menos de 9 llama a `0x80BF619C`), dos en `0x80BF4BD4` (mensaje 140) y `0x80C0CB54` (menos de 10).
-  - **Datos por temporada:** `[0x8104B5C4]` apunta a una tabla de **428 bytes por año**; el registro de un equipo está en año × 428 + equipo × 8 + 160 (`0x80A496C0`, `0x80A49810`). Con 10 años serían 4.280 bytes. Otros usos del índice: (año + 1) × 10 + 390 en `0x80B3C99C` y (año + 1) × 3 en `0x80BF54BC`.
-  - Todos esos punteros salen de un mismo bloque grande en `0x80A556E0`: estado de la temporada en +`0x47DEC`, tabla por año en +`0xEEBAC`. La partida `pm3usma.dat` mide 868.352 bytes (`0xD4000`).
-  - Para pasar de 10 temporadas no basta con quitar las comparaciones: la tabla por año, y quizá otros datos por año, tienen sitio para 10.
-Fuentes: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_status.cpp`, `docs/mods.md`.
+- **Año de la temporada** (19 de octubre de 2026; código traducido y pruebas en el juego con `wiicompiled-season-probe`):
+  - **Estado:** `[0x8104B5A8]` apunta al estado de la temporada. En +4 está el día de hoy (u16, día del año desde el 1 de enero: 0x54 = 25/3), en +6 el día anterior y en +8 el **índice del año** (byte con signo; año = 2008 + índice). `0x80B74BCC` lee el índice, `0x80B4A888` devuelve el año, `0x80B74BA4` lo fija y `0x80B74BB4` le suma 1.
+  - **La partida de Temporada** (`pm3usse<hueco>.dat`, 1.179.648 bytes) es una copia de un bloque de memoria; un desplazamiento del archivo es la posición dentro del bloque + 0x8C. El índice del año está en el archivo en 0x47E8C. Cambiar el día en memoria y guardar mueve la fecha de la partida.
+  - **Calendario:** tramos de días en `0x80D2A700` (8 bytes por tramo: primer y último día del año). Los tramos 17 a 28 son los meses; `0x80B4AA38` devuelve el mes de hoy. Tramos de la temporada: regular 19/3–1/10, postemporada 2/10–31/10, pretemporada 1/11–14/2. Días de eventos en `0x80D2A7F0` (u32 por evento; el 57 es el 1/11).
+  - **Paso de año:** `0x80B4E564` se llama al avanzar de día; si el día nuevo cae en enero, suma 1 al índice y prepara la temporada nueva (`0x80B962E8`, `0x80B71B1C`, `0x80B97D68`). Se puede provocar sin jugar: desde el menú de pretemporada, día = 25/12 y «Daily Progress» lleva al 1/1 del año siguiente («These are last year's financials»). Comprobado de 2008 a 2009 y de 2009 a 2010.
+  - **Día de la semana:** `0x80B4DADC` lo calcula con una fórmula a partir del año, el mes y el día, así que también vale para años después de 2017.
+  - **El tope de 10 temporadas es una variable:** `[0x8104BA2C]` = 10. La leen `0x80B40580`, `0x80B4065C` (temporadas que quedan, en pantalla), `0x80B4DB78`, `0x80B50948` y `0x80B5C4D4`, que comparan el índice con 10 − 1. Además hay comparaciones fijas con 9 o 10: `0x80BB4A40` (en 9, mensaje 141), `0x80BF24B4`, dos en `0x80BF4BD4` (mensaje 140), `0x80C0CB54`, `0x80BECF40` (lista de años) y `0x80C0D4F8` (bucle de 10 años de las finanzas).
+  - **Final de la temporada 10** (probado con el índice puesto en 9 y la fecha en 25/12): al pasar al 1/1 el índice llega a 10 (en pantalla 2018), sale la despedida («Take care, now»), el resumen de clasificaciones, premios y postemporada (vacío, porque lee el hueco del año 10), los créditos, «Save as Arrange Team» y se guarda. Al cargar esa partida se repite el final. En una partida normal el final probablemente llega antes: `0x80B4DB78` es verdadero el 1/11 con índice ≥ 10 − 1 (no visto en el juego).
+  - **Datos por año del modo Temporada** (P = `[0x8104B5AC]`, X = `[0x8104B5A0]`, Q = `[0x8104B59C]` + 1344; confirmados en volcados de memoria):
+
+    | Datos | Dónde | Por año | Sitio |
+    |---|---|---|---|
+    | Clasificados de postemporada (8 equipos; 44 = vacío) | P + año × 32 | 32 bytes | 20 años |
+    | Series de postemporada (8 series de 20 bytes) | P + 648 + año × 160 | 160 bytes | 20 años |
+    | Clasificación de las ligas | X + 0x11CD0 + año × 336 | 336 bytes | 21 años |
+    | Un equipo por año, sorteado al crear la partida | X + 0x159A0 + año × 2 | 2 bytes | 20 años |
+    | Valor anual de finanzas | Q + 4 + año × 4 | 4 bytes | **10 años** |
+    | Resumen anual de finanzas (10 conceptos y saldo) | Q + 44 + año × 44 | 44 bytes | **10 años** (detrás va la tabla mensual) |
+
+    Casi todo tiene sitio para 20 años; solo las finanzas tienen 10. Con el índice en 10, `0x80C0D658` escribe en el saldo del primer mes. El significado exacto de algunos campos es una suposición: las partidas probadas no tienen resultados jugados.
+  - **No son del modo Temporada:** la tabla de 428 bytes por año de `[0x8104B5C4]` y la de 176 bytes son de MLB Life (sus punteros valen 0 en Temporada). (año + 1) × 10 + 390 en `0x80B3C99C` y (año + 1) × 3 en `0x80BF54BC` son cálculos, no tablas.
+  - **Sin encontrar todavía:** un historial de premios o de estadísticas de jugadores por año.
+Fuentes: `wiicompiled-season-probe.patch`, `tools/season_save.py`, volcados en `local/tmp/season/`, `docs/superpowers/specs/2026-10-19-season-archive-findings.md`.
+Fuentes de la sección: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_status.cpp`, `docs/mods.md`.
 
 ## 11. Bibliotecas y funciones identificadas
 

@@ -896,13 +896,30 @@ Sources: `wiicompiled-mlb-pad-stick-range.patch`, `config/wiicompiled/rl8e54-dat
   - ioctlv 27 `ES_DIGetTicketView`: `0xD8` bytes. `+0x0C` console ID, `+0x10`/`+0x14` title ID, `+0x18` access mask `0xFFFF`.
 - **SYSCONF:** section 2.
 
-- **Season year** (October 19, 2026, from the translated code; not tested in the game):
-  - The year is **2008 + a signed byte** at `[[0x8104B5A8] + 8]`. `0x80B74BCC` reads it, `0x80B4A888` returns the year (2008 + index), `0x80B74BA4` sets it and `0x80B74BB4` adds 1. The last one only shows up inlined in `0x80B4E564`, the step to the next season.
-  - The 10-season cap is comparisons of the index with 9 (the last one, 2017) or with 10: in `0x80BB4A40` (at 9, a message with id 141), `0x80BF24B4` (under 9 it calls `0x80BF619C`), two in `0x80BF4BD4` (message 140) and `0x80C0CB54` (under 10).
-  - **Per-season data:** `[0x8104B5C4]` points to a table of **428 bytes per year**; a team's record is at year × 428 + team × 8 + 160 (`0x80A496C0`, `0x80A49810`). With 10 years that is 4,280 bytes. Other uses of the index: (year + 1) × 10 + 390 in `0x80B3C99C` and (year + 1) × 3 in `0x80BF54BC`.
-  - All those pointers come from one large block in `0x80A556E0`: season state at +`0x47DEC`, per-year table at +`0xEEBAC`. The `pm3usma.dat` save is 868,352 bytes (`0xD4000`).
-  - Going past 10 seasons is not just removing the comparisons: the per-year table, and maybe other per-year data, has room for 10.
-Sources: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_status.cpp`, `docs/en/mods.md`.
+- **Season year** (October 19, 2026; translated code and in-game tests with `wiicompiled-season-probe`):
+  - **State:** `[0x8104B5A8]` points to the season state. +4 holds today (u16, day of the year from January 1: 0x54 = 3/25), +6 the previous day and +8 the **year index** (signed byte; year = 2008 + index). `0x80B74BCC` reads the index, `0x80B4A888` returns the year, `0x80B74BA4` sets it and `0x80B74BB4` adds 1.
+  - **The Season save** (`pm3usse<slot>.dat`, 1,179,648 bytes) is a copy of a memory block; a file offset is the position inside the block + 0x8C. The year index is at file offset 0x47E8C. Changing the day in memory and saving moves the save's date.
+  - **Calendar:** day ranges at `0x80D2A700` (8 bytes each: first and last day of the year). Ranges 17 to 28 are the months; `0x80B4AA38` returns today's month. Season ranges: regular season 3/19–10/01, postseason 10/02–10/31, off-season 11/01–2/14. Event days at `0x80D2A7F0` (u32 per event; event 57 is 11/01).
+  - **Year rollover:** `0x80B4E564` runs when a day passes; when the new day falls in January it adds 1 to the index and sets up the new season (`0x80B962E8`, `0x80B71B1C`, `0x80B97D68`). It can be triggered without playing: from the off-season menu, day = 12/25 and «Daily Progress» goes to 1/1 of the next year («These are last year's financials»). Checked from 2008 to 2009 and from 2009 to 2010.
+  - **Day of the week:** `0x80B4DADC` computes it with a formula from year, month and day, so it also works for years after 2017.
+  - **The 10-season cap is a variable:** `[0x8104BA2C]` = 10. It is read by `0x80B40580`, `0x80B4065C` (seasons left, on screen), `0x80B4DB78`, `0x80B50948` and `0x80B5C4D4`, which compare the index with 10 − 1. There are also fixed compares with 9 or 10: `0x80BB4A40` (at 9, message 141), `0x80BF24B4`, two in `0x80BF4BD4` (message 140), `0x80C0CB54`, `0x80BECF40` (year list) and `0x80C0D4F8` (10-year loop of the finances).
+  - **End of season 10** (tested with the index set to 9 and the date to 12/25): moving to 1/1 takes the index to 10 (2018 on screen), then the farewell («Take care, now»), the summary of standings, awards and postseason (empty, since it reads year slot 10), the credits, «Save as Arrange Team», and a save. Loading that save replays the ending. In a normal game the ending probably comes earlier: `0x80B4DB78` is true on 11/01 with index ≥ 10 − 1 (not seen in the game).
+  - **Season mode per-year data** (P = `[0x8104B5AC]`, X = `[0x8104B5A0]`, Q = `[0x8104B59C]` + 1344; confirmed in memory dumps):
+
+    | Data | Where | Per year | Room |
+    |---|---|---|---|
+    | Postseason qualifiers (8 teams; 44 = empty) | P + year × 32 | 32 bytes | 20 years |
+    | Postseason series (8 series of 20 bytes) | P + 648 + year × 160 | 160 bytes | 20 years |
+    | League standings | X + 0x11CD0 + year × 336 | 336 bytes | 21 years |
+    | One team per year, drawn when the save is created | X + 0x159A0 + year × 2 | 2 bytes | 20 years |
+    | Yearly finance value | Q + 4 + year × 4 | 4 bytes | **10 years** |
+    | Yearly finance summary (10 items and balance) | Q + 44 + year × 44 | 44 bytes | **10 years** (the monthly table follows) |
+
+    Almost everything has room for 20 years; only the finances have 10. With the index at 10, `0x80C0D658` writes into the first month's balance. The exact meaning of some fields is a guess: the tested saves have no played results.
+  - **Not Season mode:** the 428-byte-per-year table at `[0x8104B5C4]` and the 176-byte one belong to MLB Life (their pointers are 0 in Season mode). (year + 1) × 10 + 390 in `0x80B3C99C` and (year + 1) × 3 in `0x80BF54BC` are calculations, not tables.
+  - **Not found yet:** a per-year history of awards or player stats.
+Sources: `wiicompiled-season-probe.patch`, `tools/season_save.py`, dumps in `local/tmp/season/`, `docs/en/superpowers/specs/2026-10-19-season-archive-findings.md`.
+Section sources: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_status.cpp`, `docs/en/mods.md`.
 
 ## 11. Identified libraries and functions
 
