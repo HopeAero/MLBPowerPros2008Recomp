@@ -187,7 +187,7 @@ def convert(coll, sources, replace=True, bake_light=True):
         bm = buckets.get(name)
         if bm is None:
             continue
-        drop_back_twins(bm)
+        drop_back_twins(bm, {i for i, m in enumerate(slots[name]) if m is not plain})
         if name != ground.name:                 # the field keeps its layers on the ground
             separate_layers(bm)
         bm.transform(obj.matrix_world.inverted())
@@ -215,22 +215,30 @@ def convert(coll, sources, replace=True, bake_light=True):
     return result
 
 
-def drop_back_twins(bm):
-    """Of faces with the same corners keep one, the one facing the field."""
-    seen, kill = {}, []
+def drop_back_twins(bm, textured=frozenset()):
+    """Of faces with the same corners keep one: a textured one (material index in `textured`) over a
+    plain one, as SketchUp exports a texture painted over a plain face, then the one facing the field.
+    A kept face that faces away from the field is turned to it."""
+    seen, kill, turn = {}, [], set()
     for f in bm.faces:
         key = tuple(sorted((round(v.co.x, 3), round(v.co.y, 3), round(v.co.z, 3)) for v in f.verts))
         c = f.calc_center_median()
         towards = f.normal.z > 0 if abs(f.normal.z) > 0.95 else f.normal.xy.dot(FIELD - c.xy) > 0
+        rank = (f.material_index in textured, towards)
         other = seen.get(key)
         if other is None:
-            seen[key] = (f, towards)
-        elif towards and not other[1]:
+            seen[key] = (f, rank)
+            continue
+        if rank > other[1]:
             kill.append(other[0])
-            seen[key] = (f, towards)
+            seen[key] = (f, rank)
         else:
             kill.append(f)
+        turn.add(key)
     bmesh.ops.delete(bm, geom=kill, context="FACES")
+    away = [seen[k][0] for k in turn if not seen[k][1][1]]
+    if away:
+        bmesh.ops.reverse_faces(bm, faces=away)
     return len(kill)
 
 

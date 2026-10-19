@@ -105,7 +105,7 @@ You can bring a stadium that doesn't exist in the game into it.
 4. Select your model's objects and press **Convert objects to pieces** (Power Pros panel, N key):
    - The field's ground goes into the stadium's ground piece and everything else into a stands piece, because the game only draws the pieces the stadium already has.
    - Each material's color and a soft sun are stored in the vertex color, because the game draws stadiums without lighting.
-   - Each face is kept only once and facing the field. Of two faces in the same place (the two sides of a wall, as SketchUp exports them) the one facing the field is kept.
+   - Each face is kept only once and facing the field. Of two faces in the same place (the two sides of a wall, or a texture painted over a plain face, as SketchUp exports them) the textured one is kept and, when neither or both are textured, the one facing the field. The kept face is turned to the field.
    - Surfaces stuck less than 25 cm from another parallel one, such as windows or signs, are separated up to 25 cm, so they don't flicker.
    - With **Remove original stadium** (**Quitar el estadio original**) (on by default), the base stadium's pieces disappear and only your model remains. Pieces with the `pp_keep` property are kept, for example a crowd piece where you've put your own crowd.
    - The game's bases, plate and mound (`BCL` pieces) always stay: the players stand on them, and a model's own rarely match (Mario Stadium's plate was 1.2 m).

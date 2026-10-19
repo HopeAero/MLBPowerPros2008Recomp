@@ -30,6 +30,29 @@ bpy.ops.extensions.package_install_files(filepath=zip_path, repo="user_default",
 pkg = "bl_ext.user_default.powerpros_stadium"
 pj7m = importlib.import_module(pkg + ".pj7m")
 tbl_mod = importlib.import_module(pkg + ".stadium_tbl")
+convert = importlib.import_module(pkg + ".convert")
+
+
+def twins(first_away, textured_first):
+    """Two faces with the same corners on a wall 80 m out: one plain (material 0), one textured (1).
+    Returns the faces drop_back_twins keeps, as (material, normal y)."""
+    bm = bmesh.new()
+    quad = [(-5.0, 80.0, 0.0), (5.0, 80.0, 0.0), (5.0, 80.0, 5.0), (-5.0, 80.0, 5.0)]
+    for textured in ((True, False) if textured_first else (False, True)):
+        away = first_away if textured == textured_first else False
+        corners = quad[::-1] if away else quad          # quad faces -Y, towards home
+        f = bm.faces.new([bm.verts.new(c) for c in corners])
+        f.material_index = 1 if textured else 0
+    bm.normal_update()
+    convert.drop_back_twins(bm, textured={1})
+    kept = [(f.material_index, round(f.normal.y, 3)) for f in bm.faces]
+    bm.free()
+    return kept
+
+
+# A texture drawn over a plain face (SketchUp exports both): the textured one stays, facing the field.
+check(twins(first_away=False, textured_first=False) == [(1, -1.0)], "twins facing the field: the textured one stays")
+check(twins(first_away=True, textured_first=True) == [(1, -1.0)], "a textured twin facing away is kept, turned to the field")
 for obj in list(bpy.data.objects):
     bpy.data.objects.remove(obj)
 bpy.ops.import_scene.powerpros_stadium(filepath=project_bin, stadium="col", collision=False)
