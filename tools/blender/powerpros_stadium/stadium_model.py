@@ -31,6 +31,8 @@ class TexMap:
     slot: int                      # index into Model.textures
     repeat_u: int                  # how many times the texture repeats (>= the meshes' largest |u|)
     repeat_v: int
+    width: int = 0                 # size the texmap declares; 0: its texture's. Differs in 129 game
+    height: int = 0                # texmaps (crowd pieces: an 8x8 texture declared 128x64)
 
 
 @dataclass
@@ -56,7 +58,8 @@ class Model:
     name: str
     wname: str                     # "_Wmodel_<name>"
     node_name: str                 # Maya node name
-    textures: list                 # [(index into Stadium.textures, index into Stadium.palettes or None)]
+    textures: list                 # [(index into Stadium.textures, index into Stadium.palettes or None,
+                                   #   mip level: 0, or 1/2 in MIP pieces that use the smaller levels)]
     texmaps: list                  # [TexMap]
     materials: list                # [Material]
     meshes: list                   # [Mesh]

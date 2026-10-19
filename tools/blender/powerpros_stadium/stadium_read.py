@@ -134,7 +134,7 @@ class _Reader:
         for i in range(m.header["textures"]):
             head = pj7m.ptr(d, textab + 8 * i)
             pal = pj7m.ptr(d, paltab + 8 * i) if paltab is not None else None
-            textures.append((self.texture(head), self.palette(pal)))
+            textures.append((self.texture(head), self.palette(pal), u32(d, textab + 8 * i + 4)))
         if textab is not None:
             n = m.header["textures"]
             self.span("gfx", "texture_table", (mi,), textab, textab + 8 * (n + 1), [8 * i for i in range(n)])
@@ -142,7 +142,10 @@ class _Reader:
 
         texmaps = []
         for ti, tm in enumerate(m.texmaps):
-            texmaps.append(TexMap(tm.texture, u16(d, tm.offset + 0x1C), u16(d, tm.offset + 0x1E)))
+            tex = m.textures[tm.texture]
+            w, h = u16(d, tm.offset + 0x0C) + 1, u16(d, tm.offset + 0x0E) + 1
+            size = (0, 0) if (w, h) == (tex.width, tex.height) else (w, h)
+            texmaps.append(TexMap(tm.texture, u16(d, tm.offset + 0x1C), u16(d, tm.offset + 0x1E), *size))
             self.span("gfx", "texmap", (mi, ti), tm.offset, tm.offset + 0x4C)
         materials = []
         for ai, mt in enumerate(m.materials):
@@ -231,15 +234,26 @@ class _Reader:
 
 def read_stadium(gfx, tbl, spans=None):
     """Both packs of a game stadium as a Stadium (see the module docstring for `spans`)."""
-    r = _Reader(bytes(gfx), bytes(tbl))
+    return _read(gfx, tbl, spans)
+
+
+def read_graphics(gfx, spans=None):
+    """The graphics pack alone (no table): models and textures; textures only the table points at
+    come out as spare_textures. For comparing a written graphics pack before its table exists."""
+    return _read(gfx, None, spans)
+
+
+def _read(gfx, tbl, spans):
+    r = _Reader(bytes(gfx), bytes(tbl or b""))
     r.span("gfx", "packwii", (), 0, 0x20)
     offsets = pj7m.find_models(r.gfx)
     for mi, off in enumerate(offsets):
         r.model(mi, off)
-    r.table({off: mi for mi, off in enumerate(offsets)})
+    if tbl is not None:
+        r.table({off: mi for mi, off in enumerate(offsets)})
     r.spare_textures()
     r.texture_tails()
     if spans is not None:
-        spans["gfx"].extend(r.spans["gfx"])
-        spans["tbl"].extend(r.spans["tbl"])
+        for where in spans:
+            spans[where].extend(r.spans[where])
     return r.st

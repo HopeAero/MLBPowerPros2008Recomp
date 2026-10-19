@@ -71,13 +71,118 @@ def test_reader_covers_every_byte(archive):
     check(not bad, "every non-zero byte of the 40 stadiums is read" + ("" if not bad else ": " + "; ".join(bad[:6])))
 
 
-SYNTHETIC = []
-GAME = [test_reader_known_values, test_reader_covers_every_byte]
+# ---- Task 2: graphics pack -----------------------------------------------------------------------
+
+COLORS = ((0, 0, 0, 255), (204, 204, 204, 255), (0, 0, 0, 255))
+
+
+def synthetic_stadium():
+    """Two models: one with an RGB5A3 and a C4 texture (16-colour palette), a textured and an untextured
+    material, a strip mesh and a triangle mesh; one with no textures at all."""
+    from powerpros_stadium.stadium_model import Material, Mesh, Model, Palette, Stadium, TexMap, Texture
+    rgb = Texture(5, 8, 8, bytes(range(128)))
+    c4 = Texture(8, 8, 8, bytes(range(32)))
+    pal = Palette(16, bytes(range(100, 132)))
+    quad = Mesh(0, [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (0.0, 0.0, -10.0), (10.0, 0.0, -10.0)], [(0.0, 1.0, 0.0)],
+                [(255, 255, 255, 255)], [(0.0, 0.0), (3.0, 0.0), (0.0, 2.0), (3.0, 2.0)],
+                [(0x98, [(0, 0, 0, 0, 0), (0, 1, 0, 0, 1), (0, 2, 0, 0, 2), (0, 3, 0, 0, 3)])])
+    tri = Mesh(1, [(0.0, 5.0, 0.0), (1.0, 5.0, 0.0), (0.0, 6.0, 0.0)], [(0.0, 0.0, 1.0)], [(90, 90, 90, 255)],
+               [(0.0, 0.0)], [(0x90, [(0, 0, 0, 0, 0), (0, 1, 0, 0, 0), (0, 2, 0, 0, 0)])])
+    a = Model("DP_test_a", "_Wmodel_DP_test_a", "pPlane1", [(0, None, 0), (1, 0, 0)], [TexMap(0, 3, 2), TexMap(1, 1, 1)],
+              [Material(3, COLORS, [0], 1), Material(3, COLORS, [], 0)], [quad, tri])
+    b = Model("DP_test_b", "_Wmodel_DP_test_b", "pPlane2", [], [], [Material(3, COLORS, [], 1)],
+              [Mesh(0, tri.positions, tri.normals, tri.colors, tri.uvs, tri.draws)])
+    return Stadium(textures=[rgb, c4], palettes=[pal], models=[a, b])
+
+
+def test_graphics_synthetic():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import stadium_re
+    from powerpros_stadium import pj7m
+    from powerpros_stadium.stadium_write import write_graphics
+    st = synthetic_stadium()
+    gfx, layout = write_graphics(st)
+    offsets = pj7m.find_models(gfx)
+    check(offsets == layout.models and len(offsets) == 2, f"two models found where the layout says ({offsets})")
+    for model, off in zip(st.models, offsets):
+        m = pj7m.parse_model(gfx, off)
+        check(m.name == model.name and m.wname == model.wname and m.node_name == model.node_name, f"{model.name}: names")
+        check([d for x in m.meshes for d in x.draws] == [(op, [tuple(v) for v in vs]) for x in model.meshes for op, vs in x.draws],
+              f"{model.name}: draws")
+        check([pj7m.array(gfx, x, "pos") for x in m.meshes] == [x.positions for x in model.meshes], f"{model.name}: positions")
+        check([len(x.texmaps) for x in m.materials] == [len(x.texmaps) for x in model.materials], f"{model.name}: material slots")
+        check([(t.fmt, t.width, t.height) for t in m.textures] == [(st.textures[i].fmt, st.textures[i].width, st.textures[i].height)
+                                                                    for i, _, _ in model.textures], f"{model.name}: textures")
+        problems = []
+        stadium_re.check_model(gfx, m, problems)
+        check(not problems, f"{model.name}: stadium_re.check_model {problems[:3]}")
+        aligned = all(x.dl % 32 == 0 and all(v % 32 == 0 for v in x.arrays.values() if v) for x in m.meshes)
+        aligned &= all(t.pixels % 32 == 0 and (t.palette is None or t.palette % 32 == 0) for t in m.textures)
+        check(aligned, f"{model.name}: display lists, arrays, pixels and colours on 32 bytes")
+
+
+TEXTURE_KINDS = ("texture_header", "texture_pixels", "texture_tail", "palette_header", "palette_colors")
+GRAPHICS_ONLY_SKIP = ("texture_tail", "palette_header", "palette_colors")    # compared with the table, Task 3
+
+
+def masked(data, spans, skip=()):
+    """{(kind, key): bytes with pointer fields zeroed} for model structures, and sorted lists of masked
+    bytes per texture kind (texture order in the file may differ)."""
+    by_key, by_kind = {}, {}
+    for s in spans:
+        if s.kind in skip:
+            continue
+        b = bytearray(data[s.start:s.end])
+        for p in s.pointers:
+            b[p:p + 4] = b"\0\0\0\0"
+        if s.kind in TEXTURE_KINDS:
+            by_kind.setdefault(s.kind, []).append(bytes(b))
+        else:
+            by_key[(s.kind, s.key)] = bytes(b)
+    return by_key, {k: sorted(v) for k, v in by_kind.items()}
+
+
+def compare_structures(code, orig, new, label):
+    """Mismatch descriptions between two masked() results."""
+    bad = []
+    keys = set(orig[0]) | set(new[0])
+    for k in sorted(keys, key=str):
+        if orig[0].get(k) != new[0].get(k):
+            a, b = orig[0].get(k), new[0].get(k)
+            at = next((i for i in range(min(len(a or b""), len(b or b""))) if a[i] != b[i]), None)
+            bad.append(f"{code} {label} {k[0]}{k[1]}: " + ("missing" if a is None or b is None else
+                       f"differs at +0x{at:X}" if at is not None else f"size {len(a)} vs {len(b)}"))
+    for kind in set(orig[1]) | set(new[1]):
+        if orig[1].get(kind) != new[1].get(kind):
+            bad.append(f"{code} {label} {kind}: {len(orig[1].get(kind, []))} vs {len(new[1].get(kind, []))} differ")
+    return bad
+
+
+def test_graphics_bytes_match_game(archive):
+    from powerpros_stadium.stadium_read import read_graphics, read_stadium
+    from powerpros_stadium.stadium_write import write_graphics
+    bad = []
+    for code in stadium_codes(archive):
+        gfx, tbl = packs(archive, code)
+        st = read_stadium(gfx, tbl)
+        new, _ = write_graphics(st)
+        a, b = {"gfx": []}, {"gfx": []}
+        read_graphics(gfx, a)
+        read_graphics(new, b)
+        bad += compare_structures(code, masked(gfx, a["gfx"], GRAPHICS_ONLY_SKIP), masked(new, b["gfx"], GRAPHICS_ONLY_SKIP), "gfx")
+    check(not bad, "graphics structures match the game's, pointers aside" + ("" if not bad else ": " + "; ".join(bad[:8])))
+
+
+SYNTHETIC = [test_graphics_synthetic]
+GAME = [test_reader_known_values, test_reader_covers_every_byte, test_graphics_bytes_match_game]
 
 
 def main(argv):
     for test in SYNTHETIC:
-        test()
+        try:
+            test()
+        except Exception as e:
+            check(False, f"{test.__name__} raised {type(e).__name__}: {e}")
     if len(argv) > 1:
         from projectbin import Archive
         archive = Archive(argv[1])
