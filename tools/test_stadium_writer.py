@@ -173,8 +173,136 @@ def test_graphics_bytes_match_game(archive):
     check(not bad, "graphics structures match the game's, pointers aside" + ("" if not bad else ": " + "; ".join(bad[:8])))
 
 
-SYNTHETIC = [test_graphics_synthetic]
-GAME = [test_reader_known_values, test_reader_covers_every_byte, test_graphics_bytes_match_game]
+# ---- Task 3: table -------------------------------------------------------------------------------
+
+def placement(model, x, z):
+    from powerpros_stadium.stadium_model import Placement
+    return Placement(model, (x, 0.0, z), (0.0, 0.5, 0.0), (1.0, 1.0, 1.0), (x - 5.0, 0.0, z - 5.0, x + 5.0, 6.0, z + 5.0),
+                     (x, 3.0, z, 8.0), 0x00001100)
+
+
+def table_stadium():
+    from powerpros_stadium.stadium_model import PointGroup, PreloadEntry
+    st = synthetic_stadium()
+    st.placements = [placement(0, 0.0, 0.0), placement(1, 100.0, -50.0)]       # one per model, as in the game
+    st.collision_vertices = [(-10.0, 0.0, 10.0), (10.0, 0.0, 10.0), (10.0, 0.0, -10.0), (-10.0, 0.0, -10.0), (0.0, 5.0, -10.0)]
+    st.collision_triangles = [(0, 1, 2, 5), (0, 2, 3, 5), (2, 3, 4, 9), (3, 4, 0, 1)]
+    st.unk_20 = [PointGroup([(1.0, 2.0, 3.0, 0.0, 0.5, 0.0), (4.0, 5.0, 6.0, 0.0, -0.5, 0.0)], (1.0, 2.0, 3.0, 4.0, 5.0, 6.0))]
+    st.unk_24 = [[(240.0, -6.5, 37.5, 1.0, 1.0, 1.0, -1.75)], [(-240.0, -6.5, 37.5, 1.0, 1.0, 1.0, 1.75)]]
+    st.preload_order = [0, 1]
+    st.preload = [PreloadEntry(0, None, 0xAC800, 0), PreloadEntry(1, 0, 0xAB800, 0xB2540)]
+    st.preload_tail = 0x6F2E80
+    return st
+
+
+def test_table_synthetic():
+    import stadium_re
+    from powerpros_stadium import stadium_tbl
+    from powerpros_stadium.stadium_read import read_stadium
+    from powerpros_stadium.stadium_write import write_stadium
+    st = table_stadium()
+    gfx, tbl = write_stadium(st)
+    root = stadium_tbl.find_root(tbl)
+    check(struct_u32(tbl, root) == 2 and struct_u32(tbl, root + 4) == 0x40000020, "root found from the end, placements at 0x20")
+    back = read_stadium(gfx, tbl)
+    check(back == st, "the written stadium reads back the same" + ("" if back == st else f": {first_difference(st, back)}"))
+    problems = []
+    stadium_re.load("synthetic", gfx, tbl, problems)
+    check(not problems, f"stadium_re.load {problems[:3]}")
+
+
+def struct_u32(d, o):
+    import struct
+    return struct.unpack_from(">I", d, o)[0]
+
+
+def first_difference(a, b):
+    from dataclasses import fields, is_dataclass
+    if is_dataclass(a) and is_dataclass(b):
+        for f in fields(a):
+            x, y = getattr(a, f.name), getattr(b, f.name)
+            if x != y:
+                return f"{f.name}: " + first_difference(x, y)
+    if isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            return f"length {len(a)} vs {len(b)}"
+        i = next(i for i, (x, y) in enumerate(zip(a, b)) if x != y)
+        return f"[{i}] " + first_difference(a[i], b[i])
+    return f"{a!r:.80} vs {b!r:.80}"
+
+
+def test_table_empty_blocks():
+    from powerpros_stadium import stadium_tbl
+    from powerpros_stadium.stadium_read import read_stadium
+    from powerpros_stadium.stadium_write import write_stadium
+    st = table_stadium()
+    st.unk_20, st.unk_24, st.preload_order, st.preload = [], [[], []], [], []
+    gfx, tbl = write_stadium(st)
+    pointers = stadium_tbl.parse_table(tbl).pointers
+    check(all(v is not None for v in pointers.values()), "empty blocks are written present, no null root pointer")
+    check(read_stadium(gfx, tbl) == st, "empty blocks read back the same")
+    st.unk_24 = [[]]                                  # bullpen: a single pair, the root right after it
+    check(read_stadium(*write_stadium(st)).unk_24 == [[]], "a single unk_24 pair reads back the same")
+
+
+def test_table_many_placements():
+    import stadium_re
+    from powerpros_stadium import stadium_tbl
+    from powerpros_stadium.stadium_write import write_stadium
+    st = table_stadium()
+    st.placements = [placement(0, 30.0 * (i % 14), -30.0 * (i // 14)) for i in range(140)]
+    gfx, tbl = write_stadium(st)
+    t = stadium_tbl.parse_table(tbl)
+    nodes = stadium_tbl.parse_tree(tbl, t.pointers["planes_a"], t.pointers["lists_a"])
+    problems = []
+    stadium_re.check_trees("many", tbl, t, problems)
+    check(len(nodes) > 1 and not problems, f"140 placements: tree A split into {len(nodes)} nodes, {problems[:2]}")
+
+
+def test_write_limits():
+    from powerpros_stadium.stadium_model import TexMap
+    from powerpros_stadium.stadium_write import StadiumWriteError, write_stadium
+    cases = []
+    st = table_stadium()
+    st.models[0].texmaps = [TexMap(0, 1, 1)] * 31
+    cases.append((st, "DP_test_a"))
+    st = table_stadium()
+    st.collision_triangles = [(0, 1, 2, 5)] * 65536
+    cases.append((st, "65535"))
+    st = table_stadium()
+    st.placements = [placement(0, 0.0, 0.0)] * 4096
+    cases.append((st, "4095"))
+    for st, word in cases:
+        try:
+            write_stadium(st)
+            check(False, f"limit with '{word}' refused")
+        except StadiumWriteError as e:
+            check(word in str(e), f"limit refused, naming '{word}': {e}")
+
+
+TREES = ("tree_a", "tree_a_lists", "tree_b", "tree_b_lists")
+
+
+def test_table_bytes_match_game(archive):
+    from powerpros_stadium.stadium_read import read_stadium
+    from powerpros_stadium.stadium_write import write_stadium
+    bad = []
+    for code in stadium_codes(archive):
+        gfx, tbl = packs(archive, code)
+        a, b = {"gfx": [], "tbl": []}, {"gfx": [], "tbl": []}
+        st = read_stadium(gfx, tbl, a)
+        new_gfx, new_tbl = write_stadium(st)
+        read_stadium(new_gfx, new_tbl, b)
+        bad += compare_structures(code, masked(gfx, a["gfx"]), masked(new_gfx, b["gfx"]), "gfx")
+        bad += compare_structures(code, masked(tbl, a["tbl"], TREES), masked(new_tbl, b["tbl"], TREES), "tbl")
+    check(not bad, "table and graphics structures match the game's, pointers and trees aside"
+          + ("" if not bad else ": " + "; ".join(bad[:8])))
+
+
+SYNTHETIC = [test_graphics_synthetic, test_table_synthetic, test_table_empty_blocks, test_table_many_placements,
+             test_write_limits]
+GAME = [test_reader_known_values, test_reader_covers_every_byte, test_graphics_bytes_match_game,
+        test_table_bytes_match_game]
 
 
 def main(argv):

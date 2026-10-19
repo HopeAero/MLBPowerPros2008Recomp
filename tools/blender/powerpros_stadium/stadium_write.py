@@ -7,7 +7,7 @@ arrays, texels and palette colours on 32 bytes, everything else on 4.
 import struct
 from dataclasses import dataclass
 
-from . import pj7m
+from . import pj7m, stadium_tbl, tbl_write
 
 P = 0x40000000
 FMT_TYPE = {fmt: kind for kind, fmt in pj7m.MODEL_FMT.items()}      # GX format -> texture type byte
@@ -156,3 +156,89 @@ def write_graphics(st):
     models = [_model(buf, st, m, tex_at, pal_at) for m in st.models]
     buf.put(b"", 32)
     return bytes(buf.d), GraphicsLayout(models, tex_at, pal_at)
+
+
+# ---- table ---------------------------------------------------------------------------------------
+
+MAX_TEXMAPS = 30            # most texmaps one piece has in the game; 82 overran a game table and crashed
+MAX_PLACEMENTS = 0xFFF      # the runtime finds the root by a placement count below 0x1000
+MAX_COLLISION = 0xFFFF      # u16 counts
+
+
+def _tree_a(placements):
+    """Tree A: one leaf in placement order when it fits (the game seems to draw pieces in the order it
+    finds them here, as TblWriter.set_model_tree does), else a spatial tree."""
+    boxes = [(i, tuple(p.bbox[:3]), tuple(p.bbox[3:])) for i, p in enumerate(placements)]
+    if len(boxes) <= tbl_write.MAX_LEAF:
+        far = max((b[2][0] for b in boxes), default=0.0) + 1.0
+        n = len(boxes)
+        return [((1.0, 0.0, 0.0, -far), (0, 0, n), (0, n, 0))], [i for i, _, _ in boxes]
+    return tbl_write.build_tree(boxes)
+
+
+def _tree_b(vertices, triangles):
+    if not triangles:
+        return [((1.0, 0.0, 0.0, 0.0), (0, 0, 0), (0, 0, 0))], []
+    return tbl_write.build_tree(tbl_write.triangle_boxes(vertices, triangles), 12)
+
+
+def write_table(st, layout):
+    """The table (stadium_<code>tbl.pack) of `st`, pointing into the graphics pack laid out as `layout`."""
+    buf = _Buffer(PACKWII)
+    put = buf.put
+    fields = {}
+    for p in st.placements:
+        put(struct.pack(">I19fI", P | layout.models[p.model], *p.translation, *p.rotation, *p.scale, *p.bbox,
+                        *p.sphere, p.flags))
+    fields["placements"] = 0x20
+    for name, (nodes, entries) in (("a", _tree_a(st.placements)),
+                                   ("b", _tree_b(st.collision_vertices, st.collision_triangles))):
+        tree, lists = tbl_write.pack_tree(nodes, entries)
+        fields["planes_" + name] = put(tree)
+        fields["lists_" + name] = put(lists)
+    fields["collision"] = put(struct.pack(">HHI", len(st.collision_triangles), len(st.collision_vertices), 0)
+                              + b"".join(struct.pack(">4H", *t) for t in st.collision_triangles))
+    fields["coll_vertices"] = put(b"".join(struct.pack(">3f", *v) for v in st.collision_vertices))
+    groups = b""
+    for g in st.unk_20:
+        at = put(b"".join(struct.pack(">6f", *pt) for pt in g.points)) if g.points else None
+        groups += struct.pack(">II6f", ptr(at), len(g.points), *g.box)
+    fields["unk_20"] = put(groups + bytes(0x20))
+    fields["unk_2c"] = put(struct.pack(f">I{len(st.preload_order)}I", len(st.preload_order), *st.preload_order))
+    fields["textures"] = put(b"".join(
+        struct.pack(">4I", ptr(layout.textures[e.texture] if e.texture is not None else None),
+                    ptr(layout.palettes[e.palette] if e.palette is not None else None), e.tmem_a, e.tmem_b)
+        for e in st.preload) + struct.pack(">4I", 0, 0, st.preload_tail, 0))
+    pairs = b""
+    for records in st.unk_24:
+        at = put(b"".join(struct.pack(">7f", *r) for r in records)) if records else None
+        pairs += struct.pack(">II", ptr(at), len(records))
+    fields["unk_24"] = put(pairs)
+    root = put(struct.pack(">I", len(st.placements))
+               + b"".join(struct.pack(">I", P | fields[name]) for name in stadium_tbl.ROOT_FIELDS))
+    put(b"", 32)
+    if stadium_tbl.find_root(buf.d) != root:
+        raise StadiumWriteError("the table root would not be found from the end of the file")
+    return bytes(buf.d)
+
+
+def check_limits(st):
+    for m in st.models:
+        if len(m.texmaps) > MAX_TEXMAPS:
+            raise StadiumWriteError(f"{m.name}: {len(m.texmaps)} texmaps, the game takes {MAX_TEXMAPS}")
+    if len(st.placements) > MAX_PLACEMENTS:
+        raise StadiumWriteError(f"{len(st.placements)} placements, at most {MAX_PLACEMENTS}")
+    if len(st.collision_triangles) > MAX_COLLISION or len(st.collision_vertices) > MAX_COLLISION:
+        raise StadiumWriteError(f"collision of {len(st.collision_triangles)} triangles and {len(st.collision_vertices)} "
+                                f"vertices, at most {MAX_COLLISION} of each")
+
+
+def write_stadium(st):
+    """(graphics pack, table) of `st`. Checks the known limits before writing anything."""
+    check_limits(st)
+    gfx, layout = write_graphics(st)
+    try:
+        tbl = write_table(st, layout)
+    except tbl_write.TreeError as e:
+        raise StadiumWriteError(str(e)) from e
+    return gfx, tbl
