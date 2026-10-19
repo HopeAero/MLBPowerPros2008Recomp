@@ -54,7 +54,7 @@ if (-not (Test-Path "$src\.git")) {
              'wiicompiled-native-efb-snapshot', 'wiicompiled-match-benchmark', 'wiicompiled-resolution-labels',
              'wiicompiled-audio-queue', 'wiicompiled-audio-depop', 'wiicompiled-periodic-sleep',
              'wiicompiled-benchmark-device-info', 'wiicompiled-launcher-controls', 'wiicompiled-roster-voices', 'wiicompiled-pad-script-cstick',
-             'wiicompiled-match-benchmark-gameplay', 'wiicompiled-texture-studio', 'wiicompiled-mlb-disc-identity', 'wiicompiled-graphics-options', 'wiicompiled-new-stadiums', 'wiicompiled-language', 'wiicompiled-mlb-fielding-diagonals', 'wiicompiled-mlb-widescreen', 'wiicompiled-mlb-fill-screen', 'wiicompiled-auto-mipmaps', 'wiicompiled-mlb-mem2-heap', 'wiicompiled-timers-when-hidden', 'wiicompiled-launcher-saves', 'wiicompiled-stadium-viewer') {
+             'wiicompiled-match-benchmark-gameplay', 'wiicompiled-texture-studio', 'wiicompiled-mlb-disc-identity', 'wiicompiled-graphics-options', 'wiicompiled-new-stadiums', 'wiicompiled-language', 'wiicompiled-mlb-fielding-diagonals', 'wiicompiled-mlb-widescreen', 'wiicompiled-mlb-fill-screen', 'wiicompiled-auto-mipmaps', 'wiicompiled-mlb-mem2-heap', 'wiicompiled-timers-when-hidden', 'wiicompiled-launcher-saves', 'wiicompiled-stadium-viewer', 'wiicompiled-season-probe') {
         git -C $src apply (Join-Path $root "tools\patches\$patch.patch"); Invoke-Checked "patch $patch"
     }
     # The runtime CMake reads translator output from <src>/generated.

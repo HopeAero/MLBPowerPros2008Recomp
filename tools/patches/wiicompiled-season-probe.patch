@@ -1,0 +1,129 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index ccc2a39..4c11fc1 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -413,6 +413,10 @@ add_executable(mkw_stadium_collision_tests "${CMAKE_CURRENT_LIST_DIR}/tests/stad
+ target_compile_features(mkw_stadium_collision_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_stadium_collision_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+ add_test(NAME mkw_stadium_collision_tests COMMAND mkw_stadium_collision_tests)
++add_executable(mkw_season_probe_tests "${CMAKE_CURRENT_LIST_DIR}/tests/season_probe_tests.cpp")
++target_compile_features(mkw_season_probe_tests PRIVATE cxx_std_20)
++target_include_directories(mkw_season_probe_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
++add_test(NAME mkw_season_probe_tests COMMAND mkw_season_probe_tests)
+ add_executable(mkw_game_camera_tests "${CMAKE_CURRENT_LIST_DIR}/tests/game_camera_tests.cpp")
+ target_compile_features(mkw_game_camera_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_game_camera_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+diff --git a/runtime/include/season_probe.h b/runtime/include/season_probe.h
+new file mode 100644
+index 0000000..1382572
+--- /dev/null
++++ b/runtime/include/season_probe.h
+@@ -0,0 +1,24 @@
++#pragma once
++// Season probe: research aid for Season mode past ten seasons. Does nothing without its variables.
++//   WIICOMPILED_SEASON_LOG=1    logs "[season] index=N year=Y state=0xADDR" whenever the season index changes
++//   WIICOMPILED_SEASON_INDEX=N  writes N (0..9) to the season index once, the first time the state exists
++// The year is 2008 + the signed byte at [[0x8104B5A8] + 8] (docs/ingenieria-inversa.md, "Año de la temporada").
++// Plan: docs/superpowers/plans/2026-10-19-season-archive-research.md
++#include <cstdlib>
++#include <cstring>
++#include <optional>
++
++namespace season_probe {
++
++// 0..9, the indices the game's per-year tables have room for; anything else is empty.
++inline std::optional<int> ParseSeasonIndex(const char* text) {
++    if (!text || !*text) return std::nullopt;
++    char* end = nullptr;
++    const long value = std::strtol(text, &end, 10);
++    if (*end != '\0' || value < 0 || value > 9) return std::nullopt;
++    return static_cast<int>(value);
++}
++
++void OnHostFrame();
++
++}  // namespace season_probe
+diff --git a/runtime/src/hle/mlb/season_probe.cpp b/runtime/src/hle/mlb/season_probe.cpp
+new file mode 100644
+index 0000000..0c83b2f
+--- /dev/null
++++ b/runtime/src/hle/mlb/season_probe.cpp
+@@ -0,0 +1,28 @@
++#include "season_probe.h"
++#include "memory.h"
++#include <cstdio>
++
++namespace season_probe {
++
++void OnHostFrame() {
++#if defined(WIICOMPILED_GAME_RL8E54)
++    static const bool log = std::getenv("WIICOMPILED_SEASON_LOG") != nullptr;
++    static std::optional<int> force = ParseSeasonIndex(std::getenv("WIICOMPILED_SEASON_INDEX"));
++    if (!log && !force) return;
++    const uint32_t state = Memory::Read32(0x8104B5A8u);
++    if (!state || !Memory::Contains(state, 16)) return;
++    if (force) {
++        Memory::Write8(state + 8, static_cast<uint8_t>(*force));
++        std::fprintf(stderr, "[season] forced index=%d year=%d state=0x%08X\n", *force, 2008 + *force, state);
++        force.reset();
++    }
++    static int last = -1000;
++    const int index = static_cast<int8_t>(Memory::Read8(state + 8));
++    if (log && index != last) {
++        std::fprintf(stderr, "[season] index=%d year=%d state=0x%08X\n", index, 2008 + index, state);
++        last = index;
++    }
++#endif
++}
++
++}  // namespace season_probe
+diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
+index 760ea75..d4d9ea6 100644
+--- a/runtime/src/settings_overlay.cpp
++++ b/runtime/src/settings_overlay.cpp
+@@ -1,6 +1,7 @@
+ #include "settings_overlay.h"
+ #include "match_benchmark.h"
+ #include "stadium_viewer.h"
++#include "season_probe.h"
+ #include "audio_backend.h"
+ #include "aurora_events.h"
+ #include "controller_button_names.h"
+@@ -1705,6 +1706,7 @@ void Draw() noexcept {
+     aurora_wait_for_frame_worker();
+     match_benchmark::OnHostFrame();
+     stadium_viewer::OnHostFrame();
++    season_probe::OnHostFrame();
+     // Also drive the Wii Remote rescan from here: PADRead runs it too, but this
+     // runs once per presented frame whatever the game is doing (e.g. sitting in
+     // its "communications interrupted" prompt without polling pads). Same guest
+diff --git a/runtime/tests/season_probe_tests.cpp b/runtime/tests/season_probe_tests.cpp
+new file mode 100644
+index 0000000..ff209c0
+--- /dev/null
++++ b/runtime/tests/season_probe_tests.cpp
+@@ -0,0 +1,24 @@
++#include "season_probe.h"
++#include <cstdio>
++
++static int failures = 0;
++static void Check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++
++int main() {
++    using season_probe::ParseSeasonIndex;
++    Check(ParseSeasonIndex("0") == 0, "0");
++    Check(ParseSeasonIndex("9") == 9, "9");
++    Check(!ParseSeasonIndex("10"), "10 is past the game's table");
++    Check(!ParseSeasonIndex("-1"), "-1");
++    Check(!ParseSeasonIndex("x"), "x");
++    Check(!ParseSeasonIndex("3x"), "3x");
++    Check(!ParseSeasonIndex(""), "empty");
++    Check(!ParseSeasonIndex(nullptr), "null");
++    if (failures == 0) std::puts("season_probe_tests: OK");
++    return failures != 0;
++}
