@@ -1,0 +1,273 @@
+diff --git a/runtime/include/ppc_runtime.h b/runtime/include/ppc_runtime.h
+index 4816c8c..167daa0 100644
+--- a/runtime/include/ppc_runtime.h
++++ b/runtime/include/ppc_runtime.h
+@@ -12,3 +12,7 @@
+ #include "isa/ppc_isa_int.h"
+ #include "isa/ppc_isa_float.h"
+ #include "isa/ppc_isa_quantized.h"
++
++// translation.immediate_overrides (translator): a listed cmpwi/cmplwi compares against the value
++// this returns instead of its immediate; original is the immediate in the instruction.
++extern "C" int32_t WiicompiledImmediate(uint32_t address, int32_t original);
+diff --git a/translator/src/Translator.Cli/Program.cs b/translator/src/Translator.Cli/Program.cs
+index 67cb216..591085c 100644
+--- a/translator/src/Translator.Cli/Program.cs
++++ b/translator/src/Translator.Cli/Program.cs
+@@ -133,6 +133,7 @@ TranslationOptions WithProjectFrontEndPolicy(
+     options with
+     {
+         AllowUnsupportedInstructions = translation.AllowUnsupportedInstructions,
++        ImmediateOverrides = translation.ImmediateOverrides.Count == 0 ? null : translation.ImmediateOverrides,
+         // Splicing a body whose runtime winner is a native registration, a
+         // dropped translation or a Kamek overlay would silently keep executing
+         // the original bytes.
+@@ -3962,6 +3963,7 @@ static TranslationOptions WithProjectCodegenPolicy(
+     options with
+     {
+         AllowUnsupportedInstructions = translation.AllowUnsupportedInstructions,
++        ImmediateOverrides = translation.ImmediateOverrides.Count == 0 ? null : translation.ImmediateOverrides,
+         // Leaf ABI spill elision is structurally self-guarding: it requires a
+         // matched save/restore pair inside the emitted body of a single-return
+         // leaf, so a partial mod chunk that only carries one half of an ABI
+diff --git a/translator/src/Translator.Cli/TranslationProjectConfig.cs b/translator/src/Translator.Cli/TranslationProjectConfig.cs
+index 980c432..f630340 100644
+--- a/translator/src/Translator.Cli/TranslationProjectConfig.cs
++++ b/translator/src/Translator.Cli/TranslationProjectConfig.cs
+@@ -95,10 +95,18 @@ internal sealed class TranslationProjectConfig
+                 workspaceRoot,
+                 Require(functionMapDto.Path, "translation.function_map.path"));
+         }
++        var immediateOverrides = new Dictionary<uint, long>();
++        foreach (var (item, index) in (dto.Translation?.ImmediateOverrides ?? []).Select((item, index) => (item, index)))
++        {
++            var address = ParseUInt32(item.Address, null, $"translation.immediate_overrides[{index}].address");
++            immediateOverrides[address] = item.Expect
++                ?? throw new InvalidDataException($"translation.immediate_overrides[{index}].expect is required");
++        }
+         var translation = new ProjectTranslation(
+             entryPoints,
+             functionMapPath,
+-            dto.Translation?.AllowUnsupportedInstructions ?? false);
++            dto.Translation?.AllowUnsupportedInstructions ?? false,
++            immediateOverrides);
+ 
+         var abiDirectories = (dto.Runtime?.NativeAbiDirectories ?? [])
+             .Select(pathValue => ResolvePath(workspaceRoot, pathValue))
+@@ -407,6 +415,15 @@ internal sealed class TranslationProjectConfig
+         public List<string>? EntryPoints { get; init; }
+         public FunctionMapDto? FunctionMap { get; init; }
+         public bool? AllowUnsupportedInstructions { get; init; }
++        public List<ImmediateOverrideDto>? ImmediateOverrides { get; init; }
++    }
++
++    // A cmpwi/cmplwi whose immediate the runtime supplies (WiicompiledImmediate); expect is the
++    // original immediate, checked against the instruction so a wrong address fails the build.
++    private sealed class ImmediateOverrideDto
++    {
++        public string? Address { get; init; }
++        public long? Expect { get; init; }
+     }
+ 
+     private sealed class FunctionMapDto
+@@ -477,7 +494,8 @@ internal sealed record ProjectInputs(ProjectBinaryInput Dol, ProjectRelInput? Re
+ internal sealed record ProjectTranslation(
+     IReadOnlyList<uint> EntryPoints,
+     string? FunctionMapPath,
+-    bool AllowUnsupportedInstructions);
++    bool AllowUnsupportedInstructions,
++    IReadOnlyDictionary<uint, long> ImmediateOverrides);
+ internal sealed record ProjectRuntime(
+     IReadOnlyList<string> NativeAbiDirectories,
+     string NativeRegistrationRoot);
+diff --git a/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.Expressions.cs b/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.Expressions.cs
+index 6884b6a..7f5d366 100644
+--- a/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.Expressions.cs
++++ b/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.Expressions.cs
+@@ -120,6 +120,11 @@ public sealed partial class CxxLinearCodeGenerator
+             return val.Constant.Value.ToString();
+         }
+ 
++        if (val.Kind == "runtime_immediate" && val.Constant is { } packed)
++        {
++            return $"WiicompiledImmediate(0x{(uint)(packed >> 32):X8}u, {(int)(uint)packed})";
++        }
++
+         if (val.Kind != "register" || val.RegisterName == null)
+         {
+             return "0";
+diff --git a/translator/src/Translator.Core/Ir/IrNodes.cs b/translator/src/Translator.Core/Ir/IrNodes.cs
+index 9e3866c..d63d272 100644
+--- a/translator/src/Translator.Core/Ir/IrNodes.cs
++++ b/translator/src/Translator.Core/Ir/IrNodes.cs
+@@ -116,6 +116,13 @@ public sealed record IrValue(string Kind, string? RegisterName = null, long? Con
+ {
+     public static IrValue Register(string name) => new("register", RegisterName: name);
+     public static IrValue Imm(long value) => new("const", Constant: value);
++
++    /// <summary>
++    /// An immediate the runtime supplies: <c>WiicompiledImmediate(address, original)</c>. Constant
++    /// packs the instruction address (high 32 bits) and the original immediate (low 32 bits).
++    /// </summary>
++    public static IrValue RuntimeImmediate(uint address, int original) =>
++        new("runtime_immediate", Constant: ((long)address << 32) | (uint)original);
+ }
+ 
+ public sealed record IrBasicBlock(string Label, IReadOnlyList<IrInstruction> Instructions);
+diff --git a/translator/src/Translator.Core/Lifting/PpcLifter.cs b/translator/src/Translator.Core/Lifting/PpcLifter.cs
+index 4d41475..afdba9f 100644
+--- a/translator/src/Translator.Core/Lifting/PpcLifter.cs
++++ b/translator/src/Translator.Core/Lifting/PpcLifter.cs
+@@ -16,7 +16,8 @@ public sealed partial class PpcLifter
+         IReadOnlyList<PpcInstruction> instructions,
+         bool allowUnsupported = false,
+         uint? functionEntryPoint = null,
+-        IReadOnlySet<uint>? knownFunctionEntryPoints = null)
++        IReadOnlySet<uint>? knownFunctionEntryPoints = null,
++        IReadOnlyDictionary<uint, long>? immediateOverrides = null)
+     {
+         var validAddresses = new HashSet<uint>(instructions.Select(i => i.Address));
+         var instructionsByAddress = instructions.ToDictionary(i => i.Address);
+@@ -29,7 +30,8 @@ public sealed partial class PpcLifter
+                 instructionsByAddress,
+                 allowUnsupported,
+                 functionEntryPoint,
+-                knownFunctionEntryPoints);
++                knownFunctionEntryPoints,
++                immediateOverrides);
+             result.Add(new LiftedInstruction(ins, ir));
+         }
+         return result;
+@@ -77,13 +79,28 @@ public sealed partial class PpcLifter
+         return args;
+     }
+ 
++    private static IrValue CompareImmediate(PpcInstruction ins, long value, IReadOnlyDictionary<uint, long>? overrides)
++    {
++        if (overrides is null || !overrides.TryGetValue(ins.Address, out var expected))
++        {
++            return IrValue.Imm(value);
++        }
++        if (expected != value)
++        {
++            throw new InvalidOperationException(
++                $"immediate override @ 0x{ins.Address:X8}: '{ins.Mnemonic}' has immediate {value}, the config expects {expected}");
++        }
++        return IrValue.RuntimeImmediate(ins.Address, checked((int)value));
++    }
++
+     private static IReadOnlyList<IrInstruction> LiftInstruction(
+         PpcInstruction ins,
+         HashSet<uint> validAddresses,
+         IReadOnlyDictionary<uint, PpcInstruction> instructionsByAddress,
+         bool allowUnsupported,
+         uint? functionEntryPoint,
+-        IReadOnlySet<uint>? knownFunctionEntryPoints)
++        IReadOnlySet<uint>? knownFunctionEntryPoints,
++        IReadOnlyDictionary<uint, long>? immediateOverrides)
+     {
+         var mnemonic = ins.Mnemonic.ToLowerInvariant();
+         var ops = ins.Operands ?? Array.Empty<PpcOperand>();
+@@ -841,7 +858,7 @@ public sealed partial class PpcLifter
+                     var dest = operands.Count == 3 ? operands[0] : "cr0";
+                     var rA = operands.Count == 3 ? operands[1] : operands[0];
+                     var uimm = operands.Count == 3 ? operands[2] : operands[1];
+-                    return LiftCompare(dest, IrValue.Register(rA), IrValue.Imm(MaskUimm(ParseImmediate(uimm))), "sub_u", isUnsigned: true);
++                    return LiftCompare(dest, IrValue.Register(rA), CompareImmediate(ins, MaskUimm(ParseImmediate(uimm)), immediateOverrides), "sub_u", isUnsigned: true);
+                 }
+ 
+             case "cmpwi" when operands.Count >= 2:
+@@ -849,7 +866,7 @@ public sealed partial class PpcLifter
+                     var dest = operands.Count == 3 ? operands[0] : "cr0";
+                     var rA = operands.Count == 3 ? operands[1] : operands[0];
+                     var simm = operands.Count == 3 ? operands[2] : operands[1];
+-                    return LiftCompare(dest, IrValue.Register(rA), IrValue.Imm(SignExtend16(ParseImmediate(simm))), "sub", isUnsigned: false);
++                    return LiftCompare(dest, IrValue.Register(rA), CompareImmediate(ins, SignExtend16(ParseImmediate(simm)), immediateOverrides), "sub", isUnsigned: false);
+                 }
+ 
+             case "cmplw" when operands.Count == 2:
+diff --git a/translator/src/Translator.Core/Translation/FunctionTranslator.cs b/translator/src/Translator.Core/Translation/FunctionTranslator.cs
+index 34bb2aa..71f467e 100644
+--- a/translator/src/Translator.Core/Translation/FunctionTranslator.cs
++++ b/translator/src/Translator.Core/Translation/FunctionTranslator.cs
+@@ -70,7 +70,12 @@ public sealed record TranslationOptions(
+     /// acyclic and every exit is a plain return. Emergency opt-out; the
+     /// straight-line shape keeps working with this off.
+     /// </summary>
+-    bool LeafInliningAllowMultiBlockCallees = true)
++    bool LeafInliningAllowMultiBlockCallees = true,
++    /// <summary>
++    /// Compare instructions (cmpwi/cmplwi) whose immediate the runtime decides: address to the
++    /// expected original immediate. They emit <c>WiicompiledImmediate(address, original)</c>.
++    /// </summary>
++    IReadOnlyDictionary<uint, long>? ImmediateOverrides = null)
+ {
+     public static TranslationOptions Default { get; } = new();
+ }
+@@ -285,7 +290,8 @@ public sealed class FunctionTranslator
+             instructions,
+             options.AllowUnsupportedInstructions,
+             entryPoint,
+-            options.KnownFunctionEntryPoints);
++            options.KnownFunctionEntryPoints,
++            options.ImmediateOverrides);
+         if (metrics is not null)
+         {
+             var unsupported = 0;
+diff --git a/translator/tests/Translator.Tests/ImmediateOverrideTests.cs b/translator/tests/Translator.Tests/ImmediateOverrideTests.cs
+new file mode 100644
+index 0000000..9c57946
+--- /dev/null
++++ b/translator/tests/Translator.Tests/ImmediateOverrideTests.cs
+@@ -0,0 +1,51 @@
++using System;
++using System.Collections.Generic;
++using Translator.Core.Translation;
++using Xunit;
++
++namespace Translator.Tests;
++
++// translation.immediate_overrides: a listed cmpwi/cmplwi reads its immediate from the runtime
++// (WiicompiledImmediate(address, original)) instead of the constant in the instruction.
++public sealed class ImmediateOverrideTests
++{
++    private const uint Entry = 0x80001000;
++
++    private static string Translate(IReadOnlyDictionary<uint, long>? overrides)
++    {
++        var image = TranslatorCppTestHarness.CreateImage(
++            (Entry + 0x00, 0x2C030009), // cmpwi r3, 9
++            (Entry + 0x04, 0x41820008), // beq +8
++            (Entry + 0x08, 0x38600001), // li r3, 1
++            (Entry + 0x0C, 0x4E800020)); // blr
++        return new FunctionTranslator(image).Translate(
++            Entry,
++            TranslationOptions.Default with
++            {
++                MaxBytes = 0x10,
++                AllowUnsupportedInstructions = true,
++                ImmediateOverrides = overrides
++            }).CxxCode;
++    }
++
++    [Fact]
++    public void ListedCompareReadsItsImmediateFromTheRuntime()
++    {
++        var code = Translate(new Dictionary<uint, long> { [Entry] = 9 });
++        Assert.Contains("WiicompiledImmediate(0x80001000u, 9)", code, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void UnlistedCompareKeepsItsConstant()
++    {
++        var code = Translate(null);
++        Assert.DoesNotContain("WiicompiledImmediate", code, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void ExpectedImmediateMismatchFailsNamingTheAddress()
++    {
++        var error = Assert.ThrowsAny<Exception>(() => Translate(new Dictionary<uint, long> { [Entry] = 8 }));
++        Assert.Contains("0x80001000", error.ToString(), StringComparison.Ordinal);
++    }
++}
