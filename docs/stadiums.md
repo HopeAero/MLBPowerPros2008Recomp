@@ -4,7 +4,7 @@
 
 El complemento **«Estadios de MLB Power Pros 2008»** abre en Blender cualquier estadio de tu juego: cada pieza en su sitio y con sus texturas, y la malla de colisión del campo.
 
-También **exporta**: lo que cambies en las piezas y en la colisión vuelve al juego como un mod. Y puede meter en el juego **un estadio tuyo** hecho en SketchUp, Blender u otro programa (ver «Tu propio modelo»). El formato está descrito en `docs/ingenieria-inversa.md`, sección 5, «Estadios».
+También **exporta**: lo que cambies en las piezas y en la colisión vuelve al juego como un mod. Y puede meter en el juego **un estadio tuyo** hecho en SketchUp, Blender u otro programa, escrito entero desde tu modelo (ver «Tu propio modelo»). El formato está descrito en `docs/ingenieria-inversa.md`, sección 5, «Estadios».
 
 ## Instalar
 
@@ -76,7 +76,7 @@ Qué hace al exportar:
 - **Banderas:** si borras las banderas (`DP_FLG_*`) del estadio base, el exportador encoge su colocación hasta hacerlas invisibles. El juego las dibuja a partir de la colocación de la tabla, no de su malla, y sin prueba de profundidad: borradas o enterradas seguían viéndose.
 - **Menú de elección de estadio** (estadio nuevo): con **Foto del menú** (activado por defecto) el exportador renderiza tu estadio desde detrás del plato, con una vista cenital difuminada a la izquierda como las fotos del juego, y escribe `project\env_stadium_menu_<código>.pack`. **Línea bajo la foto** es el texto verde de debajo, por ejemplo «Home of the Miami Marlins»; vacía, no sale ninguna. Antes se veían la foto y la línea del estadio base.
 
-Aún no: objetos sueltos que no vinieron del juego. El exportador los ignora: pásalos antes por **Convertir objetos en piezas** (abajo).
+En un estadio importado, los objetos sueltos que no vinieron del juego se ignoran: pásalos antes por **Convertir objetos en piezas** («Otra vía», abajo), o haz el estadio desde cero («Tu propio modelo»).
 
 Un material nuevo con una imagen sí se exporta: se crea en la pieza con esa imagen como textura nueva.
 
@@ -90,75 +90,33 @@ Lo que se ve bien en Blender puede verse distinto en el juego. **Ver en el juego
 - **Colisión (C):** dibuja encima la colisión del estadio, la que usan la pelota y los jugadores, como líneas que se ven a través de todo, con un color por tipo de superficie: paredes invisibles de foul y de home run, límite exterior, césped, tierra, montículo, vallas, gradas, techos, postes de foul y backstop. Abajo a la izquierda, una leyenda con los triángulos de cada tipo y una casilla para ver u ocultar cada uno (clic izquierdo), con «Todo» y «Nada». Las paredes invisibles (foul, home run y límite exterior) empiezan ocultas, porque miden 70 m y lo tapan todo. Sirve con la cámara libre y con las del partido. Así se ve si las vallas y paredes invisibles coinciden con tu modelo.
 - Pulsar el botón otra vez cierra el juego que abrió antes y lo abre con tus cambios.
 - Usa su propia caché (unos 400 MB en `UserData/Cache/preview`), así que no rehace la del juego normal. Solo carga el estadio que estás haciendo: tus otros mods no se activan.
-- Hace falta haber importado el estadio desde la carpeta del juego instalado (la que tiene `WiiCompiled.exe`); si no, el botón lo dice.
+- Hace falta haber importado el estadio, o creado el estadio desde cero, eligiendo la carpeta del juego instalado (la que tiene `WiiCompiled.exe`); si no, el botón lo dice.
 - Mientras la ventana del juego está activa, recibe tus teclas: si escribes en otro sitio sin cambiar de ventana, la cámara se mueve.
-- **Para qué sirve:** ver lo que el juego hace con tu modelo sin jugar un partido. Con el Polo Grounds (18 de octubre de 2026) enseñó tres fallos que en Blender no se veían: texturas perdidas al convertir, gradas grises y torres a rayas (ver «Límites» y «Por qué hace falta un estadio base»). Los tres están corregidos en el complemento 0.7.3.
+- **Para qué sirve:** ver lo que el juego hace con tu modelo sin jugar un partido. Con el Polo Grounds (18 de octubre de 2026) enseñó tres fallos que en Blender no se veían: texturas perdidas al convertir, gradas grises y torres a rayas (ver «Límites de piezas y texturas»). Los tres están corregidos en el complemento 0.7.3.
 
 ## Tu propio modelo (SketchUp, glTF, OBJ…)
 
-Puedes llevar al juego un estadio que no existe en él.
+Puedes llevar al juego un estadio que no existe en él. El complemento escribe el estadio **entero desde tu modelo** (desde la versión 0.8.0): no hace falta vaciar ni rellenar un estadio del juego. Del juego solo se toman unas pocas cosas que tu modelo no puede aportar (ver «Qué se toma del juego»).
 
-1. **Importa un estadio del juego** como base. Pon el que quieras que aporte sus datos de juego (medidas, menú, partidas); por ejemplo, AT&T Park para un estadio de los Giants.
-2. **Importa tu modelo** en la misma escena: Archivo > Importar > glTF, OBJ, FBX…
+**Traer el modelo a Blender:**
+- **Impórtalo** en la misma escena: Archivo > Importar > glTF, OBJ, FBX…
    - **SketchUp** (`.skp`): conviértelo antes a `.glb`. Por ejemplo, con [OpenSKP](https://github.com/iamahsanmehmood/openskp) (código abierto, MIT): `pip install openskp pillow` y luego `python -c "from openskp import SkpFile; from openskp.export import glb; s = SkpFile.open('estadio.skp'); s.parse(); glb.export(s, 'estadio.glb', textures=True)"`. Sale en milímetros: escálalo a 0,001.
      - OpenSKP da el color de la capa (`Layer0`, rojo) a las caras con el material por defecto de SketchUp cuando no resuelve el material de su grupo. Si ves caras rojas que en SketchUp no lo son, dales en Blender su color de SketchUp antes de convertir. En el Polo Grounds eran el verde `[Color_G19]` de los techos.
      - OpenSKP también escribe los colores sRGB como si fueran lineales: en Blender se ven más claros que en SketchUp.
    - Borra lo que no sea el estadio, como fotos aéreas, terreno lejano o personas.
-3. **Colócalo como el estadio del juego:**
+- **Colócalo como el estadio del juego:**
    - en metros;
    - con el plato en el origen, el suelo a la altura 0 y la segunda base hacia +Y.
    - Compruébalo con las bases de tu modelo: del plato a primera y a tercera hay 27,43 m (90 pies), y a la goma 18,44 m. Muchos modelos no están a escala: si tus bases están más lejos, escala todo el modelo hasta que cuadren.
    - Es importante porque el juego no lee del estadio dónde están las bases ni la caja de bateo: pone a los jugadores siempre en el mismo sitio, y tu modelo tiene que coincidir con él.
-4. Selecciona los objetos de tu modelo y pulsa **Convertir objetos en piezas** (panel Power Pros, tecla N):
-   - El suelo del campo va a la pieza de suelo del estadio y todo lo demás a una pieza de gradas, porque el juego solo dibuja las piezas que ya tiene el estadio.
-   - El color de cada material y un sol suave se guardan en el color de los vértices, porque el juego dibuja los estadios sin luz.
-   - Cada cara queda una sola vez y mirando al campo. De dos caras en el mismo sitio (las dos caras de una pared, o una textura pintada sobre una cara sin material, como las exporta SketchUp) queda la que tiene textura y, si ninguna o las dos la tienen, la que mira al campo. La que queda se gira hacia el campo.
-   - Las superficies pegadas a menos de 25 cm de otra paralela, como ventanas o letreros, se separan hasta 25 cm, para que no parpadeen.
-   - Con **Quitar el estadio original** (activado por defecto), las piezas del estadio base desaparecen y solo queda tu modelo. Las piezas con la propiedad `pp_keep` se conservan, por ejemplo una pieza de público en la que hayas puesto tu propio público.
-   - Las bases, el plato y el montículo del juego (piezas `BCL`) se conservan siempre: los jugadores se colocan sobre ellos, y los de un modelo rara vez coinciden (el plato del Mario Stadium medía 1,2 m).
-   - Cada pieza recibe como mucho 30 texturas: las del modelo se reparten entre las gradas del estadio base.
-   - Si el modelo trae una textura pintada sobre una cara sin material, en las mismas esquinas (SketchUp lo hace), se queda la cara con textura.
-   - Las piezas convertidas se ven en Blender como en el juego: textura × color de vértice, sin luz. Usa la vista **Material** (Z > Vista previa de material).
-5. Pulsa **Generar colisión**. Crea la colisión de tu estadio, un objeto por tipo (sustituye la que hubiera, también la hecha con «Convertir en colisión»):
-   - el suelo (césped si es verde, tierra si no) y el montículo;
-   - las vallas, siguiendo la pared más cercana al campo en todas direcciones;
-   - las paredes invisibles sobre las vallas, como las del juego: en territorio fair (1, el home run) y en foul (0);
-   - los postes de foul donde las líneas cortan las vallas;
-   - las gradas, simplificadas a unos 5.000 triángulos, y un límite exterior detrás del outfield.
 
-   Revísala: está oculta, actívala con el ojo o con **Todo** en la caja Colisión. Si algo no cuadra, edítala a mano o añade piezas con «Convertir en colisión».
-6. **Exporta** como estadio nuevo.
-
-Límites:
-- La colisión puede tener hasta 65.535 triángulos.
-- Cada pieza admite hasta 30 texturas, contando las suyas originales; es lo máximo que tiene una pieza en los estadios del juego. «Convertir objetos en piezas» reparte las texturas del modelo entre las gradas del estadio base para no pasar de ahí, y el exportador se niega a escribir una pieza con más. Con 82 en una pieza el juego leía fuera de una tabla, el estadio salía sin vallas y el partido acababa cerrándose.
-- En el pack, las texturas pasan a RGB5A3 y potencias de 2 de hasta 256 píxeles. Con **Texturas HD**, el juego usa la imagen a su tamaño (hasta 2048 píxeles).
-- Las texturas se pueden repetir todo lo que haga falta. Cada textura del pack dice cuántas veces se repite en horizontal y en vertical. Con 1, el juego no la repite: estira el borde. El exportador calcula esos números con las UV de tus caras y antes quita a cada cara las repeticiones enteras que sobran; el dibujo no cambia. Hasta la versión 0.7.2 los copiaba de la primera textura de la pieza: el Polo Grounds sobre AT&T Park salió con las gradas grises y las torres a rayas, y sobre Coors Field bien, por suerte.
-- El generador de colisión supone un campo de béisbol normal: suelo a la altura 0, el centro del campo unos 45 m por delante del plato y paredes alrededor.
-
-## Por qué hace falta un estadio base
-
-Tu modelo no entra en el juego desde cero: entra **dentro de un estadio del juego** (AT&T Park, Coors Field…), que hace de base.
-- **Tu modelo:** toda la geometría. Las piezas de la base se vacían, salvo el plato, las bases y el montículo, porque los jugadores se colocan sobre ellos.
-- **De la base:** el esqueleto que el juego sabe cargar.
-  - la lista de piezas y su papel: suelo, gradas, público, banderas, marcador;
-  - los ajustes internos de materiales y texturas, que el exportador copia como plantilla;
-  - la tabla del estadio: colisión, colocación de piezas y campos aún sin descifrar;
-  - la foto del menú, los datos de juego (medidas, partidas) y los sonidos.
-- **Por qué:** el juego no tiene forma de crear un tipo de estadio nuevo. Solo carga packs con la estructura que ya conoce, así que se rellena uno existente.
-
-Cada campo de la plantilla que se entiende es una cosa menos que se hereda a ciegas. El de las repeticiones de textura (arriba, «Límites») es un ejemplo: venía de la base y estropeaba las texturas en unas bases sí y en otras no.
-
-Desde el complemento 0.8.0 hay otra vía sin estadio base: «Estadio desde cero», abajo.
-
-## Estadio desde cero
-
-Desde el complemento 0.8.0, el pack del estadio se puede escribir entero desde tu modelo, sin vaciar un estadio del juego. Cada objeto lleva un **papel** (suelo, grada, público…) y el exportador construye con ellos las piezas, las texturas y la tabla del estadio.
-
-**Crear el estadio**
+**Crear el estadio:**
 1. Panel **Power Pros** → **Nuevo estadio desde cero**. Elige la carpeta del juego (o `files/project.bin`) y un **estadio de datos**: de él salen las partidas, el menú, el cielo y los sonidos del estadio nuevo, pero ninguna de sus piezas.
-2. Se crea una colección vacía, «Estadio desde cero». Mete en ella tus objetos (mallas, curvas, textos…), en metros, con el plato en el origen, el suelo a la altura 0 y la segunda base hacia +Y, como en «Tu propio modelo».
-3. Con un objeto seleccionado, el panel muestra su **papel** y la casilla **Ocultar en bateo y desde arriba**.
+2. Se crea una colección, «Estadio desde cero», que ya trae **las bases, el plato y el montículo del juego** en su sitio: ajusta tu modelo a ellos.
+3. Mete tus objetos (mallas, curvas, textos…) en esa colección, ya colocados.
+4. Con un objeto seleccionado, el panel muestra su **papel** y la casilla **Ocultar en bateo y desde arriba**.
+5. Pulsa **Generar colisión** y revísala (ver «Colisión del estadio»).
+6. **Exportar mod de estadio** con la colección seleccionada: siempre como estadio nuevo, con su código y nombre. Pruébalo antes con **Ver en el juego**.
 
 **Papeles**
 | Papel | Qué hace en el juego |
@@ -176,11 +134,7 @@ Desde el complemento 0.8.0, el pack del estadio se puede escribir entero desde t
 - Los objetos con el mismo papel (y la misma casilla) se juntan en una pieza; con más de 30 texturas se parte en varias. Cada bandera va sola.
 - **Bases, plato y montículo del juego:** «Nuevo estadio desde cero» los pone en la colección (piezas `BCL` del estadio de datos, bloqueadas), para que ajustes tu modelo a ellos: los jugadores se colocan siempre ahí. Se exportan tal cual y en su sitio. Si tu modelo trae los suyos, borra los de tu modelo (se pisarían con los del juego) o borra la pieza del juego que no quieras: solo se exportan las que sigan en la colección (complemento 0.8.1).
 - **Suelo por capas:** el juego dibuja el suelo sin prueba de profundidad, en orden. El exportador pone las capas de abajo arriba (por la altura media de cada material), así la tierra del cuadro, encima del césped, se ve. Antes del 0.8.1 la tierra del Polo Grounds quedaba tapada por un plano de césped 4 cm más abajo.
-- **Colisión:** como en «Tu propio modelo», con **Generar colisión**, o la genera el exportador si no la hay.
-
-**Exportar y probar**
-- **Exportar mod de estadio** con la colección seleccionada: siempre como estadio nuevo, con su código y nombre.
-- **Ver en el juego** funciona igual que con un estadio importado.
+- **Colisión:** pulsa **Generar colisión** (abajo, «Colisión del estadio»), o la genera el exportador si no la hay.
 
 **Comprobado en el juego** (19 de octubre de 2026, colección de prueba con todos los papeles): se ve en el visor desde la vista del bateador, desde arriba y desde las gradas, y se juega un partido de 2 minutos a 60 FPS sin errores. El público se anima, las banderas giran con el viento, lo transparente se ve a través y el brillo suma luz.
 
@@ -188,11 +142,57 @@ Desde el complemento 0.8.0, el pack del estadio se puede escribir entero desde t
 - **Consejo:** si el campo está unido a las gradas en un mismo objeto, sepáralo (modo edición, seleccionar el césped, P > Selección). Así «Automático» lo hace suelo y se dibuja como capa de fondo.
 - Las banderas del modelo salen como geometría quieta: para que el viento las mueva, dales el papel Banderas. Las gradas salen vacías: el papel Público pone la gente animada del juego.
 
-**Límites**
+**Límites:**
 - El público no puede llevar imagen propia: el juego anima siempre sus personas.
 - Una bandera es siempre un rectángulo: su forma en Blender no cuenta.
 - Hasta 127 piezas: con más, el orden de dibujo no está asegurado (el exportador avisa).
 - Lo que el juego hace de noche (focos, luces de las gradas) no se ha probado.
+
+**Límites de piezas y texturas** (también en «Otra vía»):
+- La colisión puede tener hasta 65.535 triángulos.
+- Cada pieza admite hasta 30 texturas, contando las suyas originales; es lo máximo que tiene una pieza en los estadios del juego. El exportador parte las piezas para no pasar de ahí y se niega a escribir una pieza con más. Con 82 en una pieza el juego leía fuera de una tabla, el estadio salía sin vallas y el partido acababa cerrándose.
+- En el pack, las texturas pasan a RGB5A3 y potencias de 2 de hasta 256 píxeles. Con **Texturas HD**, el juego usa la imagen a su tamaño (hasta 2048 píxeles).
+- Las texturas se pueden repetir todo lo que haga falta. Cada textura del pack dice cuántas veces se repite en horizontal y en vertical. Con 1, el juego no la repite: estira el borde. El exportador calcula esos números con las UV de tus caras y antes quita a cada cara las repeticiones enteras que sobran; el dibujo no cambia. Hasta la versión 0.7.2 los copiaba de la primera textura de la pieza: el Polo Grounds sobre AT&T Park salió con las gradas grises y las torres a rayas, y sobre Coors Field bien, por suerte.
+- El generador de colisión supone un campo de béisbol normal: suelo a la altura 0, el centro del campo unos 45 m por delante del plato y paredes alrededor.
+
+## Colisión del estadio
+
+**Generar colisión** (panel Power Pros) crea la colisión de tu estadio, un objeto por tipo. Sustituye la que hubiera, también la hecha con «Convertir en colisión».
+- el suelo (césped si es verde, tierra si no) y el montículo;
+- las vallas, siguiendo la pared más cercana al campo en todas direcciones;
+- las paredes invisibles sobre las vallas, como las del juego: en territorio fair (1, el home run) y en foul (0);
+- los postes de foul donde las líneas cortan las vallas;
+- las gradas, simplificadas a unos 5.000 triángulos, y un límite exterior detrás del outfield.
+
+En un estadio desde cero no cuentan las banderas, lo transparente ni el brillo aditivo; sí las curvas y los modificadores. Revísala: está oculta, actívala con el ojo o con **Todo** en la caja Colisión. Si algo no cuadra, edítala a mano o añade piezas con **Convertir en colisión**, y compruébala con **C** en «Ver en el juego».
+
+## Otra vía: dentro de un estadio del juego
+
+Antes de la versión 0.8.0 era la única forma: el modelo entraba **dentro de un estadio del juego** (AT&T Park, Coors Field…), cuyas piezas se vaciaban y se rellenaban con tu geometría. Sigue disponible, pero «Tu propio modelo» da mejores resultados: con esta vía el modelo hereda del estadio base sus piezas de público y banderas, el orden de dibujo y algunos ajustes que no se ven.
+
+1. **Importa un estadio del juego** como base (aporta sus datos de juego: medidas, menú, partidas).
+2. Importa y coloca tu modelo como arriba.
+3. Selecciona los objetos de tu modelo y pulsa **Convertir objetos en piezas** (panel Power Pros, tecla N):
+   - El suelo del campo va a la pieza de suelo del estadio y todo lo demás a una pieza de gradas, porque el juego solo dibuja las piezas que ya tiene el estadio.
+   - El color de cada material y un sol suave se guardan en el color de los vértices, porque el juego dibuja los estadios sin luz.
+   - Cada cara queda una sola vez y mirando al campo. De dos caras en el mismo sitio (las dos caras de una pared, o una textura pintada sobre una cara sin material, como las exporta SketchUp) queda la que tiene textura y, si ninguna o las dos la tienen, la que mira al campo. La que queda se gira hacia el campo.
+   - Las superficies pegadas a menos de 25 cm de otra paralela, como ventanas o letreros, se separan hasta 25 cm, para que no parpadeen.
+   - Con **Quitar el estadio original** (activado por defecto), las piezas del estadio base desaparecen y solo queda tu modelo. Las piezas con la propiedad `pp_keep` se conservan, por ejemplo una pieza de público en la que hayas puesto tu propio público.
+   - Las bases, el plato y el montículo del juego (piezas `BCL`) se conservan siempre: los jugadores se colocan sobre ellos, y los de un modelo rara vez coinciden (el plato del Mario Stadium medía 1,2 m).
+   - Cada pieza recibe como mucho 30 texturas: las del modelo se reparten entre las gradas del estadio base.
+   - Si el modelo trae una textura pintada sobre una cara sin material, en las mismas esquinas (SketchUp lo hace), se queda la cara con textura.
+   - Las piezas convertidas se ven en Blender como en el juego: textura × color de vértice, sin luz. Usa la vista **Material** (Z > Vista previa de material).
+4. Pulsa **Generar colisión** (ver «Colisión del estadio») y revísala.
+5. **Exporta** como estadio nuevo.
+
+## Qué se toma del juego
+
+Un estadio desde cero se escribe entero desde tu modelo: piezas, texturas, materiales, colisión y la tabla del estadio. Del **estadio de datos** que eliges al crearlo solo se toma lo que el juego necesita y tu modelo no puede aportar:
+- **las bases, el plato y el montículo** (piezas `BCL`), porque el juego pone a los jugadores siempre en el mismo sitio;
+- **las texturas precargadas** del marcador, la pantalla y el público: el juego anima a su público solo a través de ellas;
+- **la foto del menú, las partidas, el cielo y los sonidos** del estadio.
+
+El juego tiene una lista fija de 40 estadios: un estadio nuevo usa el número de su estadio de datos para las partidas, el menú y los datos de juego, así que desactivar el mod nunca rompe una partida (ese partido vuelve al estadio de datos). Cómo se descifró cada campo de los packs: `docs/ingenieria-inversa.md`, «Escribir packs desde cero» y «Qué hacen los campos».
 
 ## Cómo hacer un modelo que funcione bien en el juego
 
@@ -208,22 +208,28 @@ Lo aprendido al meter el Polo Grounds, un modelo de SketchUp descargado (14 y 15
 - **Sin geometría fina:** filas de sillas, barandillas o mástiles de pocos cm miden menos de un píxel a distancia y salen rotos. Los asientos son una rampa con textura de asientos, y los mástiles deben tener al menos unos 30 cm.
 - **Pocos triángulos:** un estadio del juego tiene unos 10.000. Uno de 40.000 funciona en PC, pero cuesta más dibujarlo y que se vea limpio.
 
-**Recomendación para hacerlo desde cero (en Blender):**
-1. Importa el estadio base del juego. Su campo, sus medidas y sus piezas son tu plantilla de escala y de estilo.
+**Recomendación para modelarlo en Blender:**
+1. Crea el estadio con **Nuevo estadio desde cero**: las bases, el plato y el montículo del juego te dan la escala. Si quieres comparar con un estadio real del juego, impórtalo en otra escena.
 2. Modela las gradas como rampas lisas (unos 18°, como las del juego) y aplícales una textura de asientos pequeña que se repita.
-3. Para el público, coloca caras sobre las rampas y dentro de las piezas de público del estadio base (`DP_AudienceF_*`, tumbadas sobre la grada, y `DP_AudienceS_*`, carteles verticales), con sus mismos materiales. Las del juego repiten la textura cada 6 m de ancho y cada 3–4 m de alto.
-4. Paredes, techos y fachadas: cajas sencillas con colores lisos o texturas pequeñas; detalles grandes, nada de piezas de centímetros.
+3. Para el público, pon caras sobre las rampas con el papel **Público tumbado** (gradas) o **Público vertical** (carteles de pie): el juego dibuja ahí su gente animada. Las del juego repiten la textura cada 6 m de ancho y cada 3–4 m de alto.
+4. Paredes, techos y fachadas: cajas sencillas con colores lisos o texturas pequeñas; detalles grandes, nada de piezas de centímetros. Lo lejano, con **Ocultar en bateo y desde arriba**.
 5. Ajusta las vallas a las medidas que quieras (líneas, jardines intermedios, centro) y pon los letreros de distancia a 25 cm de la pared.
-6. Convierte, genera la colisión, revisa las vallas y exporta como estadio nuevo.
+6. Genera la colisión, revisa las vallas con **C** en «Ver en el juego» y exporta.
+
+**Resuelto desde entonces** (fases 2 y 3, 18-19 de octubre de 2026; detalles en `docs/ingenieria-inversa.md`):
+- El público puesto en las piezas de público de AT&T no se veía porque el juego anima su público solo a través de las texturas precargadas del estadio: el papel **Público** lo usa.
+- Los flags de colocación: `0x1600`/`0x1700` son el público animado, `0x80000000` (`NOUPCAM`) oculta la pieza en la vista del bateador y en las cámaras altas, `0x500` son las banderas.
 
 **Sin resolver todavía:**
-- El público puesto en las piezas de público de AT&T no se llegó a ver en un partido (en Blender sí). Falta saber cuándo dibuja el juego esas piezas.
-- El efecto de los flags de colocación (`0x40000000` en las gradas altas detrás del plato, `0x80000000`/`0x20000000` en las piezas `NOUPCAM`/`EVC`, `0x1600`/`0x1700` en el público). El convertidor no pone nada en piezas con los tres primeros.
+- Lo que hacen `0x40000000` (gradas altas detrás del plato) y `0x20000000` (`EVC`): quitarlos no cambió nada desde las vistas probadas.
 - Si la pelota y el home run usan la colisión nueva o datos del estadio base: un home run al centro del Polo Grounds cayó a 400 pies, que es lo que medían allí sus vallas.
+- Lo que el juego hace de noche (focos y luces de las gradas).
 
 ## Reglas
 
 Los `.blend` con estadios importados contienen modelos y texturas del juego. Úsalos para tu mod, pero **no los compartas**. Un mod de estadio repartirá solo sus `.pack` modificados, igual que los uniformes (`docs/mods.md`).
+
+Un estadio desde cero también lleva algo del juego: las bases, el plato y el montículo y las texturas precargadas (marcador, pantalla y público) del estadio de datos van dentro de su pack. Es poco, pero es contenido del juego: tenlo en cuenta antes de compartir el mod.
 
 ## Para desarrolladores
 

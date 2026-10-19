@@ -86,16 +86,12 @@ With the Blender add-on you can edit the game's stadiums or bring in one of your
 **Edit a game stadium**
 - Move, rotate or scale pieces, edit their meshes or their images. The `pp_*` properties keep what the export needs: do not delete them.
 
-**Bring in your own model** (SketchUp, glTF, OBJ…)
-1. Import the base stadium and your model into the same scene. A `.skp` is turned into `.glb` first with OpenSKP.
-2. Place it in metres, with home plate at the origin, the ground at height 0, second base towards +Y and 90 ft between bases. The game always puts the players in the same place.
-3. Select your model and press **Convert objects to pieces**. Then **Generate collision**. The collision comes as one object per kind (fences, stands, poles…), shown or hidden in the panel's Collision box; **Make collision** turns any mesh into collision.
-4. Why a base stadium is needed: the game can only load stadiums with the structure it already knows, so your model goes inside an existing one. [stadiums.md](stadiums.md), «Why a base stadium is needed», explains it.
-
-**Stadium from scratch** (add-on 0.8.0)
-1. **Power Pros** panel → **New stadium from scratch**: creates an empty collection; you pick a data stadium that only brings saves, menu, sky and sounds.
-2. Put your objects in it and give each its **role**: ground, stand, fence, crowd (the game puts its animated people), flags, transparent or additive glow.
-3. Export it as a new stadium. Roles and limits: [stadiums.md](stadiums.md), «Stadium from scratch».
+**Bring in your own model** (SketchUp, glTF, OBJ…), from scratch
+1. **Power Pros** panel → **New stadium from scratch**. You pick a **data stadium**, which only brings saves, menu, sky and sounds; the new collection already holds the game's bases, plate and mound.
+2. Import your model (a `.skp` is turned into `.glb` first with OpenSKP) and put it in that collection, in metres, with home plate at the origin, the ground at height 0, second base towards +Y and 90 ft between bases, fitted to the game's bases.
+3. Give each object its **role**: ground, stand, fence, crowd (the game puts its animated people), flags (they move with the wind), transparent or additive glow.
+4. **Generate collision**: it comes as one object per kind (fences, stands, poles…), shown or hidden in the panel's Collision box; **Make collision** turns any mesh into collision.
+5. The stadium is written entirely from your model. What is taken from the game, and the other route, putting the model inside a game stadium with "Convert objects to pieces": [stadiums.md](stadiums.md), «Your own model».
 
 **See how it looks in the game, without playing a match**
 1. Put the 3D view where you want to start.
@@ -104,7 +100,7 @@ With the Blender add-on you can edit the game's stadiums or bring in one of your
 4. Change something in Blender and press again: the previous game closes and opens with the change. Your `mods` folder and your settings are left alone.
 
 **Export**
-1. **Export stadium mod** → **New stadium**, with a short code (for example `polo`) and a name.
+1. **Export stadium mod**, with a short code (for example `polo`) and a name. A stadium from scratch always comes out as a new stadium; one imported from the game, as **New stadium** or **Replace a stadium**.
 2. Pick the game's `mods` folder. Optional: **Menu photo** and the line under the photo («Home of …»).
 3. Enable it in MODS and pick it in Exhibition.
 

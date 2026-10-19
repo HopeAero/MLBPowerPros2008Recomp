@@ -76,7 +76,7 @@ What exporting does:
 - **Flags:** if you delete the base stadium's flags (`DP_FLG_*`), the exporter shrinks their placement until they are invisible. The game draws them from the table placement, not from their mesh, and without depth test: deleted or buried they still showed.
 - **Stadium select menu** (new stadium): with **Menu photo** (on by default) the exporter renders your stadium from behind home plate, with a faded overhead view on the left like the game's photos, and writes `project\env_stadium_menu_<code>.pack`. **Line under the photo** is the green text below it, for example "Home of the Miami Marlins"; empty shows none. Before, the base stadium's photo and line showed.
 
-Not yet: loose objects that didn't come from the game. The exporter ignores them: run them through **Convert objects to pieces** (**Convertir objetos en piezas**) first (below).
+In an imported stadium, loose objects that didn't come from the game are ignored: run them through **Convert objects to pieces** (**Convertir objetos en piezas**, «Another route» below) first, or make the stadium from scratch («Your own model»).
 
 A new material with an image does get exported: it is created in the piece with that image as a new texture.
 
@@ -90,75 +90,33 @@ What looks right in Blender may look different in the game. **View in game** (th
 - **Collision (C):** draws the stadium's collision on top, the one the ball and players use, as lines seen through everything, with one colour per surface type: foul and home run invisible walls, outer limit, grass, dirt, mound, fences, stands, roofs, foul poles and backstop. Bottom left, a legend with the triangles of each type and a box to show or hide each (left click), with «All» and «None». The invisible walls (foul, home run and outer limit) start hidden: they are 70 m tall and cover everything. It works with the free camera and the match ones. It shows whether the fences and invisible walls match your model.
 - Pressing the button again closes the game it opened before and opens it with your changes.
 - It uses its own cache (about 400 MB in `UserData/Cache/preview`), so the normal game's cache is not rebuilt. It loads only the stadium you are making: your other mods are not enabled.
-- The stadium must have been imported from the installed game folder (the one with `WiiCompiled.exe`); otherwise the button says so.
+- The stadium must have been imported, or the stadium from scratch created, from the installed game folder (the one with `WiiCompiled.exe`); otherwise the button says so.
 - While the game window is active it gets your keys: if you type somewhere else without switching windows, the camera moves.
-- **What it is for:** seeing what the game does with your model without playing a match. With the Polo Grounds (18 October 2026) it showed three faults Blender did not: textures lost when converting, grey stands and striped towers (see «Limits» and «Why a base stadium is needed»). All three are fixed in add-on 0.7.3.
+- **What it is for:** seeing what the game does with your model without playing a match. With the Polo Grounds (18 October 2026) it showed three faults Blender did not: textures lost when converting, grey stands and striped towers (see «Piece and texture limits»). All three are fixed in add-on 0.7.3.
 
 ## Your own model (SketchUp, glTF, OBJ…)
 
-You can bring a stadium that doesn't exist in the game into it.
+You can bring a stadium that doesn't exist in the game into it. The add-on writes the stadium **entirely from your model** (since version 0.8.0): no game stadium has to be emptied and filled. Only a few things your model cannot provide are taken from the game (see «What is taken from the game»).
 
-1. **Import a stadium from the game** as a base. Pick the one you want to provide its game data (dimensions, menu, saves); for example, AT&T Park for a Giants stadium.
-2. **Import your model** into the same scene: File > Import > glTF, OBJ, FBX…
+**Bring the model into Blender:**
+- **Import it** into the scene: File > Import > glTF, OBJ, FBX…
    - **SketchUp** (`.skp`): convert it to `.glb` first. For example, with [OpenSKP](https://github.com/iamahsanmehmood/openskp) (open source, MIT): `pip install openskp pillow` and then `python -c "from openskp import SkpFile; from openskp.export import glb; s = SkpFile.open('estadio.skp'); s.parse(); glb.export(s, 'estadio.glb', textures=True)"`. It comes out in millimeters: scale it to 0.001.
      - OpenSKP gives faces with SketchUp's default material the layer's colour (`Layer0`, red) when it does not resolve their group's material. If you see red faces that are not red in SketchUp, give them their SketchUp colour in Blender before converting. In the Polo Grounds they were the roofs' green `[Color_G19]`.
      - OpenSKP also writes sRGB colours as if they were linear: in Blender they look lighter than in SketchUp.
    - Delete whatever isn't the stadium, such as aerial photos, distant terrain or people.
-3. **Place it like the game's stadium:**
+- **Place it like the game's stadium:**
    - in meters;
    - with home plate at the origin, the ground at height 0 and second base towards +Y.
    - Check it with your model's bases: from home plate to first and to third it is 27.43 m (90 feet), and to the pitcher's rubber 18.44 m. Many models are not to scale: if your bases are farther away, scale the whole model until they match.
    - This matters because the game doesn't read where the bases or the batter's box are from the stadium: it always puts the players in the same place, and your model has to match it.
-4. Select your model's objects and press **Convert objects to pieces** (Power Pros panel, N key):
-   - The field's ground goes into the stadium's ground piece and everything else into a stands piece, because the game only draws the pieces the stadium already has.
-   - Each material's color and a soft sun are stored in the vertex color, because the game draws stadiums without lighting.
-   - Each face is kept only once and facing the field. Of two faces in the same place (the two sides of a wall, or a texture painted over a plain face, as SketchUp exports them) the textured one is kept and, when neither or both are textured, the one facing the field. The kept face is turned to the field.
-   - Surfaces stuck less than 25 cm from another parallel one, such as windows or signs, are separated up to 25 cm, so they don't flicker.
-   - With **Remove original stadium** (**Quitar el estadio original**) (on by default), the base stadium's pieces disappear and only your model remains. Pieces with the `pp_keep` property are kept, for example a crowd piece where you've put your own crowd.
-   - The game's bases, plate and mound (`BCL` pieces) always stay: the players stand on them, and a model's own rarely match (Mario Stadium's plate was 1.2 m).
-   - Each piece gets at most 30 textures: the model's are spread over the base stadium's stands.
-   - If the model has a texture painted over a plain face, on the same corners (SketchUp does this), the textured face is kept.
-   - Converted pieces look in Blender as in the game: texture × vertex colour, unlit. Use the **Material** view (Z > Material Preview).
-5. Press **Generate collision** (**Generar colisión**). It creates your stadium's collision, one object per kind (it replaces any there was, also the one made with "Make collision"):
-   - the ground (grass if it's green, dirt if not) and the mound;
-   - the fences, following the wall closest to the field in all directions;
-   - the invisible walls above the fences, like the game's: in fair territory (1, the home run) and in foul territory (0);
-   - the foul poles where the lines cross the fences;
-   - the stands, simplified to about 5,000 triangles, and an outer boundary behind the outfield.
 
-   Review it: it is hidden, turn it on with the eye or with **All** in the Collision box. If something doesn't fit, edit it by hand or add pieces with "Make collision".
-6. **Export** as a new stadium.
-
-Limits:
-- The collision can have up to 65,535 triangles.
-- Each piece takes up to 30 textures, counting its original ones; that is the most a piece has in the game's stadiums. «Convert objects into pieces» spreads the model's textures over the base stadium's stands to stay under it, and the exporter refuses to write a piece with more. With 82 in one piece the game read past a table, the stadium showed no fences and the match ended up closing.
-- In the pack, textures become RGB5A3 and powers of 2 up to 256 pixels. With **HD textures**, the game uses the image at its own size (up to 2048 pixels).
-- Textures can repeat as much as needed. Each texture in the pack says how many times it repeats horizontally and vertically. With 1, the game does not repeat it: it stretches the edge. The exporter works those numbers out from your faces' UVs, after taking the spare whole repeats off each face; the picture does not change. Up to version 0.7.2 it copied them from the piece's first texture: the Polo Grounds on AT&T Park came out with grey stands and striped towers, and fine on Coors Field, by luck.
-- The collision generator assumes a normal baseball field: ground at height 0, the center of the field about 45 m in front of home plate and walls around it.
-
-## Why a base stadium is needed
-
-Your model does not go into the game from scratch: it goes **inside one of the game's stadiums** (AT&T Park, Coors Field…), which acts as the base.
-- **Your model:** all the geometry. The base's pieces are emptied, except home plate, the bases and the mound, because the players stand on them.
-- **From the base:** the skeleton the game knows how to load.
-  - the list of pieces and their role: ground, stands, crowd, flags, scoreboard;
-  - the internal material and texture settings, which the exporter copies as a template;
-  - the stadium table: collision, piece placement and fields not decoded yet;
-  - the menu photo, the game data (dimensions, saves) and the sounds.
-- **Why:** the game has no way to create a new kind of stadium. It only loads packs with the structure it already knows, so an existing one is filled in.
-
-Each template field that is understood is one thing less inherited blindly. The texture repeats (above, «Limits») are an example: they came from the base and broke the textures on some bases and not on others.
-
-Since add-on 0.8.0 there is another route with no base stadium: «Stadium from scratch», below.
-
-## Stadium from scratch
-
-Since add-on 0.8.0, the stadium pack can be written entirely from your model, without emptying a game stadium. Each object carries a **role** (ground, stand, crowd…) and the exporter builds the pieces, textures and stadium table from them.
-
-**Create the stadium**
+**Create the stadium:**
 1. **Power Pros** panel → **New stadium from scratch**. Pick the game folder (or `files/project.bin`) and a **data stadium**: the new stadium takes its saves, menu, sky and sounds, but none of its pieces.
-2. An empty collection, «Stadium from scratch», is created. Put your objects in it (meshes, curves, texts…), in metres, with home plate at the origin, the ground at height 0 and second base towards +Y, as in «Your own model».
-3. With an object selected, the panel shows its **role** and the **Hide when batting and from above** box.
+2. A collection, «Stadium from scratch», is created that already holds **the game's bases, plate and mound** in their place: fit your model to them.
+3. Put your objects (meshes, curves, texts…) in that collection, already placed.
+4. With an object selected, the panel shows its **role** and the **Hide when batting and from above** box.
+5. Press **Generate collision** and review it (see «Stadium collision»).
+6. **Export stadium mod** with the collection selected: always as a new stadium, with its code and name. Try it first with **View in game**.
 
 **Roles**
 | Role | What it does in the game |
@@ -176,11 +134,7 @@ Since add-on 0.8.0, the stadium pack can be written entirely from your model, wi
 - Objects with the same role (and the same box) are joined into one piece; past 30 textures it is split. Each flag goes alone.
 - **The game's bases, plate and mound:** «New stadium from scratch» puts them in the collection (the data stadium's `BCL` pieces, locked), so you can fit your model to them: the players always stand there. They are exported as they are, in their place. If your model brings its own, delete your model's (they would overlap the game's) or delete the game piece you do not want: only the ones still in the collection are exported (add-on 0.8.1).
 - **Ground in layers:** the game draws the ground with no depth test, in order. The exporter puts its layers from the bottom up (by the mean height of each material), so the infield dirt, over the grass, shows. Before 0.8.1 the Polo Grounds' dirt was covered by a grass plane 4 cm below it.
-- **Collision:** as in «Your own model», with **Generate collision**, or the exporter generates it if there is none.
-
-**Export and test**
-- **Export stadium mod** with the collection selected: always as a new stadium, with its code and name.
-- **View in game** works as with an imported stadium.
+- **Collision:** press **Generate collision** (below, «Stadium collision»), or the exporter generates it if there is none.
 
 **Checked in the game** (19 October 2026, a test collection with every role): it shows in the viewer from the batter's view, from above and from the stands, and a 2-minute match plays at 60 FPS with no errors. The crowd animates, the flags turn with the wind, transparent pieces are seen through and the glow adds light.
 
@@ -188,11 +142,57 @@ Since add-on 0.8.0, the stadium pack can be written entirely from your model, wi
 - **Tip:** if the field is joined to the stands in one object, separate it (edit mode, select the grass, P > Selection). Then «Automatic» makes it ground and it is drawn as the background layer.
 - The model's flags come out as still geometry: for the wind to move them, give them the Flags role. The stands come out empty: the Crowd role puts in the game's animated people.
 
-**Limits**
+**Limits:**
 - The crowd cannot have its own image: the game always animates its people.
 - A flag is always a rectangle: its shape in Blender does not count.
 - Up to 127 pieces: past that, the draw order is not guaranteed (the exporter warns).
 - What the game does at night (floodlights, stand lights) has not been tested.
+
+**Piece and texture limits** (also for «Another route»):
+- The collision can have up to 65,535 triangles.
+- Each piece takes up to 30 textures, counting its original ones; that is the most a piece has in the game's stadiums. The exporter splits pieces to stay under it and refuses to write a piece with more. With 82 in one piece the game read past a table, the stadium showed no fences and the match ended up closing.
+- In the pack, textures become RGB5A3 and powers of 2 up to 256 pixels. With **HD textures**, the game uses the image at its own size (up to 2048 pixels).
+- Textures can repeat as much as needed. Each texture in the pack says how many times it repeats horizontally and vertically. With 1, the game does not repeat it: it stretches the edge. The exporter works those numbers out from your faces' UVs, after taking the spare whole repeats off each face; the picture does not change. Up to version 0.7.2 it copied them from the piece's first texture: the Polo Grounds on AT&T Park came out with grey stands and striped towers, and fine on Coors Field, by luck.
+- The collision generator assumes a normal baseball field: ground at height 0, the center of the field about 45 m in front of home plate and walls around it.
+
+## Stadium collision
+
+**Generate collision** (Power Pros panel) creates your stadium's collision, one object per kind. It replaces any there was, also the one made with "Make collision".
+- the ground (grass if it's green, dirt if not) and the mound;
+- the fences, following the wall closest to the field in all directions;
+- the invisible walls above the fences, like the game's: in fair territory (1, the home run) and in foul territory (0);
+- the foul poles where the lines cross the fences;
+- the stands, simplified to about 5,000 triangles, and an outer boundary behind the outfield.
+
+In a stadium from scratch, flags, transparent and additive pieces do not count; curves and modifiers do. Review it: it is hidden, turn it on with the eye or with **All** in the Collision box. If something doesn't fit, edit it by hand or add pieces with **Make collision**, and check it with **C** in «View in game».
+
+## Another route: inside a game stadium
+
+Before version 0.8.0 this was the only way: the model went **inside one of the game's stadiums** (AT&T Park, Coors Field…), whose pieces were emptied and filled with your geometry. It is still available, but «Your own model» gives better results: with this route the model inherits the base stadium's crowd and flag pieces, the draw order and some unseen settings.
+
+1. **Import a stadium from the game** as a base (it provides its game data: dimensions, menu, saves).
+2. Import and place your model as above.
+3. Select your model's objects and press **Convert objects to pieces** (Power Pros panel, N key):
+   - The field's ground goes into the stadium's ground piece and everything else into a stands piece, because the game only draws the pieces the stadium already has.
+   - Each material's color and a soft sun are stored in the vertex color, because the game draws stadiums without lighting.
+   - Each face is kept only once and facing the field. Of two faces in the same place (the two sides of a wall, or a texture painted over a plain face, as SketchUp exports them) the textured one is kept and, when neither or both are textured, the one facing the field. The kept face is turned to the field.
+   - Surfaces stuck less than 25 cm from another parallel one, such as windows or signs, are separated up to 25 cm, so they don't flicker.
+   - With **Remove original stadium** (**Quitar el estadio original**) (on by default), the base stadium's pieces disappear and only your model remains. Pieces with the `pp_keep` property are kept, for example a crowd piece where you've put your own crowd.
+   - The game's bases, plate and mound (`BCL` pieces) always stay: the players stand on them, and a model's own rarely match (Mario Stadium's plate was 1.2 m).
+   - Each piece gets at most 30 textures: the model's are spread over the base stadium's stands.
+   - If the model has a texture painted over a plain face, on the same corners (SketchUp does this), the textured face is kept.
+   - Converted pieces look in Blender as in the game: texture × vertex colour, unlit. Use the **Material** view (Z > Material Preview).
+4. Press **Generate collision** (see «Stadium collision») and review it.
+5. **Export** as a new stadium.
+
+## What is taken from the game
+
+A stadium from scratch is written entirely from your model: pieces, textures, materials, collision and the stadium table. From the **data stadium** you pick when creating it, only what the game needs and your model cannot provide is taken:
+- **the bases, plate and mound** (`BCL` pieces), because the game always puts the players in the same place;
+- **the preloaded textures** of the scoreboard, the video board and the crowd: the game animates its crowd only through them;
+- **the menu photo, the saves, the sky and the sounds** of the stadium.
+
+The game has a fixed list of 40 stadiums: a new stadium uses its data stadium's number for saves, menu and game data, so disabling the mod never breaks a save (that game goes back to the data stadium). How each field of the packs was worked out: `docs/en/reverse-engineering.md`, «Writing packs from scratch» and «What the fields do».
 
 ## How to make a model that works well in the game
 
@@ -208,22 +208,28 @@ What we learned bringing in the Polo Grounds, a downloaded SketchUp model (Octob
 - **No thin geometry:** rows of chairs, railings or flagpoles a few cm thick are less than a pixel at a distance and come out broken. Seats are a ramp with a seat texture, and flagpoles should be at least about 30 cm.
 - **Few triangles:** a game stadium has about 10,000. One with 40,000 works on PC, but it costs more to draw and to look clean.
 
-**Recommendation for making one from scratch (in Blender):**
-1. Import the game's base stadium. Its field, its dimensions and its pieces are your scale and style template.
+**Recommendation for modelling it in Blender:**
+1. Create the stadium with **New stadium from scratch**: the game's bases, plate and mound give you the scale. To compare with a real game stadium, import it in another scene.
 2. Model the stands as smooth ramps (about 18°, like the game's) and apply a small repeating seat texture to them.
-3. For the crowd, place faces on the ramps and inside the base stadium's crowd pieces (`DP_AudienceF_*`, lying on the stands, and `DP_AudienceS_*`, vertical boards), with the same materials. The game's repeat the texture every 6 m in width and every 3–4 m in height.
-4. Walls, roofs and facades: simple boxes with flat colors or small textures; large details, no centimeter-sized pieces.
+3. For the crowd, put faces on the ramps with the **Lying crowd** role (stands) or **Upright crowd** (standing boards): the game draws its animated people there. The game's repeat the texture every 6 m in width and every 3–4 m in height.
+4. Walls, roofs and facades: simple boxes with flat colors or small textures; large details, no centimeter-sized pieces. Far-off things with **Hide when batting and from above**.
 5. Adjust the fences to the dimensions you want (lines, gaps, center) and put the distance signs 25 cm from the wall.
-6. Convert, generate the collision, check the fences and export as a new stadium.
+6. Generate the collision, check the fences with **C** in «View in game» and export.
+
+**Solved since** (phases 2 and 3, 18-19 October 2026; details in `docs/en/reverse-engineering.md`):
+- The crowd placed in AT&T's crowd pieces did not show because the game animates its crowd only through the stadium's preloaded textures: the **Crowd** roles use them.
+- The placement flags: `0x1600`/`0x1700` are the animated crowd, `0x80000000` (`NOUPCAM`) hides the piece from the batter's view and high cameras, `0x500` are the flags.
 
 **Not solved yet:**
-- The crowd placed in AT&T's crowd pieces was never seen in a game (it was in Blender). It remains to find out when the game draws those pieces.
-- The effect of the placement flags (`0x40000000` on the upper stands behind home plate, `0x80000000`/`0x20000000` on the `NOUPCAM`/`EVC` pieces, `0x1600`/`0x1700` on the crowd). The converter puts nothing on pieces with the first three.
+- What `0x40000000` (upper stands behind home plate) and `0x20000000` (`EVC`) do: removing them changed nothing from the views tested.
 - Whether the ball and the home run use the new collision or the base stadium's data: a home run to center at the Polo Grounds landed at 400 feet, which is what its fences measured there.
+- What the game does at night (floodlights and stand lights).
 
 ## Rules
 
 `.blend` files with imported stadiums contain models and textures from the game. Use them for your mod, but **don't share them**. A stadium mod will distribute only its modified `.pack` files, just like uniforms (`docs/en/mods.md`).
+
+A stadium from scratch also carries something of the game: the data stadium's bases, plate and mound and its preloaded textures (scoreboard, video board and crowd) go inside its pack. It is little, but it is game content: keep it in mind before sharing the mod.
 
 ## For developers
 

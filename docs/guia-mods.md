@@ -86,16 +86,12 @@ Con el complemento de Blender puedes editar los estadios del juego o meter uno t
 **Editar un estadio del juego**
 - Mueve, gira o escala piezas, edita sus mallas o sus imágenes. Las propiedades `pp_*` guardan lo que necesita la exportación: no las borres.
 
-**Meter un modelo tuyo** (SketchUp, glTF, OBJ…)
-1. Importa en la misma escena el estadio base y tu modelo. Un `.skp` se pasa antes a `.glb` con OpenSKP.
-2. Colócalo en metros, con el plato en el origen, el suelo a la altura 0, la segunda base hacia +Y y 90 pies entre bases. El juego pone siempre a los jugadores en el mismo sitio.
-3. Selecciona tu modelo y pulsa **Convertir objetos en piezas**. Después, **Generar colisión**. La colisión sale en un objeto por tipo (vallas, gradas, postes…), que ves u ocultas en la caja Colisión del panel; con **Convertir en colisión** haces colisión de cualquier malla.
-4. Por qué hace falta un estadio base: el juego solo sabe cargar estadios con la estructura que ya conoce, así que tu modelo entra dentro de uno existente. Lo explica [stadiums.md](stadiums.md), «Por qué hace falta un estadio base».
-
-**Estadio desde cero** (complemento 0.8.0)
-1. Panel **Power Pros** → **Nuevo estadio desde cero**: crea una colección vacía; eliges un estadio de datos que solo aporta partidas, menú, cielo y sonidos.
-2. Mete tus objetos en ella y da a cada uno su **papel**: suelo, grada, valla, público (el juego pone su gente animada), banderas, transparente o brillo aditivo.
-3. Expórtalo como estadio nuevo. Papeles y límites: [stadiums.md](stadiums.md), «Estadio desde cero».
+**Meter un modelo tuyo** (SketchUp, glTF, OBJ…), desde cero
+1. Panel **Power Pros** → **Nuevo estadio desde cero**. Eliges un **estadio de datos**, que solo aporta partidas, menú, cielo y sonidos; la colección nueva ya trae las bases, el plato y el montículo del juego.
+2. Importa tu modelo (un `.skp` se pasa antes a `.glb` con OpenSKP) y mételo en esa colección, en metros, con el plato en el origen, el suelo a la altura 0, la segunda base hacia +Y y 90 pies entre bases, ajustado a las bases del juego.
+3. Da a cada objeto su **papel**: suelo, grada, valla, público (el juego pone su gente animada), banderas (se mueven con el viento), transparente o brillo aditivo.
+4. **Generar colisión**: sale un objeto por tipo (vallas, gradas, postes…), que ves u ocultas en la caja Colisión del panel; con **Convertir en colisión** haces colisión de cualquier malla.
+5. El estadio se escribe entero desde tu modelo. Qué se toma del juego y la otra vía, meter el modelo dentro de un estadio del juego con «Convertir objetos en piezas»: [stadiums.md](stadiums.md), «Tu propio modelo».
 
 **Ver cómo queda en el juego, sin jugar un partido**
 1. Pon la vista 3D donde quieras empezar.
@@ -104,7 +100,7 @@ Con el complemento de Blender puedes editar los estadios del juego o meter uno t
 4. Cambia algo en Blender y vuelve a pulsar: el juego anterior se cierra y se abre con el cambio. No toca tu carpeta `mods` ni tus ajustes.
 
 **Exportar**
-1. **Exportar mod de estadio** → **Estadio nuevo**, con un código corto (por ejemplo `polo`) y un nombre.
+1. **Exportar mod de estadio**, con un código corto (por ejemplo `polo`) y un nombre. Un estadio desde cero sale siempre como estadio nuevo; uno importado del juego, como **Estadio nuevo** o **Reemplazar un estadio**.
 2. Elige la carpeta `mods` del juego. Opcional: **Foto del menú** y la línea bajo la foto («Home of …»).
 3. Actívalo en MODS y elígelo en Exhibición.
 
