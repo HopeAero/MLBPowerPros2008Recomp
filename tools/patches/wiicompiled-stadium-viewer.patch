@@ -296,10 +296,10 @@ index 0000000..2067d1c
 +}  // namespace stadium_viewer
 diff --git a/runtime/src/hle/mlb/game_camera.cpp b/runtime/src/hle/mlb/game_camera.cpp
 new file mode 100644
-index 0000000..ebf6e37
+index 0000000..4aabf6c
 --- /dev/null
 +++ b/runtime/src/hle/mlb/game_camera.cpp
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,256 @@
 +// MLB Power Pros 2008 (RL8E54) game-specific natives: the match camera, for the stadium viewer's free
 +// camera and match views (docs/ingenieria-inversa.md, "Cámara del partido").
 +//
@@ -503,10 +503,8 @@ index 0000000..ebf6e37
 +    return true;
 +}
 +
-+void OnGuestFrame(CpuContext* cpu) {
++void ApplyView(CpuContext* cpu, int view) {
 +    using namespace mlb_camera_native;
-+    const int view = g_request.exchange(-1);
-+    if (view < 0 || cpu == nullptr) return;
 +    const uint32_t director = g_director.load(), source = g_sources[static_cast<size_t>(view)].load();
 +    if (source != 0) {  // the game's own camera for that shot
 +        ClearOverride();
@@ -521,6 +519,16 @@ index 0000000..ebf6e37
 +    const auto current = CurrentPose();
 +    SetOverride(EyeTargetToPose(play ? kPlayEye : kWideEye, play ? kPlayTarget : kWideTarget,
 +                                current ? current->fovY : 45.0f));
++}
++
++void OnGuestFrame(CpuContext* cpu) {
++    using namespace mlb_camera_native;
++    int view = g_request.load();
++    if (view < 0 || cpu == nullptr) return;
++    ApplyView(cpu, view);
++    // Pending until applied: the host places the initial free camera once no view is pending, and
++    // ApplyView clears the override, so clearing the request first let that camera be lost.
++    g_request.compare_exchange_strong(view, -1);
 +}
 +
 +std::optional<stadium_viewer::CameraPose> CurrentPose() {
