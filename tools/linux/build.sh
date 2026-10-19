@@ -23,6 +23,7 @@ install_dir="$HOME/Games/MLBPowerPros2008"
 jobs=$(nproc)
 fresh=0
 skip_studio=0
+skip_roster=0
 desktop_entry=0
 container=0
 in_container=0
@@ -36,6 +37,7 @@ Options:
   --jobs N           compile jobs (default: all cores; translated shards are also capped by RAM)
   --fresh            recreate the patched Wiicompiled tree and the native build from scratch
   --no-studio        skip Texture Studio
+  --no-roster-editor skip PowerUp+ (the roster editor; needs the .NET 10 SDK, Node.js is downloaded)
   --desktop-entry    add "MLB Power Pros 2008" to the desktop's application menu
   --container        build inside a glibc 2.35 container (podman or docker): a portable build for
                      the Steam Deck / SteamOS, and no compilers or -devel packages needed on the host
@@ -49,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --jobs) jobs=$2; shift 2 ;;
         --fresh) fresh=1; shift ;;
         --no-studio) skip_studio=1; shift ;;
+        --no-roster-editor) skip_roster=1; shift ;;
         --desktop-entry) desktop_entry=1; shift ;;
         --container) container=1; shift ;;
         --in-container) in_container=1; shift ;;   # internal: the half of --container that runs inside
@@ -70,17 +73,20 @@ if (( container || in_container )); then
     build=$work/build-portable
     log_tag=-portable
     studio_build=$root/local/build/texture-studio-portable
+    roster_build=$root/local/powerupplus/publish-linux-portable
 else
     build=$work/build
     log_tag=
     studio_build=$root/local/build/texture-studio
+    roster_build=$root/local/powerupplus/publish-linux
 fi
 
 if (( container && ! in_container )); then
     # ---- Steps 1-3 in the container -------------------------------------------------------------
     engine=$(command -v podman || command -v docker || true)
     [[ -n $engine ]] || fail "--container needs podman or docker (SteamOS 3.5+ includes podman)"
-    image=mlbpp08-linux-build
+    # Tagged by the Containerfile's hash: a changed Containerfile builds a new image.
+    image=mlbpp08-linux-build:$(sha256sum tools/linux/Containerfile | cut -c1-12)
     if ! "$engine" image inspect "$image" >/dev/null 2>&1; then
         step "Building the container image (once; about 1.5 GB)"
         "$engine" build -t "$image" -f tools/linux/Containerfile tools/linux
@@ -99,10 +105,12 @@ if (( container && ! in_container )); then
     fi
     (( fresh )) && inner+=(--fresh)
     (( skip_studio )) && inner+=(--no-studio)
+    (( skip_roster )) && inner+=(--no-roster-editor)
     mkdir -p "$root/local/cache/container-home"
     step "Building in the container ($engine)"
     "$engine" "${run[@]}" "$image" bash tools/linux/build.sh "${inner[@]}"
     [[ -f $studio_build/TextureStudio ]] || skip_studio=1
+    [[ -x $roster_build/PowerUp.ElectronUI ]] || skip_roster=1
 else
 # ---- Prerequisites --------------------------------------------------------------------------------
 missing=()
@@ -282,6 +290,55 @@ if (( ! skip_studio )); then
     fi
 fi
 
+if (( ! skip_roster )); then
+    # PowerUp+ (the roster editor), as tools/powerupplus.ps1 -Publish builds it for Windows: the pinned
+    # commit with tools/patches/powerupplus-*.patch, its web UI and a self-contained server, and its
+    # Data folder without the 2007 saves and rosters (game content).
+    if ! dotnet --list-sdks | grep -qE '^(1[0-9]|[2-9][0-9])\.'; then
+        echo "warning: PowerUp+ needs the .NET 10 SDK; skipping the roster editor (or use --container)" >&2
+        skip_roster=1
+    else
+        step "Building the roster editor (PowerUp+)"
+        roster_log=$root/local/analysis/linux${log_tag}-powerupplus.log
+        node_version=v22.23.3
+        node_sha=df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de
+        node_dir=$root/local/tools/node-$node_version-linux-x64
+        if [[ ! -x $node_dir/bin/node ]]; then
+            archive=$root/local/tools/node-$node_version-linux-x64.tar.xz
+            curl -fL --retry 3 -o "$archive" "https://nodejs.org/dist/$node_version/node-$node_version-linux-x64.tar.xz"
+            [[ $(sha256sum "$archive" | cut -d' ' -f1) == "$node_sha" ]] || fail "Node.js hash mismatch"
+            tar -xJf "$archive" -C "$root/local/tools" && rm -f "$archive"
+        fi
+        pup_vendor=$root/local/vendor/PowerUpPlus
+        pup_src=$root/local/powerupplus/src
+        pup_pin=eb1a2c238fdc6b27c62b46fbe23a33a460b59066
+        [[ -d $pup_vendor/.git ]] || git clone -q https://github.com/ogura-connection/PowerUpPlus.git "$pup_vendor"
+        if [[ ! -d $pup_src/.git ]]; then
+            git clone -q "$pup_vendor" "$pup_src"
+            git -C "$pup_src" -c advice.detachedHead=false checkout -q "$pup_pin"
+            for patch in "$root"/tools/patches/powerupplus-*.patch; do
+                git -C "$pup_src" apply --whitespace=nowarn "$patch" || fail "patch $(basename "$patch") does not apply"
+            done
+        fi
+        ui=$pup_src/PowerUp/PowerUp.ElectronUI
+        if (
+            export PATH="$node_dir/bin:$PATH" npm_config_cache="$root/local/cache/npm"
+            cd "$ui/electron"
+            [[ -d node_modules ]] || npm ci --ignore-scripts --no-audit --no-fund
+            npm run build
+            # The project lists macOS and Windows runtimes only; add Linux for this publish.
+            dotnet publish "$ui/PowerUp.ElectronUI.csproj" -c Release -r linux-x64 --self-contained true \
+                -p:RuntimeIdentifiers=linux-x64 -o "$roster_build"
+        ) > "$roster_log" 2>&1; then
+            rm -rf "$roster_build/Data"
+            cp -r "$ui/Data" "$roster_build/Data"
+            find "$roster_build/Data" \( -name '*.dat' -o -name '*.db' -o -name '*.pack' \) -delete
+        else
+            echo "warning: PowerUp+ failed to build ($roster_log); the game is unaffected" >&2
+            skip_roster=1
+        fi
+    fi
+fi
 fi  # steps 1-3
 (( in_container )) && exit 0
 
@@ -298,6 +355,10 @@ done
 mkdir -p "$install_dir/launcher" "$install_dir/mods" "$install_dir/UserData"
 cp -f assets/launcher/*.png "$install_dir/launcher/"
 (( skip_studio )) || cp -f "$studio_build/TextureStudio" "$install_dir/"
+if (( ! skip_roster )); then   # the launcher's TOOLS > EDIT ROSTER starts it; its database lives in UserData
+    rm -rf "$install_dir/powerupplus"
+    cp -r "$roster_build" "$install_dir/powerupplus"
+fi
 touch "$install_dir/portable.txt"   # Config.toml, NAND and caches stay in UserData/ next to the game
 # The game reads the disc files from Data/ next to it, like the Windows install. A hard-link copy
 # costs no space when the install is on the same filesystem as local/.
