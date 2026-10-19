@@ -146,7 +146,45 @@ Tu modelo no entra en el juego desde cero: entra **dentro de un estadio del jueg
 
 Cada campo de la plantilla que se entiende es una cosa menos que se hereda a ciegas. El de las repeticiones de textura (arriba, «Límites») es un ejemplo: venía de la base y estropeaba las texturas en unas bases sí y en otras no.
 
-**Más adelante (elegido, sin fecha):** generar el pack del estadio entero desde cero, sin plantilla. Hace falta descifrar todos los campos de materiales, texturas y la tabla del estadio. La otra vía, un renderizador propio que dibuje el `.glb` directamente, queda aparcada por ahora.
+Desde el complemento 0.8.0 hay otra vía sin estadio base: «Estadio desde cero», abajo.
+
+## Estadio desde cero
+
+Desde el complemento 0.8.0, el pack del estadio se puede escribir entero desde tu modelo, sin vaciar un estadio del juego. Cada objeto lleva un **papel** (suelo, grada, público…) y el exportador construye con ellos las piezas, las texturas y la tabla del estadio.
+
+**Crear el estadio**
+1. Panel **Power Pros** → **Nuevo estadio desde cero**. Elige la carpeta del juego (o `files/project.bin`) y un **estadio de datos**: de él salen las partidas, el menú, el cielo y los sonidos del estadio nuevo, pero ninguna de sus piezas.
+2. Se crea una colección vacía, «Estadio desde cero». Mete en ella tus objetos (mallas, curvas, textos…), en metros, con el plato en el origen, el suelo a la altura 0 y la segunda base hacia +Y, como en «Tu propio modelo».
+3. Con un objeto seleccionado, el panel muestra su **papel** y la casilla **Ocultar en bateo y desde arriba**.
+
+**Papeles**
+| Papel | Qué hace en el juego |
+|---|---|
+| Automático | Suelo si el objeto es plano a la altura 0; grada si no. |
+| Suelo | Se dibuja antes que todo lo demás (capa de fondo). |
+| Grada | Pieza normal. |
+| Valla | Pieza normal; la valla de verdad para la pelota es la colisión. |
+| Público tumbado / Público vertical | El juego dibuja encima **su propio público animado** (las personas de las gradas del estadio de datos). La textura del objeto no se usa: las UV deciden cuánta gente cabe; cada repetición son 8 personas (4 × 2). Tumbado es para gradas inclinadas, vertical para carteles de pie. |
+| Banderas | Cada objeto es una bandera que el juego mueve con el viento. Solo cuenta su tamaño (lo más ancho y lo alto) y su primera textura; el mástil va en el centro del objeto. |
+| Transparente | Mezcla con el alfa de la textura: cristales, sombras, bordes suaves. |
+| Brillo aditivo | Suma su color a lo que hay detrás: luces, reflejos. |
+
+- **Ocultar en bateo y desde arriba:** la pieza no sale en la vista del bateador ni en las cámaras altas, como los edificios de fuera en los estadios del juego. Sirve para lo que está lejos y estorbaría.
+- Los objetos con el mismo papel (y la misma casilla) se juntan en una pieza; con más de 30 texturas se parte en varias. Cada bandera va sola.
+- El juego pone sus bases, plato y montículo (piezas `BCL` del estadio de datos), porque los jugadores se colocan sobre ellos.
+- **Colisión:** como en «Tu propio modelo», con **Generar colisión**, o la genera el exportador si no la hay.
+
+**Exportar y probar**
+- **Exportar mod de estadio** con la colección seleccionada: siempre como estadio nuevo, con su código y nombre.
+- **Ver en el juego** funciona igual que con un estadio importado.
+
+**Comprobado en el juego** (19 de octubre de 2026, colección de prueba con todos los papeles): se ve en el visor desde la vista del bateador, desde arriba y desde las gradas, y se juega un partido de 2 minutos a 60 FPS sin errores. El público se anima, las banderas giran con el viento, lo transparente se ve a través y el brillo suma luz.
+
+**Límites**
+- El público no puede llevar imagen propia: el juego anima siempre sus personas.
+- Una bandera es siempre un rectángulo: su forma en Blender no cuenta.
+- Hasta 127 piezas: con más, el orden de dibujo no está asegurado (el exportador avisa).
+- Lo que el juego hace de noche (focos, luces de las gradas) no se ha probado.
 
 ## Cómo hacer un modelo que funcione bien en el juego
 

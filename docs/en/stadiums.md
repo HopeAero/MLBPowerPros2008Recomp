@@ -146,7 +146,45 @@ Your model does not go into the game from scratch: it goes **inside one of the g
 
 Each template field that is understood is one thing less inherited blindly. The texture repeats (above, «Limits») are an example: they came from the base and broke the textures on some bases and not on others.
 
-**Later (chosen, no date):** generate the whole stadium pack from scratch, with no template. It needs every field of the materials, textures and stadium table decoded. The other route, a renderer of our own that draws the `.glb` directly, is set aside for now.
+Since add-on 0.8.0 there is another route with no base stadium: «Stadium from scratch», below.
+
+## Stadium from scratch
+
+Since add-on 0.8.0, the stadium pack can be written entirely from your model, without emptying a game stadium. Each object carries a **role** (ground, stand, crowd…) and the exporter builds the pieces, textures and stadium table from them.
+
+**Create the stadium**
+1. **Power Pros** panel → **New stadium from scratch**. Pick the game folder (or `files/project.bin`) and a **data stadium**: the new stadium takes its saves, menu, sky and sounds, but none of its pieces.
+2. An empty collection, «Stadium from scratch», is created. Put your objects in it (meshes, curves, texts…), in metres, with home plate at the origin, the ground at height 0 and second base towards +Y, as in «Your own model».
+3. With an object selected, the panel shows its **role** and the **Hide when batting and from above** box.
+
+**Roles**
+| Role | What it does in the game |
+|---|---|
+| Automatic | Ground if the object is flat at height 0; stand otherwise. |
+| Ground | Drawn before everything else (background layer). |
+| Stand | Normal piece. |
+| Fence | Normal piece; the real wall for the ball is the collision. |
+| Lying crowd / Upright crowd | The game draws **its own animated crowd** over it (the people of the data stadium's stands). The object's texture is not used: its UVs decide how many people fit; each repeat is 8 people (4 × 2). Lying is for sloped stands, upright for standing boards. |
+| Flags | Each object is a flag the game turns with the wind. Only its size (widest side across and height) and its first texture count; the pole goes at the object's centre. |
+| Transparent | Blended with the texture's alpha: glass, shadows, soft edges. |
+| Additive glow | Adds its colour to what is behind: lights, reflections. |
+
+- **Hide when batting and from above:** the piece is not seen from the batter's view or from high cameras, like the outside buildings of the game's stadiums. For what is far away and would get in the way.
+- Objects with the same role (and the same box) are joined into one piece; past 30 textures it is split. Each flag goes alone.
+- The game's bases, plate and mound (the data stadium's `BCL` pieces) are added, because the players stand on them.
+- **Collision:** as in «Your own model», with **Generate collision**, or the exporter generates it if there is none.
+
+**Export and test**
+- **Export stadium mod** with the collection selected: always as a new stadium, with its code and name.
+- **View in game** works as with an imported stadium.
+
+**Checked in the game** (19 October 2026, a test collection with every role): it shows in the viewer from the batter's view, from above and from the stands, and a 2-minute match plays at 60 FPS with no errors. The crowd animates, the flags turn with the wind, transparent pieces are seen through and the glow adds light.
+
+**Limits**
+- The crowd cannot have its own image: the game always animates its people.
+- A flag is always a rectangle: its shape in Blender does not count.
+- Up to 127 pieces: past that, the draw order is not guaranteed (the exporter warns).
+- What the game does at night (floodlights, stand lights) has not been tested.
 
 ## How to make a model that works well in the game
 

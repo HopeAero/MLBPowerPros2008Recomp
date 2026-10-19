@@ -88,6 +88,8 @@ mesh_object(coll, "Grada_Peñarol", *box(0, 128, 0, 15, 10, 18), grey)          
 crowd = image("publico", (0.8, 0.3, 0.3, 1.0))
 mesh_object(coll, "publico", [(-20, 120, 2), (20, 120, 2), (20, 121, 12), (-20, 121, 12)], [(0, 1, 2, 3)],
             material("publico", (1, 1, 1), crowd), "crowd_upright")
+mesh_object(coll, "publico_tumbado", [(-20, 112, 1), (20, 112, 1), (20, 118, 3), (-20, 118, 3)], [(0, 1, 2, 3)],
+            material("publico2", (1, 1, 1), crowd), "crowd_lying")
 glass = image("cristal", (0.6, 0.8, 1.0, 0.4))
 mesh_object(coll, "cristal", [(-10, 110, 20), (10, 110, 20), (10, 110, 25), (-10, 110, 25)], [(0, 1, 2, 3)],
             material("cristal", (1, 1, 1), glass), "transparent")
@@ -95,6 +97,8 @@ mesh_object(coll, "brillo", [(-5, 130, 30), (5, 130, 30), (5, 130, 35), (-5, 130
             material("brillo", (1, 1, 0.6)), "additive")
 mesh_object(coll, "bandera", [(40, 120, 20), (42, 120, 20), (42, 120, 21), (40, 120, 21)], [(0, 1, 2, 3)],
             material("bandera", (0.8, 0.1, 0.1)), "flags")
+mesh_object(coll, "bandera2", [(-42, 120, 20), (-40, 120, 20), (-40, 120, 22), (-42, 120, 22)], [(0, 1, 2, 3)],
+            material("bandera2", (1, 1, 1), image("rayas", (0.9, 0.9, 0.9, 1.0))), "flags")
 mesh_object(coll, "edificio", *box(-150, 200, 0, 30, 30, 40), grey, "stand", hide=True)
 text = bpy.data.objects.new("rotulo", bpy.data.curves.new("rotulo", "FONT"))
 text.location = (0, 135, 20)
@@ -106,8 +110,6 @@ names = [m.name for m in st.models]
 check(all(n.isascii() for n in names), f"piece names are ASCII: {names}")
 by_name = {st.models[p.model].name: p.flags for p in st.placements}
 for role, (flags, _, _) in scratch.ROLES.items():
-    if role == "crowd_lying":
-        continue
     hit = [nm for nm, f in by_name.items() if nm.startswith(f"DP_{role}_") and not nm.endswith("_up")]
     check(hit and all(by_name[nm] == flags for nm in hit), f"role {role}: pieces {hit} with flags 0x{flags:08X}")
 up = [nm for nm in by_name if nm.endswith("_up")]
@@ -115,6 +117,25 @@ check(len(up) == 1 and by_name[up[0]] == scratch.ROLES["stand"][0] | scratch.HID
       f"hide from above: {up} with bit 0x80000000")
 stands = [nm for nm in by_name if nm.startswith("DP_stand_") and not nm.endswith("_up")]
 check(len(stands) == 1, f"the stand objects (two boxes, Grada_Peñarol, the text) are one piece: {stands}")
+check(scratch.ROLES["additive"][0] & 0xFF00 == 0, "additive glow has no piece type (type 0x08, lights, only shows at night)")
+projectbin = importlib.import_module(pkg + ".projectbin")
+archive = projectbin.Archive(project_bin)
+col = stadium_read.read_stadium(archive.read("stadium_col.pack"), archive.read("stadium_coltbl.pack"))
+check([(e.tmem_a, e.tmem_b) for e in st.preload] == [(e.tmem_a, e.tmem_b) for e in col.preload]
+      and [st.textures[e.texture] for e in st.preload] == [col.textures[e.texture] for e in col.preload]
+      and st.preload_order == col.preload_order and st.preload_tail == col.preload_tail,
+      "the data stadium's 8 preloaded textures (scoreboard, video board, crowd) are copied")
+for role, slot in (("crowd_upright", 4), ("crowd_lying", 6)):
+    m = next(st.models[p.model] for p in st.placements if st.models[p.model].name.startswith(f"DP_{role}_"))
+    check(m.textures and all((t, pal) == (st.preload[slot].texture, st.preload[slot].palette) for t, pal, _ in m.textures),
+          f"{role} draws the preloaded crowd texture of slot {slot} (the game animates its people there)")
+flag_pieces = [p for p in st.placements if st.models[p.model].name.startswith("DP_flags_")]
+check(len(flag_pieces) == 2 and all([len(m.positions) for m in st.models[p.model].meshes] == [10] for p in flag_pieces),
+      "each flag object is its own piece with the game's 10-vertex flag")
+check(sorted(p.translation for p in flag_pieces) == [scratch.f32(-410.0, 210.0, -1200.0), scratch.f32(410.0, 205.0, -1200.0)],
+      f"flag poles at the objects' centres: {[p.translation for p in flag_pieces]}")
+
+
 def piece_role(nm):
     """DP_<role>_<n>[_up] -> role."""
     core = nm[3:-3] if nm.endswith("_up") else nm[3:]
@@ -133,6 +154,12 @@ gfx, tbl = stadium_write.write_stadium(st)
 back = stadium_read.read_stadium(gfx, tbl)
 back.tree_a = st.tree_a
 check(back == st, "written and read back the same")
+if back != st:
+    import dataclasses
+    for f in dataclasses.fields(st):
+        a, b = getattr(st, f.name), getattr(back, f.name)
+        if a != b:
+            print("DIFF", f.name, (len(a), len(b)) if isinstance(a, list) else (a, b))
 import stadium_re                                                    # noqa: E402
 problems = []
 models, _ = stadium_re.load("scratch", gfx, tbl, problems)
@@ -142,6 +169,12 @@ check(not problems, f"stadium_re finds no problems {problems[:3]}")
 
 st2, _, _ = scratch.build_stadium(coll, game_bases=False)
 check(not any("BCL" in m.name for m in st2.models), "without game bases there are no BCL pieces")
+coll["pp_stadium"] = "ari"                                   # its crowd slots hold 8 x 8 textures
+st_ari, _, _ = scratch.build_stadium(coll, game_bases=False)
+coll["pp_stadium"] = "col"
+m = next(m for m in st_ari.models if m.name.startswith("DP_crowd_upright_"))
+sizes = {(st_ari.textures[m.textures[tm.slot][0]].width, tm.width or None, tm.height or None) for tm in m.texmaps}
+check(sizes == {(8, 128, 64)}, f"crowd texmaps declare 128 x 64 over Arizona's 8 x 8 crowd slot: {sizes}")
 
 big = scratch_collection("Muchos")
 mesh_object(big, "campo2", [(-60, -20, 0), (60, -20, 0), (60, 130, 0), (-60, 130, 0)], [(0, 1, 2, 3)], grass)

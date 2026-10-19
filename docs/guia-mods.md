@@ -92,6 +92,11 @@ Con el complemento de Blender puedes editar los estadios del juego o meter uno t
 3. Selecciona tu modelo y pulsa **Convertir objetos en piezas**. Después, **Generar colisión**.
 4. Por qué hace falta un estadio base: el juego solo sabe cargar estadios con la estructura que ya conoce, así que tu modelo entra dentro de uno existente. Lo explica [stadiums.md](stadiums.md), «Por qué hace falta un estadio base».
 
+**Estadio desde cero** (complemento 0.8.0)
+1. Panel **Power Pros** → **Nuevo estadio desde cero**: crea una colección vacía; eliges un estadio de datos que solo aporta partidas, menú, cielo y sonidos.
+2. Mete tus objetos en ella y da a cada uno su **papel**: suelo, grada, valla, público (el juego pone su gente animada), banderas, transparente o brillo aditivo.
+3. Expórtalo como estadio nuevo. Papeles y límites: [stadiums.md](stadiums.md), «Estadio desde cero».
+
 **Ver cómo queda en el juego, sin jugar un partido**
 1. Pon la vista 3D donde quieras empezar.
 2. Panel **Power Pros** → **Ver en el juego**. En unos 8 segundos se abre el juego en tu estadio, con la cámara en tu vista, sin jugadores ni marcador.

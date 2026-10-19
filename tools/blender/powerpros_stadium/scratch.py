@@ -5,8 +5,9 @@ bases, plate and mound, which the players stand on).
 
 The collection is in the game's frame of the add-on (metres, Z up, home plate at the origin, centre
 field towards +Y) and has pp_scratch, pp_stadium (the data stadium: saves, menus, sky, sounds),
-pp_project_bin and pp_game_folder. Objects with the same role (and «hide from above») become one piece,
-split at MAX_TEXMAPS textures; pieces go in draw order. docs/stadiums.md, «Estadio desde cero».
+pp_project_bin and pp_game_folder. Objects with the same role (and «hide when batting and from above») become one piece,
+split at MAX_TEXMAPS textures, but each flag is a piece of its own (the game's flag plane); pieces go in
+draw order. docs/stadiums.md, «Estadio desde cero».
 """
 import math
 import struct
@@ -17,7 +18,7 @@ from mathutils import Vector
 
 from . import collision_gen, convert, exporter, pj7m_write, stadium_read
 from .i18n import T
-from .stadium_model import Material, Mesh, Model, Placement, Stadium, TexMap
+from .stadium_model import Material, Mesh, Model, Placement, PreloadEntry, Stadium, TexMap
 
 try:
     from . import projectbin
@@ -30,20 +31,27 @@ ROLES = {
     "stand": (0x00000000, "Grada", "Stand"),
     "fence": (0x00001100, "Valla", "Fence"),
     "transparent": (0x00060000, "Transparente", "Transparent"),
-    "additive": (0x000A0800, "Brillo aditivo", "Additive glow"),
+    "additive": (0x000A0000, "Brillo aditivo", "Additive glow"),     # not 0x0A0800: type 0x08 (lights) is night only
     "crowd_lying": (0x00001600, "Público tumbado", "Lying crowd"),
     "crowd_upright": (0x00001700, "Público vertical", "Upright crowd"),
     "flags": (0x00000500, "Banderas", "Flags"),
 }
+CROWD_SLOTS = {"crowd_upright": 4, "crowd_lying": 6}   # preload slot whose texture the game animates
+CROWD_SIZE = (128, 64)                  # what every game crowd texmap declares (over 8 x 8 textures in two stadiums)
 DRAW_ORDER = ["ground", "fence", "stand", "crowd_lying", "crowd_upright", "flags", "transparent", "additive"]
-HIDE_ABOVE = 0x80000000                 # NOUPCAM: hidden when the camera is up
+HIDE_ABOVE = 0x80000000                 # NOUPCAM: hidden from the batter's view and high cameras
 MAX_TEXMAPS = exporter.MAX_TEXMAPS
 MAX_PIECES = 127                        # one-leaf tree A, which keeps the draw order
 # Undecoded fields at their most common value in the game's stadiums (as tools/stadium_minimal.py).
 COLORS = ((0, 0, 0, 255), (204, 204, 204, 255), (0, 0, 0, 255))
-KIND, UNK_32, PRELOAD_TAIL = 3, 1, 0x6EAC80
+KIND, UNK_32 = 3, 1
 GEOMETRY = {"MESH", "CURVE", "SURFACE", "FONT", "META"}
 FLAT = 0.2                              # metres from height 0 for «auto» to call an object ground
+# The game's flags (DP_FLG_flag*): a 5-column, 2-row plane, pole at x = 0, cloth towards +x, which the
+# flag system turns with the wind. Another vertex count in a flag piece makes it write out of memory.
+FLAG_COLUMNS = (0.0, 0.2984, 0.5, 0.6903, 1.0)
+FLAG_VERTICES = [(1, 0), (0, 0), (0, 1), (2, 1), (2, 0), (1, 1), (4, 0), (3, 1), (4, 1), (3, 0)]   # (column, top)
+FLAG_DRAWS = ((0x98, (6, 9, 7, 4, 3, 0, 5, 2)), (0x90, (0, 1, 2, 6, 7, 8)))
 
 
 class ScratchFailure(Exception):
@@ -56,8 +64,10 @@ def register_properties():
     items += [(k, T(es, en), "") for k, (_, es, en) in ROLES.items()]
     bpy.types.Object.powerpros_role = bpy.props.EnumProperty(name=T("Papel", "Role"), items=items, default="auto")
     bpy.types.Object.powerpros_hide_above = bpy.props.BoolProperty(
-        name=T("Ocultar desde arriba", "Hide from above"), default=False,
-        description=T("No se ve con las cámaras altas (edificios de fuera)", "Not seen from high cameras (outside buildings)"))
+        name=T("Ocultar en bateo y desde arriba", "Hide when batting and from above"), default=False,
+        description=T("No se ve desde la vista del bateador ni desde las cámaras altas, como los edificios de fuera "
+                      "del juego (bit NOUPCAM)", "Not seen from the batter's view or from high cameras, like the "
+                      "game's outside buildings (NOUPCAM bit)"))
 
 
 def unregister_properties():
@@ -137,31 +147,91 @@ def _placement(model_index, meshes, flags):
                      f32(*centre, radius), flags)
 
 
-def _add_game_bases(st, project_bin, code):
-    """The data stadium's BCL pieces (bases, plate, mound, lines) with their textures and palettes."""
+def _texture(st, img, image_index, hd_images):
+    """Index into st.textures of a Blender image, added once."""
+    if img.name not in image_index:
+        tex, hd_name, hd_rgba = exporter.image_texture(img, True)
+        image_index[img.name] = len(st.textures)
+        st.textures.append(tex)
+        if hd_name:
+            hd_images[hd_name] = hd_rgba
+    return image_index[img.name]
+
+
+def _flag_pieces(st, objects, hide, bake_light, image_index, hd_images):
+    """One piece per flag object: the game's flag plane, pole at the object's centre, as wide as its
+    longest side across and as tall as it, with its first texture over the whole cloth."""
+    flags = ROLES["flags"][0] | (HIDE_ABOVE if hide else 0)
+    for temp in _evaluated_copies(objects):
+        try:
+            bm, images = convert.prepare([temp], bake_light)
+        finally:
+            me = temp.data
+            bpy.data.objects.remove(temp)
+            bpy.data.meshes.remove(me)
+        pts = [exporter.to_game(v.co) for v in bm.verts]
+        colour = tuple(int(x * 255 + 0.5) for x in next(iter(bm.faces)).loops[0][bm.loops.layers.float_color["Color"]])             if bm.faces else (255, 255, 255, 255)
+        bm.free()
+        lo = [min(p[k] for p in pts) for k in range(3)]
+        hi = [max(p[k] for p in pts) for k in range(3)]
+        centre = f32(*((a + b) / 2 for a, b in zip(lo, hi)))
+        w, h = max(hi[0] - lo[0], hi[2] - lo[2]), hi[1] - lo[1]
+        positions = [f32(FLAG_COLUMNS[c] * w, h / 2 if top else -h / 2, 0.0) for c, top in FLAG_VERTICES]
+        uvs = [f32(FLAG_COLUMNS[c], 0.0 if top else 1.0) for c, top in FLAG_VERTICES]
+        draws = [(op, [(0, i, 0, 0, i) for i in order]) for op, order in FLAG_DRAWS]
+        img = next((i for i in images if i is not None), None)
+        textures = [(_texture(st, img, image_index, hd_images), None, 0)] if img else []
+        texmaps = [TexMap(0, 1, 1)] if img else []
+        name = f"DP_flags_{sum(m.name.startswith('DP_flags_') for m in st.models)}" + ("_up" if hide else "")
+        st.models.append(Model(name, "_Wmodel_" + name, "p" + name[3:], textures, texmaps,
+                               [Material(KIND, COLORS, [0] if img else [], UNK_32)],
+                               [Mesh(0, positions, [(0.0, 0.0, 1.0)], [colour], uvs, draws)]))
+        x, y, z = centre
+        st.placements.append(Placement(len(st.models) - 1, centre, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0),
+                                       f32(x - w, y - h / 2, z - w, x + w, y + h / 2, z + w),
+                                       f32(x, y, z, math.hypot(w, h / 2)), flags))
+
+
+def _data_stadium(project_bin, code):
     archive = projectbin.Archive(project_bin)
     gfx, tbl = archive.read(f"stadium_{code}.pack"), archive.read(f"stadium_{code}tbl.pack")
     if gfx is None or tbl is None:
         raise ScratchFailure(T(f"project.bin no tiene el estadio «{code}»", f"project.bin has no stadium '{code}'"))
-    base = stadium_read.read_stadium(gfx, tbl)
-    tex_map, pal_map = {}, {}
+    return stadium_read.read_stadium(gfx, tbl)
+
+
+def _copy_texture(st, base, t, pal, maps):
+    """(texture index, palette index or None) in st of the data stadium's texture t and palette pal."""
+    tex_map, pal_map = maps
+    if t not in tex_map:
+        tex_map[t] = len(st.textures)
+        st.textures.append(base.textures[t])
+    if pal is not None and pal not in pal_map:
+        pal_map[pal] = len(st.palettes)
+        st.palettes.append(base.palettes[pal])
+    return tex_map[t], pal_map.get(pal)
+
+
+def _add_game_bases(st, base, maps):
+    """The data stadium's BCL pieces (bases, plate, mound, lines) with their textures and palettes."""
     for p in base.placements:
         m = base.models[p.model]
         if "BCL" not in m.name:
             continue
-        textures = []
-        for t, pal, level in m.textures:
-            if t not in tex_map:
-                tex_map[t] = len(st.textures)
-                st.textures.append(base.textures[t])
-            if pal is not None and pal not in pal_map:
-                pal_map[pal] = len(st.palettes)
-                st.palettes.append(base.palettes[pal])
-            textures.append((tex_map[t], pal_map.get(pal) if pal is not None else None, level))
-        m.textures = textures
+        m.textures = [(*_copy_texture(st, base, t, pal, maps), level) for t, pal, level in m.textures]
         st.models.append(m)
         p.model = len(st.models) - 1
         st.placements.append(p)
+
+
+def _add_preload(st, base, maps):
+    """The data stadium's preloaded textures. Always 8, by role: 0-2 scoreboard, 3 video board, 4-5
+    upright crowd, 6-7 lying crowd; the crowd pieces draw the game's animated people from slots 4-7,
+    whatever their own texture."""
+    for e in base.preload:
+        t, pal = _copy_texture(st, base, e.texture, e.palette, maps) if e.texture is not None else (None, None)
+        st.preload.append(PreloadEntry(t, pal, e.tmem_a, e.tmem_b))
+    st.preload_order, st.preload_tail = list(base.preload_order), base.preload_tail
 
 
 def _collision(coll):
@@ -185,11 +255,15 @@ def build_stadium(coll, game_bases=True, bake_light=True):
     groups = {}
     for o in objects:
         groups.setdefault((role_of(o), bool(getattr(o, "powerpros_hide_above", False))), []).append(o)
-    st = Stadium(unk_20=[], unk_24=[[], []], preload_order=[], preload=[], preload_tail=PRELOAD_TAIL)
+    st = Stadium(unk_20=[], unk_24=[[], []])
+    base, maps = _data_stadium(project_bin, coll.get("pp_stadium", "col")), ({}, {})
     hd_images, warnings, image_index = {}, [], {}
     keys = sorted(groups, key=lambda k: (DRAW_ORDER.index(k[0]), k[1]))
     for key in keys:
         role, hide = key
+        if role == "flags":
+            _flag_pieces(st, groups[key], hide, bake_light, image_index, hd_images)
+            continue
         temps = _evaluated_copies(groups[key])
         if not temps:
             continue
@@ -204,6 +278,10 @@ def build_stadium(coll, game_bases=True, bake_light=True):
         plain = [i for i, img in enumerate(images) if img is None]
         chunks = [textured[i:i + MAX_TEXMAPS] for i in range(0, len(textured), MAX_TEXMAPS)] or [[]]
         chunks[0] = chunks[0] + plain
+        slot = CROWD_SLOTS.get(role)
+        crowd = base.preload[slot] if slot is not None and slot < len(base.preload) else None
+        if crowd is not None and crowd.texture is None:
+            crowd = None
         for n, chunk in enumerate(chunks):
             meshes = _meshes(bm, chunk)
             if not meshes:
@@ -211,20 +289,21 @@ def build_stadium(coll, game_bases=True, bake_light=True):
             textures, texmaps, materials = [], [], []
             for i in chunk:
                 img = images[i]
-                if img is None:
+                if crowd is not None:          # the game's animated people, whatever the object's own texture
+                    entry = (*_copy_texture(st, base, crowd.texture, crowd.palette, maps), 0)
+                elif img is None:
                     materials.append(Material(KIND, COLORS, [], UNK_32))
                     continue
-                if img.name not in image_index:
-                    tex, hd_name, hd_rgba = exporter.image_texture(img, True)
-                    image_index[img.name] = len(st.textures)
-                    st.textures.append(tex)
-                    if hd_name:
-                        hd_images[hd_name] = hd_rgba
-                textures.append((image_index[img.name], None, 0))
+                else:
+                    entry = (_texture(st, img, image_index, hd_images), None, 0)
+                if entry not in textures:
+                    textures.append(entry)
                 mi = len(materials)
                 reach = [max(1, math.ceil(max((abs(v[k]) for m in meshes if m.material == mi for v in m.uvs), default=1) - 1e-4))
                          for k in (0, 1)]
-                texmaps.append(TexMap(len(textures) - 1, *reach))
+                tex = st.textures[entry[0]]
+                size = CROWD_SIZE if crowd is not None and (tex.width, tex.height) != CROWD_SIZE else (0, 0)
+                texmaps.append(TexMap(textures.index(entry), *reach, *size))
                 materials.append(Material(KIND, COLORS, [len(texmaps) - 1], UNK_32))
             name = f"DP_{role}_{n}" + ("_up" if hide else "")
             st.models.append(Model(name, "_Wmodel_" + name, "p" + name[3:], textures, texmaps, materials, meshes))
@@ -234,10 +313,11 @@ def build_stadium(coll, game_bases=True, bake_light=True):
     if not st.models:
         raise ScratchFailure(T("La colección no tiene objetos con caras", "The collection has no objects with faces"))
     if game_bases:
-        _add_game_bases(st, project_bin, coll.get("pp_stadium", "col"))
+        _add_game_bases(st, base, maps)
         # Tree A keeps the placement order as the draw order: the bases' marks right after the ground.
         rank = lambda p: 0 if st.models[p.model].name.startswith("DP_ground_") else 1 if "BCL" in st.models[p.model].name else 2
         st.placements.sort(key=rank)
+    _add_preload(st, base, maps)                 # after the models: textures in the order the reader numbers them
     st.collision_vertices, st.collision_triangles = _collision(coll)
     st.collision_vertices = [f32(*v) for v in st.collision_vertices]
     if len(st.placements) > MAX_PIECES:

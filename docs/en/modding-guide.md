@@ -92,6 +92,11 @@ With the Blender add-on you can edit the game's stadiums or bring in one of your
 3. Select your model and press **Convert objects to pieces**. Then **Generate collision**.
 4. Why a base stadium is needed: the game can only load stadiums with the structure it already knows, so your model goes inside an existing one. [stadiums.md](stadiums.md), «Why a base stadium is needed», explains it.
 
+**Stadium from scratch** (add-on 0.8.0)
+1. **Power Pros** panel → **New stadium from scratch**: creates an empty collection; you pick a data stadium that only brings saves, menu, sky and sounds.
+2. Put your objects in it and give each its **role**: ground, stand, fence, crowd (the game puts its animated people), flags, transparent or additive glow.
+3. Export it as a new stadium. Roles and limits: [stadiums.md](stadiums.md), «Stadium from scratch».
+
 **See how it looks in the game, without playing a match**
 1. Put the 3D view where you want to start.
 2. **Power Pros** panel → **View in game**. In about 8 seconds the game opens in your stadium, with the camera at your view, no players or scoreboard.
