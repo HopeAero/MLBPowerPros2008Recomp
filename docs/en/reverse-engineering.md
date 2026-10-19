@@ -559,7 +559,7 @@ Verified (October 14, 2026):
   - `0x11` (fences): no visible change: their effect is on play, not on drawing.
 - **Placement flags, byte `+0x51` (draw group).** `0x80C600C8` looks it up in a list of groups of the scene object (`+1528`, entries with their number at `+4`). Changing it:
   - `0x06` (`ALP` pieces) to 0: the field's stains and lines go from soft transparency to hard-edged cut-outs: `0x06` is the alpha-blended group;
-  - the ground's `0x81` to 0: the grass shows through the infield dirt: `0x81` is the background layer, drawn before the rest;
+  - the ground's `0x81` to 0: the grass shows through the infield dirt: `0x81` is the background layer, drawn before the rest. Within it depth does not count, order does: in the Polo Grounds from scratch, the infield dirt at height 0 did not show because the grass plane 4 cm below was drawn after it; drawing the layers from the bottom up shows it (October 19, 2026);
   - `0x06` on a stand: the ads on its fence turn semi-transparent: the group affects the whole piece.
 - **High bits:** without `0x80000000` (`NOUPCAM`), from a high camera outside the stadium the surrounding buildings and trees the original hides show up: it hides the piece when the camera is up. It also hides it from the batter's view (checked in phase 3, in the viewer and in a match). Removing `0x40000000` or `0x20000000` changed nothing from the views tested (batter, aerial, stands); they depend on other match cameras.
 - **`unk_20`:** emptying it changes nothing by day. Its points lie inside the boxes of the `lumine` pieces, 46-57 m up and turned towards the field, one group per tower (Coors: 32, 50, 50 and 25): almost certainly the floodlights, one by one, for night games. Not checked in a night game.

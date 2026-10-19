@@ -171,7 +171,8 @@ Since add-on 0.8.0, the stadium pack can be written entirely from your model, wi
 
 - **Hide when batting and from above:** the piece is not seen from the batter's view or from high cameras, like the outside buildings of the game's stadiums. For what is far away and would get in the way.
 - Objects with the same role (and the same box) are joined into one piece; past 30 textures it is split. Each flag goes alone.
-- The game's bases, plate and mound (the data stadium's `BCL` pieces) are added, because the players stand on them.
+- **The game's bases, plate and mound:** «New stadium from scratch» puts them in the collection (the data stadium's `BCL` pieces, locked), so you can fit your model to them: the players always stand there. They are exported as they are, in their place. If your model brings its own, delete your model's (they would overlap the game's) or delete the game piece you do not want: only the ones still in the collection are exported (add-on 0.8.1).
+- **Ground in layers:** the game draws the ground with no depth test, in order. The exporter puts its layers from the bottom up (by the mean height of each material), so the infield dirt, over the grass, shows. Before 0.8.1 the Polo Grounds' dirt was covered by a grass plane 4 cm below it.
 - **Collision:** as in «Your own model», with **Generate collision**, or the exporter generates it if there is none.
 
 **Export and test**
@@ -180,7 +181,7 @@ Since add-on 0.8.0, the stadium pack can be written entirely from your model, wi
 
 **Checked in the game** (19 October 2026, a test collection with every role): it shows in the viewer from the batter's view, from above and from the stands, and a 2-minute match plays at 60 FPS with no errors. The crowd animates, the flags turn with the wind, transparent pieces are seen through and the glow adds light.
 
-**The Polo Grounds from scratch** (19 October 2026): the SketchUp model as is (456 objects, 45,000 triangles), placed by its own bases and with AT&T Park as the data stadium, ends up in 5 pieces and 6,953 collision triangles. It shows in the viewer with its textures from every camera, and a 2-minute match plays at 60 FPS with no errors. The only change to the model was moving the field's flat faces to an object of their own.
+**The Polo Grounds from scratch** (19 October 2026): the SketchUp model as is (456 objects, 45,000 triangles), placed by its own bases and with AT&T Park as the data stadium, ends up in 5 pieces and 6,953 collision triangles. It shows in the viewer with its textures from every camera, and a 2-minute match plays at 60 FPS with no errors. The only changes to the model were moving the field's flat faces to an object of their own and removing its mound and bases, which overlapped the game's.
 - **Tip:** if the field is joined to the stands in one object, separate it (edit mode, select the grass, P > Selection). Then «Automatic» makes it ground and it is drawn as the background layer.
 - The model's flags come out as still geometry: for the wind to move them, give them the Flags role. The stands come out empty: the Crowd role puts in the game's animated people.
 

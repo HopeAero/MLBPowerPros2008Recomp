@@ -171,7 +171,8 @@ Desde el complemento 0.8.0, el pack del estadio se puede escribir entero desde t
 
 - **Ocultar en bateo y desde arriba:** la pieza no sale en la vista del bateador ni en las cámaras altas, como los edificios de fuera en los estadios del juego. Sirve para lo que está lejos y estorbaría.
 - Los objetos con el mismo papel (y la misma casilla) se juntan en una pieza; con más de 30 texturas se parte en varias. Cada bandera va sola.
-- El juego pone sus bases, plato y montículo (piezas `BCL` del estadio de datos), porque los jugadores se colocan sobre ellos.
+- **Bases, plato y montículo del juego:** «Nuevo estadio desde cero» los pone en la colección (piezas `BCL` del estadio de datos, bloqueadas), para que ajustes tu modelo a ellos: los jugadores se colocan siempre ahí. Se exportan tal cual y en su sitio. Si tu modelo trae los suyos, borra los de tu modelo (se pisarían con los del juego) o borra la pieza del juego que no quieras: solo se exportan las que sigan en la colección (complemento 0.8.1).
+- **Suelo por capas:** el juego dibuja el suelo sin prueba de profundidad, en orden. El exportador pone las capas de abajo arriba (por la altura media de cada material), así la tierra del cuadro, encima del césped, se ve. Antes del 0.8.1 la tierra del Polo Grounds quedaba tapada por un plano de césped 4 cm más abajo.
 - **Colisión:** como en «Tu propio modelo», con **Generar colisión**, o la genera el exportador si no la hay.
 
 **Exportar y probar**
@@ -180,7 +181,7 @@ Desde el complemento 0.8.0, el pack del estadio se puede escribir entero desde t
 
 **Comprobado en el juego** (19 de octubre de 2026, colección de prueba con todos los papeles): se ve en el visor desde la vista del bateador, desde arriba y desde las gradas, y se juega un partido de 2 minutos a 60 FPS sin errores. El público se anima, las banderas giran con el viento, lo transparente se ve a través y el brillo suma luz.
 
-**El Polo Grounds desde cero** (19 de octubre de 2026): el modelo de SketchUp, tal cual (456 objetos, 45.000 triángulos), colocado con sus propias bases y con AT&T Park como estadio de datos, queda en 5 piezas y 6.953 triángulos de colisión. Se ve en el visor con sus texturas desde todas las cámaras y se juega un partido de 2 minutos a 60 FPS sin errores. Lo único que se hizo al modelo fue pasar las caras planas del campo a un objeto aparte.
+**El Polo Grounds desde cero** (19 de octubre de 2026): el modelo de SketchUp, tal cual (456 objetos, 45.000 triángulos), colocado con sus propias bases y con AT&T Park como estadio de datos, queda en 5 piezas y 6.953 triángulos de colisión. Se ve en el visor con sus texturas desde todas las cámaras y se juega un partido de 2 minutos a 60 FPS sin errores. Al modelo solo se le hizo pasar las caras planas del campo a un objeto aparte y quitar su montículo y sus bases, que se pisaban con los del juego.
 - **Consejo:** si el campo está unido a las gradas en un mismo objeto, sepáralo (modo edición, seleccionar el césped, P > Selección). Así «Automático» lo hace suelo y se dibuja como capa de fondo.
 - Las banderas del modelo salen como geometría quieta: para que el viento las mueva, dales el papel Banderas. Las gradas salen vacías: el papel Público pone la gente animada del juego.
 

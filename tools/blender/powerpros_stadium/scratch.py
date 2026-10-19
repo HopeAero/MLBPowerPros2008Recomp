@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import bpy
+import numpy as np
 from mathutils import Vector
 
 from . import collision_gen, convert, exporter, pj7m_write, stadium_read
@@ -86,6 +87,13 @@ def role_of(obj):
     role = getattr(obj, "powerpros_role", "auto")
     if role != "auto":
         return role
+    if obj.type == "MESH" and not obj.modifiers and len(obj.data.vertices):
+        # The mesh itself: bound_box is stale after a script edits the mesh, until the next update.
+        co = np.empty(len(obj.data.vertices) * 3, np.float32)
+        obj.data.vertices.foreach_get("co", co)
+        m = np.array(obj.matrix_world, np.float32)
+        z = co.reshape(-1, 3) @ m[2, :3] + m[2, 3]
+        return "ground" if float(np.abs(z).max()) < FLAT else "stand"
     pts = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
     return "ground" if max(abs(p.z) for p in pts) < FLAT else "stand"
 
@@ -115,6 +123,40 @@ def evaluated(objects):
             me = t.data
             bpy.data.objects.remove(t)
             bpy.data.meshes.remove(me)
+
+
+def add_game_base_objects(coll):
+    """The data stadium's BCL pieces (bases, plate, mound) as locked reference objects (pp_kind
+    game_base), so the model can be fitted to them: build_stadium exports the ones still in the
+    collection, at the game's own place."""
+    from . import importer, pj7m, stadium_tbl
+    code = coll.get("pp_stadium", "col")
+    archive = projectbin.Archive(coll["pp_project_bin"])
+    gfx, tbl = archive.read(f"stadium_{code}.pack"), archive.read(f"stadium_{code}tbl.pack")
+    if gfx is None or tbl is None:
+        raise ScratchFailure(T(f"project.bin no tiene el estadio «{code}»", f"project.bin has no stadium '{code}'"))
+    images, materials = {}, {}
+    for pl in stadium_tbl.parse_table(tbl).placements:
+        model = pj7m.parse_model(gfx, pl.model)
+        if "BCL" not in model.name:
+            continue
+        obj = bpy.data.objects.new(model.name, importer.build_mesh(gfx, model, images, materials))
+        obj.matrix_world = importer.placement_matrix(pl)
+        obj["pp_kind"] = "game_base"
+        obj["pp_model"] = model.name
+        obj.lock_location = obj.lock_rotation = obj.lock_scale = (True, True, True)
+        coll.objects.link(obj)
+    coll["pp_game_bases"] = 1                    # from now on, only the ones left are exported
+
+
+def _layer_heights(bm):
+    """Area-weighted mean height of the faces of each material."""
+    acc = {}
+    for f in bm.faces:
+        a, z = f.calc_area(), f.calc_center_median().z
+        s = acc.setdefault(f.material_index, [0.0, 0.0])
+        s[0], s[1] = s[0] + a * z, s[1] + a
+    return {i: s[0] / s[1] if s[1] else 0.0 for i, s in acc.items()}
 
 
 def solid_objects(coll):
@@ -231,11 +273,12 @@ def _copy_texture(st, base, t, pal, maps):
     return tex_map[t], pal_map.get(pal)
 
 
-def _add_game_bases(st, base, maps):
-    """The data stadium's BCL pieces (bases, plate, mound, lines) with their textures and palettes."""
+def _add_game_bases(st, base, maps, keep=None):
+    """The data stadium's BCL pieces (bases, plate, mound, lines) with their textures and palettes;
+    with `keep`, only the models named there."""
     for p in base.placements:
         m = base.models[p.model]
-        if "BCL" not in m.name:
+        if "BCL" not in m.name or (keep is not None and m.name not in keep):
             continue
         m.textures = [(*_copy_texture(st, base, t, pal, maps), level) for t, pal, level in m.textures]
         st.models.append(m)
@@ -270,7 +313,7 @@ def build_stadium(coll, game_bases=True, bake_light=True):
     if not project_bin or not Path(project_bin).is_file():
         raise ScratchFailure(T("Esta colección no tiene el project.bin del juego: créala con «Nuevo estadio desde cero»",
                                "This collection has no game project.bin: create it with «New stadium from scratch»"))
-    objects = [o for o in coll.all_objects if o.type in GEOMETRY and o.get("pp_kind") != "collision"]
+    objects = [o for o in coll.all_objects if o.type in GEOMETRY and o.get("pp_kind") not in ("collision", "game_base")]
     groups = {}
     for o in objects:
         groups.setdefault((role_of(o), bool(getattr(o, "powerpros_hide_above", False))), []).append(o)
@@ -289,8 +332,18 @@ def build_stadium(coll, game_bases=True, bake_light=True):
             bm, images = convert.prepare(temps, bake_light, separate=role != "ground")
         textured = [i for i, img in enumerate(images) if img is not None]
         plain = [i for i, img in enumerate(images) if img is None]
+        order = None
+        if role == "ground":
+            # The ground layer is drawn without depth test: its layers (base grass, infield dirt over
+            # it) must go from the bottom up, in material and in face order.
+            heights = _layer_heights(bm)
+            order = lambda i: heights.get(i, 0.0)
+            textured.sort(key=order)
+            bm.faces.sort(key=lambda f: f.calc_center_median().z)
         chunks = [textured[i:i + MAX_TEXMAPS] for i in range(0, len(textured), MAX_TEXMAPS)] or [[]]
         chunks[0] = chunks[0] + plain
+        if order is not None:
+            chunks[0].sort(key=order)
         slot = CROWD_SLOTS.get(role)
         crowd = base.preload[slot] if slot is not None and slot < len(base.preload) else None
         if crowd is not None and crowd.texture is None:
@@ -326,7 +379,8 @@ def build_stadium(coll, game_bases=True, bake_light=True):
     if not st.models:
         raise ScratchFailure(T("La colección no tiene objetos con caras", "The collection has no objects with faces"))
     if game_bases:
-        _add_game_bases(st, base, maps)
+        keep = {o.get("pp_model") for o in coll.all_objects if o.get("pp_kind") == "game_base"}             if coll.get("pp_game_bases") else None        # older collections: all of them
+        _add_game_bases(st, base, maps, keep)
         # Tree A keeps the placement order as the draw order: the bases' marks right after the ground.
         rank = lambda p: 0 if st.models[p.model].name.startswith("DP_ground_") else 1 if "BCL" in st.models[p.model].name else 2
         st.placements.sort(key=rank)

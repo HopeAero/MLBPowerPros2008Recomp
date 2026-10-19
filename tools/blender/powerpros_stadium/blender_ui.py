@@ -245,6 +245,12 @@ class PP_OT_new_scratch(bpy.types.Operator, ImportHelper):
         if game_folder is not None:
             coll["pp_game_folder"] = str(game_folder)
         context.scene.collection.children.link(coll)
+        try:
+            scratch.add_game_base_objects(coll)
+        except scratch.ScratchFailure as e:
+            bpy.data.collections.remove(coll)
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
         context.view_layer.active_layer_collection = context.view_layer.layer_collection.children[coll.name]
         self.report({"INFO"}, T(f"{coll.name}: mete aquí tus objetos y dales su papel en el panel Power Pros",
                                 f"{coll.name}: put your objects here and give them their role in the Power Pros panel"))
@@ -387,6 +393,12 @@ class PP_PT_info(bpy.types.Panel):
         layout.operator(PP_OT_generate_collision.bl_idname, icon="MOD_PHYSICS")
         obj = context.active_object
         coll = stadium_collection(context)
+        if obj is not None and scratch.is_scratch(coll) and obj.get("pp_kind") == "game_base":
+            box = layout.box()
+            box.label(text=T("Pieza del juego: ", "Game piece: ") + obj.name, translate=False)
+            box.label(text=T("Se exporta tal cual y en su sitio. Bórrala para usar la tuya.",
+                             "Exported as it is, in its place. Delete it to use your own."), translate=False)
+            return
         if obj is not None and scratch.is_scratch(coll) and obj.name in coll.all_objects and obj.get("pp_kind") != "collision":
             box = layout.box()
             box.label(text=T("Pieza del estadio desde cero: ", "From-scratch stadium piece: ") + obj.name, translate=False)

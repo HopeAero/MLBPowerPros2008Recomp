@@ -229,6 +229,30 @@ except scratch.ScratchFailure as e:
     check("bandera_plana" in str(e), f"a flat flag is refused naming it: {e}")
 check(not [o for o in bpy.data.objects if o.name.startswith("pp_tmp_")], "no temporary objects left after a refused flag")
 
+import bmesh                                                         # noqa: E402
+raised = mesh_object(scratch_collection("Editado"), "subido", [(0, 0, 0), (1, 0, 0), (1, 1, 0)], [(0, 1, 2)], grey)
+bpy.context.view_layer.update()
+bm = bmesh.new()
+bm.from_mesh(raised.data)
+for v in bm.verts:
+    v.co.z += 10.0
+bm.to_mesh(raised.data)
+bm.free()
+check(scratch.role_of(raised) == "stand", "«auto» sees a mesh edited by a script since the last update (raised: stand)")
+
+layers = scratch_collection("Capas del suelo")
+mesh_object(layers, "tierra", [(-15, 5, 0), (15, 5, 0), (15, 35, 0), (-15, 35, 0)], [(0, 1, 2, 3)],
+            material("tierra", (0.6, 0.4, 0.2)))                      # on top, made first
+mesh_object(layers, "cesped_base", [(-60, -20, -0.04), (60, -20, -0.04), (60, 130, -0.04), (-60, 130, -0.04)],
+            [(0, 1, 2, 3)], grass)
+mesh_object(layers, "valla6", fence_v, [(k, (k + 1) % n, n + (k + 1) % n, n + k) for k in range(n)], grey, "fence")
+st_l, _, _ = scratch.build_stadium(layers, game_bases=False)
+g = next(m for m in st_l.models if m.name.startswith("DP_ground_"))
+heights = [round(sum(me.positions[c[1]][1] for c in cs[i:i + 3]) / 3, 3)
+           for me in g.meshes for op, cs in me.draws for i in range(0, len(cs), 3)]
+check(len(set(heights)) == 2 and heights == sorted(heights),
+      f"ground layers drawn from the bottom up (the ground layer has no depth test): {heights}")
+
 # ---- Task 3: operators, export, View in game ----------------------------------------------------
 exporter = importlib.import_module(pkg + ".exporter")
 preview = importlib.import_module(pkg + ".preview")
@@ -237,6 +261,18 @@ check(bpy.ops.object.powerpros_new_scratch(filepath=project_bin, stadium="col") 
 made = [c for c in bpy.data.collections if c not in before]
 check(len(made) == 1 and bpy.context.view_layer.active_layer_collection.collection == made[0],
       "the new from-scratch collection is the active one: new objects go into it")
+bases = [o for o in made[0].all_objects if o.get("pp_kind") == "game_base"]
+check(len(bases) == 3 and all("BCL" in o.name and all(o.lock_location) for o in bases),
+      f"the data stadium's bases, plate and mound are shown, locked: {[o.name for o in bases]}")
+mesh_object(made[0], "campo5", [(-60, -20, 0), (60, -20, 0), (60, 130, 0), (-60, 130, 0)], [(0, 1, 2, 3)], grass)
+mesh_object(made[0], "valla5", fence_v, [(k, (k + 1) % n, n + (k + 1) % n, n + k) for k in range(n)], grey, "fence")
+mound = next(o for o in bases if "maund" in o.name and "plate" not in o.name)
+mound_name = mound.name
+bpy.data.objects.remove(mound)
+st_b, _, _ = scratch.build_stadium(made[0])
+placed_b = [st_b.models[p.model].name for p in st_b.placements]
+check(mound_name not in placed_b and sum("BCL" in nm for nm in placed_b) == 2 and not any(nm.startswith("DP_ground_") and "BCL" in nm for nm in placed_b),
+      f"a deleted game piece is not exported, the others are, and they are not taken as model geometry: {placed_b}")
 check(len(made) == 1 and made[0].get("pp_scratch") and made[0].get("pp_stadium") == "col"
       and Path(made[0].get("pp_project_bin", "")).is_file(), f"the new collection is a from-scratch one ({[dict(c) for c in made]})")
 
