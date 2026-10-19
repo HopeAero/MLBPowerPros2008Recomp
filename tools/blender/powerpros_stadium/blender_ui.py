@@ -10,7 +10,7 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
-from . import collision_gen, convert, exporter, importer, names, preview
+from . import collision_gen, convert, exporter, importer, names, preview, scratch
 from .i18n import CONTEXT, T
 
 
@@ -401,6 +401,7 @@ def blender_language_changed():
 
 def register():
     bpy.utils.register_class(PP_preferences)
+    scratch.register_properties()
     apply_language()
     for c in CLASSES:
         bpy.utils.register_class(c)
@@ -418,3 +419,4 @@ def unregister():
     for c in reversed(CLASSES):
         bpy.utils.unregister_class(c)
     bpy.utils.unregister_class(PP_preferences)
+    scratch.unregister_properties()
