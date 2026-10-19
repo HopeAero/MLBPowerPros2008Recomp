@@ -42,6 +42,17 @@ Back (Esc, Backspace, K or Circle/B) only counts on the frame it is pressed and 
 
 The launcher is in Spanish or English. By default it follows Windows: Spanish when Windows is in Spanish, English otherwise. To change it: **SETTINGS > INTERFACE > IDIOMA / LANGUAGE** (Automatic, Español or English). The change shows right away and is saved in `Config.toml` (`[ui] language = "auto" | "es" | "en"`); the Setup and Texture Studio use the same setting.
 
+## Seasons (Season mode)
+
+**SETTINGS > GAME > SEASONS** sets how long Season mode lasts: **10 (original)**, which ends after the 2017 season as on the Wii, or **20**, which goes on to 2027. It is saved in `Config.toml` (`[season] max_seasons = 10 | 20`).
+
+- With 20, a save the original game already finished (after season 10, which replays the ending on load) goes on to 2018.
+- A save already past 10 seasons keeps going with 20 even if the option is set to 10, so it is not damaged.
+- The game keeps 10 years of finances; years 11 to 20 go in the free part at the end of the save file (`pm3usse<slot>.dat`). With 10, the save stays byte for byte as the original writes it.
+- The ending's farewell text says «10 years» even after 20.
+
+Details in `docs/en/reverse-engineering.md` («Season year») and `docs/superpowers/plans/2026-10-19-season-20-build.md`.
+
 ## Saving
 
 The existing mapping files and the `[controller]` section of `Config.toml` are kept. The additional settings are saved under `UserData` in portable installations:

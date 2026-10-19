@@ -42,6 +42,17 @@ Volver (Esc, Retroceso, K o Círculo/B) solo cuenta en el fotograma en que se pu
 
 El launcher está en español o en inglés. Por defecto usa el idioma de Windows: español si Windows está en español e inglés en cualquier otro caso. Para cambiarlo: **AJUSTES > INTERFAZ > IDIOMA / LANGUAGE** (Automático, Español o English). El cambio se ve al momento y se guarda en `Config.toml` (`[ui] language = "auto" | "es" | "en"`); el Setup y el Texture Studio usan el mismo ajuste.
 
+## Temporadas (modo Temporada)
+
+**AJUSTES > JUEGO > TEMPORADAS** decide cuánto dura el modo Temporada: **10 (original)**, que acaba tras la temporada de 2017 como en la Wii, o **20**, que sigue hasta 2027. Se guarda en `Config.toml` (`[season] max_seasons = 10 | 20`).
+
+- Con 20, una partida que el juego original ya dio por terminada (tras la temporada 10, que repite el final al cargarla) sigue en 2018.
+- Una partida que ya pasó de 10 temporadas sigue con 20 aunque la opción esté en 10, para no estropearla.
+- El juego guarda 10 años de finanzas; las de los años 11 a 20 van en la parte libre del final del archivo de la partida (`pm3usse<hueco>.dat`). Con 10, la partida queda igual byte a byte que la del original.
+- El texto de la despedida del final dice «10 years» aunque hayan pasado 20.
+
+Detalles en `docs/ingenieria-inversa.md` («Año de la temporada») y `docs/superpowers/plans/2026-10-19-season-20-build.md`.
+
 ## Guardado
 
 Se mantienen los archivos de mapeo existentes y la sección `[controller]` de `Config.toml`. Los ajustes adicionales se guardan bajo `UserData` en instalaciones portátiles:

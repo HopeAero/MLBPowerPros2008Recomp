@@ -53,10 +53,10 @@ index 4cda53f..e0050cf 100644
  }
 diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
 new file mode 100644
-index 0000000..2a536ba
+index 0000000..7502e0d
 --- /dev/null
 +++ b/runtime/include/season_cap.h
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,142 @@
 +#pragma once
 +// Season mode up to 20 seasons (launcher option GAME > SEASONS, [season] max_seasons = 10 | 20).
 +//
@@ -79,11 +79,18 @@ index 0000000..2a536ba
 +constexpr int kFinanceItems = 11;             // 10 items and the balance, per year
 +
 +// Seasons for this run: 20 with the option, and also when the loaded save is already past season 10
-+// (the original would write past its 10-year finance table).
-+inline int CountFor(int configured, int loadedIndex) {
-+    if (configured == kMaxSeasons || loadedIndex >= kOriginalSeasons) return kMaxSeasons;
++// (the original would write past its 10-year finance table). Index 10 with the finished flag is the
++// original game's own end state, which keeps the original behaviour under 10.
++inline int CountFor(int configured, int loadedIndex, bool finishedFlag) {
++    if (configured == kMaxSeasons || loadedIndex > kOriginalSeasons) return kMaxSeasons;
++    if (loadedIndex == kOriginalSeasons && !finishedFlag) return kMaxSeasons;
 +    return kOriginalSeasons;
 +}
++
++// The finished flag (bit 0x20 of [[0x8104B5A8] + 0x104], read by 0x80C0D438): set when the mode's
++// ending plays, and a finished save replays the ending on load. An ending reached before this run's
++// last season (the original's, after season 10, with 20 seasons now) no longer counts.
++inline bool Finished(bool flag, int index, int count) { return flag && index >= count; }
 +
 +// The cap compares, by instruction address: 9 means "last season", 10 "number of seasons".
 +inline bool IsCapCompare(uint32_t address) {
@@ -148,6 +155,33 @@ index 0000000..2a536ba
 +    return true;
 +}
 +
++// The game writes and reads the save in chunks. OverlayTail puts our tail into whatever part of
++// [kSaveDataSize, kSaveDataSize + kTailBytes) a write chunk covers.
++inline void OverlayTail(const FinanceStore& store, uint32_t fileOffset, uint8_t* data, size_t length) {
++    const uint32_t begin = kSaveDataSize, end = kSaveDataSize + static_cast<uint32_t>(kTailBytes);
++    const uint32_t from = fileOffset > begin ? fileOffset : begin;
++    const uint32_t to = fileOffset + length < end ? fileOffset + static_cast<uint32_t>(length) : end;
++    if (from >= to) return;
++    uint8_t tail[kTailBytes];
++    WriteTail(store, tail, sizeof(tail));
++    std::memcpy(data + (from - fileOffset), tail + (from - begin), to - from);
++}
++
++// Collects the tail across read chunks; Feed returns true (with store filled from it) on the
++// chunk that completes the tail.
++struct TailReader {
++    uint8_t tail[kTailBytes] = {};
++    bool Feed(uint32_t fileOffset, const uint8_t* data, size_t length, FinanceStore& store) {
++        const uint32_t begin = kSaveDataSize, end = kSaveDataSize + static_cast<uint32_t>(kTailBytes);
++        const uint32_t from = fileOffset > begin ? fileOffset : begin;
++        const uint32_t to = fileOffset + length < end ? fileOffset + static_cast<uint32_t>(length) : end;
++        if (from >= to) return false;
++        std::memcpy(tail + (from - begin), data + (from - fileOffset), to - from);
++        if (to != end) return false;
++        return ReadTail(tail, sizeof(tail), store);
++    }
++};
++
 +// pm3usse0.dat .. pm3usse2.dat, the three Season mode slots.
 +inline bool IsSeasonSaveName(const char* fileName) {
 +    return fileName && std::strncmp(fileName, "pm3usse", 7) == 0 && fileName[7] >= '0' && fileName[7] <= '2' &&
@@ -157,6 +191,7 @@ index 0000000..2a536ba
 +// Runtime side (hle/mlb/season_cap.cpp).
 +int Count();                          // this run's number of seasons
 +FinanceStore& Store();                // years 10..19 of the loaded season save
++void OnHostFrame();                   // settings_overlay.cpp, once per presented frame
 +// nand_isfs.cpp hooks for the season saves (IsSeasonSaveName): a read of `length` bytes at
 +// fileOffset landed in data; a write of length bytes at fileOffset is about to go out from data
 +// (a copy the hook may change).
@@ -166,10 +201,10 @@ index 0000000..2a536ba
 +}  // namespace season_cap
 diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
 new file mode 100644
-index 0000000..cb55b20
+index 0000000..5d88e96
 --- /dev/null
 +++ b/runtime/src/hle/mlb/season_cap.cpp
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,181 @@
 +// Season mode up to 20 seasons: the cap and the finances of years 10..19 (season_cap.h).
 +#include "season_cap.h"
 +
@@ -191,6 +226,13 @@ index 0000000..cb55b20
 +    const uint32_t state = Memory::Read32(0x8104B5A8u);
 +    if (!state || !Memory::Contains(state, 16)) return -1;
 +    return static_cast<int8_t>(Memory::Read8(state + 8));
++}
++
++// The raw finished flag: bit 0x20 of [state + 0x104].
++bool FinishedFlag() {
++    const uint32_t state = Memory::Read32(0x8104B5A8u);
++    if (!state || !Memory::Contains(state, 0x108)) return false;
++    return (Memory::Read8(state + 0x104) & 0x20) != 0;
 +}
 +
 +uint32_t Call(CpuContext* ctx, uint32_t returnAddress, void (*invoke)(CpuContext*)) {
@@ -226,7 +268,7 @@ index 0000000..cb55b20
 +}  // namespace
 +
 +int Count() {
-+    const int count = CountFor(static_cast<int>(RuntimeConfigFile::MaxSeasons(10)), CurrentIndex());
++    const int count = CountFor(static_cast<int>(RuntimeConfigFile::MaxSeasons(10)), CurrentIndex(), FinishedFlag());
 +    static std::atomic<int> logged{0};
 +    if (logged.exchange(count) != count) std::fprintf(stderr, "[season] %d seasons\n", count);
 +    return count;
@@ -234,17 +276,34 @@ index 0000000..cb55b20
 +
 +FinanceStore& Store() { return g_store; }
 +
++void OnHostFrame() {
++    // A save the original game finished after season 10 replays its ending on load; with more seasons
++    // the flag is cleared as soon as the save is in memory, before the menu reads it. The game's own
++    // checksum covers it on the next save. (The load-time check does not go through 0x80C0D438.)
++    const uint32_t state = Memory::Read32(0x8104B5A8u);
++    if (!state || !Memory::Contains(state, 0x108)) return;
++    if (!FinishedFlag() || Finished(true, CurrentIndex(), Count())) return;
++    Memory::Write8(state + 0x104, static_cast<uint8_t>(Memory::Read8(state + 0x104) & ~0x20));
++    std::fprintf(stderr, "[season] season %d: the ending flag of a shorter game cleared\n", CurrentIndex() + 1);
++}
++
 +void OnSeasonSaveRead(uint32_t fileOffset, const uint8_t* data, size_t length) {
-+    // Only a read that covers the whole tail is the game loading the save (the slot list reads less).
-+    if (fileOffset > kSaveDataSize || fileOffset + length < kSaveFileSize) return;
-+    const bool ours = ReadTail(data + (kSaveDataSize - fileOffset), kSaveFileSize - kSaveDataSize, g_store);
++    // The slot list reads only the header; a load reads the whole file, in chunks.
++    static TailReader reader;
++    FinanceStore loaded;
++    const uint32_t tailEnd = kSaveDataSize + static_cast<uint32_t>(kTailBytes);
++    if (fileOffset >= tailEnd || fileOffset + length <= kSaveDataSize) return;
++    const bool ours = reader.Feed(fileOffset, data, length, loaded);
++    if (fileOffset + length < tailEnd) return;  // the tail is not complete yet
++    g_store = loaded;                           // empty for a save without our tail
 +    if (ours) std::fprintf(stderr, "[season] finances of seasons 11-20 read from the save\n");
 +}
 +
 +void OnSeasonSaveWrite(uint32_t fileOffset, uint8_t* data, size_t length) {
-+    if (fileOffset > kSaveDataSize || fileOffset + length < kSaveFileSize) return;
 +    if (CurrentIndex() < kOriginalSeasons) return;  // nothing stored: keep the original file byte for byte
-+    WriteTail(g_store, data + (kSaveDataSize - fileOffset), kSaveFileSize - kSaveDataSize);
++    OverlayTail(g_store, fileOffset, data, length);
++    if (fileOffset + length >= kSaveDataSize + kTailBytes && fileOffset < kSaveDataSize + kTailBytes)
++        std::fprintf(stderr, "[season] finances of seasons 11-20 written to the save\n");
 +}
 +
 +}  // namespace season_cap
@@ -258,6 +317,13 @@ index 0000000..cb55b20
 +// 0x80C06534: number of seasons (returns 10 in the original).
 +extern "C" void MLB_SeasonCount_80C06534(CpuContext* ctx) { ctx->gpr[3] = static_cast<uint32_t>(Count()); }
 +PPC_NATIVE_OVERRIDE_VOID(80C06534, MLB_SeasonCount_80C06534, (CpuContext* ctx), (ctx));
++
++// 0x80C0D438: has Season mode ended (bit 0x20 of [state + 0x104])? Not when the ending came before
++// this run's last season, so a save the original finished after season 10 goes on to 2018.
++extern "C" void MLB_SeasonFinished_80C0D438(CpuContext* ctx) {
++    ctx->gpr[3] = Finished(FinishedFlag(), CurrentIndex(), Count()) ? 1u : 0u;
++}
++PPC_NATIVE_OVERRIDE_VOID(80C0D438, MLB_SeasonFinished_80C0D438, (CpuContext* ctx), (ctx));
 +
 +// 0x80C0D614 (year, item): yearly summary.
 +extern "C" void MLB_FinanceAnnual_80C0D614(CpuContext* ctx) {
@@ -418,14 +484,35 @@ index d2dd7e9..9f9ceb8 100644
          if (label == language.label) {
              const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
              RuntimeConfigFile::SetUiLanguage(code);
+diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
+index d4d9ea6..2498e69 100644
+--- a/runtime/src/settings_overlay.cpp
++++ b/runtime/src/settings_overlay.cpp
+@@ -2,6 +2,7 @@
+ #include "match_benchmark.h"
+ #include "stadium_viewer.h"
+ #include "season_probe.h"
++#include "season_cap.h"
+ #include "audio_backend.h"
+ #include "aurora_events.h"
+ #include "controller_button_names.h"
+@@ -1707,6 +1708,7 @@ void Draw() noexcept {
+     match_benchmark::OnHostFrame();
+     stadium_viewer::OnHostFrame();
+     season_probe::OnHostFrame();
++    season_cap::OnHostFrame();
+     // Also drive the Wii Remote rescan from here: PADRead runs it too, but this
+     // runs once per presented frame whatever the game is doing (e.g. sitting in
+     // its "communications interrupted" prompt without polling pads). Same guest
 diff --git a/runtime/tests/season_cap_tests.cpp b/runtime/tests/season_cap_tests.cpp
 new file mode 100644
-index 0000000..9f73ff6
+index 0000000..d23243d
 --- /dev/null
 +++ b/runtime/tests/season_cap_tests.cpp
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,76 @@
 +#include "season_cap.h"
 +#include <cstdio>
++#include <algorithm>
 +#include <vector>
 +
 +static int failures = 0;
@@ -438,10 +525,17 @@ index 0000000..9f73ff6
 +
 +int main() {
 +    using namespace season_cap;
-+    Check(CountFor(10, 3) == 10, "option 10, season 4: 10");
-+    Check(CountFor(20, 3) == 20, "option 20: 20");
-+    Check(CountFor(10, 12) == 20, "option 10 but the save is already past season 10: 20");
-+    Check(CountFor(15, 0) == 10, "anything but 20 is the original 10");
++    Check(CountFor(10, 3, false) == 10, "option 10, season 4: 10");
++    Check(CountFor(20, 3, false) == 20, "option 20: 20");
++    Check(CountFor(10, 12, false) == 20, "option 10 but the save is already past season 10: 20");
++    Check(CountFor(15, 0, false) == 10, "anything but 20 is the original 10");
++    Check(CountFor(10, 10, true) == 10, "option 10, the original game's finished save: stays finished");
++    Check(CountFor(10, 10, false) == 20, "option 10, a 2018 season played with 20: 20");
++
++    Check(Finished(true, 10, 20) == false, "finished after season 10, now 20 seasons: keep playing");
++    Check(Finished(true, 10, 10) == true, "finished after season 10 with 10 seasons: the original ending");
++    Check(Finished(true, 20, 20) == true, "finished after season 20");
++    Check(Finished(false, 20, 20) == false, "not finished");
 +
 +    Check(ImmediateFor(0x80BB4A6Cu, 9, 20) == 19, "last-season compare follows the cap");
 +    Check(ImmediateFor(0x80C0CC0Cu, 10, 20) == 20, "season-count compare follows the cap");
@@ -468,6 +562,24 @@ index 0000000..9f73ff6
 +    ClearAfter(keep, 0);
 +    Check(keep.annual[0][10] == 0, "a season at year 0 (new game) drops every stored year");
 +
++    // The game writes and reads the file in chunks: the tail must survive any split.
++    for (uint32_t chunk : {0x4000u, 0x1000u, 0x120000u, 0x777u}) {
++        std::vector<uint8_t> out(kSaveFileSize, 0);
++        for (uint32_t at = 0; at < kSaveFileSize; at += chunk) {
++            const uint32_t n = std::min(chunk, kSaveFileSize - at);
++            OverlayTail(store, at, out.data() + at, n);
++        }
++        TailReader reader;
++        FinanceStore got;
++        bool done = false;
++        for (uint32_t at = 0; at < kSaveFileSize; at += chunk) {
++            const uint32_t n = std::min(chunk, kSaveFileSize - at);
++            done |= reader.Feed(at, out.data() + at, n, got);
++        }
++        Check(done && got.annual[0][10] == 12345 && got.yearly[4] == 99, "chunked write and read keep the tail");
++        Check(std::all_of(out.begin(), out.begin() + kSaveDataSize, [](uint8_t b) { return b == 0; }),
++              "the overlay never touches the game's data");
++    }
 +    Check(IsSeasonSaveName("pm3usse0.dat") && IsSeasonSaveName("pm3usse2.dat"), "season slots");
 +    Check(!IsSeasonSaveName("pm3usma.dat") && !IsSeasonSaveName("pm3usse3.dat") && !IsSeasonSaveName("pm3usse0.dat.tmp"),
 +          "main data, a fourth slot and a scratch file are not season saves");
