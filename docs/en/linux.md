@@ -22,7 +22,7 @@ What was measured on one PC (Fedora 44, Ryzen 7 8840HS, Radeon 780M with RADV/Me
 | Steam Deck (LCD, SteamOS 3.8.28, glibc 2.41) | the portable build, copied from the PC: every library resolves; the test match in Desktop Mode at 2x, 16:9, Vulkan (RADV VANGOGH): **59.9 FPS**, frame time p50 16.7 ms, p99 24.4 ms, GPU 6.6 ms per frame |
 | Steam Deck, by hand | Game Mode: fullscreen, the built-in controls and sound work (reported by the tester, October 18) |
 | Saves | work after the fix in `wiicompiled-mlb-save-dir` (below): a save in the game writes `pm3usma.dat` (868 KB). Before it, every save said "Save failed" |
-| Roster editor (PowerUp+) | builds for Linux (`linux-x64`, self-contained). Through its API, on this PC: the base roster loads from the player's `project.bin`, a roster exports as a 2008 mod into `mods/`, and the game enables it, converts it and rebuilds `PROJECT.BIN` (seen in its log). The browser UI and the launcher's EDIT ROSTER button were not tried by hand |
+| Roster editor (PowerUp+) | builds for Linux (`linux-x64`, self-contained). Through its API, on this PC: the base roster loads from the player's `project.bin`, a roster exports as a 2008 mod into `mods/`, and the game enables it, converts it and rebuilds `PROJECT.BIN` (seen in its log). By hand: the launcher's EDIT ROSTER opens it in the browser and editing works (reported by the tester, October 18) |
 | **Not tested** | building on the Deck; the roster editor on the Deck (it opens in a web browser: use Desktop Mode); X11 sessions; NVIDIA and Intel GPUs; season, league and MLB Life modes |
 | Not ported | the benchmark's CPU/GPU/RAM counters read "n/d" (they come from Windows performance counters) |
 
