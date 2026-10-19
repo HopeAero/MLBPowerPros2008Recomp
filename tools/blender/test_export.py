@@ -6,6 +6,7 @@ Edits: DP_stand_C raised 15 m (transform), DP_score geometry raised 10 m (mesh),
 DP_ground's texture tinted blue (image). Writes <mods dir>/BlenderTest; exits 1 on failure.
 """
 import importlib
+import struct
 import sys
 from pathlib import Path
 
@@ -47,6 +48,10 @@ px = px.reshape(-1, 4)
 px[:, 0] *= 0.2
 px[:, 1] *= 0.4
 ground_img.pixels.foreach_set(px.ravel())
+# Its texture repeated 40 times plus an offset of 1000 repeats (SketchUp-like UVs): the texmap must
+# say how far it repeats, or the game stretches the edge (texmap +0x1C/+0x1E).
+for loop_uv in objs["DP_ground"].data.uv_layers.active.data:
+    loop_uv.uv = (loop_uv.uv[0] * 40 + 1000, loop_uv.uv[1] * 40 - 1000)
 
 bpy.context.view_layer.objects.active = objs["DP_ground"]
 result = bpy.ops.export_scene.powerpros_stadium(mod_name="BlenderTest", mods_folder=mods_dir, mode="replace",
@@ -77,6 +82,13 @@ check(len(emptied.meshes) == 0, f"deleted {flag} has no meshes")
 ground = pj7m.parse_model(gfx, offsets["DP_ground"])
 new_tex = [t for t in ground.textures if t.offset >= len(orig)]
 check(len(new_tex) >= 1 and new_tex[0].fmt == 5, "DP_ground uses a new RGB5A3 texture")
+for mesh in ground.meshes:
+    tm = ground.texmaps[ground.materials[mesh.material].texmaps[0]]
+    reach = struct.unpack_from(">HH", tm.raw, 0x1C)
+    uv = pj7m.array(gfx, mesh, "tex")
+    need = [max(abs(t[k]) for t in uv) for k in (0, 1)]
+    check(all(reach[k] >= need[k] - 1e-3 for k in (0, 1)), f"texmap repeats {reach} cover the UVs {[round(n, 2) for n in need]}")
+    check(max(need) < 1000, f"the 1000-repeat offset is gone: whole repeats taken off each face ({max(need):.1f})")
 # Its HD copy: named after the pack texels as the runtime hashes them, full size, tinted.
 hd_mod = importlib.import_module(pkg + ".hd_textures")
 t = new_tex[0]

@@ -390,12 +390,13 @@ Verified (October 14, 2026):
 | Mesh list | 8-byte entries: u16 material, u16 1, → mesh |
 | Mesh (`0x1C`) | u32 0, u32 display list size, → display list, → POS, → NRM, → CLR0, → TEX0 |
 | Material (`0x34`) | u16 3, u16 first texmap (`0xFFFF` without texture), 3 RGBA8 colors, `+0x1C` 8 u16 texmap slots (`0xFFFF` = free; one is always used) |
-| Texmap (`0x4C`) | u16 texture index, `+0x0C` u16 width − 1 and height − 1; bytes `+2..+0x0C` are the same in the 11,281 of all stadiums |
+| Texmap (`0x4C`) | u16 texture index, `+0x0C` u16 width − 1 and height − 1, `+0x1C` u16 and `+0x1E` u16 how many times the texture repeats in U and V; bytes `+2..+0x0C` are the same in the 11,281 of all stadiums |
 | Texture and palette tables | 8-byte entries {→ header, 0}, in parallel. The headers are the model texture ones from the texture table above. Without a palette, the pointer is 0. |
 
 - **Vertices:** not quantized.
   - POS and NRM in f32 xyz, CLR0 in RGBA8, TEX0 in f32 uv.
   - UVs go up to 32: textures repeat.
+  - **Texmap repeats** (`+0x1C` U, `+0x1E` V): in the meshes of the 43 stadium packs, always `≥` the largest `|u|` and `|v|` of the meshes using it (usually rounded up; up to 280). With 1 the game does not repeat the texture in that direction and stretches the edge: flat colour with 1/1, stripes with 1 in one direction only. Seen on 18 October 2026 in the viewer with the Polo Grounds on AT&T Park (SketchUp UVs up to ±1,600, templates 1/1 and 1/2): grey stands and striped towers; with the fields set right, the same as in Blender.
   - Each array is as long as the highest index in its display list asks for; there is no size field.
   - A few normals are (0, 0, 0).
 - **Display lists:**

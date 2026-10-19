@@ -171,6 +171,14 @@ class Exporter:
             uvs = np.zeros((len(me.loops), 2), np.float32)
             if uv is not None:
                 uv.data.foreach_get("uv", uvs.reshape(-1))
+                # Whole repeats off each face, so its UVs start near 0 (SketchUp writes them in the
+                # hundreds); the texture looks the same and the texmap's repeat counts stay small.
+                starts = np.empty(len(me.polygons), np.int32)
+                me.polygons.foreach_get("loop_start", starts)
+                totals = np.empty(len(me.polygons), np.int32)
+                me.polygons.foreach_get("loop_total", totals)
+                if len(starts):
+                    uvs -= np.repeat(np.floor(np.minimum.reduceat(uvs, starts)), totals, axis=0)
             col = me.color_attributes.get("Color")
             colors = np.full((len(me.loops), 4), 1.0, np.float32)
             if col is not None:
@@ -253,6 +261,7 @@ class Exporter:
             if mesh_changed:
                 meshes = self.mesh_groups(obj, model)
                 self.w.set_meshes(pj7m.parse_model(self.w.d, off), meshes, FIELD_CENTRE)
+                self.w.fit_texmap_repeats(pj7m.parse_model(self.w.d, off))
                 texmaps = len(pj7m.parse_model(self.w.d, off).texmaps)
                 if texmaps > MAX_TEXMAPS:      # the game indexes a fixed table with them and crashes
                     raise ExportFailure(T(f"La pieza {obj.name} tendría {texmaps} texturas y el juego admite {MAX_TEXMAPS}: "

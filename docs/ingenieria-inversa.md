@@ -391,12 +391,13 @@ Verificado (14 de octubre de 2026):
 | Lista de mallas | entradas de 8 bytes: u16 material, u16 1, → malla |
 | Malla (`0x1C`) | u32 0, u32 tamaño de la display list, → display list, → POS, → NRM, → CLR0, → TEX0 |
 | Material (`0x34`) | u16 3, u16 primer texmap (`0xFFFF` sin textura), 3 colores RGBA8, `+0x1C` 8 ranuras u16 de texmap (`0xFFFF` = libre; siempre se usa una) |
-| Texmap (`0x4C`) | u16 índice de textura, `+0x0C` u16 ancho − 1 y alto − 1; los bytes `+2..+0x0C` son iguales en las 11.281 de todos los estadios |
+| Texmap (`0x4C`) | u16 índice de textura, `+0x0C` u16 ancho − 1 y alto − 1, `+0x1C` u16 y `+0x1E` u16 cuántas veces se repite la textura en U y en V; los bytes `+2..+0x0C` son iguales en las 11.281 de todos los estadios |
 | Tablas de texturas y paletas | entradas de 8 bytes {→ cabecera, 0}, en paralelo. Las cabeceras son las de textura de modelo de la tabla de texturas de arriba. Sin paleta, el puntero es 0. |
 
 - **Vértices:** sin cuantizar.
   - POS y NRM en f32 xyz, CLR0 en RGBA8, TEX0 en f32 uv.
   - Las UV llegan hasta 32: las texturas se repiten.
+  - **Repeticiones del texmap** (`+0x1C` U, `+0x1E` V): en las mallas de los 43 packs de estadio, siempre `≥` el mayor `|u|` y `|v|` de las mallas que lo usan (normalmente su redondeo hacia arriba; hasta 280). Con 1 el juego no repite la textura en esa dirección y estira el borde: color plano con 1/1, rayas con 1 en una sola dirección. Visto el 18 de octubre de 2026 en el visor con el Polo Grounds sobre AT&T Park (UV de SketchUp de hasta ±1.600, plantillas 1/1 y 1/2): gradas grises y torres a rayas; con los campos bien puestos, igual que en Blender.
   - Cada array mide lo que pide el índice más alto de su display list; no hay campo de tamaño.
   - Unas pocas normales valen (0, 0, 0).
 - **Display lists:**

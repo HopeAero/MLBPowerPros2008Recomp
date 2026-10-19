@@ -6,6 +6,7 @@ tables and textures go at the end, 32-byte aligned, and the model's structures a
 to them. Checked in the game (docs/ingenieria-inversa.md): appended data with fresh
 0x40000000 pointers loads, and a graphics pack of 21 MB still loads in a match (31.5 MB does not).
 """
+import math
 import struct
 from dataclasses import dataclass, field
 
@@ -94,6 +95,22 @@ class PackWriter:
         self.u32(scene + 0x18, nmat + 1)
         self.u32(scene + 0x1C, P | self.append(bytes(d[mat_off:mat_off + 0x34 * nmat]) + mat, 4))
         return nmat
+
+    def fit_texmap_repeats(self, model):
+        """Texmap +0x1C/+0x1E: how many times its texture repeats in U and V, at least the largest |u|
+        and |v| of the meshes using it (as in every game stadium). With 1 the game does not repeat:
+        it stretches the edge texels (flat colour, or stripes with 1 in one direction)."""
+        reach = {}
+        for mesh in model.meshes:
+            mat = model.materials[mesh.material]
+            if not mat.texmaps or not mesh.counts.get("tex"):
+                continue
+            uv = pj7m.array(self.d, mesh, "tex")
+            need = [max(1, math.ceil(max(abs(t[k]) for t in uv) - 1e-4)) for k in (0, 1)]
+            old = reach.get(mat.texmaps[0], (1, 1))
+            reach[mat.texmaps[0]] = (max(old[0], need[0]), max(old[1], need[1]))
+        for index, (u, v) in reach.items():
+            struct.pack_into(">HH", self.d, model.texmaps[index].offset + 0x1C, min(u, 0xFFFF), min(v, 0xFFFF))
 
     # ---- geometry ------------------------------------------------------------------------------
 
