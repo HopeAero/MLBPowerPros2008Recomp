@@ -88,6 +88,8 @@ What looks right in Blender may look different in the game. **View in game** (th
 - Pressing the button again closes the game it opened before and opens it with your changes.
 - It uses its own cache (about 400 MB in `UserData/Cache/preview`), so the normal game's cache is not rebuilt. It loads only the stadium you are making: your other mods are not enabled.
 - The stadium must have been imported from the installed game folder (the one with `WiiCompiled.exe`); otherwise the button says so.
+- While the game window is active it gets your keys: if you type somewhere else without switching windows, the camera moves.
+- **What it is for:** seeing what the game does with your model without playing a match. With the Polo Grounds (18 October 2026) it showed three faults Blender did not: textures lost when converting, grey stands and striped towers (see «Limits» and «Why a base stadium is needed»). All three are fixed in add-on 0.7.3.
 
 ## Your own model (SketchUp, glTF, OBJ…)
 
@@ -96,6 +98,8 @@ You can bring a stadium that doesn't exist in the game into it.
 1. **Import a stadium from the game** as a base. Pick the one you want to provide its game data (dimensions, menu, saves); for example, AT&T Park for a Giants stadium.
 2. **Import your model** into the same scene: File > Import > glTF, OBJ, FBX…
    - **SketchUp** (`.skp`): convert it to `.glb` first. For example, with [OpenSKP](https://github.com/iamahsanmehmood/openskp) (open source, MIT): `pip install openskp pillow` and then `python -c "from openskp import SkpFile; from openskp.export import glb; s = SkpFile.open('estadio.skp'); s.parse(); glb.export(s, 'estadio.glb', textures=True)"`. It comes out in millimeters: scale it to 0.001.
+     - OpenSKP gives faces with SketchUp's default material the layer's colour (`Layer0`, red) when it does not resolve their group's material. If you see red faces that are not red in SketchUp, give them their SketchUp colour in Blender before converting. In the Polo Grounds they were the roofs' green `[Color_G19]`.
+     - OpenSKP also writes sRGB colours as if they were linear: in Blender they look lighter than in SketchUp.
    - Delete whatever isn't the stadium, such as aerial photos, distant terrain or people.
 3. **Place it like the game's stadium:**
    - in meters;
@@ -110,6 +114,8 @@ You can bring a stadium that doesn't exist in the game into it.
    - With **Remove original stadium** (**Quitar el estadio original**) (on by default), the base stadium's pieces disappear and only your model remains. Pieces with the `pp_keep` property are kept, for example a crowd piece where you've put your own crowd.
    - The game's bases, plate and mound (`BCL` pieces) always stay: the players stand on them, and a model's own rarely match (Mario Stadium's plate was 1.2 m).
    - Each piece gets at most 30 textures: the model's are spread over the base stadium's stands.
+   - If the model has a texture painted over a plain face, on the same corners (SketchUp does this), the textured face is kept.
+   - Converted pieces look in Blender as in the game: texture × vertex colour, unlit. Use the **Material** view (Z > Material Preview).
 5. Press **Generate collision** (**Generar colisión**). It creates your stadium's "Collision" mesh:
    - the ground (grass if it's green, dirt if not) and the mound;
    - the fences, following the wall closest to the field in all directions;
@@ -124,7 +130,23 @@ Limits:
 - The collision can have up to 65,535 triangles.
 - Each piece takes up to 30 textures, counting its original ones; that is the most a piece has in the game's stadiums. «Convert objects into pieces» spreads the model's textures over the base stadium's stands to stay under it, and the exporter refuses to write a piece with more. With 82 in one piece the game read past a table, the stadium showed no fences and the match ended up closing.
 - In the pack, textures become RGB5A3 and powers of 2 up to 256 pixels. With **HD textures**, the game uses the image at its own size (up to 2048 pixels).
+- Textures can repeat as much as needed. Each texture in the pack says how many times it repeats horizontally and vertically. With 1, the game does not repeat it: it stretches the edge. The exporter works those numbers out from your faces' UVs, after taking the spare whole repeats off each face; the picture does not change. Up to version 0.7.2 it copied them from the piece's first texture: the Polo Grounds on AT&T Park came out with grey stands and striped towers, and fine on Coors Field, by luck.
 - The collision generator assumes a normal baseball field: ground at height 0, the center of the field about 45 m in front of home plate and walls around it.
+
+## Why a base stadium is needed
+
+Your model does not go into the game from scratch: it goes **inside one of the game's stadiums** (AT&T Park, Coors Field…), which acts as the base.
+- **Your model:** all the geometry. The base's pieces are emptied, except home plate, the bases and the mound, because the players stand on them.
+- **From the base:** the skeleton the game knows how to load.
+  - the list of pieces and their role: ground, stands, crowd, flags, scoreboard;
+  - the internal material and texture settings, which the exporter copies as a template;
+  - the stadium table: collision, piece placement and fields not decoded yet;
+  - the menu photo, the game data (dimensions, saves) and the sounds.
+- **Why:** the game has no way to create a new kind of stadium. It only loads packs with the structure it already knows, so an existing one is filled in.
+
+Each template field that is understood is one thing less inherited blindly. The texture repeats (above, «Limits») are an example: they came from the base and broke the textures on some bases and not on others.
+
+**Later (chosen, no date):** generate the whole stadium pack from scratch, with no template. It needs every field of the materials, textures and stadium table decoded. The other route, a renderer of our own that draws the `.glb` directly, is set aside for now.
 
 ## How to make a model that works well in the game
 

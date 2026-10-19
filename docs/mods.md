@@ -2,6 +2,8 @@
 
 *English version: [en/mods.md](en/mods.md)*
 
+**¿Primera vez?** La [guía para crear mods](guia-mods.md) lo explica paso a paso; esto es la referencia.
+
 Los mods se activan en el launcher: **MODS** en el menú principal (con el arte MoonInning) o la pestaña **MODS** de Ajustes (con el estilo dibujado). Cada cambio se guarda en `Config.toml` (`[mods] enabled = [...]`) y se aplica al pulsar JUGAR, porque el juego relee los mods al arrancar.
 
 ## Dónde van

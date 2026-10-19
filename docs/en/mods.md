@@ -2,6 +2,8 @@
 
 *Versión en español: [../mods.md](../mods.md)*
 
+**First time?** The [modding guide](modding-guide.md) explains it step by step; this is the reference.
+
 Mods are enabled in the launcher: **MODS** in the main menu (with the MoonInning art) or the **MODS** tab in Settings (with the hand-drawn style). Each change is saved in `Config.toml` (`[mods] enabled = [...]`) and applied when you press PLAY (JUGAR), because the game reloads mods at startup.
 
 ## Where they go

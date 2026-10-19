@@ -88,6 +88,8 @@ Lo que se ve bien en Blender puede verse distinto en el juego. **Ver en el juego
 - Pulsar el botón otra vez cierra el juego que abrió antes y lo abre con tus cambios.
 - Usa su propia caché (unos 400 MB en `UserData/Cache/preview`), así que no rehace la del juego normal. Solo carga el estadio que estás haciendo: tus otros mods no se activan.
 - Hace falta haber importado el estadio desde la carpeta del juego instalado (la que tiene `WiiCompiled.exe`); si no, el botón lo dice.
+- Mientras la ventana del juego está activa, recibe tus teclas: si escribes en otro sitio sin cambiar de ventana, la cámara se mueve.
+- **Para qué sirve:** ver lo que el juego hace con tu modelo sin jugar un partido. Con el Polo Grounds (18 de octubre de 2026) enseñó tres fallos que en Blender no se veían: texturas perdidas al convertir, gradas grises y torres a rayas (ver «Límites» y «Por qué hace falta un estadio base»). Los tres están corregidos en el complemento 0.7.3.
 
 ## Tu propio modelo (SketchUp, glTF, OBJ…)
 
@@ -96,6 +98,8 @@ Puedes llevar al juego un estadio que no existe en él.
 1. **Importa un estadio del juego** como base. Pon el que quieras que aporte sus datos de juego (medidas, menú, partidas); por ejemplo, AT&T Park para un estadio de los Giants.
 2. **Importa tu modelo** en la misma escena: Archivo > Importar > glTF, OBJ, FBX…
    - **SketchUp** (`.skp`): conviértelo antes a `.glb`. Por ejemplo, con [OpenSKP](https://github.com/iamahsanmehmood/openskp) (código abierto, MIT): `pip install openskp pillow` y luego `python -c "from openskp import SkpFile; from openskp.export import glb; s = SkpFile.open('estadio.skp'); s.parse(); glb.export(s, 'estadio.glb', textures=True)"`. Sale en milímetros: escálalo a 0,001.
+     - OpenSKP da el color de la capa (`Layer0`, rojo) a las caras con el material por defecto de SketchUp cuando no resuelve el material de su grupo. Si ves caras rojas que en SketchUp no lo son, dales en Blender su color de SketchUp antes de convertir. En el Polo Grounds eran el verde `[Color_G19]` de los techos.
+     - OpenSKP también escribe los colores sRGB como si fueran lineales: en Blender se ven más claros que en SketchUp.
    - Borra lo que no sea el estadio, como fotos aéreas, terreno lejano o personas.
 3. **Colócalo como el estadio del juego:**
    - en metros;
@@ -110,6 +114,8 @@ Puedes llevar al juego un estadio que no existe en él.
    - Con **Quitar el estadio original** (activado por defecto), las piezas del estadio base desaparecen y solo queda tu modelo. Las piezas con la propiedad `pp_keep` se conservan, por ejemplo una pieza de público en la que hayas puesto tu propio público.
    - Las bases, el plato y el montículo del juego (piezas `BCL`) se conservan siempre: los jugadores se colocan sobre ellos, y los de un modelo rara vez coinciden (el plato del Mario Stadium medía 1,2 m).
    - Cada pieza recibe como mucho 30 texturas: las del modelo se reparten entre las gradas del estadio base.
+   - Si el modelo trae una textura pintada sobre una cara sin material, en las mismas esquinas (SketchUp lo hace), se queda la cara con textura.
+   - Las piezas convertidas se ven en Blender como en el juego: textura × color de vértice, sin luz. Usa la vista **Material** (Z > Vista previa de material).
 5. Pulsa **Generar colisión**. Crea la malla «Colisión» de tu estadio:
    - el suelo (césped si es verde, tierra si no) y el montículo;
    - las vallas, siguiendo la pared más cercana al campo en todas direcciones;
@@ -124,7 +130,23 @@ Límites:
 - La colisión puede tener hasta 65.535 triángulos.
 - Cada pieza admite hasta 30 texturas, contando las suyas originales; es lo máximo que tiene una pieza en los estadios del juego. «Convertir objetos en piezas» reparte las texturas del modelo entre las gradas del estadio base para no pasar de ahí, y el exportador se niega a escribir una pieza con más. Con 82 en una pieza el juego leía fuera de una tabla, el estadio salía sin vallas y el partido acababa cerrándose.
 - En el pack, las texturas pasan a RGB5A3 y potencias de 2 de hasta 256 píxeles. Con **Texturas HD**, el juego usa la imagen a su tamaño (hasta 2048 píxeles).
+- Las texturas se pueden repetir todo lo que haga falta. Cada textura del pack dice cuántas veces se repite en horizontal y en vertical. Con 1, el juego no la repite: estira el borde. El exportador calcula esos números con las UV de tus caras y antes quita a cada cara las repeticiones enteras que sobran; el dibujo no cambia. Hasta la versión 0.7.2 los copiaba de la primera textura de la pieza: el Polo Grounds sobre AT&T Park salió con las gradas grises y las torres a rayas, y sobre Coors Field bien, por suerte.
 - El generador de colisión supone un campo de béisbol normal: suelo a la altura 0, el centro del campo unos 45 m por delante del plato y paredes alrededor.
+
+## Por qué hace falta un estadio base
+
+Tu modelo no entra en el juego desde cero: entra **dentro de un estadio del juego** (AT&T Park, Coors Field…), que hace de base.
+- **Tu modelo:** toda la geometría. Las piezas de la base se vacían, salvo el plato, las bases y el montículo, porque los jugadores se colocan sobre ellos.
+- **De la base:** el esqueleto que el juego sabe cargar.
+  - la lista de piezas y su papel: suelo, gradas, público, banderas, marcador;
+  - los ajustes internos de materiales y texturas, que el exportador copia como plantilla;
+  - la tabla del estadio: colisión, colocación de piezas y campos aún sin descifrar;
+  - la foto del menú, los datos de juego (medidas, partidas) y los sonidos.
+- **Por qué:** el juego no tiene forma de crear un tipo de estadio nuevo. Solo carga packs con la estructura que ya conoce, así que se rellena uno existente.
+
+Cada campo de la plantilla que se entiende es una cosa menos que se hereda a ciegas. El de las repeticiones de textura (arriba, «Límites») es un ejemplo: venía de la base y estropeaba las texturas en unas bases sí y en otras no.
+
+**Más adelante (elegido, sin fecha):** generar el pack del estadio entero desde cero, sin plantilla. Hace falta descifrar todos los campos de materiales, texturas y la tabla del estadio. La otra vía, un renderizador propio que dibuje el `.glb` directamente, queda aparcada por ahora.
 
 ## Cómo hacer un modelo que funcione bien en el juego
 
