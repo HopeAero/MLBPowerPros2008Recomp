@@ -290,10 +290,13 @@ def make_object(tris, collection):
 
 def generate(coll):
     """Replace the stadium's collision with one generated from its pieces (in a from-scratch collection,
-    all its meshes). Returns the object or None."""
-    pieces = [o for o in coll.all_objects if o.type == "MESH" and (o.get("pp_kind") == "model" or
-              (coll.get("pp_scratch") and o.get("pp_kind") != "collision"))]
-    tris = build(pieces)
+    its objects but flags, transparent and additive, as evaluated). Returns the object or None."""
+    if coll.get("pp_scratch"):
+        from . import scratch                      # imports this module
+        with scratch.evaluated(scratch.solid_objects(coll)) as pieces:   # curves and modifiers too
+            tris = build(pieces)
+    else:
+        tris = build([o for o in coll.all_objects if o.type == "MESH" and o.get("pp_kind") == "model"])
     if tris is None:
         return None
     sub = next((c for c in coll.children if c.name.endswith("Colisión")), None)

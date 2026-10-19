@@ -187,12 +187,56 @@ st3, _, w3 = scratch.build_stadium(big, game_bases=False)
 check(len(st3.placements) < 127 and all(len(m.texmaps) <= 30 for m in st3.models),
       f"300 boxes with 40 textures: {len(st3.placements)} pieces of at most 30 texmaps")
 
+# ---- Final review fixes ----------------------------------------------------------------------------
+curved = scratch_collection("Valla curva")
+mesh_object(curved, "campo3", [(-60, -20, 0), (60, -20, 0), (60, 130, 0), (-60, 130, 0)], [(0, 1, 2, 3)], grass)
+cu = bpy.data.curves.new("valla_curva", "CURVE")
+cu.dimensions, cu.extrude = "2D", 1.5                        # a wall 3 m high around the field
+spline = cu.splines.new("POLY")
+spline.points.add(n - 1)
+for k, (x, y) in enumerate(ring):
+    spline.points[k].co = (x, y, 1.5, 1.0)
+spline.use_cyclic_u = True
+fence_curve = bpy.data.objects.new("valla_curva", cu)
+curved.objects.link(fence_curve)
+fence_curve.powerpros_role = "fence"
+try:
+    st_c, _, _ = scratch.build_stadium(curved, game_bases=False)
+    check(len(st_c.collision_triangles) > 0, f"a fence made with a curve counts for the collision: {len(st_c.collision_triangles)} triangles")
+except scratch.ScratchFailure as e:
+    check(False, f"a fence made with a curve counts for the collision: {e}")
+check(not [o for o in bpy.data.objects if o.name.startswith("pp_tmp_")], "no temporary objects left after the collision")
+
+menu_render = importlib.import_module(pkg + ".menu_render")
+import numpy as np                                                   # noqa: E402
+shot = menu_render.photo(coll).astype(np.float32)
+sky = np.array(menu_render.SKY) * 255
+not_sky = float((np.abs(shot[..., :3] - sky).max(-1) > 24).mean())
+check(not_sky > 0.2, f"the menu photo of a from-scratch stadium shows it: {not_sky:.0%} of the pixels are not sky")
+check(not [o for o in bpy.data.objects if o.name.startswith("pp_tmp_")], "no temporary objects left after the photo")
+
+flat = scratch_collection("Bandera plana")
+mesh_object(flat, "campo4", [(-60, -20, 0), (60, -20, 0), (60, 130, 0), (-60, 130, 0)], [(0, 1, 2, 3)], grass)
+mesh_object(flat, "valla4", fence_v, [(k, (k + 1) % n, n + (k + 1) % n, n + k) for k in range(n)], grey, "fence")
+mesh_object(flat, "bandera_plana", [(0, 120, 20), (3, 120, 20), (3, 122, 20), (0, 122, 20)], [(0, 1, 2, 3)],
+            material("bandera3", (0.8, 0.1, 0.1)), "flags")
+mesh_object(flat, "bandera_de_pie", [(5, 120, 20), (8, 120, 20), (8, 120, 22), (5, 120, 22)], [(0, 1, 2, 3)],
+            material("bandera4", (0.8, 0.1, 0.1)), "flags")
+try:
+    scratch.build_stadium(flat, game_bases=False)
+    check(False, "a flat flag is refused naming it")
+except scratch.ScratchFailure as e:
+    check("bandera_plana" in str(e), f"a flat flag is refused naming it: {e}")
+check(not [o for o in bpy.data.objects if o.name.startswith("pp_tmp_")], "no temporary objects left after a refused flag")
+
 # ---- Task 3: operators, export, View in game ----------------------------------------------------
 exporter = importlib.import_module(pkg + ".exporter")
 preview = importlib.import_module(pkg + ".preview")
 before = set(bpy.data.collections)
 check(bpy.ops.object.powerpros_new_scratch(filepath=project_bin, stadium="col") == {"FINISHED"}, "New stadium from scratch")
 made = [c for c in bpy.data.collections if c not in before]
+check(len(made) == 1 and bpy.context.view_layer.active_layer_collection.collection == made[0],
+      "the new from-scratch collection is the active one: new objects go into it")
 check(len(made) == 1 and made[0].get("pp_scratch") and made[0].get("pp_stadium") == "col"
       and Path(made[0].get("pp_project_bin", "")).is_file(), f"the new collection is a from-scratch one ({[dict(c) for c in made]})")
 

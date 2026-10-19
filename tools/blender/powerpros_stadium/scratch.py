@@ -11,6 +11,7 @@ draw order. docs/stadiums.md, «Estadio desde cero».
 """
 import math
 import struct
+from contextlib import contextmanager
 from pathlib import Path
 
 import bpy
@@ -47,6 +48,8 @@ COLORS = ((0, 0, 0, 255), (204, 204, 204, 255), (0, 0, 0, 255))
 KIND, UNK_32 = 3, 1
 GEOMETRY = {"MESH", "CURVE", "SURFACE", "FONT", "META"}
 FLAT = 0.2                              # metres from height 0 for «auto» to call an object ground
+FLAG_MIN = 1.0                          # decimetres: a flag thinner than this across or tall is refused
+NOT_SOLID = ("flags", "transparent", "additive")   # left out of the collision and the menu photo
 # The game's flags (DP_FLG_flag*): a 5-column, 2-row plane, pole at x = 0, cloth towards +x, which the
 # flag system turns with the wind. Another vertex count in a flag piece makes it write out of memory.
 FLAG_COLUMNS = (0.0, 0.2984, 0.5, 0.6903, 1.0)
@@ -91,19 +94,33 @@ def f32(*values):
     return tuple(struct.unpack(f">{len(values)}f", struct.pack(f">{len(values)}f", *values)))
 
 
-def _evaluated_copies(objects):
-    """Temporary mesh objects of the evaluated geometry (modifiers, curves, texts), in place."""
+@contextmanager
+def evaluated(objects):
+    """Temporary mesh objects of the evaluated geometry (modifiers, curves, texts), in place; the ones
+    with faces. Removed on leaving, also on errors."""
     dg = bpy.context.evaluated_depsgraph_get()
     out = []
-    for o in objects:
-        me = bpy.data.meshes.new_from_object(o.evaluated_get(dg), preserve_all_data_layers=True, depsgraph=dg)
-        if not me.polygons:
+    try:
+        for o in objects:
+            me = bpy.data.meshes.new_from_object(o.evaluated_get(dg), preserve_all_data_layers=True, depsgraph=dg)
+            if not me.polygons:
+                bpy.data.meshes.remove(me)
+                continue
+            tmp = bpy.data.objects.new("pp_tmp_" + o.name, me)
+            tmp.matrix_world = o.matrix_world.copy()
+            out.append(tmp)
+        yield out
+    finally:
+        for t in out:
+            me = t.data
+            bpy.data.objects.remove(t)
             bpy.data.meshes.remove(me)
-            continue
-        tmp = bpy.data.objects.new("pp_tmp_" + o.name, me)
-        tmp.matrix_world = o.matrix_world.copy()
-        out.append(tmp)
-    return out
+
+
+def solid_objects(coll):
+    """The objects of a from-scratch collection that the collision and the menu photo take."""
+    return [o for o in coll.all_objects if o.type in GEOMETRY and o.get("pp_kind") != "collision"
+            and role_of(o) not in NOT_SOLID]
 
 
 def _meshes(bm, indices):
@@ -162,20 +179,22 @@ def _flag_pieces(st, objects, hide, bake_light, image_index, hd_images):
     """One piece per flag object: the game's flag plane, pole at the object's centre, as wide as its
     longest side across and as tall as it, with its first texture over the whole cloth."""
     flags = ROLES["flags"][0] | (HIDE_ABOVE if hide else 0)
-    for temp in _evaluated_copies(objects):
-        try:
-            bm, images = convert.prepare([temp], bake_light)
-        finally:
-            me = temp.data
-            bpy.data.objects.remove(temp)
-            bpy.data.meshes.remove(me)
-        pts = [exporter.to_game(v.co) for v in bm.verts]
-        colour = tuple(int(x * 255 + 0.5) for x in next(iter(bm.faces)).loops[0][bm.loops.layers.float_color["Color"]])             if bm.faces else (255, 255, 255, 255)
-        bm.free()
-        lo = [min(p[k] for p in pts) for k in range(3)]
-        hi = [max(p[k] for p in pts) for k in range(3)]
+    for obj in objects:
+        with evaluated([obj]) as temps:
+            bm, images = convert.prepare(temps, bake_light) if temps else (None, [])
+        pts = [exporter.to_game(v.co) for v in bm.verts] if bm else []
+        colour = (255, 255, 255, 255)
+        if bm is not None and bm.faces:
+            colour = tuple(int(x * 255 + 0.5) for x in next(iter(bm.faces)).loops[0][bm.loops.layers.float_color["Color"]])
+        if bm is not None:
+            bm.free()
+        lo = [min((p[k] for p in pts), default=0.0) for k in range(3)]
+        hi = [max((p[k] for p in pts), default=0.0) for k in range(3)]
         centre = f32(*((a + b) / 2 for a, b in zip(lo, hi)))
         w, h = max(hi[0] - lo[0], hi[2] - lo[2]), hi[1] - lo[1]
+        if w < FLAG_MIN or h < FLAG_MIN:
+            raise ScratchFailure(T(f"La bandera «{obj.name}» no tiene alto o ancho: modélala de pie",
+                                   f"The flag '{obj.name}' has no height or width: model it standing up"))
         positions = [f32(FLAG_COLUMNS[c] * w, h / 2 if top else -h / 2, 0.0) for c, top in FLAG_VERTICES]
         uvs = [f32(FLAG_COLUMNS[c], 0.0 if top else 1.0) for c, top in FLAG_VERTICES]
         draws = [(op, [(0, i, 0, 0, i) for i in order]) for op, order in FLAG_DRAWS]
@@ -264,16 +283,10 @@ def build_stadium(coll, game_bases=True, bake_light=True):
         if role == "flags":
             _flag_pieces(st, groups[key], hide, bake_light, image_index, hd_images)
             continue
-        temps = _evaluated_copies(groups[key])
-        if not temps:
-            continue
-        try:
+        with evaluated(groups[key]) as temps:
+            if not temps:
+                continue
             bm, images = convert.prepare(temps, bake_light, separate=role != "ground")
-        finally:
-            for t in temps:
-                me = t.data
-                bpy.data.objects.remove(t)
-                bpy.data.meshes.remove(me)
         textured = [i for i, img in enumerate(images) if img is not None]
         plain = [i for i, img in enumerate(images) if img is None]
         chunks = [textured[i:i + MAX_TEXMAPS] for i in range(0, len(textured), MAX_TEXMAPS)] or [[]]

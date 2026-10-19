@@ -64,9 +64,16 @@ def _drop(scene):
 
 
 def photo(coll):
+    from . import scratch
+    if scratch.is_scratch(coll):
+        with scratch.evaluated(scratch.solid_objects(coll)) as pieces:
+            return _photo(pieces)
     # Alpha and additive pieces (turf patterns, light glows) render opaque white in Workbench: left out.
-    pieces = [o for o in coll.all_objects if o.get("pp_kind") == "model" and o.type == "MESH"
-              and not any(k in o.name for k in ("ALP", "ADD", "MIP", "lumine"))]
+    return _photo([o for o in coll.all_objects if o.get("pp_kind") == "model" and o.type == "MESH"
+                   and not any(k in o.name for k in ("ALP", "ADD", "MIP", "lumine"))])
+
+
+def _photo(pieces):
     scene, cam = _scene("pp_menu_photo", "TEXTURE")
     for o in pieces:
         scene.collection.objects.link(o)

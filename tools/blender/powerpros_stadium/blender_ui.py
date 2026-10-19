@@ -245,6 +245,7 @@ class PP_OT_new_scratch(bpy.types.Operator, ImportHelper):
         if game_folder is not None:
             coll["pp_game_folder"] = str(game_folder)
         context.scene.collection.children.link(coll)
+        context.view_layer.active_layer_collection = context.view_layer.layer_collection.children[coll.name]
         self.report({"INFO"}, T(f"{coll.name}: mete aquí tus objetos y dales su papel en el panel Power Pros",
                                 f"{coll.name}: put your objects here and give them their role in the Power Pros panel"))
         return {"FINISHED"}
