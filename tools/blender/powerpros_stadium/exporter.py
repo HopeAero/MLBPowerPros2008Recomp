@@ -54,7 +54,7 @@ def image_of(mat):
 
 
 MAX_TEXTURE = 256      # the game's stadium textures are 32-256 px: bigger ones (no mipmaps) shimmer far away
-MAX_TEXMAPS = 30       # most texmaps one piece has in the game's stadiums; 82 overran a game table (Mario Stadium probe)
+MAX_TEXMAPS = 30       # most texmaps one piece has in the game's stadiums; 82 overran a game table (probe with a downloaded model)
 
 
 def pow2(n):

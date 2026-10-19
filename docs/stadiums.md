@@ -178,7 +178,7 @@ Antes de la versión 0.8.0 era la única forma: el modelo entraba **dentro de un
    - Cada cara queda una sola vez y mirando al campo. De dos caras en el mismo sitio (las dos caras de una pared, o una textura pintada sobre una cara sin material, como las exporta SketchUp) queda la que tiene textura y, si ninguna o las dos la tienen, la que mira al campo. La que queda se gira hacia el campo.
    - Las superficies pegadas a menos de 25 cm de otra paralela, como ventanas o letreros, se separan hasta 25 cm, para que no parpadeen.
    - Con **Quitar el estadio original** (activado por defecto), las piezas del estadio base desaparecen y solo queda tu modelo. Las piezas con la propiedad `pp_keep` se conservan, por ejemplo una pieza de público en la que hayas puesto tu propio público.
-   - Las bases, el plato y el montículo del juego (piezas `BCL`) se conservan siempre: los jugadores se colocan sobre ellos, y los de un modelo rara vez coinciden (el plato del Mario Stadium medía 1,2 m).
+   - Las bases, el plato y el montículo del juego (piezas `BCL`) se conservan siempre: los jugadores se colocan sobre ellos, y los de un modelo rara vez coinciden (el plato de un modelo descargado medía 1,2 m).
    - Cada pieza recibe como mucho 30 texturas: las del modelo se reparten entre las gradas del estadio base.
    - Si el modelo trae una textura pintada sobre una cara sin material, en las mismas esquinas (SketchUp lo hace), se queda la cara con textura.
    - Las piezas convertidas se ven en Blender como en el juego: textura × color de vértice, sin luz. Usa la vista **Material** (Z > Vista previa de material).

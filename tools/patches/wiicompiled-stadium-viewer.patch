@@ -1576,7 +1576,7 @@ index 0000000..8f3d064
 +}
 diff --git a/runtime/tests/stadium_viewer_tests.cpp b/runtime/tests/stadium_viewer_tests.cpp
 new file mode 100644
-index 0000000..aeb3ccd
+index 0000000..a1fe190
 --- /dev/null
 +++ b/runtime/tests/stadium_viewer_tests.cpp
 @@ -0,0 +1,37 @@
@@ -1597,8 +1597,8 @@ index 0000000..aeb3ccd
 +    require(c->code == "pp_preview");
 +    require(!c->camera.has_value());
 +
-+    c = ParseConfig(L"D:\\m", L"mario", L"12.5,30,-400,0.5,-0.25,45");
-+    require(c && c->code == "mario" && c->camera.has_value());
++    c = ParseConfig(L"D:\\m", L"miestadio", L"12.5,30,-400,0.5,-0.25,45");
++    require(c && c->code == "miestadio" && c->camera.has_value());
 +    require(near(c->camera->eye[0], 12.5f) && near(c->camera->eye[1], 30.0f) && near(c->camera->eye[2], -400.0f));
 +    require(near(c->camera->yaw, 0.5f) && near(c->camera->pitch, -0.25f) && near(c->camera->fovY, 45.0f));
 +

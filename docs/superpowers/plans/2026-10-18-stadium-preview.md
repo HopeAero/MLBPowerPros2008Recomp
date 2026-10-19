@@ -25,7 +25,7 @@
 
 ## Review Focus
 
-1. **Rutas con espacios, paréntesis y acentos** (`Mario Stadium (local)`, carpetas de usuario como `C:\Users\José`): el runtime debe leer las variables de entorno como UTF-16 (`_wgetenv`) y convertirlas a `std::filesystem::path`. Lo prueba la Task 1 (`ParseConfig` con una ruta no ASCII) y la Task 7 (vista previa real desde una carpeta con espacios y paréntesis).
+1. **Rutas con espacios, paréntesis y acentos** (`Mi Estadio (local)`, carpetas de usuario como `C:\Users\José`): el runtime debe leer las variables de entorno como UTF-16 (`_wgetenv`) y convertirlas a `std::filesystem::path`. Lo prueba la Task 1 (`ParseConfig` con una ruta no ASCII) y la Task 7 (vista previa real desde una carpeta con espacios y paréntesis).
 2. **La exportación falla** (por ejemplo, más de 30 texturas en una pieza): el error sale en Blender y el juego no se abre. Lo prueba la Task 6 (`test_preview.py`, caso `ExportFailure`).
 3. **Falta `WiiCompiled.exe` en `pp_game_folder`** o la colección no tiene `pp_game_folder`: mensaje claro, sin excepción sin capturar. Task 6.
 4. **Después de una vista previa, el juego normal sigue igual:** `Config.toml` byte a byte, el sello `<cachePath>/mods/disc/project.bin.sources` sin cambios. Task 2 (comprobación en el juego) y Task 7.
@@ -52,7 +52,7 @@
 - [ ] **Step 1: Escribir las pruebas que fallan** en `stadium_viewer_tests.cpp` (estilo `match_benchmark_tests.cpp`, `require` que aborta):
   - `ParseConfig(L"", L"", L"")` → vacío.
   - `ParseConfig(L"C:\\Temp\\Vista previa (José)", L"", L"")` → `modDir == std::filesystem::path(L"C:\\Temp\\Vista previa (José)")`, `code == "pp_preview"`, sin cámara.
-  - `ParseConfig(L"D:\\m", L"mario", L"12.5,30,-400,0.5,-0.25,45")` → `code == "mario"`, cámara `{12.5, 30, -400}`, `yaw 0.5`, `pitch -0.25`, `fovY 45`.
+  - `ParseConfig(L"D:\\m", L"miestadio", L"12.5,30,-400,0.5,-0.25,45")` → `code == "miestadio"`, cámara `{12.5, 30, -400}`, `yaw 0.5`, `pitch -0.25`, `fovY 45`.
   - `ParseConfig(L"D:\\m", L"", L"1,2,3")` → cámara vacía; `ParseConfig(L"D:\\m", L"", L"1,2,3,x,0,45")` → cámara vacía.
 - [ ] **Step 2: Compilar y ver que fallan** — `local/tools/llvm-mingw-20260616-ucrt-x86_64/bin/clang++.exe -std=c++20 -static -I local/wiicompiled-mlb/src/runtime/include local/wiicompiled-mlb/src/runtime/tests/stadium_viewer_tests.cpp local/wiicompiled-mlb/src/runtime/src/stadium_viewer.cpp -o <scratchpad>/stadium_viewer_tests.exe` → error de compilación (no existe `stadium_viewer.h`).
 - [ ] **Step 3: Implementar `stadium_viewer.h/.cpp`.** `ParseConfig` no depende de nada del runtime (para que la prueba compile sola); la lectura del entorno vive en `Active()`.
@@ -83,7 +83,7 @@ git commit -m "Stadium viewer: env config, one-run preview mod, own project.bin 
 - [ ] **Step 2: Pantalla de la correa:** en el visor, si `WIICOMPILED_PAD_SCRIPT` no está definida, se define antes del primer `PADRead` como `2500-2700:100,3500-3700:100` (A dos veces). Medido: estadio en pantalla a ~8 s.
 - [ ] **Step 3: `AutomatedRun()`** en `launcher.cpp` cuenta `WIICOMPILED_STADIUM_VIEWER` para no mostrar el launcher.
 - [ ] **Step 4: Ocultar el panel del benchmark** («Prueba GPU – …») y el contador de FPS en el visor; el panel de «Preparando partido…» puede quedarse hasta `StadiumReady()`.
-- [ ] **Step 5: Compilar y medir** — crear a mano un mod de vista previa copiando `build/mods/Mario Stadium (local)` a `<scratchpad>/Vista previa (José)` con `code = "pp_preview"` en su `mod.toml` y los archivos renombrados a `stadium_pp_preview*.pack` / `env_stadium_menu_pp_preview.pack`; lanzar `WiiCompiled.exe` con `WIICOMPILED_STADIUM_VIEWER=<esa ruta>` y registrar la salida con marcas de tiempo. Esperado: `[viewer] mod ...`, `[stadiums] loading "..."`, `[viewer] stadium ready at` ≤ 12 s, ningún `unmapped guest touch`; captura sin launcher ni panel del benchmark; `Config.toml` y el sello normal de `project.bin` sin cambios.
+- [ ] **Step 5: Compilar y medir** — crear a mano un mod de vista previa copiando un mod de estadio de `build/mods` a `<scratchpad>/Vista previa (José)` con `code = "pp_preview"` en su `mod.toml` y los archivos renombrados a `stadium_pp_preview*.pack` / `env_stadium_menu_pp_preview.pack`; lanzar `WiiCompiled.exe` con `WIICOMPILED_STADIUM_VIEWER=<esa ruta>` y registrar la salida con marcas de tiempo. Esperado: `[viewer] mod ...`, `[stadiums] loading "..."`, `[viewer] stadium ready at` ≤ 12 s, ningún `unmapped guest touch`; captura sin launcher ni panel del benchmark; `Config.toml` y el sello normal de `project.bin` sin cambios.
 - [ ] **Step 6: Regenerar el parche y commit** (`Stadium viewer: boot straight into the preview stadium`).
 
 ### Task 3: Cámara del juego (ingeniería inversa)
@@ -192,7 +192,7 @@ git commit -m "Stadium viewer: env config, one-run preview mod, own project.bin 
 - Modify: `tools/wiicompiled-translate.ps1` (si no se hizo en la Task 1)
 
 - [ ] **Step 1: Pila de parches desde cero** — clon limpio del Wiicompiled fijado, aplicar todos los parches de la lista → todos aplican; `tools/wiicompiled-translate.ps1` + `tools/wiicompiled-build.ps1` compilan; `runtime/tests` pasan.
-- [ ] **Step 2: Punta a punta desde Blender sin interfaz** — un script temporal importa el Mario Stadium (`local/analysis/mario/mario_powerpros.blend`) o Coors Field, llama a `preview.launch(coll, pose)` real con `pp_game_folder = local/wiicompiled-mlb/build`, con la carpeta temporal renombrada a una con espacios y paréntesis. Esperado: el juego abre sin launcher, `[viewer] stadium ready` ≤ 12 s después de lanzar, captura con la vista pedida, sin jugadores ni HUD. Segundo `launch` → el primer proceso se cierra y el nuevo muestra el cambio (por ejemplo, una pieza movida 20 m).
+- [ ] **Step 2: Punta a punta desde Blender sin interfaz** — un script temporal importa un estadio de prueba de `local/analysis/` o Coors Field, llama a `preview.launch(coll, pose)` real con `pp_game_folder = local/wiicompiled-mlb/build`, con la carpeta temporal renombrada a una con espacios y paréntesis. Esperado: el juego abre sin launcher, `[viewer] stadium ready` ≤ 12 s después de lanzar, captura con la vista pedida, sin jugadores ni HUD. Segundo `launch` → el primer proceso se cierra y el nuevo muestra el cambio (por ejemplo, una pieza movida 20 m).
 - [ ] **Step 3: El juego normal sigue igual** — tras lo anterior, `Config.toml` y `<cachePath>/mods/disc/project.bin.sources` sin cambios; benchmark normal con los mods del usuario → `gameplay phase=4`, marcador y jugadores visibles.
 - [ ] **Step 4: Prueba a mano con el usuario** (avisando antes): pulsa «Ver en el juego» en Blender, vuela con la cámara, prueba 1/2/3/F/H, cierra y repite. Anotar lo que diga.
 - [ ] **Step 5: Documentación ES/EN** (archivos de arriba) y commit (`Stadium preview: docs and end-to-end check`).

@@ -178,7 +178,7 @@ Before version 0.8.0 this was the only way: the model went **inside one of the g
    - Each face is kept only once and facing the field. Of two faces in the same place (the two sides of a wall, or a texture painted over a plain face, as SketchUp exports them) the textured one is kept and, when neither or both are textured, the one facing the field. The kept face is turned to the field.
    - Surfaces stuck less than 25 cm from another parallel one, such as windows or signs, are separated up to 25 cm, so they don't flicker.
    - With **Remove original stadium** (**Quitar el estadio original**) (on by default), the base stadium's pieces disappear and only your model remains. Pieces with the `pp_keep` property are kept, for example a crowd piece where you've put your own crowd.
-   - The game's bases, plate and mound (`BCL` pieces) always stay: the players stand on them, and a model's own rarely match (Mario Stadium's plate was 1.2 m).
+   - The game's bases, plate and mound (`BCL` pieces) always stay: the players stand on them, and a model's own rarely match (a downloaded model's plate was 1.2 m).
    - Each piece gets at most 30 textures: the model's are spread over the base stadium's stands.
    - If the model has a texture painted over a plain face, on the same corners (SketchUp does this), the textured face is kept.
    - Converted pieces look in Blender as in the game: texture × vertex colour, unlit. Use the **Material** view (Z > Material Preview).
