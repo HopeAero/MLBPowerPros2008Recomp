@@ -550,6 +550,20 @@ Verified (October 14, 2026):
 - **Tree A culls by camera:** rebuilt as a single leaf (as the add-on's exporter does), Coors Field seen from outside drew the stands behind home and other pieces the original does not draw from there; from the batter's view nothing changed. The game walks that tree with the camera position and drops the placements on the sides it does not visit (`0x80CCB438` decides the sides). That is why the description keeps the game's tree A.
 - **Pending** (phase 2): what each placement flag does, the `unk_20` and `unk_24` blocks, the preloaded textures, the material fields and how to build a tree A of our own that culls well.
 
+**What the fields do, tested in the viewer** (phase 2, 18 October 2026). Method: Coors Field rebuilt with the writer, with a single value changed, compared in the viewer with the unchanged rebuild from the same cameras (the agent's `exp.py`, captures at 17 and 19 s to see what animates).
+- **Placement flags, byte `+0x52` (piece type).** The code reads it in `0x80C600C8`, which treats 17 (fences) and 18 (the backstop net) apart. Removing the type (to 0):
+  - `0x16` and `0x17` (lying and upright crowd): the crowd **stops animating** (the difference between two captures drops from 1.44 to 0.25 on a 0-255 scale) and is still drawn;
+  - `0x01` (scoreboard): what the game draws on it live disappears (the score rows come out as black blocks);
+  - `0x02` (video board): the board comes out black: the game paints its picture into the «placeholder» texture;
+  - `0x05` (flags): the flags are drawn as normal, still pieces. With their type the stadium does not draw them; a flag system of their own does, which hangs from the match's state tree: **in the viewer, with the match frozen, they do not show**;
+  - `0x11` (fences): no visible change: their effect is on play, not on drawing.
+- **Placement flags, byte `+0x51` (draw group).** `0x80C600C8` looks it up in a list of groups of the scene object (`+1528`, entries with their number at `+4`). Changing it:
+  - `0x06` (`ALP` pieces) to 0: the field's stains and lines go from soft transparency to hard-edged cut-outs: `0x06` is the alpha-blended group;
+  - the ground's `0x81` to 0: the grass shows through the infield dirt: `0x81` is the background layer, drawn before the rest;
+  - `0x06` on a stand: the ads on its fence turn semi-transparent: the group affects the whole piece.
+- **High bits:** without `0x80000000` (`NOUPCAM`), from a high camera outside the stadium the surrounding buildings and trees the original hides show up: it hides the piece when the camera is up. Removing `0x40000000` or `0x20000000` changed nothing from the views tested (batter, aerial, stands); they depend on other match cameras.
+- **`unk_20`:** emptying it changes nothing by day. Its points lie inside the boxes of the `lumine` pieces, 46-57 m up and turned towards the field, one group per tower (Coors: 32, 50, 50 and 25): almost certainly the floodlights, one by one, for night games. Not checked in a night game.
+
 **Game stadium list** (October 14, 2026, from the REL data; for adding stadiums):
 - **File numbers:** the game does not store file names. It requests `project.bin` entries by record number: Coors Field = 75, its table = 76. There are 4,681 records, of which 2,424 have a name: 2,256 remain free for new files.
 - **Stadium table:** `ovl_main.rel` `+0x92A450` (in memory `0x80E9F9D0`, section 5). It has 40 entries of 12 bytes: {u32 graphics pack number, u32 `tbl` number, pointer to the `tbl` root (`0x40000000 | position`)}.

@@ -551,6 +551,20 @@ Verificado (14 de octubre de 2026):
 - **El árbol A recorta por cámara:** reconstruido como una sola hoja (como hace el exportador del complemento), Coors Field visto desde fuera dibujaba las gradas detrás del plato y otras piezas que el original no dibuja desde ahí; desde la vista del bateador no cambiaba nada. El juego recorre ese árbol con la posición de la cámara y descarta las colocaciones de los lados que no visita (`0x80CCB438` decide los lados). Por eso la descripción conserva el árbol A del juego.
 - **Pendiente** (fase 2): qué hace cada flag de colocación, los bloques `unk_20` y `unk_24`, las texturas precargadas, los campos del material y cómo construir un árbol A propio que recorte bien.
 
+**Qué hacen los campos, probado en el visor** (fase 2, 18 de octubre de 2026). Método: Coors Field reconstruido con el escritor, con un solo dato cambiado, comparado en el visor con el reconstruido sin cambios desde las mismas cámaras (`exp.py` del agente, capturas a los 17 y 19 s para ver lo que se anima).
+- **Flags de colocación, byte `+0x52` (tipo de pieza).** El código lo lee en `0x80C600C8`, que trata aparte el 17 (vallas) y el 18 (red de detrás del plato). Quitando el tipo (a 0):
+  - `0x16` y `0x17` (público tumbado y vertical): el público **deja de animarse** (la diferencia entre dos capturas baja de 1,44 a 0,25 en una escala de 0 a 255) y sigue dibujado;
+  - `0x01` (marcador): desaparece lo que el juego dibuja encima en vivo (las filas de resultados salen como bloques negros);
+  - `0x02` (pantalla grande): la pantalla sale negra: el juego pinta su imagen en la textura «hueco»;
+  - `0x05` (banderas): las banderas pasan a dibujarse como piezas normales y quietas. Con su tipo no las dibuja el estadio sino un sistema de banderas propio que cuelga del árbol de estados del partido: **en el visor, con el partido quieto, no salen**;
+  - `0x11` (vallas): ningún cambio visible: su efecto es de juego, no de dibujo.
+- **Flags de colocación, byte `+0x51` (grupo de dibujo).** `0x80C600C8` lo busca en una lista de grupos del objeto escena (`+1528`, entradas con su número en `+4`). Cambiándolo:
+  - `0x06` (piezas `ALP`) a 0: las manchas y líneas del campo pasan de transparencia suave a recorte con bordes duros: `0x06` es el grupo con mezcla alfa;
+  - el `0x81` del suelo a 0: el césped atraviesa la tierra del cuadro: `0x81` es la capa de fondo, que se dibuja antes que el resto;
+  - `0x06` puesto en una grada: los anuncios de su valla se vuelven semitransparentes: el grupo afecta a toda la pieza.
+- **Bits altos:** sin `0x80000000` (`NOUPCAM`), desde una cámara alta fuera del estadio aparecen los edificios y árboles de alrededor que el original esconde: esconde la pieza cuando la cámara está arriba. Quitar `0x40000000` o `0x20000000` no cambió nada desde las vistas probadas (bateador, aérea, gradas); dependen de otras cámaras del partido.
+- **`unk_20`:** vaciarlo no cambia nada de día. Sus puntos están dentro de las cajas de las piezas `lumine`, a 46-57 m de altura y girados hacia el campo, un grupo por torre (Coors: 32, 50, 50 y 25): casi seguro son los focos, uno a uno, para la noche. Sin comprobar en un partido de noche.
+
 **Lista de estadios del juego** (14 de octubre de 2026, por los datos del REL; para añadir estadios):
 - **Números de archivo:** el juego no guarda nombres de archivo. Pide las entradas de `project.bin` por número de registro: Coors Field = 75, su tabla = 76. Hay 4.681 registros, de los que 2.424 tienen nombre: quedan 2.256 libres para archivos nuevos.
 - **Tabla de estadios:** `ovl_main.rel` `+0x92A450` (en memoria `0x80E9F9D0`, sección 5). Son 40 entradas de 12 bytes: {u32 número del pack gráfico, u32 número del `tbl`, puntero a la raíz del `tbl` (`0x40000000 | posición`)}.
