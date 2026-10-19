@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Build a Blender collection from a stadium of the player's project.bin."""
-import colorsys
 import tomllib
 from pathlib import Path
 
@@ -8,7 +7,7 @@ import bpy
 import numpy as np
 from mathutils import Euler, Matrix
 
-from . import fingerprint, names, pj7m, stadium_tbl, textures
+from . import fingerprint, names, pj7m, stadium_tbl, surfaces, textures
 from .i18n import T
 
 try:
@@ -191,26 +190,8 @@ def build_mesh(gfx, model, images, materials):
 
 
 def build_collision(table, parent):
-    me = bpy.data.meshes.new("Colisión")
-    me.from_pydata([to_blender(v) for v in table.vertices], [],
-                   [(a, b, c) for a, b, c, _ in table.triangles])    # normal: the side the ball hits
-    ids = sorted({t[3] for t in table.triangles})
-    for i in ids:
-        mat = bpy.data.materials.new(f"Superficie {i}")
-        r, g, b = colorsys.hsv_to_rgb((i * 0.618034) % 1.0, 0.65, 0.95)
-        mat.diffuse_color = (r, g, b, 1.0)
-        me.materials.append(mat)
-    slot = {i: k for k, i in enumerate(ids)}
-    me.polygons.foreach_set("material_index", np.asarray([slot[t[3]] for t in table.triangles], np.int32))
-    attr = me.attributes.new("surface_id", "INT", "FACE")
-    attr.data.foreach_set("value", np.asarray([t[3] for t in table.triangles], np.int32))
-    me.validate()
-    me.update()
-    obj = bpy.data.objects.new("Colisión", me)
-    obj["pp_kind"] = "collision"
-    parent.objects.link(obj)
-    obj["pp_signature"] = fingerprint.collision_signature(obj)
-    return obj
+    """The table's collision as one object per surface (surfaces.py)."""
+    return surfaces.make_objects([to_blender(v) for v in table.vertices], table.triangles, parent)
 
 
 def import_stadium(context, path, code, collision=True):
@@ -257,7 +238,7 @@ def import_stadium(context, path, code, collision=True):
         sub = bpy.data.collections.new(f"{coll.name} · Colisión")
         sub.hide_render = True           # its 70 m invisible walls would hide the stands in renders
         coll.children.link(sub)
-        build_collision(table, sub)
+        surfaces.remember(coll, build_collision(table, sub))
         layer = context.view_layer.layer_collection.children[coll.name].children[sub.name]
         layer.hide_viewport = True
     return coll, objects, images

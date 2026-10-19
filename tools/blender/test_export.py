@@ -137,20 +137,20 @@ except RuntimeError as error:
     refused = "ya es un estadio del juego" in str(error) or "is already a stadium of the game" in str(error)
 check(refused, "a code the game already has is refused")
 
-# Collision: import with it, raise the field walls (surface 9) 3 m, make one of their faces a foul
-# pole (material «Superficie 14»), export, read the tbl back.
+# Collision: import with it, raise the field walls (surface 9, their own object) 3 m, make one of their
+# faces a foul pole (material «Superficie 14 · …»), export, read the tbl back.
 for obj in list(bpy.data.objects):
     bpy.data.objects.remove(obj)
 bpy.ops.import_scene.powerpros_stadium(filepath=project_bin, stadium="col", collision=True)
-coll_obj = next(o for o in bpy.data.objects if o.get("pp_kind") == "collision")
+collision_objs = [o for o in bpy.data.objects if o.get("pp_kind") == "collision"]
+coll_obj = next(o for o in collision_objs if o.get("pp_surface") == 9)
 me = coll_obj.data
-ids = np.empty(len(me.polygons), np.int32)
-me.attributes["surface_id"].data.foreach_get("value", ids)
-walls = [p for p in me.polygons if ids[p.index] == 9]
-for v in {v for p in walls for v in p.vertices}:
-    me.vertices[v].co.z += 3.0
-pole = next(m for m in me.materials if m.name.startswith("Superficie 14"))
-walls[0].material_index = list(me.materials).index(pole)
+walls = list(me.polygons)
+for v in me.vertices:
+    v.co.z += 3.0
+pole = next(m for m in bpy.data.materials if m.name.startswith("Superficie 14"))
+me.materials.append(pole)
+walls[0].material_index = len(me.materials) - 1
 me.update()
 bpy.context.view_layer.objects.active = coll_obj
 result = bpy.ops.export_scene.powerpros_stadium(mod_name="BlenderColision", mods_folder=mods_dir, mode="replace",
@@ -161,7 +161,8 @@ orig_bytes = archive.read("stadium_coltbl.pack")
 ctable = tbl_mod.parse_table(ctbl)
 check(ctable.root == orig_tbl.root and ctbl[:ctable.root] == orig_bytes[:ctable.root],
       "tbl root and everything before it unchanged (the game's stadium table points at the root)")
-check(len(ctable.triangles) == len(me.polygons), f"collision has {len(ctable.triangles)} triangles")
+check(len(ctable.triangles) == sum(len(o.data.polygons) for o in collision_objs),
+      f"collision has {len(ctable.triangles)} triangles")
 wall_y = [ctable.vertices[k][1] for t in ctable.triangles if t[3] == 9 for k in t[:3]]
 old_wall_y = [orig_tbl.vertices[k][1] for t in orig_tbl.triangles if t[3] == 9 for k in t[:3]]
 check(abs(max(wall_y) - max(old_wall_y) - 30.0) < 0.5, f"walls raised 30 dm (max y {max(old_wall_y):.0f} -> {max(wall_y):.0f})")

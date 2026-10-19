@@ -14,6 +14,8 @@ import bpy
 import numpy as np
 from mathutils import Vector
 
+from . import surfaces
+
 TOP = 102.8                         # the game's invisible walls reach 102.8 m
 MOUND = Vector((0.0, 18.51, 0.0))   # centre of the mound (surface 8) in every game stadium but Toronto
 MOUND_RADIUS = 2.82
@@ -258,9 +260,9 @@ def build(objects, stand_target=5000):
     return tris
 
 
-def make_object(tris, collection):
-    """Collision object like the importer's: materials «Superficie N» and a surface_id attribute."""
-    verts, index, faces, ids = [], {}, [], []
+def make_objects(tris, collection):
+    """Collision objects like the importer's (one per surface, surfaces.py) from [(three Vector, surface)]."""
+    verts, index, faces = [], {}, []
     for vs, sid in tris:
         f = []
         for v in vs:
@@ -269,28 +271,14 @@ def make_object(tris, collection):
                 index[key] = len(verts)
                 verts.append(key)
             f.append(index[key])
-        if len(set(f)) == 3:
-            faces.append(f)
-            ids.append(sid)
-    me = bpy.data.meshes.new("Colisión")
-    me.from_pydata(verts, [], faces)
-    used = sorted(set(ids))
-    for i in used:
-        me.materials.append(bpy.data.materials.get(f"Superficie {i}") or bpy.data.materials.new(f"Superficie {i}"))
-    slot = {i: k for k, i in enumerate(used)}
-    me.polygons.foreach_set("material_index", np.asarray([slot[i] for i in ids], np.int32))
-    attr = me.attributes.new("surface_id", "INT", "FACE")
-    attr.data.foreach_set("value", np.asarray(ids, np.int32))
-    me.update()
-    obj = bpy.data.objects.new("Colisión", me)
-    obj["pp_kind"] = "collision"
-    collection.objects.link(obj)
-    return obj
+        faces.append((*f, sid))
+    return surfaces.make_objects(verts, faces, collection)
 
 
 def generate(coll):
     """Replace the stadium's collision with one generated from its pieces (in a from-scratch collection,
-    its objects but flags, transparent and additive, as evaluated). Returns the object or None."""
+    its objects but flags, transparent and additive, as evaluated). Returns the objects (one per
+    surface) or None."""
     if coll.get("pp_scratch"):
         from . import scratch                      # imports this module
         with scratch.evaluated(scratch.solid_objects(coll)) as pieces:   # curves and modifiers too
@@ -299,12 +287,7 @@ def generate(coll):
         tris = build([o for o in coll.all_objects if o.type == "MESH" and o.get("pp_kind") == "model"])
     if tris is None:
         return None
-    sub = next((c for c in coll.children if c.name.endswith("Colisión")), None)
-    if sub is None:
-        sub = bpy.data.collections.new(f"{coll.name} · Colisión")
-        sub.hide_render = True
-        coll.children.link(sub)
-    for o in list(sub.objects):
-        if o.get("pp_kind") == "collision":
-            bpy.data.objects.remove(o)
-    return make_object(tris, sub)
+    sub = surfaces.collision_collection(coll)
+    for o in surfaces.collision_objects(coll):
+        bpy.data.objects.remove(o)
+    return make_objects(tris, sub)

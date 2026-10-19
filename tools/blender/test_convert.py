@@ -151,7 +151,7 @@ for m in {m for o in pieces for m in o.data.materials}:
 
 bpy.context.view_layer.objects.active = pieces[0]
 check(bpy.ops.object.powerpros_generate_collision() == {"FINISHED"}, "collision generated")
-coll_obj = next(o for o in stadium.all_objects if o.get("pp_kind") == "collision")
+coll_objs = [o for o in stadium.all_objects if o.get("pp_kind") == "collision"]
 result = bpy.ops.export_scene.powerpros_stadium(mod_name="Sintetico", mods_folder=mods_dir, mode="new",
                                                 new_code="sintetico", new_name="Estadio sintético")
 check(result == {"FINISHED"}, "export finishes")
@@ -161,7 +161,7 @@ tbl = (out / "stadium_sinteticotbl.pack").read_bytes()
 table = tbl_mod.parse_table(tbl)
 surfaces = collections.Counter(t[3] for t in table.triangles)
 print("surfaces", sorted(surfaces.items()))
-check(len(table.triangles) == len(coll_obj.data.polygons), f"tbl has the {len(table.triangles)} collision triangles")
+check(len(table.triangles) == sum(len(o.data.polygons) for o in coll_objs), f"tbl has the {len(table.triangles)} collision triangles")
 for sid, what in ((5, "grass"), (6, "dirt"), (8, "mound"), (9, "field wall"), (0, "foul invisible wall"),
                   (1, "outfield invisible wall"), (14, "foul poles"), (11, "stands")):
     check(surfaces[sid] > 0, f"surface {sid} ({what}) present")

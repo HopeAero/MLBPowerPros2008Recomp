@@ -18,7 +18,7 @@ import bpy
 import numpy as np
 from mathutils import Vector
 
-from . import collision_gen, convert, exporter, pj7m_write, stadium_read
+from . import collision_gen, convert, exporter, pj7m_write, stadium_read, surfaces
 from .i18n import T
 from .stadium_model import Material, Mesh, Model, Placement, PreloadEntry, Stadium, TexMap
 
@@ -297,14 +297,12 @@ def _add_preload(st, base, maps):
 
 
 def _collision(coll):
-    obj = next((o for o in coll.all_objects if o.get("pp_kind") == "collision" and o.type == "MESH"), None)
-    if obj is None:
-        obj = collision_gen.generate(coll)
-    if obj is None:
+    objects = surfaces.collision_objects(coll) or collision_gen.generate(coll)
+    if not objects:
         raise ScratchFailure(T("No encuentro el campo para la colisión: hace falta suelo a la altura 0 y paredes "
                                "alrededor del plato", "Field not found for the collision: it needs ground at "
                                "height 0 and walls around home plate"))
-    return exporter.collision_data(obj)
+    return surfaces.gather(objects, exporter.to_game)
 
 
 def build_stadium(coll, game_bases=True, bake_light=True):

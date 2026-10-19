@@ -10,7 +10,7 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
-from . import collision_gen, convert, exporter, importer, names, preview, scratch
+from . import collision_gen, convert, exporter, importer, names, preview, scratch, surfaces
 from .i18n import CONTEXT, T
 
 
@@ -366,13 +366,69 @@ class PP_OT_generate_collision(bpy.types.Operator):
         return stadium_collection(context) is not None
 
     def execute(self, context):
-        obj = collision_gen.generate(stadium_collection(context))
-        if obj is None:
+        objs = collision_gen.generate(stadium_collection(context))
+        if not objs:
             self.report({"ERROR"}, T("No encuentro el campo: hace falta suelo a la altura 0 y paredes alrededor del plato",
                                      "Field not found: it needs ground at height 0 and walls around home plate"))
             return {"CANCELLED"}
-        self.report({"INFO"}, T(f"Colisión nueva: {len(obj.data.polygons)} triángulos",
-                                f"New collision: {len(obj.data.polygons)} triangles"))
+        n = sum(len(o.data.polygons) for o in objs)
+        self.report({"INFO"}, T(f"Colisión nueva: {n} triángulos en {len(objs)} tipos",
+                                f"New collision: {n} triangles of {len(objs)} kinds"))
+        return {"FINISHED"}
+
+
+class PP_OT_collision_visibility(bpy.types.Operator):
+    bl_idname = "object.powerpros_collision_visibility"
+    bl_options = {"REGISTER", "UNDO"}
+    bl_translation_context = CONTEXT
+
+    show: BoolProperty(default=True, options={"HIDDEN"})
+
+    @classmethod
+    def relabel(cls):
+        cls.bl_label = T("Ver u ocultar la colisión", "Show or hide the collision")
+        cls.bl_description = T("Muestra u oculta todos los tipos de colisión", "Show or hide every kind of collision")
+
+    @classmethod
+    def poll(cls, context):
+        return stadium_collection(context) is not None
+
+    def execute(self, context):
+        surfaces.show(context, stadium_collection(context), self.show)
+        return {"FINISHED"}
+
+
+class PP_OT_make_collision(bpy.types.Operator):
+    bl_idname = "object.powerpros_make_collision"
+    bl_options = {"REGISTER", "UNDO"}
+    bl_translation_context = CONTEXT
+
+    @classmethod
+    def relabel(cls):
+        cls.bl_label = T("Convertir en colisión", "Make collision")
+        cls.bl_description = T("Convierte las mallas seleccionadas en colisión del tipo elegido: la pelota y los "
+                               "jugadores chocan con ellas en el juego. Dejan de dibujarse",
+                               "Turn the selected meshes into collision of the chosen kind: the ball and the players "
+                               "hit them in the game. They are no longer drawn")
+        set_props(cls, surface=EnumProperty(
+            name=T("Tipo", "Kind"), translation_context=CONTEXT, default="9",
+            items=[(str(sid), f"{surfaces.name(sid)} ({sid})", "") for sid in surfaces.SURFACES]))
+
+    @classmethod
+    def poll(cls, context):
+        return stadium_collection(context) is not None and any(o.type == "MESH" for o in context.selected_objects)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        coll = stadium_collection(context)
+        meshes = [o for o in context.selected_objects if o.type == "MESH" and o.get("pp_kind") not in ("game_base",)]
+        for o in meshes:
+            surfaces.make_collision(o, int(self.surface), coll)
+        surfaces.show(context, coll, True)
+        self.report({"INFO"}, T(f"{len(meshes)} objetos son ahora colisión: {surfaces.name(int(self.surface))}",
+                                f"{len(meshes)} objects are collision now: {surfaces.name(int(self.surface))}"))
         return {"FINISHED"}
 
 
@@ -393,6 +449,8 @@ class PP_PT_info(bpy.types.Panel):
         layout.operator(PP_OT_generate_collision.bl_idname, icon="MOD_PHYSICS")
         obj = context.active_object
         coll = stadium_collection(context)
+        if coll is not None:
+            draw_collision(layout, coll)
         if obj is not None and scratch.is_scratch(coll) and obj.get("pp_kind") == "game_base":
             box = layout.box()
             box.label(text=T("Pieza del juego: ", "Game piece: ") + obj.name, translate=False)
@@ -414,12 +472,15 @@ class PP_PT_info(bpy.types.Panel):
             return
         box = layout.box()
         if obj["pp_kind"] == "collision":
-            box.label(text=T("Malla de colisión", "Collision mesh"), translate=False)
+            box.label(text=T("Colisión: ", "Collision: ") + obj.name, translate=False)
             face = obj.data.polygons.active
-            attr = obj.data.attributes.get("surface_id")
-            if attr is not None and face is not None and face < len(attr.data):
-                box.label(text=T("Superficie de la cara activa: ", "Surface of the active face: ")
-                          + str(attr.data[face].value), translate=False)
+            if face is not None and face < len(obj.data.polygons):
+                p = obj.data.polygons[face]
+                mat = obj.data.materials[p.material_index] if p.material_index < len(obj.data.materials) else None
+                sid = surfaces.surface_of(mat, obj.get("pp_surface", surfaces.DEFAULT))
+                box.label(text=T("Cara activa: ", "Active face: ") + f"{surfaces.name(sid)} ({sid})", translate=False)
+            box.label(text=T("Cambia el tipo de una cara con su material «Superficie N»",
+                             "Change a face's kind with its «Superficie N» material"), translate=False)
             return
         box.label(text=T("Pieza: ", "Piece: ") + obj.name, translate=False)
         box.label(text=T("Modelo: ", "Model: ") + str(obj.get("pp_wmodel", "")), translate=False)
@@ -430,6 +491,24 @@ class PP_PT_info(bpy.types.Panel):
         mat = obj.active_material
         if mat is not None:
             box.label(text=f"Material: {mat.name}", translate=False)
+
+
+def draw_collision(layout, coll):
+    """The collision box: triangles, All/None, one eye per kind, Make collision."""
+    objs = surfaces.collision_objects(coll)
+    box = layout.box()
+    total = sum(len(o.data.polygons) for o in objs)
+    box.label(text=T(f"Colisión: {total} caras", f"Collision: {total} faces"), icon="MOD_PHYSICS", translate=False)
+    if objs:
+        row = box.row(align=True)
+        row.operator(PP_OT_collision_visibility.bl_idname, text=T("Todo", "All"), translate=False).show = True
+        row.operator(PP_OT_collision_visibility.bl_idname, text=T("Nada", "None"), translate=False).show = False
+        col = box.column(align=True)
+        for o in objs:
+            r = col.row(align=True)
+            r.prop(o, "hide_viewport", text="", emboss=False, icon="HIDE_ON" if o.hide_viewport else "HIDE_OFF")
+            r.label(text=f"{o.name}: {len(o.data.polygons)}", translate=False)
+    box.operator(PP_OT_make_collision.bl_idname, icon="ADD")
 
 
 def menu_import(self, context):
@@ -443,7 +522,7 @@ def menu_export(self, context):
 
 
 CLASSES = (PP_OT_import_stadium, PP_OT_new_scratch, PP_OT_export_stadium, PP_OT_preview_in_game,
-           PP_OT_convert_objects, PP_OT_generate_collision, PP_PT_info)
+           PP_OT_convert_objects, PP_OT_generate_collision, PP_OT_collision_visibility, PP_OT_make_collision, PP_PT_info)
 
 
 def apply_language():

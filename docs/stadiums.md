@@ -38,8 +38,9 @@ Tarda unos segundos. No se extrae nada al disco: todo se lee del `project.bin` d
 - **Texturas** empaquetadas dentro del `.blend`.
 - **Colisión**, en la subcolección «… · Colisión», oculta al importar (actívala con el ojo):
   - es la malla con la que el juego decide por dónde rebota la pelota;
-  - cada cara tiene un `surface_id` y un color por tipo (césped, tierra, montículo, vallas, gradas, postes de foul…; ver la tabla en `docs/ingenieria-inversa.md`).
-- **Panel Power Pros (N):** la pieza seleccionada, su modelo original, el nodo de Maya y los flags de colocación. En la colisión, la superficie de la cara activa.
+  - va en **un objeto por tipo** («Colisión · Vallas», «Colisión · Gradas», «Colisión · Postes de foul»…), con su material «Superficie N · nombre» del mismo color que en «Ver en el juego» (tabla de tipos en `docs/ingenieria-inversa.md`);
+  - en el panel Power Pros, la caja **Colisión** muestra los caras de cada tipo, con un ojo para verlo u ocultarlo y los botones **Todo** y **Nada** (complemento 0.8.2).
+- **Panel Power Pros (N):** la pieza seleccionada, su modelo original, el nodo de Maya y los flags de colocación. En la colisión, el tipo de la cara activa.
 
 Las propiedades personalizadas `pp_*` de objetos y materiales guardan los datos originales que necesitará la exportación. No las borres si quieres volver a meter el estadio en el juego.
 
@@ -67,8 +68,9 @@ Qué hace al exportar:
 - Una imagen editada o nueva se guarda en el pack como textura RGB5A3. Si sus lados no son potencias de 2, se reescala a la más cercana, de 4 a 256 píxeles, como las del juego.
 - **Texturas HD** (activado por defecto en el diálogo): además, la imagen se guarda a su tamaño, hasta 2048 píxeles y con 8 bits por color, en `mods\<nombre>\textures\stadium_<código>\`. El juego la usa en lugar de la del pack y le crea mipmaps, así que una imagen grande se ve nítida de cerca y limpia de lejos. La de 256 del pack queda para cuando no hay texturas de reemplazo.
 - Si mueves una pieza, actualiza su caja y su esfera en la tabla, para que el juego no la oculte cuando entra en cámara, y rehace el árbol con el que el juego reparte las piezas.
-- **Colisión:** si cambiaste la malla «Colisión» (moverla, editar sus caras o cambiar su superficie), la escribe entera y rehace el árbol de colisión del juego.
-  - La **superficie** de cada cara sale del número final del nombre de su material: «Superficie 9» es valla. Para cambiar una cara de tipo, asígnale otro material «Superficie N».
+- **Colisión:** si cambiaste la colisión (mover un objeto, editar sus caras, cambiar su tipo, borrar un objeto o añadir uno), junta todos los objetos de colisión en la del juego, la escribe entera y rehace su árbol. Los puntos que comparten se unen.
+  - El **tipo** de cada cara sale del número del nombre de su material: «Superficie 9 · Vallas» (o «Superficie 9», en archivos anteriores) es valla. Para cambiar una cara de tipo, asígnale otro material «Superficie N».
+  - **Tu propia colisión:** selecciona cualquier malla y pulsa **Convertir en colisión** (caja Colisión del panel). Eliges el tipo (valla, gradas, pared invisible de home run…) y la malla pasa a la colección de colisión: deja de dibujarse y la pelota y los jugadores chocan con ella. Sirve para cerrar huecos de la colisión generada o para hacerla a mano. Comprueba el resultado con **C** en «Ver en el juego».
   - La normal de cada cara apunta al lado que golpea la pelota: arriba en el suelo y hacia el campo en las vallas.
 - **Límite de tamaño:** un pack de gráficos de 80 MB carga en un partido y uno de 96 MB no. El original pesa 1,1 MB. Si pasas de 80 MB, el exportador avisa. (En el Wii el tope era de unos 21 MB: el juego reserva un montón de memoria fijo; el recomp lo amplía.) Las texturas HD no cuentan: van aparte, fuera del pack.
 - **Banderas:** si borras las banderas (`DP_FLG_*`) del estadio base, el exportador encoge su colocación hasta hacerlas invisibles. El juego las dibuja a partir de la colocación de la tabla, no de su malla, y sin prueba de profundidad: borradas o enterradas seguían viéndose.
@@ -117,14 +119,14 @@ Puedes llevar al juego un estadio que no existe en él.
    - Cada pieza recibe como mucho 30 texturas: las del modelo se reparten entre las gradas del estadio base.
    - Si el modelo trae una textura pintada sobre una cara sin material, en las mismas esquinas (SketchUp lo hace), se queda la cara con textura.
    - Las piezas convertidas se ven en Blender como en el juego: textura × color de vértice, sin luz. Usa la vista **Material** (Z > Vista previa de material).
-5. Pulsa **Generar colisión**. Crea la malla «Colisión» de tu estadio:
+5. Pulsa **Generar colisión**. Crea la colisión de tu estadio, un objeto por tipo (sustituye la que hubiera, también la hecha con «Convertir en colisión»):
    - el suelo (césped si es verde, tierra si no) y el montículo;
    - las vallas, siguiendo la pared más cercana al campo en todas direcciones;
    - las paredes invisibles sobre las vallas, como las del juego: en territorio fair (1, el home run) y en foul (0);
    - los postes de foul donde las líneas cortan las vallas;
    - las gradas, simplificadas a unos 5.000 triángulos, y un límite exterior detrás del outfield.
 
-   Revísala: está oculta, actívala con el ojo. Si algo no cuadra, puedes editarla a mano.
+   Revísala: está oculta, actívala con el ojo o con **Todo** en la caja Colisión. Si algo no cuadra, edítala a mano o añade piezas con «Convertir en colisión».
 6. **Exporta** como estadio nuevo.
 
 Límites:

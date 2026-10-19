@@ -89,7 +89,7 @@ With the Blender add-on you can edit the game's stadiums or bring in one of your
 **Bring in your own model** (SketchUp, glTF, OBJ…)
 1. Import the base stadium and your model into the same scene. A `.skp` is turned into `.glb` first with OpenSKP.
 2. Place it in metres, with home plate at the origin, the ground at height 0, second base towards +Y and 90 ft between bases. The game always puts the players in the same place.
-3. Select your model and press **Convert objects to pieces**. Then **Generate collision**.
+3. Select your model and press **Convert objects to pieces**. Then **Generate collision**. The collision comes as one object per kind (fences, stands, poles…), shown or hidden in the panel's Collision box; **Make collision** turns any mesh into collision.
 4. Why a base stadium is needed: the game can only load stadiums with the structure it already knows, so your model goes inside an existing one. [stadiums.md](stadiums.md), «Why a base stadium is needed», explains it.
 
 **Stadium from scratch** (add-on 0.8.0)

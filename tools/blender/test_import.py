@@ -79,9 +79,10 @@ check(len(pieces) == len(table.placements), f"{len(pieces)} pieces == {len(table
 check(abs(faces - want_faces) <= want_faces // 200, f"{faces} faces ~ {want_faces} triangles from the display lists")
 used = {m.textures[m.texmaps[mat.texmaps[0]].texture].offset for m in models for mat in m.materials if mat.texmaps}
 check(len(images) == len(used), f"{len(images)} images == {len(used)} textures in use ({len(textures)} listed)")
-proper = len({tuple(sorted((a, b, c))) for a, b, c, _ in table.triangles if len({a, b, c}) == 3})  # no degenerate/duplicate
-check(len(coll) == 1 and len(coll[0].data.polygons) == proper,
-      f"collision has {len(coll[0].data.polygons) if coll else 0} faces of {proper} ({len(table.triangles)} with degenerate)")
+proper = len({(tuple(sorted((a, b, c))), s) for a, b, c, s in table.triangles if len({a, b, c}) == 3})  # no degenerate/repeat
+got = sum(len(o.data.polygons) for o in coll)
+check(len(coll) == len({t[3] for t in table.triangles}) and got == proper,
+      f"collision: {len(coll)} kinds, {got} faces of {proper} ({len(table.triangles)} with degenerate)")
 check(all(i.packed_file is not None for i in images), "images are packed into the .blend")
 
 # Renders to compare with the game (EEVEE, unlit materials as imported).

@@ -89,7 +89,7 @@ Con el complemento de Blender puedes editar los estadios del juego o meter uno t
 **Meter un modelo tuyo** (SketchUp, glTF, OBJ…)
 1. Importa en la misma escena el estadio base y tu modelo. Un `.skp` se pasa antes a `.glb` con OpenSKP.
 2. Colócalo en metros, con el plato en el origen, el suelo a la altura 0, la segunda base hacia +Y y 90 pies entre bases. El juego pone siempre a los jugadores en el mismo sitio.
-3. Selecciona tu modelo y pulsa **Convertir objetos en piezas**. Después, **Generar colisión**.
+3. Selecciona tu modelo y pulsa **Convertir objetos en piezas**. Después, **Generar colisión**. La colisión sale en un objeto por tipo (vallas, gradas, postes…), que ves u ocultas en la caja Colisión del panel; con **Convertir en colisión** haces colisión de cualquier malla.
 4. Por qué hace falta un estadio base: el juego solo sabe cargar estadios con la estructura que ya conoce, así que tu modelo entra dentro de uno existente. Lo explica [stadiums.md](stadiums.md), «Por qué hace falta un estadio base».
 
 **Estadio desde cero** (complemento 0.8.0)

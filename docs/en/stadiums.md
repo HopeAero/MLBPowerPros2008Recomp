@@ -38,8 +38,9 @@ It takes a few seconds. Nothing is extracted to disk: everything is read from yo
 - **Textures** packed inside the `.blend`.
 - **Collision**, in the "… · Collision" («… · Colisión») subcollection, hidden on import (turn it on with the eye):
   - it is the mesh the game uses to decide where the ball bounces;
-  - each face has a `surface_id` and a color by type (grass, dirt, mound, fences, stands, foul poles…; see the table in `docs/en/reverse-engineering.md`).
-- **Power Pros panel (N):** the selected piece, its original model, the Maya node and the placement flags. In the collision, the surface of the active face.
+  - it comes as **one object per kind** ("Collision · Fences", "Collision · Stands", "Collision · Foul poles"…), with its "Superficie N · name" material in the same colour as in "View in game" (table of kinds in `docs/en/reverse-engineering.md`);
+  - in the Power Pros panel, the **Collision** box shows the faces of each kind, with an eye to show or hide it and the **All** and **None** buttons (add-on 0.8.2).
+- **Power Pros panel (N):** the selected piece, its original model, the Maya node and the placement flags. In the collision, the kind of the active face.
 
 The `pp_*` custom properties on objects and materials store the original data the export will need. Don't delete them if you want to put the stadium back into the game.
 
@@ -67,8 +68,9 @@ What exporting does:
 - An edited or new image is saved in the pack as an RGB5A3 texture. If its sides are not powers of 2, it is rescaled to the nearest one, from 4 to 256 pixels, like the game's.
 - **HD textures** (on by default in the dialog): the image is also saved at its own size, up to 2048 pixels and 8 bits per channel, in `mods\<name>\textures\stadium_<code>\`. The game uses it instead of the pack's and builds its mipmaps, so a large image looks sharp up close and clean from afar. The pack's 256 px one remains for when there are no replacement textures.
 - If you move a piece, it updates its box and sphere in the table, so the game doesn't hide it when it comes into the camera's view, and rebuilds the tree the game uses to sort the pieces.
-- **Collision:** if you changed the "Collision" mesh (moving it, editing its faces or changing its surface), it writes it in full and rebuilds the game's collision tree.
-  - The **surface** of each face comes from the final number in its material's name: "Surface 9" («Superficie 9») is a fence. To change a face's type, assign it another "Surface N" material.
+- **Collision:** if you changed the collision (moving an object, editing its faces, changing its kind, deleting an object or adding one), it joins every collision object into the game's one, writes it in full and rebuilds its tree. Shared points are welded.
+  - The **kind** of each face comes from the number in its material's name: "Superficie 9 · Fences" (or "Superficie 9", in older files) is a fence. To change a face's kind, assign it another "Superficie N" material.
+  - **Your own collision:** select any mesh and press **Make collision** (Collision box of the panel). You pick the kind (fence, stands, home run invisible wall…) and the mesh moves to the collision collection: it is no longer drawn and the ball and players hit it. Use it to close gaps in the generated collision or to make it by hand. Check the result with **C** in "View in game".
   - Each face's normal points to the side the ball hits: up on the ground and towards the field on fences.
 - **Size limit:** an 80 MB graphics pack loads in a game and a 96 MB one doesn't. The original weighs 1.1 MB. If you go over 80 MB, the exporter warns you. (On the Wii the cap was about 21 MB: the game reserves a fixed memory heap; the recomp enlarges it.) HD textures don't count: they go separately, outside the pack.
 - **Flags:** if you delete the base stadium's flags (`DP_FLG_*`), the exporter shrinks their placement until they are invisible. The game draws them from the table placement, not from their mesh, and without depth test: deleted or buried they still showed.
@@ -117,14 +119,14 @@ You can bring a stadium that doesn't exist in the game into it.
    - Each piece gets at most 30 textures: the model's are spread over the base stadium's stands.
    - If the model has a texture painted over a plain face, on the same corners (SketchUp does this), the textured face is kept.
    - Converted pieces look in Blender as in the game: texture × vertex colour, unlit. Use the **Material** view (Z > Material Preview).
-5. Press **Generate collision** (**Generar colisión**). It creates your stadium's "Collision" mesh:
+5. Press **Generate collision** (**Generar colisión**). It creates your stadium's collision, one object per kind (it replaces any there was, also the one made with "Make collision"):
    - the ground (grass if it's green, dirt if not) and the mound;
    - the fences, following the wall closest to the field in all directions;
    - the invisible walls above the fences, like the game's: in fair territory (1, the home run) and in foul territory (0);
    - the foul poles where the lines cross the fences;
    - the stands, simplified to about 5,000 triangles, and an outer boundary behind the outfield.
 
-   Review it: it is hidden, turn it on with the eye. If something doesn't fit, you can edit it by hand.
+   Review it: it is hidden, turn it on with the eye or with **All** in the Collision box. If something doesn't fit, edit it by hand or add pieces with "Make collision".
 6. **Export** as a new stadium.
 
 Limits:

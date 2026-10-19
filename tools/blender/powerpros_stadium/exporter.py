@@ -7,7 +7,6 @@ images become RGB5A3 textures. An edited collision mesh is written with its surf
 plane trees of the tbl are rebuilt for what changed. New pieces come in a later phase.
 """
 import math
-import re
 from pathlib import Path
 
 import bpy
@@ -15,7 +14,7 @@ import numpy as np
 from mathutils import Matrix, Vector
 
 from . import (fingerprint, hd_textures, importer, menu_pack, menu_render, names, packwii, pj7m, pj7m_write,
-               stadium_model, stadium_tbl, tbl_write)
+               stadium_model, stadium_tbl, surfaces, tbl_write)
 from .i18n import T
 from .names import valid_code
 
@@ -286,43 +285,17 @@ class Exporter:
         self.w.d.extend(b"\0" * (-len(self.w.d) % 32))          # original packs end 32-byte aligned
         if self.tbl is None:
             return bytes(self.w.d), None
-        collision = next((o for o in coll.all_objects if o.get("pp_kind") == "collision"), None)
-        changed = collision is not None and collision.get("pp_signature") != fingerprint.collision_signature(collision)
+        collision = surfaces.collision_objects(coll)
+        changed = bool(collision) and surfaces.changed(coll, collision)
         if not (self.stats["moved"] or changed):
             return bytes(self.w.d), bytes(self.tbl)
         tw = tbl_write.TblWriter(self.tbl)
         tw.set_model_tree()                       # the boxes of the pieces changed: tree A again
         if changed:
-            vertices, triangles = collision_data(collision)
+            vertices, triangles = surfaces.gather(collision, to_game)
             tw.set_collision(vertices, triangles)
             self.stats["collision"] = len(triangles)
         return bytes(self.w.d), tw.finish()
-
-
-def surface_of(mat, fallback):
-    """Surface id of a collision face: the number its material name ends with («Superficie 9»)."""
-    m = re.search(r"(\d+)\s*$", mat.name) if mat is not None else None
-    return int(m.group(1)) if m else fallback
-
-
-def collision_data(obj):
-    """(game-space vertices, triangles (a, b, c, surface)) from the collision object."""
-    me = obj.data
-    me.calc_loop_triangles()
-    attr = me.attributes.get("surface_id")
-    ids = None
-    if attr is not None and attr.domain == "FACE" and attr.data_type == "INT":
-        ids = np.empty(len(me.polygons), np.int32)
-        attr.data.foreach_get("value", ids)
-    mw = obj.matrix_world
-    vertices = [to_game(mw @ v.co) for v in me.vertices]
-    triangles = []
-    for lt in me.loop_triangles:
-        mat = me.materials[lt.material_index] if lt.material_index < len(me.materials) else None
-        sid = surface_of(mat, int(ids[lt.polygon_index]) if ids is not None else 11)
-        a, b, c = lt.vertices
-        triangles.append((a, b, c, sid))       # normal (b-a)x(c-a): the side the ball hits
-    return vertices, triangles
 
 
 def add_stadium_to_toml(toml, code, name, base):
