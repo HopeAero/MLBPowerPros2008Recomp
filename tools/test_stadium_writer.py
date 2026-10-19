@@ -299,10 +299,97 @@ def test_table_bytes_match_game(archive):
           + ("" if not bad else ": " + "; ".join(bad[:8])))
 
 
+# ---- Task 4: round trip, description only, rebuild tool ------------------------------------------
+
+def test_round_trip_all(archive):
+    import stadium_re
+    from powerpros_stadium.stadium_read import read_stadium
+    from powerpros_stadium.stadium_write import write_stadium
+    bad = []
+    for code in stadium_codes(archive):
+        st = read_stadium(*packs(archive, code))
+        gfx, tbl = write_stadium(st)
+        back = read_stadium(gfx, tbl)
+        if back != st:
+            bad.append(f"{code}: {first_difference(st, back)}")
+        problems = []
+        models, _ = stadium_re.load(code, gfx, tbl, problems)
+        for m in models:
+            stadium_re.check_model(gfx, m, problems)
+        bad += problems[:2]
+    check(not bad, "the 40 stadiums read, write and read back the same" + ("" if not bad else ": " + "; ".join(bad[:6])))
+
+
+def to_plain(value):
+    """Lists, numbers, strings and hex for bytes only: nothing left of the reader's objects."""
+    from dataclasses import fields, is_dataclass
+    if is_dataclass(value):
+        return {f.name: to_plain(getattr(value, f.name)) for f in fields(value)}
+    if isinstance(value, (list, tuple)):
+        return [to_plain(v) for v in value]
+    if isinstance(value, bytes):
+        return {"hex": value.hex()}
+    return value
+
+
+def from_plain(d):
+    from powerpros_stadium import stadium_model as sm
+    tup = lambda v: tuple(tup(x) if isinstance(x, list) else x for x in v)
+    raw = lambda v: bytes.fromhex(v["hex"])
+    return sm.Stadium(
+        textures=[sm.Texture(t["fmt"], t["width"], t["height"], raw(t["pixels"]), raw(t["tail"])) for t in d["textures"]],
+        palettes=[sm.Palette(p["entries"], raw(p["colors"]), p["format"]) for p in d["palettes"]],
+        models=[sm.Model(m["name"], m["wname"], m["node_name"], [tup(x) for x in m["textures"]],
+                         [sm.TexMap(**t) for t in m["texmaps"]],
+                         [sm.Material(a["kind"], tup(a["colors"]), list(a["texmaps"]), a["unk_32"]) for a in m["materials"]],
+                         [sm.Mesh(x["material"], [tup(v) for v in x["positions"]], [tup(v) for v in x["normals"]],
+                                  [tup(v) for v in x["colors"]], [tup(v) for v in x["uvs"]],
+                                  [(op, [tup(v) for v in verts]) for op, verts in x["draws"]]) for x in m["meshes"]],
+                         m["scene_word"]) for m in d["models"]],
+        placements=[sm.Placement(p["model"], tup(p["translation"]), tup(p["rotation"]), tup(p["scale"]), tup(p["bbox"]),
+                                 tup(p["sphere"]), p["flags"]) for p in d["placements"]],
+        collision_vertices=[tup(v) for v in d["collision_vertices"]],
+        collision_triangles=[tup(t) for t in d["collision_triangles"]],
+        unk_20=[sm.PointGroup([tup(p) for p in g["points"]], tup(g["box"])) for g in d["unk_20"]],
+        unk_24=[[tup(r) for r in rs] for rs in d["unk_24"]],
+        preload_order=list(d["preload_order"]),
+        preload=[sm.PreloadEntry(**e) for e in d["preload"]],
+        preload_tail=d["preload_tail"],
+        spare_textures=[tup(x) for x in d["spare_textures"]])
+
+
+def test_writer_uses_only_the_description(archive):
+    import json
+    from powerpros_stadium.stadium_read import read_stadium
+    from powerpros_stadium.stadium_write import write_stadium
+    st = read_stadium(*packs(archive, "col"))
+    copy = from_plain(json.loads(json.dumps(to_plain(st))))
+    check(write_stadium(copy) == write_stadium(st), "col: a description rebuilt from plain data writes the same bytes")
+
+
+def test_rebuild_tool(archive):
+    import shutil
+    import subprocess
+    from powerpros_stadium.stadium_read import read_stadium
+    root = Path(__file__).resolve().parent.parent
+    out = root / "local" / "tmp" / "stadium-writer" / "mods"
+    shutil.rmtree(out, ignore_errors=True)
+    for flag, folder, code in (([], "Reconstruido col", "rb_col"), (["--original"], "Original col", "og_col")):
+        run = subprocess.run([sys.executable, str(root / "tools" / "stadium_rebuild.py"), str(archive.path), "col", str(out)] + flag,
+                             capture_output=True, text=True)
+        mod = out / folder
+        toml = (mod / "mod.toml").read_text(encoding="utf-8") if (mod / "mod.toml").is_file() else ""
+        gfx, tbl = mod / "project" / f"stadium_{code}.pack", mod / "project" / f"stadium_{code}tbl.pack"
+        ok = run.returncode == 0 and f'code = "{code}"' in toml and 'base = "col"' in toml and gfx.is_file() and tbl.is_file()
+        if ok:
+            read_stadium(gfx.read_bytes(), tbl.read_bytes())
+        check(ok, f"stadium_rebuild.py {' '.join(flag) or '(rebuild)'}: {folder} with {code} ({run.stderr.strip()[-200:]})")
+
+
 SYNTHETIC = [test_graphics_synthetic, test_table_synthetic, test_table_empty_blocks, test_table_many_placements,
              test_write_limits]
 GAME = [test_reader_known_values, test_reader_covers_every_byte, test_graphics_bytes_match_game,
-        test_table_bytes_match_game]
+        test_table_bytes_match_game, test_round_trip_all, test_writer_uses_only_the_description, test_rebuild_tool]
 
 
 def main(argv):

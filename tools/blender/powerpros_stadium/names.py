@@ -51,3 +51,8 @@ CODES = [c for c, _ in stadiums()]
 
 def name(code):
     return dict(stadiums()).get(code, code)
+
+
+def valid_code(code):
+    """A new stadium's code: 2 to 16 lowercase letters, digits or _."""
+    return 2 <= len(code) <= 16 and all(c.isascii() and (c.isalnum() or c == "_") for c in code) and code.islower()

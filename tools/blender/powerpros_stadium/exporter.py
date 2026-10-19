@@ -17,6 +17,7 @@ from mathutils import Matrix, Vector
 from . import (fingerprint, hd_textures, importer, menu_pack, menu_render, names, packwii, pj7m, pj7m_write,
                stadium_tbl, tbl_write)
 from .i18n import T
+from .names import valid_code
 
 try:
     from . import projectbin
@@ -314,10 +315,6 @@ def collision_data(obj):
         a, b, c = lt.vertices
         triangles.append((a, b, c, sid))       # normal (b-a)x(c-a): the side the ball hits
     return vertices, triangles
-
-
-def valid_code(code):
-    return 2 <= len(code) <= 16 and all(c.isascii() and (c.isalnum() or c == "_") for c in code) and code.islower()
 
 
 def add_stadium_to_toml(toml, code, name, base):
