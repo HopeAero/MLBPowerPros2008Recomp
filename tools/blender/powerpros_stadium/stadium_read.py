@@ -9,7 +9,7 @@ import struct
 
 from . import pj7m, stadium_tbl
 from .stadium_model import (Material, Mesh, Model, Palette, Placement, PointGroup, PreloadEntry, Span, Stadium,
-                            TexMap, Texture)
+                            TexMap, Texture, mip_chain_size)
 
 BITS = {5: 16, 6: 32, 8: 4, 9: 8}                    # GX format -> bits per texel
 TYPE_FMT = pj7m.MODEL_FMT                            # texture type byte -> GX format
@@ -84,11 +84,19 @@ class _Reader:
             self.st.spare_textures.append((tex, palette))
 
     def texture_tails(self):
-        """Non-zero bytes between a texture's pixels and the next structure go to Texture.tail."""
+        """Bytes between a texture's pixels and the next structure go to Texture.tail: at least the mip
+        levels its models use (they may end in zero texels), and any non-zero bytes after them."""
+        levels = {}
+        for m in self.st.models:
+            for t, _, level in m.textures:
+                levels[t] = max(levels.get(t, 0), level)
         starts = sorted(s.start for s in self.spans["gfx"])
         for s in [s for s in self.spans["gfx"] if s.kind == "texture_pixels"]:
             nxt = next((x for x in starts if x >= s.end), len(self.gfx))
             tail = self.gfx[s.end:nxt].rstrip(b"\0")
+            chain = mip_chain_size(self.st.textures[s.key[0]], levels.get(s.key[0], 0))
+            if len(tail) < chain:
+                tail = self.gfx[s.end:min(nxt, s.end + chain)]
             if tail:
                 self.st.textures[s.key[0]].tail = tail
                 self.span("gfx", "texture_tail", s.key, s.end, s.end + len(tail))

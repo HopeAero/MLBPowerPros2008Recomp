@@ -8,6 +8,7 @@ import struct
 from dataclasses import dataclass
 
 from . import pj7m, stadium_tbl, tbl_write
+from .stadium_model import mip_chain_size
 
 P = 0x40000000
 FMT_TYPE = {fmt: kind for kind, fmt in pj7m.MODEL_FMT.items()}      # GX format -> texture type byte
@@ -222,20 +223,101 @@ def write_table(st, layout):
     return bytes(buf.d)
 
 
-def check_limits(st):
-    for m in st.models:
-        if len(m.texmaps) > MAX_TEXMAPS:
-            raise StadiumWriteError(f"{m.name}: {len(m.texmaps)} texmaps, the game takes {MAX_TEXMAPS}")
+def _ascii(text, what):
+    if not text.isascii():
+        raise StadiumWriteError(f"{what} '{text}': the game's strings are ASCII")
+
+
+def _tree_a_reaches(nodes, entries):
+    """Placement indices tree A lists, walking from the root (as stadium_tbl.tree_members)."""
+    found, stack = set(), [nodes[0][1], nodes[0][2]] if nodes else []
+    while stack:
+        child, start, count = stack.pop()
+        if child:
+            if child >= len(nodes):
+                raise StadiumWriteError(f"tree A: node {child} does not exist")
+            stack += [nodes[child][1], nodes[child][2]]
+        else:
+            found.update(entries[start:start + count])
+    return found
+
+
+def validate(st):
+    """Everything the writer needs from a description, with an error naming the model or the field,
+    before anything is written (a description may come from Blender, not the game)."""
+    E = StadiumWriteError
+    if not st.placements:
+        raise E("a stadium needs at least 1 placement (the table root is found by a count above 0)")
     if len(st.placements) > MAX_PLACEMENTS:
-        raise StadiumWriteError(f"{len(st.placements)} placements, at most {MAX_PLACEMENTS}")
+        raise E(f"{len(st.placements)} placements, at most {MAX_PLACEMENTS}")
+    for i, tex in enumerate(st.textures):
+        if tex.fmt not in FMT_TYPE:
+            raise E(f"texture {i}: unknown GX format {tex.fmt} (5, 6, 8 or 9)")
+        if not (0 < tex.width <= 0xFFFF and 0 < tex.height <= 0xFFFF):
+            raise E(f"texture {i}: size {tex.width} x {tex.height}")
+    for i, pal in enumerate(st.palettes):
+        if pal.colors and len(pal.colors) != 2 * pal.entries:
+            raise E(f"palette {i}: {len(pal.colors)} bytes of colours for {pal.entries} entries")
+    for m in st.models:
+        for text, what in ((m.name, "model name"), (m.wname, f"{m.name}: wname"), (m.node_name, f"{m.name}: node name")):
+            _ascii(text, what)
+        if len(m.texmaps) > MAX_TEXMAPS:
+            raise E(f"{m.name}: {len(m.texmaps)} texmaps, the game takes {MAX_TEXMAPS}")
+        for t, p, level in m.textures:
+            if not 0 <= t < len(st.textures) or (p is not None and not 0 <= p < len(st.palettes)):
+                raise E(f"{m.name}: texture {t} / palette {p} not in the stadium")
+            if level and len(st.textures[t].tail) < mip_chain_size(st.textures[t], level):
+                raise E(f"{m.name}: texture {t} used at mip level {level}, but its tail lacks those levels")
+        for tm in m.texmaps:
+            if not 0 <= tm.slot < len(m.textures):
+                raise E(f"{m.name}: texmap slot {tm.slot}, the model has {len(m.textures)} textures")
+        for k, mat in enumerate(m.materials):
+            if len(mat.colors) != 3 or any(len(c) != 4 for c in mat.colors):
+                raise E(f"{m.name}: material {k} needs three RGBA colors")
+            if len(mat.texmaps) > 8 or any(not 0 <= x < len(m.texmaps) for x in mat.texmaps):
+                raise E(f"{m.name}: material {k} texmap slots {mat.texmaps} (at most 8, each below {len(m.texmaps)})")
+        for k, mesh in enumerate(m.meshes):
+            if not 0 <= mesh.material < len(m.materials):
+                raise E(f"{m.name}: mesh {k} uses material {mesh.material}")
+            sizes = (len(mesh.positions), len(mesh.normals), len(mesh.colors), len(mesh.uvs))
+            if max(sizes) > 0x10000:
+                raise E(f"{m.name}: mesh {k} has more than 65536 elements in an array")
+            for op, verts in mesh.draws:
+                if op not in (0x90, 0x98) or len(verts) < 3 or (op == 0x90 and len(verts) % 3) or len(verts) > 0xFFFF:
+                    raise E(f"{m.name}: mesh {k} has a draw of opcode 0x{op:02X} with {len(verts)} vertices")
+                for v in verts:
+                    if not 0 <= v[0] <= 0xFF or any(not 0 <= v[1 + a] < max(sizes[a], 1) for a in range(4)):
+                        raise E(f"{m.name}: mesh {k} vertex {v} indexes past its arrays {sizes}")
+    for i, p in enumerate(st.placements):
+        if not 0 <= p.model < len(st.models):
+            raise E(f"placement {i}: model {p.model} not in the stadium")
     if len(st.collision_triangles) > MAX_COLLISION or len(st.collision_vertices) > MAX_COLLISION:
-        raise StadiumWriteError(f"collision of {len(st.collision_triangles)} triangles and {len(st.collision_vertices)} "
-                                f"vertices, at most {MAX_COLLISION} of each")
+        raise E(f"collision of {len(st.collision_triangles)} triangles and {len(st.collision_vertices)} "
+                f"vertices, at most {MAX_COLLISION} of each")
+    for t in st.collision_triangles:
+        if any(not 0 <= x < len(st.collision_vertices) for x in t[:3]) or not 0 <= t[3] <= 0xFFFF:
+            raise E(f"collision triangle {t}: index past the {len(st.collision_vertices)} vertices")
+    for g in st.unk_20:
+        if not g.points and not any(g.box):
+            raise E("unk_20: an empty group with a zero box would end the list early")
+    if len(st.unk_24) not in (1, 2):
+        raise E(f"unk_24: {len(st.unk_24)} pairs, the game has 1 or 2")
+    if len(st.preload_order) != len(st.preload):
+        raise E(f"preload: {len(st.preload_order)} order entries for {len(st.preload)} textures")
+    for e in st.preload:
+        if (e.texture is not None and not 0 <= e.texture < len(st.textures)) or \
+                (e.palette is not None and not 0 <= e.palette < len(st.palettes)):
+            raise E(f"preload entry {e}: texture or palette not in the stadium")
+    if st.tree_a is not None:
+        nodes, entries = st.tree_a
+        if any(not 0 <= x < len(st.placements) for x in entries) or \
+                _tree_a_reaches(nodes, entries) != set(range(len(st.placements))):
+            raise E(f"tree A does not match the {len(st.placements)} placements (set tree_a to None to build one)")
 
 
 def write_stadium(st):
-    """(graphics pack, table) of `st`. Checks the known limits before writing anything."""
-    check_limits(st)
+    """(graphics pack, table) of `st`. Validates the description before writing anything."""
+    validate(st)
     gfx, layout = write_graphics(st)
     try:
         tbl = write_table(st, layout)

@@ -502,11 +502,11 @@ Verified (October 14, 2026):
 **Bringing in an external model** (Polo Grounds from SketchUp, October 14 and 15, 2026; benchmark matches):
 - **Sizes of the game's stadiums**, in the 47 packs:
   - at most 24,768 bytes of display list, 573 vertices per draw call, 1,303 positions per mesh and 29 meshes per model;
-  - textures from 32 to 256 pixels, single-level (no mipmaps): 8,135 CI4, 3,130 CI8, 77 RGBA8 and 33 RGB5A3 (`tools/stadium_re.py stats`). The recomp builds mipmaps for them on load (patch `wiicompiled-auto-mipmaps`).
+  - textures from 32 to 256 pixels, almost all single-level (`MIP` pieces, such as the turf, also use smaller levels: see «Field inventory…»): 8,135 CI4, 3,130 CI8, 77 RGBA8 and 33 RGB5A3 (`tools/stadium_re.py stats`). The recomp builds mipmaps for them on load (patch `wiicompiled-auto-mipmaps`).
   The exporter splits meshes at 600 triangles, 1,300 positions and 570 vertices per call, and reduces new textures to 256 pixels. Without splitting, what was missing on screen was later explained by the coplanar surfaces, not by the size: the splitting is a precaution.
 - **Depth:** parallel surfaces 0–2 cm apart (windows on a wall, a seat texture on the stands, the two faces of a wall) flicker or hide each other at 100–150 m; in Blender they look fine. Separating them or leaving a single face fixes it. The recomp draws with `Depth32Float` reversed-Z depth (aurora, `UseReversedZ`), far more precise than the Wii's 24-bit one: faces at 0 cm will always flicker, but at 2 cm they should not. Not checked with an isolated test.
 - **Back faces:** the model, with both faces of each wall in the same place, showed the back one covering the good one. With a single face facing the field it looks fine. It is not checked whether the game culls back faces in stadiums.
-- **Large textures** (512 px or more) look noisy at 100 m: stadiums do not use mipmaps.
+- **Large textures** (512 px or more) look noisy at 100 m: almost no stadium texture carries mipmaps (only those of `MIP` pieces).
 - **`0x80047874`** does not draw models. It sets `GXSetZMode(1, GX_ALWAYS, …)`, changes the color and alpha writes and draws a square: it is a screen clear.
 - **Stadium crowd:**
   - `DP_AudienceF_*` are almost horizontal faces over the stands (normal z ≈ 0.95), with 128 × 64 textures that repeat every 6 m of width and 4 m of height;

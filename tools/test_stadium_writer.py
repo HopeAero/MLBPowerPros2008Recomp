@@ -393,6 +393,83 @@ def test_rebuild_tool(archive):
         check(ok, f"stadium_rebuild.py {' '.join(flag) or '(rebuild)'}: {folder} with {code} ({run.stderr.strip()[-200:]})")
 
 
+# ---- Final review fixes ----------------------------------------------------------------------
+
+def refused(st, word, label):
+    from powerpros_stadium.stadium_write import StadiumWriteError, write_stadium
+    try:
+        write_stadium(st)
+        check(False, f"{label}: refused")
+    except StadiumWriteError as e:
+        check(word in str(e), f"{label}: refused naming '{word}' ({e})")
+    except Exception as e:
+        check(False, f"{label}: refused with StadiumWriteError, not {type(e).__name__}: {e}")
+
+
+def test_stale_tree_a_refused():
+    from powerpros_stadium.stadium_read import read_stadium
+    from powerpros_stadium.stadium_write import write_stadium
+    st = read_stadium(*write_stadium(table_stadium()))      # carries the tree A the writer built
+    st.placements.append(placement(0, 300.0, -300.0))
+    refused(st, "tree A", "a placement added after tree A was built")
+    st = read_stadium(*write_stadium(table_stadium()))
+    st.placements.pop()
+    refused(st, "tree A", "a placement removed after tree A was built")
+
+
+def test_mip_tail_kept():
+    from powerpros_stadium.stadium_model import Texture
+    from powerpros_stadium.stadium_read import read_stadium
+    from powerpros_stadium.stadium_write import write_stadium
+    st = table_stadium()
+    # C4 32x64 with levels 16x32 (256 bytes) and 8x16 (64), the last one all index 0, used at level 2.
+    st.textures[1] = Texture(8, 32, 64, bytes(range(256)) * 4, bytes([7] * 256) + bytes(64))
+    st.models[0].textures[1] = (1, 0, 2)
+    back = read_stadium(*write_stadium(st))
+    check(back.textures[1].tail == st.textures[1].tail, f"mip levels ending in zeros are kept ({len(back.textures[1].tail)} of 320 bytes)")
+    st.textures[1] = Texture(8, 32, 64, bytes(range(256)) * 4, bytes([7] * 256))
+    refused(st, "mip", "a level-2 texture without its 8x16 level")
+
+
+def test_validate_descriptions():
+    from powerpros_stadium.stadium_model import PointGroup, TexMap
+    cases = [
+        (lambda st: setattr(st, "placements", []), "placement", "no placements"),
+        (lambda st: st.preload_order.append(5), "preload", "preload order and entries of different lengths"),
+        (lambda st: setattr(st.models[0].materials[0], "colors", ((0, 0, 0, 255),)), "colors", "a material with one colour"),
+        (lambda st: setattr(st.palettes[0], "colors", bytes(4)), "palette", "palette colours shorter than its entries"),
+        (lambda st: st.unk_20.append(PointGroup([], (0.0,) * 6)), "unk_20", "an empty point group"),
+        (lambda st: st.unk_24.append([]), "unk_24", "three unk_24 pairs"),
+        (lambda st: st.models[0].materials[0].texmaps.append(9), "DP_test_a", "a material slot past the texmaps"),
+        (lambda st: st.models[0].texmaps.append(TexMap(7, 1, 1)), "DP_test_a", "a texmap slot past the textures"),
+        (lambda st: setattr(st.placements[0], "model", 9), "placement", "a placement of a missing model"),
+        (lambda st: st.collision_triangles.append((0, 1, 99, 5)), "collision", "a collision index past the vertices"),
+        (lambda st: setattr(st.models[0].materials[0], "texmaps", [0] * 9), "DP_test_a", "nine texmap slots"),
+        (lambda st: st.models[0].meshes[0].draws.append((0x98, [(0, 0, 0, 0, 0)] * 2)), "DP_test_a", "a two-vertex strip"),
+        (lambda st: st.models[0].meshes[0].draws.append((0x98, [(0, 0, 0, 0, 70000)] * 3)), "DP_test_a", "a vertex index above 65535"),
+        (lambda st: setattr(st.textures[0], "fmt", 7), "format", "an unknown texture format"),
+        (lambda st: setattr(st.textures[0], "width", 0), "size", "a zero-sized texture"),
+        (lambda st: setattr(st.models[0], "name", "DP_gradería"), "ASCII", "a non-ASCII model name"),
+    ]
+    for mutate, word, label in cases:
+        st = table_stadium()
+        mutate(st)
+        refused(st, word, label)
+
+
+def test_mip_tails_cover_levels(archive):
+    from powerpros_stadium.stadium_model import mip_chain_size
+    from powerpros_stadium.stadium_read import read_stadium
+    short = []
+    for code in stadium_codes(archive):
+        st = read_stadium(*packs(archive, code))
+        for m in st.models:
+            for t, _, level in m.textures:
+                if level and len(st.textures[t].tail) < mip_chain_size(st.textures[t], level):
+                    short.append(f"{code} {m.name} level {level}")
+    check(not short, "every texture used at a smaller mip level keeps the whole chain" + ("" if not short else f": {short[:5]}"))
+
+
 # ---- Task 5: minimal stadium ---------------------------------------------------------------------
 
 def test_minimal_stadium():
@@ -412,10 +489,11 @@ def test_minimal_stadium():
     check(len(gfx) < 1 << 20, f"minimal graphics pack under 1 MB ({len(gfx)} bytes)")
 
 
-SYNTHETIC = [test_minimal_stadium, test_graphics_synthetic, test_table_synthetic, test_table_empty_blocks, test_table_many_placements,
+SYNTHETIC = [test_stale_tree_a_refused, test_mip_tail_kept, test_validate_descriptions, test_minimal_stadium, test_graphics_synthetic, test_table_synthetic, test_table_empty_blocks, test_table_many_placements,
              test_write_limits]
 GAME = [test_reader_known_values, test_reader_covers_every_byte, test_graphics_bytes_match_game,
-        test_table_bytes_match_game, test_round_trip_all, test_writer_uses_only_the_description, test_rebuild_tool]
+        test_table_bytes_match_game, test_round_trip_all, test_writer_uses_only_the_description, test_rebuild_tool,
+        test_mip_tails_cover_levels]
 
 
 def main(argv):

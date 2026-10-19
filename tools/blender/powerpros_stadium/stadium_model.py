@@ -22,8 +22,8 @@ class Texture:
     width: int
     height: int
     pixels: bytes                  # already in GX tile order
-    tail: bytes = b""              # bytes right after the pixels, before the next structure: smaller mip
-                                   # levels in the ones checked; the game reads only the first level
+    tail: bytes = b""              # bytes right after the pixels: the smaller mip levels, which models
+                                   # use through a level above 0 in their texture table (MIP pieces)
 
 
 @dataclass
@@ -64,6 +64,19 @@ class Model:
     materials: list                # [Material]
     meshes: list                   # [Mesh]
     scene_word: int = 0x01000000   # the word behind the scene's second list
+
+
+TILES = {8: (8, 8, 32), 9: (8, 4, 32), 5: (4, 4, 32), 6: (4, 4, 64)}     # GX format -> tile w, h, bytes
+
+
+def mip_chain_size(tex, levels):
+    """Bytes of mip levels 1..levels after a texture's first level, each padded to whole GX tiles."""
+    tw, th, size = TILES[tex.fmt]
+    total, w, h = 0, tex.width, tex.height
+    for _ in range(levels):
+        w, h = max(1, w // 2), max(1, h // 2)
+        total += -(-w // tw) * -(-h // th) * size
+    return total
 
 
 @dataclass
