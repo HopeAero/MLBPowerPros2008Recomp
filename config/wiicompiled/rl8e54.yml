@@ -37,6 +37,15 @@ translation:
     path: config/wiicompiled/rl8e54-functions.map
   # Measure instead of aborting on the first unsupported instruction.
   allow_unsupported_instructions: true
+  # Season mode cap compares (index 9 = last season, 10 = number of seasons), found by
+  # tools/season_cap_sites.py; the runtime answers them from the SEASONS option
+  # (hle/mlb/season_cap.cpp, docs/superpowers/plans/2026-10-19-season-20-build.md).
+  immediate_overrides:
+    - {address: 0x80BB4A6C, expect: 9}    # index == 9: message 141
+    - {address: 0x80BF2530, expect: 9}    # index < 9: calls 0x80BF619C
+    - {address: 0x80BF51BC, expect: 9}    # off-season events, index < 9
+    - {address: 0x80BF52D0, expect: 9}    # off-season events, index < 9
+    - {address: 0x80C0CC0C, expect: 10}   # index < 10
 
 runtime:
   # Rebound by tools/wiicompiled_rebind.py; unbound hooks are invisible here.
