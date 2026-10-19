@@ -100,7 +100,7 @@ With the Blender add-on you can edit the game's stadiums or bring in one of your
 **See how it looks in the game, without playing a match**
 1. Put the 3D view where you want to start.
 2. **Power Pros** panel → **View in game**. In about 8 seconds the game opens in your stadium, with the camera at your view, no players or scoreboard.
-3. Move with W/A/S/D, Q/E (down and up), Shift (fast), right mouse button + mouse (look) and the wheel (speed). 1, 2 and 3 show the match cameras (batter, play, wide), F goes back to the free camera and H hides the help.
+3. Move with W/A/S/D, Q/E (down and up), Shift (fast), right mouse button + mouse (look) and the wheel (speed). 1, 2 and 3 show the match cameras (batter, play, wide), F goes back to the free camera, C shows the collision (by colour, through everything) and H hides the help.
 4. Change something in Blender and press again: the previous game closes and opens with the change. Your `mods` folder and your settings are left alone.
 
 **Export**

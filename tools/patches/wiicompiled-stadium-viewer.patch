@@ -83,10 +83,10 @@ index 49ceddb..3214f1e 100644
  struct MappedRenderState {
    gfx::Viewport viewport{};
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index dee842d..542fae1 100644
+index dee842d..84c82a3 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
-@@ -399,6 +399,19 @@ add_test(NAME mkw_stick_response_tests COMMAND mkw_stick_response_tests)
+@@ -399,6 +399,24 @@ add_test(NAME mkw_stick_response_tests COMMAND mkw_stick_response_tests)
  add_executable(mkw_auto_mips_tests "${CMAKE_CURRENT_LIST_DIR}/tests/auto_mips_tests.cpp")
  target_compile_features(mkw_auto_mips_tests PRIVATE cxx_std_20)
  add_test(NAME mkw_auto_mips_tests COMMAND mkw_auto_mips_tests)
@@ -95,6 +95,11 @@ index dee842d..542fae1 100644
 +target_compile_features(mkw_stadium_viewer_tests PRIVATE cxx_std_20)
 +target_include_directories(mkw_stadium_viewer_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 +add_test(NAME mkw_stadium_viewer_tests COMMAND mkw_stadium_viewer_tests)
++add_executable(mkw_stadium_collision_tests "${CMAKE_CURRENT_LIST_DIR}/tests/stadium_collision_tests.cpp"
++                                           "${CMAKE_CURRENT_LIST_DIR}/src/stadium_collision.cpp")
++target_compile_features(mkw_stadium_collision_tests PRIVATE cxx_std_20)
++target_include_directories(mkw_stadium_collision_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
++add_test(NAME mkw_stadium_collision_tests COMMAND mkw_stadium_collision_tests)
 +add_executable(mkw_game_camera_tests "${CMAKE_CURRENT_LIST_DIR}/tests/game_camera_tests.cpp")
 +target_compile_features(mkw_game_camera_tests PRIVATE cxx_std_20)
 +target_include_directories(mkw_game_camera_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
@@ -245,18 +250,63 @@ index d2c1dd3..4cda53f 100644
      const auto path = ResolveConfigPath();
      std::ifstream input(path);
      std::vector<std::string> lines;
+diff --git a/runtime/include/stadium_collision.h b/runtime/include/stadium_collision.h
+new file mode 100644
+index 0000000..032eaab
+--- /dev/null
++++ b/runtime/include/stadium_collision.h
+@@ -0,0 +1,38 @@
++#pragma once
++// Stadium viewer: the stadium's collision drawn over the picture (key C), from its table pack
++// (stadium_<code>tbl.pack). Layout in docs/ingenieria-inversa.md, "Colisión": the root at the end
++// (count < 0x1000, then 11 pointers 0x40000000 | offset; [5] vertices, [6] collision), the collision a
++// u16 triangle count, u16 vertex count, u32 0 and triangles of four u16 (a, b, c, surface id), the
++// vertices f32 xyz, all big-endian. Pure functions, tested in tests/stadium_collision_tests.cpp.
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <vector>
++
++namespace stadium_collision {
++
++struct Mesh {
++    std::vector<std::array<float, 3>> vertices;     // game frame: decimetres, Y up
++    std::vector<std::array<uint16_t, 4>> triangles;  // a, b, c, surface id
++};
++
++struct Edge {
++    uint16_t a, b, surface;
++};
++
++// The camera that draws the picture and where the picture is in the window.
++struct View {
++    float eye[3], target[3];  // up is +Y, as the game's cameras
++    float fovY;               // degrees
++    float x, y, w, h;         // the picture's rectangle in window pixels
++};
++
++std::optional<Mesh> Parse(const std::vector<uint8_t>& tbl);  // nullopt: no table root or collision
++std::vector<Edge> Edges(const Mesh& mesh);                    // each edge once (the first triangle's surface)
++// Window pixels of segment a-b (out: x0, y0, x1, y1), cut at the near plane; false when it is all behind
++// the camera or all off one side of the picture.
++bool Project(const View& view, const float a[3], const float b[3], float out[4]);
++uint32_t SurfaceColor(uint16_t surface);           // 0xRRGGBB
++const char* SurfaceName(uint16_t surface, bool en);  // nullptr: no name (shown with its number)
++
++}  // namespace stadium_collision
 diff --git a/runtime/include/stadium_viewer.h b/runtime/include/stadium_viewer.h
 new file mode 100644
-index 0000000..2067d1c
+index 0000000..106ef22
 --- /dev/null
 +++ b/runtime/include/stadium_viewer.h
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,44 @@
 +#pragma once
 +// Stadium viewer: the Blender add-on's "View in game" opens the game straight into the stadium being
 +// made, from a one-run preview mod, with a free camera. Enabled by environment variables:
 +//   WIICOMPILED_STADIUM_VIEWER        the preview mod's folder (the only mod loaded in that run)
 +//   WIICOMPILED_STADIUM_VIEWER_CODE   the stadium code it declares (default pp_preview)
 +//   WIICOMPILED_STADIUM_VIEWER_CAMERA "x,y,z,yaw,pitch,fov": initial free camera
++//   WIICOMPILED_STADIUM_VIEWER_COLLISION 1: start with the collision shown (key C)
 +// Spec: docs/superpowers/specs/2026-10-18-stadium-preview-design.md
 +#include <filesystem>
 +#include <optional>
@@ -835,6 +885,155 @@ index dba114e..760ea75 100644
      // Also drive the Wii Remote rescan from here: PADRead runs it too, but this
      // runs once per presented frame whatever the game is doing (e.g. sitting in
      // its "communications interrupted" prompt without polling pads). Same guest
+diff --git a/runtime/src/stadium_collision.cpp b/runtime/src/stadium_collision.cpp
+new file mode 100644
+index 0000000..e70c85b
+--- /dev/null
++++ b/runtime/src/stadium_collision.cpp
+@@ -0,0 +1,143 @@
++#include "stadium_collision.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <unordered_set>
++
++namespace stadium_collision {
++namespace {
++
++uint32_t U32(const std::vector<uint8_t>& d, size_t o) {
++    return (uint32_t(d[o]) << 24) | (uint32_t(d[o + 1]) << 16) | (uint32_t(d[o + 2]) << 8) | d[o + 3];
++}
++uint16_t U16(const std::vector<uint8_t>& d, size_t o) { return uint16_t((d[o] << 8) | d[o + 1]); }
++float F32(const std::vector<uint8_t>& d, size_t o) {
++    const uint32_t v = U32(d, o);
++    float f;
++    std::memcpy(&f, &v, 4);
++    return f;
++}
++std::optional<size_t> Pointer(const std::vector<uint8_t>& d, size_t o) {
++    const uint32_t p = U32(d, o);
++    if (p >> 30 != 1) return std::nullopt;
++    return p & 0x3FFFFFFFu;
++}
++
++}  // namespace
++
++std::optional<Mesh> Parse(const std::vector<uint8_t>& d) {
++    constexpr size_t kRootSize = 4 + 11 * 4;
++    if (d.size() < 0x20 + kRootSize) return std::nullopt;
++    // As tools/blender/powerpros_stadium/stadium_tbl.py: the root is the last {count, -> 0x20}.
++    std::optional<size_t> root;
++    for (size_t o = (d.size() - 8) & ~size_t{3}; o >= 0x20; o -= 4) {
++        if (U32(d, o + 4) == 0x40000020u && U32(d, o) > 0 && U32(d, o) < 0x1000) {
++            root = o;
++            break;
++        }
++    }
++    if (!root || *root + kRootSize > d.size()) return std::nullopt;
++    const auto verts = Pointer(d, *root + 4 + 5 * 4), head = Pointer(d, *root + 4 + 6 * 4);
++    if (!verts || !head || *head + 8 > d.size()) return std::nullopt;
++    const size_t ntri = U16(d, *head), nvert = U16(d, *head + 2);
++    if (*head + 8 + ntri * 8 > d.size() || *verts + nvert * 12 > d.size()) return std::nullopt;
++    Mesh mesh;
++    for (size_t i = 0; i < nvert; ++i)
++        mesh.vertices.push_back({F32(d, *verts + i * 12), F32(d, *verts + i * 12 + 4), F32(d, *verts + i * 12 + 8)});
++    for (size_t i = 0; i < ntri; ++i) {
++        const size_t o = *head + 8 + i * 8;
++        const std::array<uint16_t, 4> t{U16(d, o), U16(d, o + 2), U16(d, o + 4), U16(d, o + 6)};
++        if (t[0] < nvert && t[1] < nvert && t[2] < nvert) mesh.triangles.push_back(t);
++    }
++    return mesh;
++}
++
++std::vector<Edge> Edges(const Mesh& mesh) {
++    std::vector<Edge> out;
++    std::unordered_set<uint32_t> seen;
++    for (const auto& t : mesh.triangles) {
++        for (int k = 0; k < 3; ++k) {
++            const uint16_t a = std::min(t[k], t[(k + 1) % 3]), b = std::max(t[k], t[(k + 1) % 3]);
++            if (a != b && seen.insert((uint32_t(a) << 16) | b).second) out.push_back({a, b, t[3]});
++        }
++    }
++    return out;
++}
++
++bool Project(const View& v, const float a[3], const float b[3], float out[4]) {
++    constexpr float kNear = 5.0f;  // decimetres
++    float f[3] = {v.target[0] - v.eye[0], v.target[1] - v.eye[1], v.target[2] - v.eye[2]};
++    const float fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
++    if (fl <= 0.0f) return false;
++    for (float& c : f) c /= fl;
++    float s[3] = {-f[2], 0.0f, f[0]};  // f x up(0, 1, 0)
++    const float sl = std::sqrt(s[0] * s[0] + s[2] * s[2]);
++    if (sl < 1e-6f) return false;     // looking straight up or down
++    s[0] /= sl;
++    s[2] /= sl;
++    const float u[3] = {s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0]};
++    auto toCamera = [&](const float p[3], float c[3]) {
++        const float d[3] = {p[0] - v.eye[0], p[1] - v.eye[1], p[2] - v.eye[2]};
++        c[0] = d[0] * s[0] + d[1] * s[1] + d[2] * s[2];
++        c[1] = d[0] * u[0] + d[1] * u[1] + d[2] * u[2];
++        c[2] = d[0] * f[0] + d[1] * f[1] + d[2] * f[2];
++    };
++    float ca[3], cb[3];
++    toCamera(a, ca);
++    toCamera(b, cb);
++    if (ca[2] < kNear && cb[2] < kNear) return false;
++    if (ca[2] < kNear || cb[2] < kNear) {  // cut at the near plane
++        float* behind = ca[2] < kNear ? ca : cb;
++        const float* front = ca[2] < kNear ? cb : ca;
++        const float t = (kNear - behind[2]) / (front[2] - behind[2]);
++        for (int k = 0; k < 3; ++k) behind[k] += (front[k] - behind[k]) * t;
++    }
++    const float ty = std::tan(v.fovY * 0.5f * 3.14159265f / 180.0f), tx = ty * v.w / v.h;
++    const float* cs[2] = {ca, cb};
++    for (int i = 0; i < 2; ++i) {
++        out[2 * i] = v.x + (cs[i][0] / (cs[i][2] * tx) + 1.0f) * 0.5f * v.w;
++        out[2 * i + 1] = v.y + (1.0f - cs[i][1] / (cs[i][2] * ty)) * 0.5f * v.h;
++    }
++    const bool left = out[0] < v.x && out[2] < v.x, right = out[0] > v.x + v.w && out[2] > v.x + v.w;
++    const bool top = out[1] < v.y && out[3] < v.y, bottom = out[1] > v.y + v.h && out[3] > v.y + v.h;
++    return !(left || right || top || bottom);
++}
++
++uint32_t SurfaceColor(uint16_t surface) {
++    switch (surface) {
++        case 0: return 0xFF9A1F;   // invisible wall, foul
++        case 1: return 0xFF2A2A;   // invisible wall, home run
++        case 2: return 0xB04CFF;   // outer limit
++        case 5: return 0x3CE03C;   // grass
++        case 6: return 0xC8843C;   // dirt
++        case 7: return 0xE8C070;   // warning track
++        case 8: return 0xFFD9A0;   // mound
++        case 9: return 0xFFF030;   // fences
++        case 11: return 0x40A0FF;  // stands
++        case 13: return 0x40F0F0;  // stand tops and roofs
++        case 14: return 0xFFFFFF;  // foul poles
++        case 15: return 0xFF70C0;  // backstop
++        default: return 0xA0A0A0;
++    }
++}
++
++const char* SurfaceName(uint16_t surface, bool en) {
++    switch (surface) {
++        case 0: return en ? "Invisible wall (foul)" : "Pared invisible (foul)";
++        case 1: return en ? "Invisible wall (home run)" : "Pared invisible (home run)";
++        case 2: return en ? "Outer limit" : "Limite exterior";
++        case 5: return en ? "Grass" : "Cesped";
++        case 6: return en ? "Dirt" : "Tierra";
++        case 7: return en ? "Warning track" : "Pista de aviso";
++        case 8: return en ? "Mound" : "Monticulo";
++        case 9: return en ? "Fences" : "Vallas";
++        case 11: return en ? "Stands" : "Gradas";
++        case 13: return en ? "Stand tops, roofs" : "Techos y gradas altas";
++        case 14: return en ? "Foul poles" : "Postes de foul";
++        case 15: return en ? "Backstop" : "Backstop";
++        default: return nullptr;
++    }
++}
++
++}  // namespace stadium_collision
 diff --git a/runtime/src/stadium_viewer.cpp b/runtime/src/stadium_viewer.cpp
 new file mode 100644
 index 0000000..6a8d088
@@ -910,23 +1109,30 @@ index 0000000..6a8d088
 +}  // namespace stadium_viewer
 diff --git a/runtime/src/stadium_viewer_input.cpp b/runtime/src/stadium_viewer_input.cpp
 new file mode 100644
-index 0000000..94abd76
+index 0000000..3825239
 --- /dev/null
 +++ b/runtime/src/stadium_viewer_input.cpp
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,199 @@
 +// Stadium viewer controls (host thread, once per presented frame): the free camera and the game's match
 +// shots. Keys: W/A/S/D move, Q down, E up, Shift fast, right mouse button + mouse to look, wheel for
-+// speed; 1 batter, 2 play, 3 wide (the game's own cameras); F back to the free camera; H hides the help.
++// speed; 1 batter, 2 play, 3 wide (the game's own cameras); F back to the free camera; C shows the
++// stadium's collision over the picture (stadium_collision.h); H hides the help.
 +#include <SDL3/SDL.h>
 +#include <imgui.h>
 +#include <aurora/aurora.h>
 +
++#include <cstdlib>
++#include <fstream>
++#include <iterator>
++#include <map>
 +#include <optional>
 +
++#include "aurora_events.h"
 +#include "free_camera.h"
 +#include "mlb_camera.h"
 +#include "power_pros_ui.h"
 +#include "runtime_config.h"
++#include "stadium_collision.h"
 +#include "stadium_viewer.h"
 +
 +namespace stadium_viewer {
@@ -937,6 +1143,31 @@ index 0000000..94abd76
 +bool g_initialFree = false;  // the Blender view, once the batter shot is in
 +bool g_help = true;
 +bool g_previous[SDL_SCANCODE_COUNT] = {};
++bool g_collision = false;
++struct Collision {
++    stadium_collision::Mesh mesh;
++    std::vector<stadium_collision::Edge> edges;
++    std::map<uint16_t, size_t> counts;  // triangles per surface, for the legend
++};
++std::optional<std::optional<Collision>> g_loaded;  // outer: tried; inner: found
++
++// The preview mod's table pack, read once.
++const std::optional<Collision>& LoadedCollision() {
++    if (!g_loaded) {
++        const auto& config = *Active();
++        std::ifstream in(config.modDir / "project" / ("stadium_" + config.code + "tbl.pack"), std::ios::binary);
++        const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++        std::optional<Collision> c;
++        if (auto mesh = stadium_collision::Parse(bytes)) {
++            c.emplace();
++            c->mesh = std::move(*mesh);
++            c->edges = stadium_collision::Edges(c->mesh);
++            for (const auto& t : c->mesh.triangles) ++c->counts[t[3]];
++        }
++        g_loaded = std::move(c);
++    }
++    return *g_loaded;
++}
 +
 +bool Pressed(const bool* keys, SDL_Scancode key) {  // went down this frame
 +    const bool down = keys[key];
@@ -956,6 +1187,8 @@ index 0000000..94abd76
 +    if (!Enabled() || !StadiumReady()) return;
 +    if (!g_started) {
 +        g_started = true;
++        const char* collision = std::getenv("WIICOMPILED_STADIUM_VIEWER_COLLISION");  // 1: start with it shown
++        g_collision = collision && collision[0] == '1';
 +        // Only the stadium: no 2D HUD.
 +        aurora_set_draw_filter(AURORA_DRAW_FILTER_HUD);
 +        // The batter shot first: applying a shot ends the camera's opening fly-over, which would
@@ -974,6 +1207,7 @@ index 0000000..94abd76
 +    const bool* keys = SDL_GetKeyboardState(nullptr);
 +    const ImGuiIO& io = ImGui::GetIO();
 +    if (Pressed(keys, SDL_SCANCODE_H)) g_help = !g_help;
++    if (Pressed(keys, SDL_SCANCODE_C)) g_collision = !g_collision;
 +    const SDL_Scancode viewKeys[3] = {SDL_SCANCODE_1, SDL_SCANCODE_2, SDL_SCANCODE_3};
 +    for (int i = 0; i < 3; ++i) {
 +        if (Pressed(keys, viewKeys[i]) && game_camera::ShowMatchView(static_cast<game_camera::MatchView>(i))) g_free.reset();
@@ -1005,11 +1239,64 @@ index 0000000..94abd76
 +    }
 +}
 +
++// The collision as lines over the picture, coloured by surface, seen through everything, and its legend.
++void DrawCollision(bool en) {
++    const auto& collision = LoadedCollision();
++    const auto pose = game_camera::CurrentPose();
++    const ImGuiViewport* vp = ImGui::GetMainViewport();
++    if (!collision) {
++        ImGui::GetForegroundDrawList()->AddText(ImVec2(vp->Pos.x + 12, vp->Pos.y + vp->Size.y - 30), IM_COL32(255, 80, 80, 255),
++                                                en ? "No collision in this stadium's table" : "La tabla de este estadio no tiene colision");
++        return;
++    }
++    if (!pose) return;
++    stadium_collision::View view{};
++    game_camera::PoseToEyeTarget(*pose, view.eye, view.target);
++    view.fovY = pose->fovY;
++    // The picture: 16:9 with bars when forced (the default), else the whole window.
++    view.x = vp->Pos.x, view.y = vp->Pos.y, view.w = vp->Size.x, view.h = vp->Size.y;
++    if (MkwForceAspect169Requested()) {
++        const float w = std::min(view.w, view.h * 16.0f / 9.0f), h = w * 9.0f / 16.0f;
++        view.x += (view.w - w) * 0.5f, view.y += (view.h - h) * 0.5f, view.w = w, view.h = h;
++    }
++    ImDrawList* dl = ImGui::GetBackgroundDrawList();
++    const auto& v = collision->mesh.vertices;
++    float seg[4];
++    for (const auto& e : collision->edges) {
++        if (!stadium_collision::Project(view, v[e.a].data(), v[e.b].data(), seg)) continue;
++        const uint32_t rgb = stadium_collision::SurfaceColor(e.surface);
++        dl->AddLine(ImVec2(seg[0], seg[1]), ImVec2(seg[2], seg[3]),
++                    IM_COL32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, 200));
++    }
++    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + 12, vp->Pos.y + vp->Size.y - 12), ImGuiCond_Always, ImVec2(0, 1));
++    ImGui::SetNextWindowBgAlpha(0.65f);
++    if (ImGui::Begin("##viewer-collision", nullptr,
++                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
++                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing)) {
++        ImGui::Text(en ? "Collision: %zu triangles" : "Colision: %zu triangulos", collision->mesh.triangles.size());
++        for (const auto& [surface, count] : collision->counts) {
++            const uint32_t rgb = stadium_collision::SurfaceColor(surface);
++            const ImVec2 p = ImGui::GetCursorScreenPos();
++            const float size = ImGui::GetTextLineHeight();
++            ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + size, p.y + size),
++                                                      IM_COL32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, 255));
++            ImGui::Dummy(ImVec2(size, size));
++            ImGui::SameLine();
++            const char* name = stadium_collision::SurfaceName(surface, en);
++            if (name) ImGui::Text("%s (%u): %zu", name, unsigned(surface), count);
++            else ImGui::Text(en ? "Surface %u: %zu" : "Superficie %u: %zu", unsigned(surface), count);
++        }
++    }
++    ImGui::End();
++}
++
 +void DrawHelp() {
-+    if (!Enabled() || !StadiumReady() || !g_help) return;
++    if (!Enabled() || !StadiumReady()) return;
 +    using power_pros_ui::Lang;
 +    const Lang lang = power_pros_ui::LangFromSetting(RuntimeConfigFile::UiLanguage("auto"));
 +    const bool en = lang == Lang::En;
++    if (g_collision) DrawCollision(en);
++    if (!g_help) return;
 +    ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
 +    ImGui::SetNextWindowBgAlpha(0.55f);
 +    if (ImGui::Begin("##viewer-help", nullptr,
@@ -1018,8 +1305,8 @@ index 0000000..94abd76
 +        ImGui::TextUnformatted(en ? "Stadium preview" : "Vista previa del estadio");
 +        ImGui::TextDisabled(en ? "WASD move  Q/E down/up  Shift fast  right mouse look  wheel speed"
 +                               : "WASD mover  Q/E bajar/subir  Shift rapido  clic derecho mirar  rueda velocidad");
-+        ImGui::TextDisabled(en ? "1 batter  2 play  3 wide  F free camera  H hide"
-+                               : "1 bateador  2 jugada  3 lejana  F camara libre  H ocultar");
++        ImGui::TextDisabled(en ? "1 batter  2 play  3 wide  F free camera  C collision  H hide"
++                               : "1 bateador  2 jugada  3 lejana  F camara libre  C colision  H ocultar");
 +    }
 +    ImGui::End();
 +}
@@ -1182,6 +1469,61 @@ index 337d40a..ab135ed 100644
 +    }
      return 0;
  }
+diff --git a/runtime/tests/stadium_collision_tests.cpp b/runtime/tests/stadium_collision_tests.cpp
+new file mode 100644
+index 0000000..f79b249
+--- /dev/null
++++ b/runtime/tests/stadium_collision_tests.cpp
+@@ -0,0 +1,49 @@
++#include "stadium_collision.h"
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++int main() {
++    using namespace stadium_collision;
++    const auto require = [](bool ok) { if (!ok) std::abort(); };
++    const auto near = [](float a, float b) { return std::fabs(a - b) < 1e-3f; };
++
++    // A table with one triangle: header, vertices at 0x20, collision at 0x44, root at 0x5C.
++    std::vector<uint8_t> d(0x5C + 48, 0);
++    auto put32 = [&](size_t o, uint32_t v) { for (int k = 0; k < 4; ++k) d[o + k] = uint8_t(v >> (24 - 8 * k)); };
++    auto putF = [&](size_t o, float f) { uint32_t v; std::memcpy(&v, &f, 4); put32(o, v); };
++    const float verts[9] = {0, 0, 0, 100, 0, 0, 0, 50, -20};
++    for (int i = 0; i < 9; ++i) putF(0x20 + 4 * i, verts[i]);
++    put32(0x44, (1u << 16) | 3u);                  // 1 triangle, 3 vertices
++    put32(0x4C, (0u << 16) | 1u);                  // a=0, b=1
++    put32(0x50, (2u << 16) | 9u);                  // c=2, surface 9
++    put32(0x5C, 1);                                // root: count
++    put32(0x60, 0x40000020);                       // placements
++    put32(0x60 + 4 * 5, 0x40000020);               // vertices
++    put32(0x60 + 4 * 6, 0x40000044);               // collision
++    const auto mesh = Parse(d);
++    require(mesh && mesh->vertices.size() == 3 && mesh->triangles.size() == 1);
++    require(near(mesh->vertices[2][1], 50.0f) && near(mesh->vertices[2][2], -20.0f));
++    require(mesh->triangles[0] == (std::array<uint16_t, 4>{0, 1, 2, 9}));
++    require(!Parse(std::vector<uint8_t>(0x100, 0)).has_value());  // no root
++
++    // Two triangles sharing an edge: five edges.
++    Mesh quad;
++    quad.vertices = {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}};
++    quad.triangles = {{0, 1, 2, 5}, {0, 2, 3, 6}};
++    require(Edges(quad).size() == 5);
++
++    // Camera at the origin looking towards -Z (second base), 90 degrees, a 200 x 100 picture at (10, 20).
++    const View view{{0, 0, 0}, {0, 0, -100}, 90.0f, 10, 20, 200, 100};
++    float out[4];
++    const float centre[3] = {0, 0, -10}, right[3] = {20, 0, -10}, up[3] = {0, 10, -10};
++    require(Project(view, centre, right, out));
++    require(near(out[0], 110) && near(out[1], 70) && near(out[2], 210) && near(out[3], 70));  // +X is right
++    require(Project(view, centre, up, out) && near(out[3], 20));                              // +Y is up
++    const float behind[3] = {0, 0, 10}, behind2[3] = {5, 0, 20};
++    require(!Project(view, behind, behind2, out));                                            // all behind
++    require(Project(view, centre, behind, out) && near(out[0], 110) && near(out[2], 110));  // cut, not flipped
++    const float farLeft[3] = {-500, 0, -10}, farLeft2[3] = {-400, 5, -10};
++    require(!Project(view, farLeft, farLeft2, out));                                          // off the left side
++
++    require(SurfaceColor(1) != SurfaceColor(0) && SurfaceName(9, false) && !SurfaceName(17, true));
++}
 diff --git a/runtime/tests/stadium_viewer_tests.cpp b/runtime/tests/stadium_viewer_tests.cpp
 new file mode 100644
 index 0000000..aeb3ccd

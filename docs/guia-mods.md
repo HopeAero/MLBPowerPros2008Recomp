@@ -100,7 +100,7 @@ Con el complemento de Blender puedes editar los estadios del juego o meter uno t
 **Ver cómo queda en el juego, sin jugar un partido**
 1. Pon la vista 3D donde quieras empezar.
 2. Panel **Power Pros** → **Ver en el juego**. En unos 8 segundos se abre el juego en tu estadio, con la cámara en tu vista, sin jugadores ni marcador.
-3. Muévete con W/A/S/D, Q/E (bajar y subir), Shift (rápido), botón derecho del ratón + ratón (mirar) y la rueda (velocidad). 1, 2 y 3 ponen las cámaras del partido (bateador, jugada, lejana), F vuelve a la cámara libre y H oculta la ayuda.
+3. Muévete con W/A/S/D, Q/E (bajar y subir), Shift (rápido), botón derecho del ratón + ratón (mirar) y la rueda (velocidad). 1, 2 y 3 ponen las cámaras del partido (bateador, jugada, lejana), F vuelve a la cámara libre, C muestra la colisión (por colores, a través de todo) y H oculta la ayuda.
 4. Cambia algo en Blender y vuelve a pulsar: el juego anterior se cierra y se abre con el cambio. No toca tu carpeta `mods` ni tus ajustes.
 
 **Exportar**
