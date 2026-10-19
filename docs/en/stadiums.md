@@ -9,7 +9,7 @@ It also **exports**: whatever you change in the pieces and in the collision goes
 ## Install
 
 1. You need **Blender 4.2 or newer** ([blender.org](https://www.blender.org/download/)).
-2. Get the add-on, a zip called `powerpros_stadium-<version>.zip`. To build it from the repository: `python tools/blender/build_addon.py` (it ends up in `local/build/blender/`).
+2. Get the add-on, a zip called `powerpros_stadium-<version>.zip`: the latest, `powerpros_stadium-0.8.2.zip`, is in [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (v0.1.2). To build it from the repository: `python tools/blender/build_addon.py` (it ends up in `local/build/blender/`).
 3. In Blender: **Edit > Preferences > Get Extensions**. In the ⌄ menu at the top right choose **Install from Disk…** and select the zip.
 
 **Language:** in the add-on's preferences (**Edit > Preferences > Add-ons**), **Idioma / Language**: Auto (Blender's interface language), Español or English. It applies without restarting Blender.
@@ -245,6 +245,10 @@ What we learned bringing in the Polo Grounds, a downloaded SketchUp model (Octob
   The resulting mod, loaded in a game, shows the four changes.
   4. imports Coors Field again with collision, raises its fences (surface 9) 3 m, changes a face to foul pole and checks the written table: surfaces, face orientation and both trees.
 - **Own model** (`tools/blender/test_convert.py`, same arguments as the export): builds a test stadium with simple shapes (grass, dirt, a circular fence and stands), converts it into Coors Field pieces, generates its collision, exports it as a new stadium and checks what was written.
+- **Stadium from scratch** (`tools/blender/test_scratch.py <zip> <project.bin> <temp folder>`): roles, grouping, draw order, the game's `BCL` pieces (shown and locked in the collection; only the ones left are exported), ground layers bottom-up, flags, crowd through the preload, collision with curves, menu photo, operators and View in game without opening the game.
+- **Collision by kind** (`tools/blender/test_collision.py <zip> <project.bin> <temp folder>`): one object per surface, named and coloured, show or hide by kind, Make collision, export joining the objects (and no rewrite when nothing changed).
+- **View in game** (`tools/blender/test_preview.py`): the preview export and the game launch, without opening windows.
+- **Runtime viewer:** `WIICOMPILED_STADIUM_VIEWER=<mod folder>`, `WIICOMPILED_STADIUM_VIEWER_CODE=<code>`, `WIICOMPILED_STADIUM_VIEWER_CAMERA=x,y,z,yaw,pitch,fov`, `WIICOMPILED_STADIUM_VIEWER_COLLISION=1` (start with the collision shown) and `WIICOMPILED_STADIUM_VIEWER_SPIN=<rad/s>` (the free camera turns by itself, to check that the collision lines do not slide).
 - **From-scratch writer** (`python tools/test_stadium_writer.py [project.bin]`): without the `project.bin`, the synthetic tests; with it, also the ones on the game's 40 stadiums (about 45 s). Tools:
   - `python tools/stadium_rebuild.py <project.bin> <code> <mods folder> [--original]`: rebuilds a game stadium with the writer as a new stadium (`rb_<code>`), or copies it untouched (`og_<code>`) to compare it the same way;
   - `python tools/stadium_minimal.py <mods folder>`: the minimal stadium made from scratch (`minimo`).

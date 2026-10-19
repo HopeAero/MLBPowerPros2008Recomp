@@ -9,7 +9,7 @@ También **exporta**: lo que cambies en las piezas y en la colisión vuelve al j
 ## Instalar
 
 1. Necesitas **Blender 4.2 o más nuevo** ([blender.org](https://www.blender.org/download/)).
-2. Consigue el complemento, un zip llamado `powerpros_stadium-<versión>.zip`. Para crearlo desde el repositorio: `python tools/blender/build_addon.py` (queda en `local/build/blender/`).
+2. Consigue el complemento, un zip llamado `powerpros_stadium-<versión>.zip`: el último, `powerpros_stadium-0.8.2.zip`, está en [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (v0.1.2). Para crearlo desde el repositorio: `python tools/blender/build_addon.py` (queda en `local/build/blender/`).
 3. En Blender: **Editar > Preferencias > Obtener extensiones**. En el menú ⌄ de arriba a la derecha elige **Instalar desde disco…** y selecciona el zip.
 
 **Idioma:** en las preferencias del complemento (**Editar > Preferencias > Complementos**), **Idioma / Language**: Automático (el idioma de la interfaz de Blender), Español o English. Se aplica sin reiniciar Blender.
@@ -245,6 +245,10 @@ Los `.blend` con estadios importados contienen modelos y texturas del juego. Ús
   El mod resultante, cargado en un partido, muestra los cuatro cambios.
   4. vuelve a importar Coors Field con colisión, sube sus vallas (superficie 9) 3 m, cambia una cara a poste de foul y comprueba la tabla escrita: superficies, sentido de las caras y los dos árboles.
 - **Modelo propio** (`tools/blender/test_convert.py`, mismos argumentos que la exportación): construye un estadio de prueba con formas simples (césped, tierra, una valla circular y gradas), lo convierte en piezas de Coors Field, genera su colisión, lo exporta como estadio nuevo y comprueba lo escrito.
+- **Estadio desde cero** (`tools/blender/test_scratch.py <zip> <project.bin> <carpeta temporal>`): papeles, agrupación, orden de dibujo, piezas `BCL` del juego (visibles y bloqueadas en la colección; solo se exportan las que quedan), capas del suelo de abajo arriba, banderas, público con la precarga, colisión con curvas, foto del menú, operadores y «Ver en el juego» sin abrir el juego.
+- **Colisión por tipo** (`tools/blender/test_collision.py <zip> <project.bin> <carpeta temporal>`): un objeto por superficie con nombre y color, ver u ocultar por tipo, «Convertir en colisión», exportar juntando los objetos (y no reescribir si no cambió nada).
+- **Ver en el juego** (`tools/blender/test_preview.py`): la exportación de vista previa y el arranque del juego, sin abrir ventanas.
+- **Visor del runtime:** `WIICOMPILED_STADIUM_VIEWER=<carpeta del mod>`, `WIICOMPILED_STADIUM_VIEWER_CODE=<código>`, `WIICOMPILED_STADIUM_VIEWER_CAMERA=x,y,z,yaw,pitch,fov`, `WIICOMPILED_STADIUM_VIEWER_COLLISION=1` (empieza con la colisión visible) y `WIICOMPILED_STADIUM_VIEWER_SPIN=<rad/s>` (la cámara libre gira sola, para comprobar que las líneas de colisión no se deslizan).
 - **Escritor desde cero** (`python tools/test_stadium_writer.py [project.bin]`): sin el `project.bin`, las pruebas sintéticas; con él, además, las de los 40 estadios del juego (unos 45 s). Herramientas:
   - `python tools/stadium_rebuild.py <project.bin> <código> <carpeta de mods> [--original]`: reconstruye un estadio del juego con el escritor como estadio nuevo (`rb_<código>`), o lo copia sin tocar (`og_<código>`) para compararlo por la misma vía;
   - `python tools/stadium_minimal.py <carpeta de mods>`: el estadio mínimo hecho desde cero (`minimo`).

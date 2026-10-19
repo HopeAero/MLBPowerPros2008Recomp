@@ -150,6 +150,7 @@ More in [roster-2008.md](roster-2008.md).
 | Stadium with grey stands or striped textures | Update the Blender add-on to 0.7.3 or later and export again. |
 | In Blender the converted stadium looks grey | Use the **Material** view (Z > Material Preview). |
 | In «View in game» the camera moves by itself | The active game window gets your keys: switch windows before typing. |
+| My saves vanished when I enabled a mod | Roster mods have their own saves; the others stay saved. In MODS, **SAVES IN USE** says which ones the game uses and opens their folder (v0.1.2). |
 
 ## More information
 

@@ -262,6 +262,8 @@ Investigated in October 2026 to fix the commentator crackle (disassembly, memory
 
 **Bug found and its cause (for porters):** if the 5 ms timer does not wake up 200 times per second, the phrase clock runs slow. The phrase is then stopped between 1.2 and 1.7 times late: the zero padding and the beginning of the next phrase are heard, and then it is cut off. It sounds like clicks and clipped words.
 
+**The same with a hidden window on Windows 11** (October 19, 2026): Windows 11 stops honouring `timeBeginPeriod(1)` while the program's window is minimized or fully covered, and timers go back to 15.6 ms. Measured with a `Sleep(5)` test program: 135 wakes/s with the window visible and 64/s minimized. At that pace the 5 ms timer runs at a third and the commentary breaks for as long as it lasts (a player: about 15 seconds in the seventh inning). The runtime asks for the opt-out with `SetProcessInformation(ProcessPowerThrottling)` (`PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` and `EXECUTION_SPEED`): 171-177/s minimized too. Patch `wiicompiled-timers-when-hidden`.
+
 Sources: disassembly (`0x80027A54`, `0x80027BF8`, `0x80038E50`-`0x8003A41C`); `wiicompiled-periodic-sleep.patch`, `wiicompiled-audio-depop.patch`, `config/wiicompiled/rl8e54-data.csv`, `docs/en/wiicompiled-feasibility.md`.
 
 ## 5. Disc and `project.bin`
@@ -777,6 +779,16 @@ Sources: `docs/en/roster-2008.md`, `tools/roster/powerup_to_2008.py`, `tools/ros
   - At `0x80664C18` there are five consecutive functions that dtk took as a single one. `C20`, `C28` and `C30` are two-instruction getters called only from the vtable `0x80D5183C`.
   - About 450 similar candidates remain unreviewed.
 - **Controllers per mode:** Exhibition, Home Run and other modes ask for a Nunchuk or Classic Controller. Without a Nunchuk, "Power Pros via Wii Remote" is offered.
+
+
+**Season mode, walked with the controller** (October 19, 2026; scripted GameCube controller, `WIICOMPILED_PAD_SCRIPT`):
+- **Boot to the main menu:** strap warning (two A) → «Loading data» → Konami, 2K Sports, licences and Power Pros Production logos (skipped with Start) → title around 32 s → controllers screen («You can use the following Controllers»), which waits for a press → main menu.
+- **Main menu:** 12 options in 3 rows: Exhibition, Success, Home Run, Practice / MLB Life, Season, League, Arrange / Wii Remote, Shop, Baseball Cards, My Data. The cursor starts on Exhibition. Switching controller shows «1P Nintendo GameCube Controller detected».
+- **Entering Season:** a black screen for a few seconds and a help window («Starting Play», closed with B). On entering, the game tries to open `pm3usse0.dat`, `pm3usse1.dat` and `pm3usse2.dat` in the save folder: in a new save they do not exist. They look like three Season mode save slots, apart from `pm3usma.dat`.
+- **Screens of a new season:** From Beginning / Continue → Quick Start / Start → team select (30 teams, with 2007 stats and salary) → options (Game Setup, Controller Setup, Season Settings) → a warning that improvements, free agents, draft and trades can only be changed at certain points of the off-season → intro talk with the secretary (A advances, L skips, R talk history). It starts on Monday March 24, 2008.
+- **Season mode menu:** on the left, seven buttons: Daily Progress, Practice, Management, Commands, MLB Data, System, Exit; on the right, the division standings. At the top, the team, the date, players in MLB and AAA, owner points and total salary. At the bottom, the help bar: Start (help), Y (schedule), R (history), Z (switch info).
+- **MLB Data:** tabs «◄ 2008 ►» (the year, changed with L/R), All-Time/Career and Honors. Within a year: Player Stats (Season Stats, Player Records), Team Stats (Team Stats, Team Records), Schedule (Standings, Matchup Chart, Postseason) and Roster (Player List, Transactions).
+- **For scripts:** timings vary between boots (the intro talk started between 84 and 160 s), so a fixed-time script drifts; better press L repeatedly until the talk is over.
 
 Sources: `wiicompiled-match-benchmark.patch` (`match_benchmark.cpp`), `docs/en/wiicompiled-feasibility.md`.
 

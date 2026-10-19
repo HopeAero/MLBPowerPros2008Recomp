@@ -263,6 +263,8 @@ Investigado en octubre de 2026 para arreglar el petardeo del comentarista (desen
 
 **Fallo encontrado y su causa (para portadores):** si el temporizador de 5 ms no despierta 200 veces por segundo, el reloj de las frases va lento. Entonces la frase se para entre 1,2 y 1,7 veces tarde: suena el relleno de ceros y el principio de la frase siguiente, y luego se corta. Se oye como chasquidos y palabras cortadas.
 
+**Lo mismo con la ventana oculta en Windows 11** (19 de octubre de 2026): Windows 11 deja de respetar `timeBeginPeriod(1)` mientras la ventana del programa está minimizada o tapada del todo, y los temporizadores vuelven a 15,6 ms. Medido con un programa de prueba de `Sleep(5)`: 135 despertares/s con la ventana visible y 64/s minimizada. A ese ritmo el temporizador de 5 ms va a un tercio y el comentario se rompe mientras dure (un jugador: unos 15 segundos en la séptima entrada). El runtime pide la exención con `SetProcessInformation(ProcessPowerThrottling)` (`PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` y `EXECUTION_SPEED`): 171-177/s también minimizada. Parche `wiicompiled-timers-when-hidden`.
+
 Fuentes: desensamblado (`0x80027A54`, `0x80027BF8`, `0x80038E50`-`0x8003A41C`); `wiicompiled-periodic-sleep.patch`, `wiicompiled-audio-depop.patch`, `config/wiicompiled/rl8e54-data.csv`, `docs/wiicompiled-feasibility.md`.
 
 ## 5. Disco y `project.bin`
@@ -778,6 +780,15 @@ Fuentes: `docs/roster-2008.md`, `tools/roster/powerup_to_2008.py`, `tools/roster
   - En `0x80664C18` hay cinco funciones seguidas que dtk tomó por una sola. `C20`, `C28` y `C30` son getters de dos instrucciones llamados solo desde la vtable `0x80D5183C`.
   - Quedan unos 450 candidatos parecidos sin revisar.
 - **Mandos por modo:** Exhibition, Home Run y otros modos piden Nunchuk o mando Clásico. Sin Nunchuk se ofrece "Power Pros via Wii Remote".
+
+**Modo Temporada, recorrido con el mando** (19 de octubre de 2026; mando de GameCube por guion, `WIICOMPILED_PAD_SCRIPT`):
+- **Arranque hasta el menú principal:** aviso de la correa (dos A) → «Loading data» → logos de Konami, 2K Sports, licencias y Power Pros Production (se saltan con Start) → título hacia los 32 s → pantalla de mandos («You can use the following Controllers»), que espera una pulsación → menú principal.
+- **Menú principal:** 12 opciones en 3 filas: Exhibition, Success, Home Run, Practice / MLB Life, Season, League, Arrange / Wii Remote, Shop, Baseball Cards, My Data. El cursor empieza en Exhibition. Al cambiar de mando sale «1P Nintendo GameCube Controller detected».
+- **Entrar en Season:** pantalla negra unos segundos y una ventana de ayuda («Starting Play», se cierra con B). Al entrar, el juego intenta abrir `pm3usse0.dat`, `pm3usse1.dat` y `pm3usse2.dat` en la carpeta de partidas: en una partida nueva no existen. Parecen tres huecos de partida del modo Temporada, aparte de `pm3usma.dat`.
+- **Pantallas de una temporada nueva:** From Beginning / Continue → Quick Start / Start → elegir equipo (30 equipos, con estadísticas de 2007 y salario) → opciones (Game Setup, Controller Setup, Season Settings) → aviso de que mejoras, agentes libres, draft y traspasos solo se cambian en ciertos momentos de la pretemporada → charla de presentación con la secretaria (A avanza, L salta, R historial de la charla). Empieza el lunes 24 de marzo de 2008.
+- **Menú del modo Temporada:** a la izquierda, siete pastillas: Daily Progress, Practice, Management, Commands, MLB Data, System, Exit; a la derecha, la clasificación de la división. Arriba, el equipo, la fecha, jugadores en MLB y AAA, puntos del dueño y salario total. Abajo, la barra de ayudas: Start (ayuda), Y (calendario), R (historial), Z (cambiar información).
+- **MLB Data:** pestañas «◄ 2008 ►» (el año, que se cambia con L/R), All-Time/Career y Honors. Dentro de un año: Player Stats (Season Stats, Player Records), Team Stats (Team Stats, Team Records), Schedule (Standings, Matchup Chart, Postseason) y Roster (Player List, Transactions).
+- **Para los guiones:** los tiempos varían de un arranque a otro (la charla de presentación empezó entre los 84 y los 160 s), así que un guion de tiempos fijos se descuadra; mejor pulsar L repetidamente hasta pasar la charla.
 
 Fuentes: `wiicompiled-match-benchmark.patch` (`match_benchmark.cpp`), `docs/wiicompiled-feasibility.md`.
 

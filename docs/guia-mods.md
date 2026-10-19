@@ -150,6 +150,7 @@ Más en [roster-2008.md](roster-2008.md).
 | Estadio con gradas grises o texturas a rayas | Actualiza el complemento de Blender a la 0.7.3 o posterior y vuelve a exportar. |
 | En Blender el estadio convertido se ve gris | Usa la vista **Material** (Z > Vista previa de material). |
 | En «Ver en el juego» la cámara se mueve sola | La ventana del juego activa recibe tus teclas: cambia de ventana antes de escribir. |
+| Mis partidas desaparecieron al activar un mod | Los mods de roster tienen partidas propias; las otras siguen guardadas. En MODS, **PARTIDAS EN USO** dice cuáles usa el juego y abre su carpeta (v0.1.2). |
 
 ## Más información
 
