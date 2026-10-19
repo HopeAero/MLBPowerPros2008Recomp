@@ -252,10 +252,10 @@ index d2c1dd3..4cda53f 100644
      std::vector<std::string> lines;
 diff --git a/runtime/include/stadium_collision.h b/runtime/include/stadium_collision.h
 new file mode 100644
-index 0000000..032eaab
+index 0000000..5048840
 --- /dev/null
 +++ b/runtime/include/stadium_collision.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,39 @@
 +#pragma once
 +// Stadium viewer: the stadium's collision drawn over the picture (key C), from its table pack
 +// (stadium_<code>tbl.pack). Layout in docs/ingenieria-inversa.md, "Colisión": the root at the end
@@ -292,6 +292,7 @@ index 0000000..032eaab
 +bool Project(const View& view, const float a[3], const float b[3], float out[4]);
 +uint32_t SurfaceColor(uint16_t surface);           // 0xRRGGBB
 +const char* SurfaceName(uint16_t surface, bool en);  // nullptr: no name (shown with its number)
++bool ShownByDefault(uint16_t surface);  // the 70 m invisible walls (0, 1, 2) start hidden: they cover everything
 +
 +}  // namespace stadium_collision
 diff --git a/runtime/include/stadium_viewer.h b/runtime/include/stadium_viewer.h
@@ -887,10 +888,10 @@ index dba114e..760ea75 100644
      // its "communications interrupted" prompt without polling pads). Same guest
 diff --git a/runtime/src/stadium_collision.cpp b/runtime/src/stadium_collision.cpp
 new file mode 100644
-index 0000000..e70c85b
+index 0000000..756f7fc
 --- /dev/null
 +++ b/runtime/src/stadium_collision.cpp
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,145 @@
 +#include "stadium_collision.h"
 +
 +#include <algorithm>
@@ -1015,6 +1016,8 @@ index 0000000..e70c85b
 +    }
 +}
 +
++bool ShownByDefault(uint16_t surface) { return surface > 2; }
++
 +const char* SurfaceName(uint16_t surface, bool en) {
 +    switch (surface) {
 +        case 0: return en ? "Invisible wall (foul)" : "Pared invisible (foul)";
@@ -1109,10 +1112,10 @@ index 0000000..6a8d088
 +}  // namespace stadium_viewer
 diff --git a/runtime/src/stadium_viewer_input.cpp b/runtime/src/stadium_viewer_input.cpp
 new file mode 100644
-index 0000000..3825239
+index 0000000..0a384d7
 --- /dev/null
 +++ b/runtime/src/stadium_viewer_input.cpp
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,210 @@
 +// Stadium viewer controls (host thread, once per presented frame): the free camera and the game's match
 +// shots. Keys: W/A/S/D move, Q down, E up, Shift fast, right mouse button + mouse to look, wheel for
 +// speed; 1 batter, 2 play, 3 wide (the game's own cameras); F back to the free camera; C shows the
@@ -1121,6 +1124,7 @@ index 0000000..3825239
 +#include <imgui.h>
 +#include <aurora/aurora.h>
 +
++#include <cstdio>
 +#include <cstdlib>
 +#include <fstream>
 +#include <iterator>
@@ -1148,11 +1152,12 @@ index 0000000..3825239
 +    stadium_collision::Mesh mesh;
 +    std::vector<stadium_collision::Edge> edges;
 +    std::map<uint16_t, size_t> counts;  // triangles per surface, for the legend
++    std::map<uint16_t, bool> shown;     // the legend's ticks
 +};
 +std::optional<std::optional<Collision>> g_loaded;  // outer: tried; inner: found
 +
 +// The preview mod's table pack, read once.
-+const std::optional<Collision>& LoadedCollision() {
++std::optional<Collision>& LoadedCollision() {
 +    if (!g_loaded) {
 +        const auto& config = *Active();
 +        std::ifstream in(config.modDir / "project" / ("stadium_" + config.code + "tbl.pack"), std::ios::binary);
@@ -1163,6 +1168,7 @@ index 0000000..3825239
 +            c->mesh = std::move(*mesh);
 +            c->edges = stadium_collision::Edges(c->mesh);
 +            for (const auto& t : c->mesh.triangles) ++c->counts[t[3]];
++            for (const auto& [surface, count] : c->counts) c->shown[surface] = stadium_collision::ShownByDefault(surface);
 +        }
 +        g_loaded = std::move(c);
 +    }
@@ -1239,9 +1245,10 @@ index 0000000..3825239
 +    }
 +}
 +
-+// The collision as lines over the picture, coloured by surface, seen through everything, and its legend.
++// The collision as lines over the picture, coloured by surface, seen through everything, and its legend
++// (a tick per surface, clicked with the left mouse button).
 +void DrawCollision(bool en) {
-+    const auto& collision = LoadedCollision();
++    auto& collision = LoadedCollision();
 +    const auto pose = game_camera::CurrentPose();
 +    const ImGuiViewport* vp = ImGui::GetMainViewport();
 +    if (!collision) {
@@ -1263,7 +1270,7 @@ index 0000000..3825239
 +    const auto& v = collision->mesh.vertices;
 +    float seg[4];
 +    for (const auto& e : collision->edges) {
-+        if (!stadium_collision::Project(view, v[e.a].data(), v[e.b].data(), seg)) continue;
++        if (!collision->shown[e.surface] || !stadium_collision::Project(view, v[e.a].data(), v[e.b].data(), seg)) continue;
 +        const uint32_t rgb = stadium_collision::SurfaceColor(e.surface);
 +        dl->AddLine(ImVec2(seg[0], seg[1]), ImVec2(seg[2], seg[3]),
 +                    IM_COL32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, 200));
@@ -1271,20 +1278,27 @@ index 0000000..3825239
 +    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + 12, vp->Pos.y + vp->Size.y - 12), ImGuiCond_Always, ImVec2(0, 1));
 +    ImGui::SetNextWindowBgAlpha(0.65f);
 +    if (ImGui::Begin("##viewer-collision", nullptr,
-+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
++                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
 +                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing)) {
 +        ImGui::Text(en ? "Collision: %zu triangles" : "Colision: %zu triangulos", collision->mesh.triangles.size());
-+        for (const auto& [surface, count] : collision->counts) {
++        const bool all = ImGui::SmallButton(en ? "All" : "Todo");
++        ImGui::SameLine();
++        const bool none = ImGui::SmallButton(en ? "None" : "Nada");
++        for (auto& [surface, on] : collision->shown) {
++            if (all || none) on = all;
 +            const uint32_t rgb = stadium_collision::SurfaceColor(surface);
 +            const ImVec2 p = ImGui::GetCursorScreenPos();
-+            const float size = ImGui::GetTextLineHeight();
-+            ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + size, p.y + size),
++            const float size = ImGui::GetFrameHeight();
++            ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x + 3, p.y + 3), ImVec2(p.x + size - 3, p.y + size - 3),
 +                                                      IM_COL32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, 255));
 +            ImGui::Dummy(ImVec2(size, size));
 +            ImGui::SameLine();
 +            const char* name = stadium_collision::SurfaceName(surface, en);
-+            if (name) ImGui::Text("%s (%u): %zu", name, unsigned(surface), count);
-+            else ImGui::Text(en ? "Surface %u: %zu" : "Superficie %u: %zu", unsigned(surface), count);
++            char label[96];
++            if (name) std::snprintf(label, sizeof label, "%s (%u): %zu##s%u", name, unsigned(surface), collision->counts[surface], unsigned(surface));
++            else std::snprintf(label, sizeof label, en ? "Surface %u: %zu##s%u" : "Superficie %u: %zu##s%u", unsigned(surface),
++                               collision->counts[surface], unsigned(surface));
++            ImGui::Checkbox(label, &on);
 +        }
 +    }
 +    ImGui::End();
@@ -1471,10 +1485,10 @@ index 337d40a..ab135ed 100644
  }
 diff --git a/runtime/tests/stadium_collision_tests.cpp b/runtime/tests/stadium_collision_tests.cpp
 new file mode 100644
-index 0000000..f79b249
+index 0000000..8f3d064
 --- /dev/null
 +++ b/runtime/tests/stadium_collision_tests.cpp
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,52 @@
 +#include "stadium_collision.h"
 +#include <cmath>
 +#include <cstdlib>
@@ -1523,6 +1537,9 @@ index 0000000..f79b249
 +    require(!Project(view, farLeft, farLeft2, out));                                          // off the left side
 +
 +    require(SurfaceColor(1) != SurfaceColor(0) && SurfaceName(9, false) && !SurfaceName(17, true));
++    // The 70 m invisible walls hide everything: off until ticked; the rest on.
++    require(!ShownByDefault(0) && !ShownByDefault(1) && !ShownByDefault(2));
++    require(ShownByDefault(5) && ShownByDefault(9) && ShownByDefault(11) && ShownByDefault(17));
 +}
 diff --git a/runtime/tests/stadium_viewer_tests.cpp b/runtime/tests/stadium_viewer_tests.cpp
 new file mode 100644
