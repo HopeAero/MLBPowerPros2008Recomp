@@ -190,6 +190,8 @@ class _Reader:
             nodes_at, lists_at = P["planes_" + tree], P["lists_" + tree]
             nodes = stadium_tbl.parse_tree(d, nodes_at, lists_at)
             entries = max((s + k for _, *sides in nodes for _, s, k in sides), default=0)
+            if tree == "a":
+                st.tree_a = (nodes, list(struct.unpack_from(f">{entries}H", d, lists_at)))
             self.span("tbl", "tree_" + tree, (), nodes_at, lists_at)
             self.span("tbl", "tree_" + tree + "_lists", (), lists_at, lists_at + 2 * entries)
 

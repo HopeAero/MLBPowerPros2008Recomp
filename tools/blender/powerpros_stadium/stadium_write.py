@@ -191,7 +191,7 @@ def write_table(st, layout):
         put(struct.pack(">I19fI", P | layout.models[p.model], *p.translation, *p.rotation, *p.scale, *p.bbox,
                         *p.sphere, p.flags))
     fields["placements"] = 0x20
-    for name, (nodes, entries) in (("a", _tree_a(st.placements)),
+    for name, (nodes, entries) in (("a", st.tree_a or _tree_a(st.placements)),
                                    ("b", _tree_b(st.collision_vertices, st.collision_triangles))):
         tree, lists = tbl_write.pack_tree(nodes, entries)
         fields["planes_" + name] = put(tree)

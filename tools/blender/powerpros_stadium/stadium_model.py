@@ -106,6 +106,8 @@ class Stadium:
     preload: list = field(default_factory=list)                # [PreloadEntry]
     preload_tail: int = 0          # u32 +8 of the zero entry closing the preload list (0x692800..0x703280)
     spare_textures: list = field(default_factory=list)         # [(texture, palette or None)] nothing uses
+    tree_a: tuple | None = None    # (nodes, entries) as tbl_write.build_tree gives them: the game culls
+                                   # placements by the camera with it. None: the writer builds one
 
 
 @dataclass

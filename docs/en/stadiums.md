@@ -199,3 +199,7 @@ What we learned bringing in the Polo Grounds, a downloaded SketchUp model (Octob
   The resulting mod, loaded in a game, shows the four changes.
   4. imports Coors Field again with collision, raises its fences (surface 9) 3 m, changes a face to foul pole and checks the written table: surfaces, face orientation and both trees.
 - **Own model** (`tools/blender/test_convert.py`, same arguments as the export): builds a test stadium with simple shapes (grass, dirt, a circular fence and stands), converts it into Coors Field pieces, generates its collision, exports it as a new stadium and checks what was written.
+- **From-scratch writer** (`python tools/test_stadium_writer.py [project.bin]`): without the `project.bin`, the synthetic tests; with it, also the ones on the game's 40 stadiums (about 45 s). Tools:
+  - `python tools/stadium_rebuild.py <project.bin> <code> <mods folder> [--original]`: rebuilds a game stadium with the writer as a new stadium (`rb_<code>`), or copies it untouched (`og_<code>`) to compare it the same way;
+  - `python tools/stadium_minimal.py <mods folder>`: the minimal stadium made from scratch (`minimo`).
+  The packs they produce are game content (except the minimal one): keep them in `local/`.

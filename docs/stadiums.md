@@ -199,3 +199,7 @@ Los `.blend` con estadios importados contienen modelos y texturas del juego. Ús
   El mod resultante, cargado en un partido, muestra los cuatro cambios.
   4. vuelve a importar Coors Field con colisión, sube sus vallas (superficie 9) 3 m, cambia una cara a poste de foul y comprueba la tabla escrita: superficies, sentido de las caras y los dos árboles.
 - **Modelo propio** (`tools/blender/test_convert.py`, mismos argumentos que la exportación): construye un estadio de prueba con formas simples (césped, tierra, una valla circular y gradas), lo convierte en piezas de Coors Field, genera su colisión, lo exporta como estadio nuevo y comprueba lo escrito.
+- **Escritor desde cero** (`python tools/test_stadium_writer.py [project.bin]`): sin el `project.bin`, las pruebas sintéticas; con él, además, las de los 40 estadios del juego (unos 45 s). Herramientas:
+  - `python tools/stadium_rebuild.py <project.bin> <código> <carpeta de mods> [--original]`: reconstruye un estadio del juego con el escritor como estadio nuevo (`rb_<código>`), o lo copia sin tocar (`og_<código>`) para compararlo por la misma vía;
+  - `python tools/stadium_minimal.py <carpeta de mods>`: el estadio mínimo hecho desde cero (`minimo`).
+  Los packs que generan son contenido del juego (salvo el mínimo): déjalos en `local/`.

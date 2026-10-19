@@ -453,7 +453,7 @@ Verified (October 14, 2026):
 - **Side H:** what reaches n·p + d < 0. **Side L:** what reaches n·p + d > 0. Whatever crosses the plane is in both.
   - In the 47 packs, every triangle (by its vertices) and every placement (by its box and its sphere) is on the correct side of all the planes above it.
   - From the root, every triangle and every placement can be reached.
-- **Tree A:** partitions the placements by their box. In AT&T Park, Coors Field and Yankee Stadium it uses diagonal planes; in all packs it has at most 32 per leaf.
+- **Tree A:** partitions the placements by their box. In AT&T Park, Coors Field and Yankee Stadium it uses diagonal planes; in all packs it has at most 32 per leaf. The game uses it to **cull by camera**: see «Writing packs from scratch».
 - **Tree B:** partitions the collision triangles. It uses axis-aligned planes, depth ≤ 13, leaves of 11 to 15 triangles on average and at most 111.
 - **Traversal:** `0x80C860E4` and `0x80C862EC` are recursive (index × 28). They call `0x80CCB438` with the plane to decide which sides they visit. At each leaf they set `flags[index]` to 1 in an array of one byte per element: there is no fixed-size buffer.
   - **They read the leaf count as signed** (`lbz` + `extsb`): a leaf with more than 127 entries is not traversed.
@@ -536,6 +536,19 @@ Verified (October 14, 2026):
   - `unk_24`: two pairs {→ list, u32 n} of `0x1C`-byte records {position xyz, scale xyz = 1, angle}; in Coors, 7 per list, 24 m to each side of home and 0.64 m below ground: they look like the dugout seats. `bullpen`, `bullpen2` and `season` have a single pair {0, 0} with the root right after it;
   - `textures` (pointer 10): `0x10`-byte entries {→ texture header, → palette, u32, u32}, the two u32 being TMEM addresses (preloaded textures);
   - `unk_2c`: {u32 n, n × u32 order} (always 8 and 0 to 7) followed by the texture list, which ends with an entry {0, 0, u32, 0}; that u32 goes from `0x692800` to `0x703280` depending on the stadium (not decoded). In `bullpen`, some entries point at no texture.
+
+**Writing packs from scratch** (18 October 2026; `tools/blender/powerpros_stadium/stadium_model.py`, `stadium_read.py` and `stadium_write.py`):
+- **Description:** a stadium as data (textures, palettes, models, placements, collision, tree A and the table blocks), with indices instead of offsets. The reader takes it from the game's two packs; the writer writes both packs from empty buffers, reading no pack.
+- **Checked outside the game** (`tools/test_stadium_writer.py`, 45 s):
+  - the reader covers every non-zero byte of the 40 stadiums with a table;
+  - every structure written is byte for byte the game's, with its pointers zeroed (except tree B, which is rebuilt);
+  - read, write and read again gives the same for the 40, and what is written passes `stadium_re.py check`;
+  - a description turned into lists, numbers and hex text writes the same bytes: the writer uses nothing else.
+- **Checked in the game:**
+  - an **invented minimal stadium** (`tools/stadium_minimal.py`: checkered ground, fence, stands and collision, reading nothing from the game, with the table blocks empty) shows in the viewer after 7.6 s and a 2-minute match plays in it, at 60 FPS with no out-of-memory accesses;
+  - **Coors Field, AT&T Park and Yankee Stadium rebuilt** (`tools/stadium_rebuild.py`, as new stadiums) look in the viewer the same as their originals, loaded the same way, from the batter's view and two free cameras: mean pixel difference 0 to 0.003 out of 255. A 2-minute match with each, with no out-of-memory accesses.
+- **Tree A culls by camera:** rebuilt as a single leaf (as the add-on's exporter does), Coors Field seen from outside drew the stands behind home and other pieces the original does not draw from there; from the batter's view nothing changed. The game walks that tree with the camera position and drops the placements on the sides it does not visit (`0x80CCB438` decides the sides). That is why the description keeps the game's tree A.
+- **Pending** (phase 2): what each placement flag does, the `unk_20` and `unk_24` blocks, the preloaded textures, the material fields and how to build a tree A of our own that culls well.
 
 **Game stadium list** (October 14, 2026, from the REL data; for adding stadiums):
 - **File numbers:** the game does not store file names. It requests `project.bin` entries by record number: Coors Field = 75, its table = 76. There are 4,681 records, of which 2,424 have a name: 2,256 remain free for new files.

@@ -205,7 +205,7 @@ def test_table_synthetic():
     root = stadium_tbl.find_root(tbl)
     check(struct_u32(tbl, root) == 2 and struct_u32(tbl, root + 4) == 0x40000020, "root found from the end, placements at 0x20")
     back = read_stadium(gfx, tbl)
-    check(back == st, "the written stadium reads back the same" + ("" if back == st else f": {first_difference(st, back)}"))
+    check(same(st, back), "the written stadium reads back the same" + ("" if same(st, back) else f": {first_difference(st, back)}"))
     problems = []
     stadium_re.load("synthetic", gfx, tbl, problems)
     check(not problems, f"stadium_re.load {problems[:3]}")
@@ -214,6 +214,12 @@ def test_table_synthetic():
 def struct_u32(d, o):
     import struct
     return struct.unpack_from(">I", d, o)[0]
+
+
+def same(st, back):
+    """back == st, except a tree A the writer built because st had none."""
+    import dataclasses
+    return back == (dataclasses.replace(st, tree_a=back.tree_a) if st.tree_a is None else st)
 
 
 def first_difference(a, b):
@@ -240,7 +246,7 @@ def test_table_empty_blocks():
     gfx, tbl = write_stadium(st)
     pointers = stadium_tbl.parse_table(tbl).pointers
     check(all(v is not None for v in pointers.values()), "empty blocks are written present, no null root pointer")
-    check(read_stadium(gfx, tbl) == st, "empty blocks read back the same")
+    check(same(st, read_stadium(gfx, tbl)), "empty blocks read back the same")
     st.unk_24 = [[]]                                  # bullpen: a single pair, the root right after it
     check(read_stadium(*write_stadium(st)).unk_24 == [[]], "a single unk_24 pair reads back the same")
 
@@ -280,7 +286,7 @@ def test_write_limits():
             check(word in str(e), f"limit refused, naming '{word}': {e}")
 
 
-TREES = ("tree_a", "tree_a_lists", "tree_b", "tree_b_lists")
+TREES = ("tree_b", "tree_b_lists")          # tree B is rebuilt; tree A (the game culls pieces with it) is kept
 
 
 def test_table_bytes_match_game(archive):
@@ -295,7 +301,7 @@ def test_table_bytes_match_game(archive):
         read_stadium(new_gfx, new_tbl, b)
         bad += compare_structures(code, masked(gfx, a["gfx"]), masked(new_gfx, b["gfx"]), "gfx")
         bad += compare_structures(code, masked(tbl, a["tbl"], TREES), masked(new_tbl, b["tbl"], TREES), "tbl")
-    check(not bad, "table and graphics structures match the game's, pointers and trees aside"
+    check(not bad, "table and graphics structures match the game's, pointers and tree B aside"
           + ("" if not bad else ": " + "; ".join(bad[:8])))
 
 
@@ -355,7 +361,8 @@ def from_plain(d):
         preload_order=list(d["preload_order"]),
         preload=[sm.PreloadEntry(**e) for e in d["preload"]],
         preload_tail=d["preload_tail"],
-        spare_textures=[tup(x) for x in d["spare_textures"]])
+        spare_textures=[tup(x) for x in d["spare_textures"]],
+        tree_a=None if d["tree_a"] is None else ([tup(n) for n in d["tree_a"][0]], list(d["tree_a"][1])))
 
 
 def test_writer_uses_only_the_description(archive):
@@ -372,7 +379,7 @@ def test_rebuild_tool(archive):
     import subprocess
     from powerpros_stadium.stadium_read import read_stadium
     root = Path(__file__).resolve().parent.parent
-    out = root / "local" / "tmp" / "stadium-writer" / "mods"
+    out = root / "local" / "tmp" / "stadium-writer" / "test-mods"     # not the mods compared in the game
     shutil.rmtree(out, ignore_errors=True)
     for flag, folder, code in (([], "Reconstruido col", "rb_col"), (["--original"], "Original col", "og_col")):
         run = subprocess.run([sys.executable, str(root / "tools" / "stadium_rebuild.py"), str(archive.path), "col", str(out)] + flag,
@@ -396,7 +403,7 @@ def test_minimal_stadium():
     st = minimal_stadium()
     gfx, tbl = write_stadium(st)
     back = read_stadium(gfx, tbl)
-    check(back == st, "minimal stadium reads back the same" + ("" if back == st else f": {first_difference(st, back)}"))
+    check(same(st, back), "minimal stadium reads back the same" + ("" if same(st, back) else f": {first_difference(st, back)}"))
     problems = []
     models, _ = stadium_re.load("minimo", gfx, tbl, problems)
     for m in models:

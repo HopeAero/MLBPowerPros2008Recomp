@@ -454,7 +454,7 @@ Verificado (14 de octubre de 2026):
 - **Lado H:** lo que llega a n·p + d < 0. **Lado L:** lo que llega a n·p + d > 0. Lo que cruza el plano está en los dos.
   - En los 47 packs, cada triángulo (por sus vértices) y cada colocación (por su caja y su esfera) está en el lado correcto de todos los planos por encima.
   - Desde la raíz se llega a todos los triángulos y a todas las colocaciones.
-- **Árbol A:** reparte las colocaciones por su caja. En AT&T Park, Coors Field y Yankee Stadium usa planos diagonales; en todos los packs tiene como mucho 32 por hoja.
+- **Árbol A:** reparte las colocaciones por su caja. En AT&T Park, Coors Field y Yankee Stadium usa planos diagonales; en todos los packs tiene como mucho 32 por hoja. El juego lo usa para **recortar por cámara**: ver «Escribir packs desde cero».
 - **Árbol B:** reparte los triángulos de colisión. Usa planos alineados con los ejes, profundidad ≤ 13, hojas de 11 a 15 triángulos de media y como mucho 111.
 - **Recorrido:** `0x80C860E4` y `0x80C862EC` son recursivas (índice × 28). Llaman a `0x80CCB438` con el plano para decidir qué lados visitan. En cada hoja ponen a 1 `banderas[índice]` en un array de un byte por elemento: no hay un búfer de tamaño fijo.
   - **Leen el número de la hoja con signo** (`lbz` + `extsb`): una hoja con más de 127 entradas no se recorre.
@@ -537,6 +537,19 @@ Verificado (14 de octubre de 2026):
   - `unk_24`: dos pares {→ lista, u32 n} de registros de `0x1C` bytes {posición xyz, escala xyz = 1, ángulo}; en Coors, 7 por lista, a 24 m a cada lado del plato y 0,64 m bajo el suelo: parecen los asientos de los banquillos. `bullpen`, `bullpen2` y `season` tienen un solo par {0, 0} y la raíz justo detrás;
   - `textures` (puntero 10): entradas de `0x10` bytes {→ cabecera de textura, → paleta, u32, u32}, con los dos u32 como direcciones de TMEM (texturas precargadas);
   - `unk_2c`: {u32 n, n × u32 orden} (siempre 8 y 0 a 7) seguido de la lista de texturas, que acaba con una entrada {0, 0, u32, 0}; ese u32 va de `0x692800` a `0x703280` según el estadio (sin descifrar). En `bullpen`, algunas entradas no apuntan a ninguna textura.
+
+**Escribir packs desde cero** (18 de octubre de 2026; `tools/blender/powerpros_stadium/stadium_model.py`, `stadium_read.py` y `stadium_write.py`):
+- **Descripción:** un estadio como datos (texturas, paletas, modelos, colocaciones, colisión, árbol A y los bloques de la tabla), con índices en lugar de posiciones. El lector la saca de los dos packs del juego; el escritor escribe los dos packs desde búferes vacíos, sin leer ningún pack.
+- **Comprobado fuera del juego** (`tools/test_stadium_writer.py`, 45 s):
+  - el lector cubre todos los bytes distintos de cero de los 40 estadios con tabla;
+  - cada estructura escrita es igual byte a byte a la del juego, puestos a cero sus punteros (salvo el árbol B, que se reconstruye);
+  - leer, escribir y volver a leer da lo mismo en los 40, y lo escrito pasa `stadium_re.py check`;
+  - una descripción pasada a listas, números y texto hexadecimal escribe los mismos bytes: el escritor no usa nada más.
+- **Comprobado en el juego:**
+  - un **estadio mínimo inventado** (`tools/stadium_minimal.py`: suelo a cuadros, valla, grada y colisión, sin leer nada del juego, con los bloques de la tabla vacíos) se ve en el visor a los 7,6 s y se juega un partido de 2 minutos en él, a 60 FPS y sin accesos fuera de memoria;
+  - **Coors Field, AT&T Park y Yankee Stadium reconstruidos** (`tools/stadium_rebuild.py`, como estadios nuevos) se ven en el visor igual que sus originales, cargados por la misma vía, desde la vista del bateador y dos cámaras libres: diferencia media por píxel de 0 a 0,003 sobre 255. Un partido de 2 minutos con cada uno, sin accesos fuera de memoria.
+- **El árbol A recorta por cámara:** reconstruido como una sola hoja (como hace el exportador del complemento), Coors Field visto desde fuera dibujaba las gradas detrás del plato y otras piezas que el original no dibuja desde ahí; desde la vista del bateador no cambiaba nada. El juego recorre ese árbol con la posición de la cámara y descarta las colocaciones de los lados que no visita (`0x80CCB438` decide los lados). Por eso la descripción conserva el árbol A del juego.
+- **Pendiente** (fase 2): qué hace cada flag de colocación, los bloques `unk_20` y `unk_24`, las texturas precargadas, los campos del material y cómo construir un árbol A propio que recorte bien.
 
 **Lista de estadios del juego** (14 de octubre de 2026, por los datos del REL; para añadir estadios):
 - **Números de archivo:** el juego no guarda nombres de archivo. Pide las entradas de `project.bin` por número de registro: Coors Field = 75, su tabla = 76. Hay 4.681 registros, de los que 2.424 tienen nombre: quedan 2.256 libres para archivos nuevos.
