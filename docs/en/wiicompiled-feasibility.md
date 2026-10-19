@@ -743,6 +743,11 @@ It is not validated pixel by pixel against Dolphin.
   - Result: 200-203 wakeups/s all the time (only ~15 are lost in the second when the field loads), 0 crackles in 69 s, 1.5/min in 90 s with none at the start, 60 FPS at x1 and x4, 8 of 8 boots fine.
   - Result, same direct match: 200-201 sleeps/s, **3.0-3.4 jumps/min** (Dolphin 3.1), 59.96 FPS at x1.
   - **Confirmed by ear** by the user in normal play on October 13, 2026: the commentator crackle can no longer be heard. The comparison with Dolphin of the data's own saturation has still not been done.
+- **Window minimized or covered on Windows 11** (October 19, 2026, patch `wiicompiled-timers-when-hidden`). A player on Windows 11 24H2 (i7-6700, RTX 3050) heard broken commentary for about 15 seconds in the seventh inning, then it fixed itself.
+  - Since Windows 11, the system ignores `timeBeginPeriod(1)` while the program's window is minimized or fully covered: timers go back to 15.6 ms.
+  - Measured on this PC with a `Sleep(5)` test program: 135 wakes/s with the window visible and **64/s minimized**. Asking for the opt-out (`SetProcessInformation(ProcessPowerThrottling)` with `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION`): 177/s visible and 171/s minimized.
+  - At 64 wakes/s the 5 ms sound timer runs at a third of its pace and goes past the 50 ms catch-up cap: phrases overrun, as in the crackle above.
+  - Fix: at start the runtime asks for that opt-out and for the one from the lower execution speed Windows gives background processes. Checked from outside with `GetProcessInformation`: `ControlMask=0x5`, `StateMask=0`. Still to confirm with the player whether the game was minimized or covered at that moment.
 
 ## Texture Studio (October 14, 2026)
 

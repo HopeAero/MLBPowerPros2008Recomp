@@ -1,0 +1,40 @@
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 2c09abd..f50b45e 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -137,6 +137,7 @@ public:
+         } else {
+             RT_LOG(RT_TAG_RUNTIME) << "timeBeginPeriod(1) failed: " << result << std::endl;
+         }
++        KeepTimersWhenHidden();
+     }
+ 
+     ~WindowsTimerResolutionGuard() {
+@@ -145,6 +146,27 @@ public:
+         }
+     }
+ 
++    // Windows 11 ignores timeBeginPeriod while the window is minimized or fully covered: 5 ms sleeps
++    // become 15.6 ms (measured: 64 wakes/s instead of ~180), the game's 5 ms sound ticker falls behind
++    // and commentary phrases overrun (a player's 15 s of broken audio). Opt out of that throttling, and of
++    // the lower execution speed Windows gives background processes.
++    static void KeepTimersWhenHidden() {
++        struct PowerThrottlingState {
++            ULONG Version, ControlMask, StateMask;
++        };
++        using SetInfo = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
++        const auto setInfo = reinterpret_cast<SetInfo>(
++            reinterpret_cast<void*>(::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation")));
++        if (setInfo == nullptr) return;  // before Windows 8: no such throttling
++        constexpr int kProcessPowerThrottling = 4;
++        constexpr ULONG kExecutionSpeed = 0x1, kIgnoreTimerResolution = 0x4;
++        PowerThrottlingState state{1, kExecutionSpeed | kIgnoreTimerResolution, 0};
++        if (!setInfo(::GetCurrentProcess(), kProcessPowerThrottling, &state, sizeof state)) {
++            state.ControlMask = kExecutionSpeed;  // before Windows 11 the timer flag is unknown
++            setInfo(::GetCurrentProcess(), kProcessPowerThrottling, &state, sizeof state);
++        }
++    }
++
+     WindowsTimerResolutionGuard(const WindowsTimerResolutionGuard&) = delete;
+     WindowsTimerResolutionGuard& operator=(const WindowsTimerResolutionGuard&) = delete;
+ 

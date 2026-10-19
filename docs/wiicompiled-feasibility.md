@@ -743,6 +743,11 @@ No está validado píxel a píxel contra Dolphin.
   - Resultado: 200-203 despertares/s todo el tiempo (solo se pierden ~15 en el segundo de la carga del campo), 0 chasquidos en 69 s, 1,5/min en 90 s sin ninguno al inicio, 60 FPS en x1 y x4, 8 de 8 arranques bien.
   - Resultado, mismo partido directo: 200-201 sueños/s, **3,0-3,4 saltos/min** (Dolphin 3,1), 59,96 FPS a x1.
   - **Confirmado a oído** por el usuario en juego normal el 13 de octubre de 2026: el chasquido del comentarista ya no se oye. La comparación con Dolphin de la saturación propia de los datos sigue sin hacerse.
+- **Ventana minimizada o tapada en Windows 11** (19 de octubre de 2026, parche `wiicompiled-timers-when-hidden`). Un jugador con Windows 11 24H2 (i7-6700, RTX 3050) oyó el comentario roto unos 15 segundos en la séptima entrada, y luego se arregló solo.
+  - Desde Windows 11, el sistema no respeta `timeBeginPeriod(1)` mientras la ventana del programa está minimizada o tapada del todo: los temporizadores vuelven a 15,6 ms.
+  - Medido en este PC con un programa de prueba de `Sleep(5)`: 135 despertares/s con la ventana visible y **64/s minimizada**. Pidiendo la exención (`SetProcessInformation(ProcessPowerThrottling)` con `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION`): 177/s visible y 171/s minimizada.
+  - A 64 despertares/s el temporizador de sonido de 5 ms va a un tercio de su ritmo y supera el tope de recuperación de 50 ms: las frases se pasan de largo, como en el chasquido de arriba.
+  - Arreglo: al arrancar, el runtime pide esa exención y la de la velocidad de ejecución reducida que Windows da a los procesos en segundo plano. Comprobado desde fuera con `GetProcessInformation`: `ControlMask=0x5`, `StateMask=0`. Falta que el jugador confirme si en ese momento tenía el juego minimizado o tapado.
 
 ## Texture Studio (14 de octubre de 2026)
 
