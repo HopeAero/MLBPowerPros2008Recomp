@@ -825,7 +825,7 @@ Encontrada el 18 de octubre de 2026 para la vista previa de estadios (`runtime/s
 | `+0x70` | vector arriba (0, 1, 0, 1) |
 | `+0x8C` | puntero a su función de vista (`0x80055D24`) |
 | `+0x90` | puntero a su función de proyección (`0x80054B1C`) |
-| `+0x94` | cot(fovY/2) de la proyección: 2,206 en la vista del bateador (≈ 48,8°) |
+| `+0x94` | cot de la mitad del ángulo **horizontal** de la proyección: 2,206 en la vista del bateador (48,8° de ancho; 28,6° de alto en 16:9). Comprobado al dibujar la colisión en el visor: leído como ángulo vertical, todo salía 16/9 veces más cerca del centro de la imagen |
 | `+0x154` | matriz de vista 3×4 |
 | `+0x184` | dirección de la vista |
 

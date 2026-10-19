@@ -824,7 +824,7 @@ Found on 18 October 2026 for the stadium preview (`runtime/src/hle/mlb/game_came
 | `+0x70` | up vector (0, 1, 0, 1) |
 | `+0x8C` | pointer to its view function (`0x80055D24`) |
 | `+0x90` | pointer to its projection function (`0x80054B1C`) |
-| `+0x94` | the projection's cot(fovY/2): 2.206 in the batter view (≈ 48.8°) |
+| `+0x94` | cot of half the projection's **horizontal** angle: 2.206 in the batter view (48.8° wide; 28.6° tall at 16:9). Checked by drawing the collision in the viewer: read as the vertical angle, everything came out 16/9 times closer to the centre of the picture |
 | `+0x154` | 3×4 view matrix |
 | `+0x184` | viewing direction |
 

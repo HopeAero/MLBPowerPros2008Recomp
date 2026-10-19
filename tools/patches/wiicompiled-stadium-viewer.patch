@@ -297,10 +297,10 @@ index 0000000..5048840
 +}  // namespace stadium_collision
 diff --git a/runtime/include/stadium_viewer.h b/runtime/include/stadium_viewer.h
 new file mode 100644
-index 0000000..106ef22
+index 0000000..96fb460
 --- /dev/null
 +++ b/runtime/include/stadium_viewer.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,45 @@
 +#pragma once
 +// Stadium viewer: the Blender add-on's "View in game" opens the game straight into the stadium being
 +// made, from a one-run preview mod, with a free camera. Enabled by environment variables:
@@ -308,6 +308,7 @@ index 0000000..106ef22
 +//   WIICOMPILED_STADIUM_VIEWER_CODE   the stadium code it declares (default pp_preview)
 +//   WIICOMPILED_STADIUM_VIEWER_CAMERA "x,y,z,yaw,pitch,fov": initial free camera
 +//   WIICOMPILED_STADIUM_VIEWER_COLLISION 1: start with the collision shown (key C)
++//   WIICOMPILED_STADIUM_VIEWER_SPIN   rad/s: the free camera turns by itself (tests of the collision lines)
 +// Spec: docs/superpowers/specs/2026-10-18-stadium-preview-design.md
 +#include <filesystem>
 +#include <optional>
@@ -347,15 +348,16 @@ index 0000000..106ef22
 +}  // namespace stadium_viewer
 diff --git a/runtime/src/hle/mlb/game_camera.cpp b/runtime/src/hle/mlb/game_camera.cpp
 new file mode 100644
-index 0000000..4aabf6c
+index 0000000..79c9cb1
 --- /dev/null
 +++ b/runtime/src/hle/mlb/game_camera.cpp
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,257 @@
 +// MLB Power Pros 2008 (RL8E54) game-specific natives: the match camera, for the stadium viewer's free
 +// camera and match views (docs/ingenieria-inversa.md, "Cámara del partido").
 +//
 +// Camera objects (vtable 0x801568AC) keep eye (+0x40), target (+0x60) and up (+0x70) as (x, y, z, 1) in
-+// game units (decimetres, Y up, second base towards -Z), the projection's cot(fovY/2) at +0x94 and the
++// game units (decimetres, Y up, second base towards -Z), cot of half the projection's horizontal angle at +0x94 (CameraPose::fovY here holds
++// that horizontal angle; the vertical one depends on the picture's aspect) and the
 +// view matrix at +0x154.
 +// - 0x80055D24 rebuilds the view every frame: LookAt (0x80055620) into +0x154, then the viewing
 +//   direction (target - eye, 0x8006327C) through 0x80060588 into +0x184. Decompiled here; while the
@@ -1112,10 +1114,10 @@ index 0000000..6a8d088
 +}  // namespace stadium_viewer
 diff --git a/runtime/src/stadium_viewer_input.cpp b/runtime/src/stadium_viewer_input.cpp
 new file mode 100644
-index 0000000..0a384d7
+index 0000000..e0bc15d
 --- /dev/null
 +++ b/runtime/src/stadium_viewer_input.cpp
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,241 @@
 +// Stadium viewer controls (host thread, once per presented frame): the free camera and the game's match
 +// shots. Keys: W/A/S/D move, Q down, E up, Shift fast, right mouse button + mouse to look, wheel for
 +// speed; 1 batter, 2 play, 3 wide (the game's own cameras); F back to the free camera; C shows the
@@ -1124,6 +1126,8 @@ index 0000000..0a384d7
 +#include <imgui.h>
 +#include <aurora/aurora.h>
 +
++#include <array>
++#include <cmath>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <fstream>
@@ -1148,6 +1152,14 @@ index 0000000..0a384d7
 +bool g_help = true;
 +bool g_previous[SDL_SCANCODE_COUNT] = {};
 +bool g_collision = false;
++// Free camera poses of the last host frames, newest first: the picture on screen was drawn with an older
++// one than the pose just set, and the collision lines must use that same one or they slide while moving.
++std::array<CameraPose, 4> g_poses{};
++size_t g_poseCount = 0;
++// The picture on screen is one host frame behind: measured turning the camera at 3 rad/s, the lines sit
++// on the stadium with the pose of the previous frame (ahead with the current one, behind with older ones).
++constexpr size_t kOverlayDelay = 1;
++float g_spin = 0.0f;  // rad/s; WIICOMPILED_STADIUM_VIEWER_SPIN turns the free camera (tests)
 +struct Collision {
 +    stadium_collision::Mesh mesh;
 +    std::vector<stadium_collision::Edge> edges;
@@ -1195,6 +1207,7 @@ index 0000000..0a384d7
 +        g_started = true;
 +        const char* collision = std::getenv("WIICOMPILED_STADIUM_VIEWER_COLLISION");  // 1: start with it shown
 +        g_collision = collision && collision[0] == '1';
++        if (const char* spin = std::getenv("WIICOMPILED_STADIUM_VIEWER_SPIN")) g_spin = std::strtof(spin, nullptr);
 +        // Only the stadium: no 2D HUD.
 +        aurora_set_draw_filter(AURORA_DRAW_FILTER_HUD);
 +        // The batter shot first: applying a shot ends the camera's opening fly-over, which would
@@ -1239,9 +1252,19 @@ index 0000000..0a384d7
 +    } else {
 +        Pressed(keys, SDL_SCANCODE_F);  // keep the edge state current
 +    }
++    if (g_free && g_spin != 0.0f) {
++        in.look = true;
++        in.mouseDx = g_spin * in.dt / FreeCamera::kMouseRadiansPerPixel;
++        in.mouseDy = 0.0f;
++    }
 +    if (g_free) {
 +        g_free->Update(in);
 +        game_camera::SetOverride(g_free->Pose());
++        std::copy_backward(g_poses.begin(), g_poses.end() - 1, g_poses.end());
++        g_poses[0] = g_free->Pose();
++        g_poseCount = std::min(g_poseCount + 1, g_poses.size());
++    } else {
++        g_poseCount = 0;
 +    }
 +}
 +
@@ -1249,7 +1272,14 @@ index 0000000..0a384d7
 +// (a tick per surface, clicked with the left mouse button).
 +void DrawCollision(bool en) {
 +    auto& collision = LoadedCollision();
-+    const auto pose = game_camera::CurrentPose();
++    // The free camera: the pose the picture on screen was drawn with, but the game's field of view (the
++    // viewer moves and turns the game's camera, the game keeps its own lens). A match shot: the game's camera.
++    auto pose = game_camera::CurrentPose();
++    if (pose && g_poseCount > 0) {
++        const float fovY = pose->fovY;
++        pose = g_poses[std::min(kOverlayDelay, g_poseCount - 1)];
++        pose->fovY = fovY;
++    }
 +    const ImGuiViewport* vp = ImGui::GetMainViewport();
 +    if (!collision) {
 +        ImGui::GetForegroundDrawList()->AddText(ImVec2(vp->Pos.x + 12, vp->Pos.y + vp->Size.y - 30), IM_COL32(255, 80, 80, 255),
@@ -1259,13 +1289,16 @@ index 0000000..0a384d7
 +    if (!pose) return;
 +    stadium_collision::View view{};
 +    game_camera::PoseToEyeTarget(*pose, view.eye, view.target);
-+    view.fovY = pose->fovY;
++    view.fovY = pose->fovY;  // set below, once the picture's aspect is known
 +    // The picture: 16:9 with bars when forced (the default), else the whole window.
 +    view.x = vp->Pos.x, view.y = vp->Pos.y, view.w = vp->Size.x, view.h = vp->Size.y;
 +    if (MkwForceAspect169Requested()) {
 +        const float w = std::min(view.w, view.h * 16.0f / 9.0f), h = w * 9.0f / 16.0f;
 +        view.x += (view.w - w) * 0.5f, view.y += (view.h - h) * 0.5f, view.w = w, view.h = h;
 +    }
++    // The game's +0x94 is cot of half the horizontal angle (measured: lines 16:9 times too close to the
++    // centre when read as vertical), so the vertical angle depends on the picture's aspect.
++    view.fovY = 2.0f * std::atan(std::tan(pose->fovY * 0.5f * 3.14159265f / 180.0f) * view.h / view.w) * 180.0f / 3.14159265f;
 +    ImDrawList* dl = ImGui::GetBackgroundDrawList();
 +    const auto& v = collision->mesh.vertices;
 +    float seg[4];
