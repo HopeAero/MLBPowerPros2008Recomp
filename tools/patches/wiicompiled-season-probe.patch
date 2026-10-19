@@ -15,19 +15,30 @@ index ccc2a39..4c11fc1 100644
  target_include_directories(mkw_game_camera_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 diff --git a/runtime/include/season_probe.h b/runtime/include/season_probe.h
 new file mode 100644
-index 0000000..1382572
+index 0000000..8560836
 --- /dev/null
 +++ b/runtime/include/season_probe.h
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,81 @@
 +#pragma once
 +// Season probe: research aid for Season mode past ten seasons. Does nothing without its variables.
 +//   WIICOMPILED_SEASON_LOG=1    logs "[season] index=N year=Y state=0xADDR" whenever the season index changes
 +//   WIICOMPILED_SEASON_INDEX=N  writes N (0..9) to the season index once, the first time the state exists
++//   WIICOMPILED_PAD_LIVE=FILE   a driver writes one command to FILE; the game reads it at its next pad read
++//                               and deletes FILE when done:
++//                                 "pad HEX MS"  hold pad 0 buttons (PAD_BUTTON_* bits, 0x10000-0x80000 C-stick
++//                                               right/left/up/down as in WIICOMPILED_PAD_SCRIPT) for MS ms
++//                                 "dump NAME"   write MEM1 and MEM2 to NAME.mem1 / NAME.mem2 next to FILE
++//                                 "poke ADDR HEX"  write the bytes HEX (two digits each) from guest ADDR
 +// The year is 2008 + the signed byte at [[0x8104B5A8] + 8] (docs/ingenieria-inversa.md, "Año de la temporada").
 +// Plan: docs/superpowers/plans/2026-10-19-season-archive-research.md
++#include <cctype>
++#include <cstdint>
++#include <cstdio>
 +#include <cstdlib>
-+#include <cstring>
 +#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
 +
 +namespace season_probe {
 +
@@ -40,18 +51,97 @@ index 0000000..1382572
 +    return static_cast<int>(value);
 +}
 +
++struct LiveCommand {
++    enum Kind { Pad, Dump, Poke } kind;
++    uint32_t buttons = 0;
++    uint32_t ms = 0;
++    std::string name;  // Dump: letters, digits, '_' and '-' only, so it stays next to the command file
++    uint32_t address = 0;        // Poke: guest address
++    std::vector<uint8_t> bytes;  // Poke: written in order from address (big-endian as the guest sees them)
++};
++
++inline std::optional<LiveCommand> ParseLiveCommand(std::string_view text) {
++    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.remove_suffix(1);
++    const std::string line(text);
++    if (line.rfind("pad ", 0) == 0) {
++        unsigned buttons = 0, ms = 0;
++        int used = 0;
++        if (std::sscanf(line.c_str() + 4, "%x %u%n", &buttons, &ms, &used) != 2 || line[4 + used] != '\0')
++            return std::nullopt;
++        return LiveCommand{LiveCommand::Pad, buttons, ms, {}};
++    }
++    if (line.rfind("dump ", 0) == 0) {
++        const std::string name = line.substr(5);
++        if (name.empty()) return std::nullopt;
++        for (char c : name)
++            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') return std::nullopt;
++        return LiveCommand{LiveCommand::Dump, 0, 0, name};
++    }
++    if (line.rfind("poke ", 0) == 0) {
++        unsigned address = 0;
++        char hex[513] = {};
++        int used = 0;
++        if (std::sscanf(line.c_str() + 5, "%x %512[0-9A-Fa-f]%n", &address, hex, &used) != 2 || line[5 + used] != '\0')
++            return std::nullopt;
++        const std::string digits(hex);
++        if (digits.size() % 2) return std::nullopt;
++        LiveCommand poke{LiveCommand::Poke};
++        poke.address = address;
++        for (size_t i = 0; i < digits.size(); i += 2)
++            poke.bytes.push_back(static_cast<uint8_t>(std::stoul(digits.substr(i, 2), nullptr, 16)));
++        return poke;
++    }
++    return std::nullopt;
++}
++
 +void OnHostFrame();
++// Live driver (WIICOMPILED_PAD_LIVE): enabled, and the pad 0 bits it holds right now; runs dump commands.
++bool LiveEnabled();
++uint32_t LiveButtons();
 +
 +}  // namespace season_probe
+diff --git a/runtime/src/hle/input/pad.cpp b/runtime/src/hle/input/pad.cpp
+index 219c7c1..2e6251e 100644
+--- a/runtime/src/hle/input/pad.cpp
++++ b/runtime/src/hle/input/pad.cpp
+@@ -1,3 +1,4 @@
++#include "season_probe.h"
+ #include "hle_stubs.h"
+ #include "memory.h"
+ #include "hle/controller_status_contract.h"
+@@ -107,12 +108,16 @@ void ApplyPadScript(PADStatus* statuses) {
+         }
+         return steps;
+     }();
+-    if (script.empty()) return;
++    if (script.empty() && !season_probe::LiveEnabled()) return;
+     const uint64_t now = SDL_GetTicks();
+     PADStatus& status = statuses[0];
+     status.err = PAD_ERR_NONE;
+-    for (const Step& step : script) {
+-        if (now < step.start || now >= step.end) continue;
++    std::vector<Step> active;
++    for (const Step& step : script)
++        if (now >= step.start && now < step.end) active.push_back(step);
++    // season_probe.h: buttons sent live by a research driver (WIICOMPILED_PAD_LIVE).
++    if (const uint32_t live = season_probe::LiveButtons()) active.push_back({0, 0, live});
++    for (const Step& step : active) {
+         status.button |= static_cast<u16>(step.hold);
+         // Bits 16-19 push the C-stick right, left, up or down (menus open player data with it).
+         if (step.hold & 0x10000) status.substickX = 127;
 diff --git a/runtime/src/hle/mlb/season_probe.cpp b/runtime/src/hle/mlb/season_probe.cpp
 new file mode 100644
-index 0000000..0c83b2f
+index 0000000..540277f
 --- /dev/null
 +++ b/runtime/src/hle/mlb/season_probe.cpp
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,80 @@
 +#include "season_probe.h"
 +#include "memory.h"
++#include <chrono>
 +#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <sstream>
 +
 +namespace season_probe {
 +
@@ -74,6 +164,54 @@ index 0000000..0c83b2f
 +        last = index;
 +    }
 +#endif
++}
++
++static const char* LivePath() {
++    static const char* path = std::getenv("WIICOMPILED_PAD_LIVE");
++    return path && *path ? path : nullptr;
++}
++
++bool LiveEnabled() { return LivePath() != nullptr; }
++
++static void Dump(const std::filesystem::path& base, uint32_t address, uint32_t size, const char* ext) {
++    if (!Memory::Contains(address, size)) return;
++    std::filesystem::path file = base;
++    file += ext;
++    std::ofstream(file, std::ios::binary).write(reinterpret_cast<const char*>(Memory::GetPointer(address, size)), size);
++}
++
++uint32_t LiveButtons() {
++    if (!LiveEnabled()) return 0;
++    using Clock = std::chrono::steady_clock;
++    static Clock::time_point holdUntil{};
++    static uint32_t held = 0;
++    const std::filesystem::path file = std::filesystem::u8path(LivePath());
++    std::error_code ec;
++    if (Clock::now() >= holdUntil && std::filesystem::exists(file, ec)) {
++        held = 0;
++        std::stringstream text;
++        text << std::ifstream(file).rdbuf();
++        if (const auto command = ParseLiveCommand(text.str())) {
++            if (command->kind == LiveCommand::Pad) {
++                held = command->buttons;
++                holdUntil = Clock::now() + std::chrono::milliseconds(command->ms);
++            } else if (command->kind == LiveCommand::Poke) {
++                for (size_t i = 0; i < command->bytes.size(); ++i)
++                    Memory::Write8(command->address + static_cast<uint32_t>(i), command->bytes[i]);
++            } else {
++                // Guest RAM in its own big-endian layout, read inside PADRead while the game waits on it.
++                const std::filesystem::path base = file.parent_path() / command->name;
++                Dump(base, 0x80000000u, 0x01800000u, ".mem1");
++                Dump(base, 0x90000000u, 0x04000000u, ".mem2");
++            }
++            std::fprintf(stderr, "[season] live: %s\n", text.str().c_str());
++        } else {
++            std::fprintf(stderr, "[season] live: bad command '%s'\n", text.str().c_str());
++        }
++        std::filesystem::remove(file, ec);
++    }
++    if (Clock::now() >= holdUntil) held = 0;
++    return held;
 +}
 +
 +}  // namespace season_probe
@@ -99,10 +237,10 @@ index 760ea75..d4d9ea6 100644
      // its "communications interrupted" prompt without polling pads). Same guest
 diff --git a/runtime/tests/season_probe_tests.cpp b/runtime/tests/season_probe_tests.cpp
 new file mode 100644
-index 0000000..ff209c0
+index 0000000..a4f51f5
 --- /dev/null
 +++ b/runtime/tests/season_probe_tests.cpp
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,41 @@
 +#include "season_probe.h"
 +#include <cstdio>
 +
@@ -124,6 +262,23 @@ index 0000000..ff209c0
 +    Check(!ParseSeasonIndex("3x"), "3x");
 +    Check(!ParseSeasonIndex(""), "empty");
 +    Check(!ParseSeasonIndex(nullptr), "null");
++    using season_probe::LiveCommand;
++    using season_probe::ParseLiveCommand;
++    auto pad = ParseLiveCommand("pad 100 150");
++    Check(pad && pad->kind == LiveCommand::Pad && pad->buttons == 0x100 && pad->ms == 150, "pad A for 150 ms");
++    auto stick = ParseLiveCommand("pad 80000 200\n");
++    Check(stick && stick->buttons == 0x80000 && stick->ms == 200, "pad C-stick down, trailing newline");
++    auto dump = ParseLiveCommand("dump day0");
++    Check(dump && dump->kind == LiveCommand::Dump && dump->name == "day0", "dump day0");
++    Check(!ParseLiveCommand("dump ../x"), "dump name with a path is refused");
++    Check(!ParseLiveCommand("dump "), "dump without a name");
++    Check(!ParseLiveCommand("pad zz 10"), "pad with bad buttons");
++    Check(!ParseLiveCommand("jump 1"), "unknown command");
++    auto poke = ParseLiveCommand("poke 90DC4FFC 01210120");
++    Check(poke && poke->kind == LiveCommand::Poke && poke->address == 0x90DC4FFCu && poke->bytes.size() == 4 &&
++              poke->bytes[0] == 0x01 && poke->bytes[3] == 0x20, "poke four bytes");
++    Check(!ParseLiveCommand("poke 90DC4FFC 012"), "poke with an odd number of digits");
++    Check(!ParseLiveCommand("poke 90DC4FFC"), "poke without bytes");
 +    if (failures == 0) std::puts("season_probe_tests: OK");
 +    return failures != 0;
 +}
