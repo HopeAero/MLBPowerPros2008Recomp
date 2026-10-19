@@ -1,6 +1,8 @@
 # Estadios desde cero en Blender — diseño (fase 3)
 
-Fecha: 19 de octubre de 2026. Estado: borrador para aprobar.
+*English version: [../../en/superpowers/specs/2026-10-19-stadium-from-scratch-blender-design.md](../../en/superpowers/specs/2026-10-19-stadium-from-scratch-blender-design.md)*
+
+Fecha: 19 de octubre de 2026. Estado: aprobado por el usuario el 19 de octubre de 2026 («adelante»).
 
 ## Por qué
 
