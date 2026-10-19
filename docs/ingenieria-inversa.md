@@ -517,6 +517,23 @@ Verificado (14 de octubre de 2026):
 - **Una textura con paleta de otra pieza:** reutilizarla en una pieza distinta (tablas de textura y paleta ampliadas) la dibujó negra. Convertida a RGB5A3 se ve.
 - **Orden de las piezas:** reconstruir el árbol A como una sola hoja en el orden de la tabla no cambió nada visible.
 
+**Inventario de campos para escribir packs desde cero** (18 de octubre de 2026; recorrido de los 43 packs gráficos y 40 tablas por campo de 2 o 4 bytes):
+- **Modelo `PJ7M`:** todo lo que varía es puntero, contador o tamaño, que se calcula al escribir, salvo:
+  - la segunda lista de la escena `{1, → ?}`: apunta a un bloque de `0x20` bytes cuyo primer campo apunta 4 bytes antes de sí mismo, casi siempre ceros, que en su `+0x1C` suele llevar `0x98000400`, el comienzo de una display list; sin descifrar;
+  - el material: `+0x00` vale 3 (11.239) o 4 (6); los tres colores RGBA8 de `+0x04` casi siempre son `000000FF`, `CCCCCCFF`/`FFFFFFFF` y `000000FF` (sin efecto visible comprobado); `+0x32` vale 1 (7.567) o 0 (3.678), sin descifrar;
+  - el texmap: además del índice, el tamaño y las repeticiones, todo constante;
+  - la cabecera de textura: `+0x06` vale `0x2000` en C4, `0x0000` en C8/RGBA8 y `0x6000` en RGB5A3.
+- **El código del juego no busca piezas por nombre:** ni `main.dol` ni `ovl_main.rel` contienen `DP_`, `Audience`, `FLG` o `auroravision`. El papel de cada pieza lo dan los **flags de colocación**.
+- **Flags de colocación según la pieza** (por los nombres de los modelos que los llevan; hipótesis por comprobar en el juego):
+  - **byte `0x0000FF00`, tipo de pieza:** `0x01` marcador, `0x02` pantalla (`auroravision`), `0x04` montículo y líneas (`BCL`), `0x05` banderas (sin prueba de profundidad), `0x06` sombras, `0x08` luces (`lumine`), `0x09` focos encendidos, `0x0A` parasoles de focos, `0x11` vallas, `0x12` red de detrás del plato, `0x15` público C, `0x16` público F (tumbado), `0x17` público S (vertical), `0x18` fuentes, `0x19` césped `MIP`, `0x1A` césped con alfa; `0x00` gradas y resto;
+  - **byte `0x00FF0000`, cómo se dibuja:** `0x06` con alfa (`ALP`), `0x0A`/`0x0F` aditivo (`ADD`), `0x81`/`0x87`/`0x90`/`0x93` suelo, `0x20` `LOF`;
+  - **bits altos:** `0x40000000` gradas altas detrás del plato (`2F`), `0x20000000` `EVC`, `0x80000000` `NOUPCAM`; `0x04000000`/`0x08000000` acompañan al suelo y al césped.
+- **Bloques de la tabla sin descifrar** (Coors Field):
+  - `unk_20`: registros de `0x20` bytes {2.0, 0.0, punto A xyz, punto B xyz}, con los puntos a unos 50 m de altura: parecen torres de luz y hacia dónde apuntan;
+  - `unk_24`: dos listas de 7 registros de `0x1C` bytes {posición xyz, escala xyz = 1, ángulo}, a 24 m a cada lado del plato y 0,64 m bajo el suelo: parecen los asientos de los banquillos;
+  - `textures` (puntero 10): entradas de `0x10` bytes {→ cabecera de textura, → paleta, u32, u32}, con los dos u32 como direcciones de TMEM (texturas precargadas);
+  - `unk_2c`: {u32 8, índices 0 a 7} seguido de la lista de texturas.
+
 **Lista de estadios del juego** (14 de octubre de 2026, por los datos del REL; para añadir estadios):
 - **Números de archivo:** el juego no guarda nombres de archivo. Pide las entradas de `project.bin` por número de registro: Coors Field = 75, su tabla = 76. Hay 4.681 registros, de los que 2.424 tienen nombre: quedan 2.256 libres para archivos nuevos.
 - **Tabla de estadios:** `ovl_main.rel` `+0x92A450` (en memoria `0x80E9F9D0`, sección 5). Son 40 entradas de 12 bytes: {u32 número del pack gráfico, u32 número del `tbl`, puntero a la raíz del `tbl` (`0x40000000 | posición`)}.

@@ -516,6 +516,23 @@ Verified (October 14, 2026):
 - **A texture with a palette from another piece:** reusing it in a different piece (enlarged texture and palette tables) drew it black. Converted to RGB5A3 it shows.
 - **Piece order:** rebuilding tree A as a single leaf in table order changed nothing visible.
 
+**Field inventory for writing packs from scratch** (18 October 2026; a survey of the 43 graphics packs and 40 tables, field by field in 2- or 4-byte steps):
+- **`PJ7M` model:** everything that varies is a pointer, count or size, worked out when writing, except:
+  - the scene's second list `{1, → ?}`: it points to a `0x20`-byte block whose first field points 4 bytes before itself, almost all zeros, usually with `0x98000400` at `+0x1C`, the start of a display list; not decoded;
+  - the material: `+0x00` is 3 (11,239) or 4 (6); the three RGBA8 colours at `+0x04` are almost always `000000FF`, `CCCCCCFF`/`FFFFFFFF` and `000000FF` (no visible effect seen); `+0x32` is 1 (7,567) or 0 (3,678), not decoded;
+  - the texmap: besides index, size and repeats, all constant;
+  - the texture header: `+0x06` is `0x2000` for C4, `0x0000` for C8/RGBA8 and `0x6000` for RGB5A3.
+- **The game's code does not look pieces up by name:** neither `main.dol` nor `ovl_main.rel` contains `DP_`, `Audience`, `FLG` or `auroravision`. Each piece's role comes from the **placement flags**.
+- **Placement flags by piece** (from the names of the models carrying them; hypotheses to check in the game):
+  - **byte `0x0000FF00`, piece type:** `0x01` scoreboard, `0x02` video board (`auroravision`), `0x04` mound and lines (`BCL`), `0x05` flags (no depth test), `0x06` shadows, `0x08` lights (`lumine`), `0x09` lit floodlights, `0x0A` floodlight parasols, `0x11` fences, `0x12` backstop net, `0x15` crowd C, `0x16` crowd F (lying), `0x17` crowd S (upright), `0x18` fountains, `0x19` `MIP` turf, `0x1A` turf with alpha; `0x00` stands and the rest;
+  - **byte `0x00FF0000`, how it is drawn:** `0x06` alpha (`ALP`), `0x0A`/`0x0F` additive (`ADD`), `0x81`/`0x87`/`0x90`/`0x93` ground, `0x20` `LOF`;
+  - **high bits:** `0x40000000` upper decks behind home (`2F`), `0x20000000` `EVC`, `0x80000000` `NOUPCAM`; `0x04000000`/`0x08000000` go with ground and turf.
+- **Undecoded table blocks** (Coors Field):
+  - `unk_20`: `0x20`-byte records {2.0, 0.0, point A xyz, point B xyz}, with the points about 50 m up: they look like light towers and where they aim;
+  - `unk_24`: two lists of 7 `0x1C`-byte records {position xyz, scale xyz = 1, angle}, 24 m to each side of home and 0.64 m below ground: they look like the dugout seats;
+  - `textures` (pointer 10): `0x10`-byte entries {→ texture header, → palette, u32, u32}, the two u32 being TMEM addresses (preloaded textures);
+  - `unk_2c`: {u32 8, indices 0 to 7} followed by the texture list.
+
 **Game stadium list** (October 14, 2026, from the REL data; for adding stadiums):
 - **File numbers:** the game does not store file names. It requests `project.bin` entries by record number: Coors Field = 75, its table = 76. There are 4,681 records, of which 2,424 have a name: 2,256 remain free for new files.
 - **Stadium table:** `ovl_main.rel` `+0x92A450` (in memory `0x80E9F9D0`, section 5). It has 40 entries of 12 bytes: {u32 graphics pack number, u32 `tbl` number, pointer to the `tbl` root (`0x40000000 | position`)}.
