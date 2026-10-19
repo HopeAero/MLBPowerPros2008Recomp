@@ -386,7 +386,26 @@ def test_rebuild_tool(archive):
         check(ok, f"stadium_rebuild.py {' '.join(flag) or '(rebuild)'}: {folder} with {code} ({run.stderr.strip()[-200:]})")
 
 
-SYNTHETIC = [test_graphics_synthetic, test_table_synthetic, test_table_empty_blocks, test_table_many_placements,
+# ---- Task 5: minimal stadium ---------------------------------------------------------------------
+
+def test_minimal_stadium():
+    import stadium_re
+    from stadium_minimal import minimal_stadium
+    from powerpros_stadium.stadium_read import read_stadium
+    from powerpros_stadium.stadium_write import write_stadium
+    st = minimal_stadium()
+    gfx, tbl = write_stadium(st)
+    back = read_stadium(gfx, tbl)
+    check(back == st, "minimal stadium reads back the same" + ("" if back == st else f": {first_difference(st, back)}"))
+    problems = []
+    models, _ = stadium_re.load("minimo", gfx, tbl, problems)
+    for m in models:
+        stadium_re.check_model(gfx, m, problems)
+    check(not problems, f"minimal stadium passes stadium_re {problems[:3]}")
+    check(len(gfx) < 1 << 20, f"minimal graphics pack under 1 MB ({len(gfx)} bytes)")
+
+
+SYNTHETIC = [test_minimal_stadium, test_graphics_synthetic, test_table_synthetic, test_table_empty_blocks, test_table_many_placements,
              test_write_limits]
 GAME = [test_reader_known_values, test_reader_covers_every_byte, test_graphics_bytes_match_game,
         test_table_bytes_match_game, test_round_trip_all, test_writer_uses_only_the_description, test_rebuild_tool]
