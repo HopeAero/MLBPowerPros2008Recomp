@@ -885,6 +885,12 @@ Fuentes: `wiicompiled-mlb-pad-stick-range.patch`, `config/wiicompiled/rl8e54-dat
   - ioctlv 27 `ES_DIGetTicketView`: `0xD8` bytes. `+0x0C` ID de consola, `+0x10`/`+0x14` ID de título, `+0x18` máscara de acceso `0xFFFF`.
 - **SYSCONF:** sección 2.
 
+- **Año de la temporada** (19 de octubre de 2026, por el código traducido; sin probar en el juego):
+  - El año es **2008 + un byte con signo** en `[[0x8104B5A8] + 8]`. `0x80B74BCC` lo lee, `0x80B4A888` devuelve el año (2008 + índice), `0x80B74BA4` lo fija y `0x80B74BB4` le suma 1. Este último solo aparece metido dentro de `0x80B4E564`, que es el paso a la temporada siguiente.
+  - El tope de 10 temporadas son comparaciones del índice con 9 (la última, 2017) o con 10: en `0x80BB4A40` (si es 9, un mensaje con id 141), `0x80BF24B4` (con menos de 9 llama a `0x80BF619C`), dos en `0x80BF4BD4` (mensaje 140) y `0x80C0CB54` (menos de 10).
+  - **Datos por temporada:** `[0x8104B5C4]` apunta a una tabla de **428 bytes por año**; el registro de un equipo está en año × 428 + equipo × 8 + 160 (`0x80A496C0`, `0x80A49810`). Con 10 años serían 4.280 bytes. Otros usos del índice: (año + 1) × 10 + 390 en `0x80B3C99C` y (año + 1) × 3 en `0x80BF54BC`.
+  - Todos esos punteros salen de un mismo bloque grande en `0x80A556E0`: estado de la temporada en +`0x47DEC`, tabla por año en +`0xEEBAC`. La partida `pm3usma.dat` mide 868.352 bytes (`0xD4000`).
+  - Para pasar de 10 temporadas no basta con quitar las comparaciones: la tabla por año, y quizá otros datos por año, tienen sitio para 10.
 Fuentes: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_status.cpp`, `docs/mods.md`.
 
 ## 11. Bibliotecas y funciones identificadas

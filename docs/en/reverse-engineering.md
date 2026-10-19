@@ -884,6 +884,12 @@ Sources: `wiicompiled-mlb-pad-stick-range.patch`, `config/wiicompiled/rl8e54-dat
   - ioctlv 27 `ES_DIGetTicketView`: `0xD8` bytes. `+0x0C` console ID, `+0x10`/`+0x14` title ID, `+0x18` access mask `0xFFFF`.
 - **SYSCONF:** section 2.
 
+- **Season year** (October 19, 2026, from the translated code; not tested in the game):
+  - The year is **2008 + a signed byte** at `[[0x8104B5A8] + 8]`. `0x80B74BCC` reads it, `0x80B4A888` returns the year (2008 + index), `0x80B74BA4` sets it and `0x80B74BB4` adds 1. The last one only shows up inlined in `0x80B4E564`, the step to the next season.
+  - The 10-season cap is comparisons of the index with 9 (the last one, 2017) or with 10: in `0x80BB4A40` (at 9, a message with id 141), `0x80BF24B4` (under 9 it calls `0x80BF619C`), two in `0x80BF4BD4` (message 140) and `0x80C0CB54` (under 10).
+  - **Per-season data:** `[0x8104B5C4]` points to a table of **428 bytes per year**; a team's record is at year × 428 + team × 8 + 160 (`0x80A496C0`, `0x80A49810`). With 10 years that is 4,280 bytes. Other uses of the index: (year + 1) × 10 + 390 in `0x80B3C99C` and (year + 1) × 3 in `0x80BF54BC`.
+  - All those pointers come from one large block in `0x80A556E0`: season state at +`0x47DEC`, per-year table at +`0xEEBAC`. The `pm3usma.dat` save is 868,352 bytes (`0xD4000`).
+  - Going past 10 seasons is not just removing the comparisons: the per-year table, and maybe other per-year data, has room for 10.
 Sources: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_status.cpp`, `docs/en/mods.md`.
 
 ## 11. Identified libraries and functions
