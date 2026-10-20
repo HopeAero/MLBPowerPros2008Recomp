@@ -54,10 +54,10 @@ index 4cda53f..a74152c 100644
  }
 diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
 new file mode 100644
-index 0000000..1378e48
+index 0000000..99b33af
 --- /dev/null
 +++ b/runtime/include/season_cap.h
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,241 @@
 +#pragma once
 +// Season mode past 10 seasons (launcher option GAME > SEASONS, [season] max_seasons = 10 | 20 | 0).
 +//
@@ -122,6 +122,14 @@ index 0000000..1378e48
 +    if (year < 0 || year >= kMaxSeasons) return YearWhere::Nowhere;
 +    return year < kOriginalSeasons ? YearWhere::Game : YearWhere::Store;
 +}
++// The luxury tax threshold of a year (0x80C4762C reads a table of 10 at 0x80D2F9B8, 2008..2017, and
++// whatever follows it after that). Later years go on by the table's last step.
++inline int32_t LuxuryThreshold(const int32_t table[kOriginalSeasons], int year) {
++    if (year < 0) year = 0;
++    if (year < kOriginalSeasons) return table[year];
++    const int32_t last = table[kOriginalSeasons - 1], step = last - table[kOriginalSeasons - 2];
++    return last + step * (year - (kOriginalSeasons - 1));
++}
 +inline bool ItemInRange(int item) { return item >= 0 && item < kFinanceItems; }
 +inline bool RecordInRange(int k) { return k >= 0 && k < kRecordsPerYear; }
 +
@@ -155,6 +163,11 @@ index 0000000..1378e48
 +    case 0x80B4B310u: case 0x80B4B644u: case 0x80B4B648u: case 0x80B4B7E8u: case 0x80B4B7ECu:
 +    case 0x80B4BF60u: case 0x80B4BF64u: case 0x80B4C0F8u: case 0x80B4C0FCu: case 0x80B4C8C0u:
 +    case 0x80B4C8C4u: case 0x80B4CA44u: case 0x80B4CA48u: case 0x80B4CBC8u: case 0x80B4CBCCu:
++    // the season of a date (0x80B4A7DC) + 8: event dates (0x80BAFB8C, 0x80BAFCC4, 0x80BAFE40, 0x80BAFFE8)
++    case 0x80BAFBACu: case 0x80BAFBF0u: case 0x80BAFC34u: case 0x80BAFD08u: case 0x80BAFD48u:
++    case 0x80BAFD74u: case 0x80BAFE6Cu: case 0x80BAFEACu: case 0x80BAFED8u: case 0x80BB0014u:
++    case 0x80BB0054u: case 0x80BB0080u:
++    case 0x80A3873Cu:  // the same in 0x80A38494 (its branch that reads 0x80B4A7DC)
 +        return true;
 +    default:
 +        return false;
@@ -288,14 +301,15 @@ index 0000000..1378e48
 +}  // namespace season_cap
 diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
 new file mode 100644
-index 0000000..a2b3a65
+index 0000000..d18cd29
 --- /dev/null
 +++ b/runtime/src/hle/mlb/season_cap.cpp
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,534 @@
 +// Season mode past 10 seasons: the cap, years 10..19 of the 10-year tables, and the moving window
 +// with no limit (season_cap.h).
 +#include "season_cap.h"
 +
++#include <algorithm>
 +#include <atomic>
 +#include <cstdio>
 +#include <mutex>
@@ -608,6 +622,25 @@ index 0000000..a2b3a65
 +    ctx->gpr[4] = state;
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80B74BB4, MLB_SeasonNext_80B74BB4, (CpuContext* ctx), (ctx));
++
++// 0x80C4762C (year): the luxury tax threshold, from the game's table of 10 (0x80D2F9B8). Called with
++// 0x80B4A7DC's season for today by the tax (0x80C4764C) and the screens that show it. Past 2017 the
++// original reads the next table (no tax, then tax on the whole payroll from 2021); with more seasons
++// the threshold goes on by the table's last step, counting the seasons that left the window.
++extern "C" void MLB_LuxuryThreshold_80C4762C(CpuContext* ctx) {
++    constexpr uint32_t kTable = 0x80D2F9B8u;
++    const int32_t year = std::max(static_cast<int32_t>(ctx->gpr[3]), 0);
++    ctx->gpr[4] = kTable;
++    ctx->gpr[0] = static_cast<uint32_t>(year) << 2;
++    if (Count() <= kOriginalSeasons) {
++        ctx->gpr[3] = Memory::Read32(kTable + ctx->gpr[0]);
++        return;
++    }
++    int32_t table[kOriginalSeasons];
++    for (int i = 0; i < kOriginalSeasons; ++i) table[i] = static_cast<int32_t>(Memory::Read32(kTable + i * 4u));
++    ctx->gpr[3] = static_cast<uint32_t>(LuxuryThreshold(table, year + static_cast<int>(YearOffset())));
++}
++PPC_NATIVE_OVERRIDE_VOID(80C4762C, MLB_LuxuryThreshold_80C4762C, (CpuContext* ctx), (ctx));
 +
 +// 0x80C0D614 (year, item): yearly summary.
 +extern "C" void MLB_FinanceAnnual_80C0D614(CpuContext* ctx) {
@@ -964,10 +997,10 @@ index ab135ed..749652e 100644
          _putenv("WIICOMPILED_MATCH_BENCH=");
 diff --git a/runtime/tests/season_cap_tests.cpp b/runtime/tests/season_cap_tests.cpp
 new file mode 100644
-index 0000000..0470e49
+index 0000000..650a431
 --- /dev/null
 +++ b/runtime/tests/season_cap_tests.cpp
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,143 @@
 +#include "season_cap.h"
 +#include <algorithm>
 +#include <cstdio>
@@ -1018,6 +1051,8 @@ index 0000000..0470e49
 +    Check(ImmediateFor(0x80B4A7A0u, 2007, kUnlimitedSeasons, 5) == 2012, "2007 + index too");
 +    Check(ImmediateFor(0x80B4AF20u, 28, kUnlimitedSeasons, 5) == 33, "the calendar clamp moves with the year");
 +    Check(ImmediateFor(0x80B4AF24u, 28, kUnlimitedSeasons, 0) == 28, "no offset: the original clamp");
++    Check(ImmediateFor(0x80BAFBF0u, 8, kUnlimitedSeasons, 2) == 10 && ImmediateFor(0x80A3873Cu, 8, kUnlimitedSeasons, 2) == 10,
++          "the event dates' 2-digit year (season of the date + 8) moves with the year");
 +    Check(ImmediateFor(0x80001000u, 9, 20, 5) == 9, "an address not in the lists keeps its immediate");
 +
 +    // Where a year's finances and records live: the game's 10 rows, our 10, or nowhere.
@@ -1090,6 +1125,12 @@ index 0000000..0470e49
 +    Check(dropped == std::vector<uint8_t>{1, 1} && rows == std::vector<uint8_t>({2, 2, 3, 3, 9, 9}), "shift with a fill");
 +    dropped = ShiftRows(rows.data(), 2, 3, nullptr);
 +    Check(dropped == std::vector<uint8_t>{2, 2} && rows == std::vector<uint8_t>({3, 3, 9, 9, 2, 2}), "shift as a rotation");
++
++    // The luxury tax threshold: the game's 10 (2008..2017), then its last step every year after.
++    const int32_t thresholds[10] = {155000, 162000, 170000, 178000, 186000, 194000, 202000, 210000, 218000, 226000};
++    Check(LuxuryThreshold(thresholds, -1) == 155000 && LuxuryThreshold(thresholds, 9) == 226000, "the game's years");
++    Check(LuxuryThreshold(thresholds, 10) == 234000 && LuxuryThreshold(thresholds, 21) == 322000,
++          "later years go on by the last step");
 +
 +    // The loaded file says which season and whether it ended (offsets in the file).
 +    std::vector<uint8_t> save(kSaveFileSize, 0);

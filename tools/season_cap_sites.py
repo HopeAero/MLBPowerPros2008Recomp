@@ -76,6 +76,36 @@ def year_sites_in(base: int, data: bytes, wanted: tuple[int, ...]) -> list[tuple
     return found
 
 
+# Calls that return the season index: 0x80B74BCC, and 0x80B4A7DC (the season of a date, index or index - 1).
+INDEX_CALLS = (GET_INDEX, 0x80B4A7DC)
+
+
+def index_year_sites_in(base: int, data: bytes) -> list[tuple[int, str, int]]:
+    """(address, "addi", imm) of each addi rD, r3, 8 / 2007 / 2008 within three instructions after a call
+    in INDEX_CALLS: a 2-digit or 4-digit year made from the index on the spot."""
+    words = struct.unpack(f">{len(data) // 4}I", data[:len(data) // 4 * 4])
+    found = []
+    for i, w in enumerate(words):
+        at = base + 4 * i
+        if w & 0xFC000003 != 0x48000001:
+            continue
+        disp = w & 0x03FFFFFC
+        if disp & 0x02000000:
+            disp -= 0x04000000
+        if (at + disp) & 0xFFFFFFFF not in INDEX_CALLS:
+            continue
+        for j in (1, 2, 3):
+            if i + j >= len(words):
+                break
+            nxt = words[i + j]
+            if nxt >> 26 == 14 and (nxt >> 16) & 31 == 3 and nxt & 0xFFFF in (8, 2007, 2008):
+                found.append((at + 4 * j, "addi", nxt & 0xFFFF))
+                break
+            if nxt >> 26 in (16, 18, 19) or (nxt >> 21) & 31 == 3:  # a branch, or r3 written
+                break
+    return found
+
+
 def function_end(start: int, starts: list[int]) -> int:
     return min(a for a in starts if a > start)
 
@@ -94,6 +124,9 @@ def main(argv):
                 end = function_end(start, starts)
                 for address, mnemonic, imm in year_sites_in(start, data[start - MEM1:end - MEM1], wanted):
                     print(f"0x{address:08X} {mnemonic} {imm}")
+        start, end = 0x80575580, 0x81000000
+        for address, mnemonic, imm in index_year_sites_in(start, data[start - MEM1:end - MEM1]):
+            print(f"0x{address:08X} {mnemonic} {imm}")
         return
     start, end = 0x80575580, 0x81000000  # ovl_main.rel text, loaded
     for address, mnemonic, imm in sites_in(start, data[start - MEM1:end - MEM1]):

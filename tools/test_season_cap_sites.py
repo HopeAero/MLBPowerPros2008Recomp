@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from season_cap_sites import GET_INDEX, sites_in, year_sites_in
+from season_cap_sites import GET_INDEX, index_year_sites_in, sites_in, year_sites_in
 
 failures = []
 
@@ -46,5 +46,17 @@ check(year_sites_in(*code(F, 0x38000000 | 2008, 0x2C000000 | 2008), wanted=(2007
 check(year_sites_in(*code(F, 0x3800001C, 0x2C03001C), wanted=(28,)) == [(F, "li", 28), (F + 4, "cmpwi", 28)],
       "li r0, 28; cmpwi r3, 28")
 check(year_sites_in(*code(F, 0x2C03001C), wanted=(2008,)) == [], "only the wanted immediates")
+
+# Inline years: a call that returns the season index (0x80B4A7DC, the season of a date, or 0x80B74BCC), then
+# addi rD, r3, 8 (the 2-digit year) or 2007 / 2008, within three instructions.
+S = 0x80BAFBE0
+check(index_year_sites_in(*code(S, bl(S, 0x80B4A7DC), 0x57800E38, 0x3BC30008)) == [(S + 8, "addi", 8)],
+      "bl 0x80B4A7DC; rlwinm; addi r30, r3, 8")
+check(index_year_sites_in(*code(S, bl(S, GET_INDEX), 0x38030000 | 2008)) == [(S + 4, "addi", 2008)],
+      "bl get-index; addi r0, r3, 2008")
+check(index_year_sites_in(*code(S, bl(S, 0x80B4A7DC), 0x3BC40008)) == [], "addi from another register")
+check(index_year_sites_in(*code(S, bl(S, 0x80B4A888), 0x3BC30008)) == [], "after another call")
+check(index_year_sites_in(*code(S, bl(S, 0x80B4A7DC), 0x60000000, 0x60000000, 0x60000000, 0x3BC30008)) == [],
+      "too far from the call")
 
 sys.exit(1 if failures else 0)

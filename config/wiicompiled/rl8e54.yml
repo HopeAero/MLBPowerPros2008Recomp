@@ -76,6 +76,20 @@ translation:
     - {address: 0x80B4CA48, expect: 28}
     - {address: 0x80B4CBC8, expect: 28}
     - {address: 0x80B4CBCC, expect: 28}
+    # The season of a date (0x80B4A7DC) + 8, the 2-digit year of event dates (tools/season_cap_sites.py --years).
+    - {address: 0x80BAFBAC, expect: 8}
+    - {address: 0x80BAFBF0, expect: 8}
+    - {address: 0x80BAFC34, expect: 8}
+    - {address: 0x80BAFD08, expect: 8}
+    - {address: 0x80BAFD48, expect: 8}
+    - {address: 0x80BAFD74, expect: 8}
+    - {address: 0x80BAFE6C, expect: 8}
+    - {address: 0x80BAFEAC, expect: 8}
+    - {address: 0x80BAFED8, expect: 8}
+    - {address: 0x80BB0014, expect: 8}
+    - {address: 0x80BB0054, expect: 8}
+    - {address: 0x80BB0080, expect: 8}
+    - {address: 0x80A3873C, expect: 8}    # the same in 0x80A38494
 
 runtime:
   # Rebound by tools/wiicompiled_rebind.py; unbound hooks are invisible here.

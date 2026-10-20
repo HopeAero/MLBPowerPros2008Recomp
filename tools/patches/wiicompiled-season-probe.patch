@@ -131,10 +131,10 @@ index 219c7c1..2e6251e 100644
          if (step.hold & 0x10000) status.substickX = 127;
 diff --git a/runtime/src/hle/mlb/season_probe.cpp b/runtime/src/hle/mlb/season_probe.cpp
 new file mode 100644
-index 0000000..540277f
+index 0000000..473febb
 --- /dev/null
 +++ b/runtime/src/hle/mlb/season_probe.cpp
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,86 @@
 +#include "season_probe.h"
 +#include "memory.h"
 +#include <chrono>
@@ -162,6 +162,12 @@ index 0000000..540277f
 +    if (log && index != last) {
 +        std::fprintf(stderr, "[season] index=%d year=%d state=0x%08X\n", index, 2008 + index, state);
 +        last = index;
++    }
++    static int lastDay = -1;
++    const int day = Memory::Read16(state + 4);
++    if (log && day != lastDay) {
++        std::fprintf(stderr, "[season] day=%d index=%d\n", day, index);
++        lastDay = day;
 +    }
 +#endif
 +}
