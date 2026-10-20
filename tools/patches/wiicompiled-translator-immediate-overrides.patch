@@ -31,10 +31,10 @@ index 67cb216..591085c 100644
          // matched save/restore pair inside the emitted body of a single-return
          // leaf, so a partial mod chunk that only carries one half of an ABI
 diff --git a/translator/src/Translator.Cli/TranslationProjectConfig.cs b/translator/src/Translator.Cli/TranslationProjectConfig.cs
-index 980c432..f630340 100644
+index 980c432..e22c71d 100644
 --- a/translator/src/Translator.Cli/TranslationProjectConfig.cs
 +++ b/translator/src/Translator.Cli/TranslationProjectConfig.cs
-@@ -95,10 +95,18 @@ internal sealed class TranslationProjectConfig
+@@ -95,10 +95,22 @@ internal sealed class TranslationProjectConfig
                  workspaceRoot,
                  Require(functionMapDto.Path, "translation.function_map.path"));
          }
@@ -42,6 +42,10 @@ index 980c432..f630340 100644
 +        foreach (var (item, index) in (dto.Translation?.ImmediateOverrides ?? []).Select((item, index) => (item, index)))
 +        {
 +            var address = ParseUInt32(item.Address, null, $"translation.immediate_overrides[{index}].address");
++            if (immediateOverrides.ContainsKey(address))
++            {
++                throw new InvalidDataException($"translation.immediate_overrides[{index}].address 0x{address:X8} is listed twice");
++            }
 +            immediateOverrides[address] = item.Expect
 +                ?? throw new InvalidDataException($"translation.immediate_overrides[{index}].expect is required");
 +        }
@@ -54,7 +58,7 @@ index 980c432..f630340 100644
  
          var abiDirectories = (dto.Runtime?.NativeAbiDirectories ?? [])
              .Select(pathValue => ResolvePath(workspaceRoot, pathValue))
-@@ -407,6 +415,15 @@ internal sealed class TranslationProjectConfig
+@@ -407,6 +419,15 @@ internal sealed class TranslationProjectConfig
          public List<string>? EntryPoints { get; init; }
          public FunctionMapDto? FunctionMap { get; init; }
          public bool? AllowUnsupportedInstructions { get; init; }
@@ -70,7 +74,7 @@ index 980c432..f630340 100644
      }
  
      private sealed class FunctionMapDto
-@@ -477,7 +494,8 @@ internal sealed record ProjectInputs(ProjectBinaryInput Dol, ProjectRelInput? Re
+@@ -477,7 +498,8 @@ internal sealed record ProjectInputs(ProjectBinaryInput Dol, ProjectRelInput? Re
  internal sealed record ProjectTranslation(
      IReadOnlyList<uint> EntryPoints,
      string? FunctionMapPath,

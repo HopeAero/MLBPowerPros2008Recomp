@@ -53,10 +53,10 @@ index 4cda53f..e0050cf 100644
  }
 diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
 new file mode 100644
-index 0000000..7502e0d
+index 0000000..1cba3f1
 --- /dev/null
 +++ b/runtime/include/season_cap.h
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,165 @@
 +#pragma once
 +// Season mode up to 20 seasons (launcher option GAME > SEASONS, [season] max_seasons = 10 | 20).
 +//
@@ -78,19 +78,42 @@ index 0000000..7502e0d
 +constexpr uint32_t kSaveFileSize = 0x120000;  // pm3usse<slot>.dat
 +constexpr int kFinanceItems = 11;             // 10 items and the balance, per year
 +
-+// Seasons for this run: 20 with the option, and also when the loaded save is already past season 10
-+// (the original would write past its 10-year finance table). Index 10 with the finished flag is the
-+// original game's own end state, which keeps the original behaviour under 10.
-+inline int CountFor(int configured, int loadedIndex, bool finishedFlag) {
-+    if (configured == kMaxSeasons || loadedIndex > kOriginalSeasons) return kMaxSeasons;
-+    if (loadedIndex == kOriginalSeasons && !finishedFlag) return kMaxSeasons;
-+    return kOriginalSeasons;
++// Seasons for this game, fixed when it starts or loads (never from the live index, which passes 10
++// on its way into the original ending): 20 with the option, or when the loaded save was played with
++// 20 (SaveIsExtended).
++inline int CountFor(int configured, bool extendedSave) {
++    return configured == kMaxSeasons || extendedSave ? kMaxSeasons : kOriginalSeasons;
 +}
 +
-+// The finished flag (bit 0x20 of [[0x8104B5A8] + 0x104], read by 0x80C0D438): set when the mode's
-+// ending plays, and a finished save replays the ending on load. An ending reached before this run's
-+// last season (the original's, after season 10, with 20 seasons now) no longer counts.
-+inline bool Finished(bool flag, int index, int count) { return flag && index >= count; }
++// A loaded save played past season 10 with 20: it carries our tail, or it is past index 10 (only
++// reachable with 20). Index 10 without the tail is the original game's own end state.
++inline bool SaveIsExtended(int loadedIndex, bool hasTail) { return hasTail || loadedIndex > kOriginalSeasons; }
++
++// The finished flag (bit 0x20 of [[0x8104B5A8] + 0x104]): set when the mode's ending plays, and a
++// finished save replays the ending on load. The natural end comes on 11/01 of the last season
++// (index count - 1), the forced one after the rollover (index count).
++inline bool Finished(bool flag, int index, int count) { return flag && index >= count - 1; }
++// With 20 seasons, an ending from an earlier cap (the original's after season 10) no longer counts.
++inline bool ClearStaleFinished(bool flag, int index, int count) {
++    return count == kMaxSeasons && flag && !Finished(flag, index, count);
++}
++
++// Where a finance year (season index) lives: the game's 10-year table, our store for years 10..19
++// with 20 seasons, or nowhere (no season, or past every table). With 10 seasons everything goes to
++// the original address, as the original game does, even past its table.
++enum class FinanceWhere { Game, Store, Nowhere };
++inline FinanceWhere FinanceSlot(int year, int count) {
++    if (count != kMaxSeasons) return FinanceWhere::Game;
++    if (year < 0 || year >= kMaxSeasons) return FinanceWhere::Nowhere;
++    return year < kOriginalSeasons ? FinanceWhere::Game : FinanceWhere::Store;
++}
++inline bool ItemInRange(int item) { return item >= 0 && item < kFinanceItems; }
++
++// Offsets in pm3usse<slot>.dat: the season index and the flags byte holding the finished bit.
++constexpr uint32_t kFileIndexOffset = 0x47E8C;  // [state + 8]
++constexpr uint32_t kFileFlagsOffset = 0x47F88;  // [state + 0x104]
++inline int FileIndex(const uint8_t* file) { return static_cast<int8_t>(file[kFileIndexOffset]); }
++inline bool FileFinishedFlag(const uint8_t* file) { return (file[kFileFlagsOffset] & 0x20) != 0; }
 +
 +// The cap compares, by instruction address: 9 means "last season", 10 "number of seasons".
 +inline bool IsCapCompare(uint32_t address) {
@@ -201,10 +224,10 @@ index 0000000..7502e0d
 +}  // namespace season_cap
 diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
 new file mode 100644
-index 0000000..5d88e96
+index 0000000..6043af9
 --- /dev/null
 +++ b/runtime/src/hle/mlb/season_cap.cpp
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,244 @@
 +// Season mode up to 20 seasons: the cap and the finances of years 10..19 (season_cap.h).
 +#include "season_cap.h"
 +
@@ -220,8 +243,18 @@ index 0000000..5d88e96
 +namespace {
 +
 +FinanceStore g_store;
++// The loaded save was played past season 10 with 20 seasons (SaveIsExtended); a new game clears it.
++std::atomic<bool> g_extendedSave{false};
++// The index of the last loaded save, and whether it has reached memory yet (so the previous game's
++// index, still in memory while the load runs, is not taken for a new game).
++std::atomic<int> g_loadedIndex{-1};
++std::atomic<bool> g_loadedInMemory{false};
++// After a season save is read: the loaded index whose stale ending flag has to go once the save is
++// in memory (-1: nothing to do), and how many frames to wait for it.
++std::atomic<int> g_pendingClearIndex{-1};
++int g_pendingFrames = 0;
 +
-+// [[0x8104B5A8] + 8]: the season index, or -1 outside Season mode.
++// [[0x8104B5A8] + 8]: the season index, or -1 when there is no state.
 +int CurrentIndex() {
 +    const uint32_t state = Memory::Read32(0x8104B5A8u);
 +    if (!state || !Memory::Contains(state, 16)) return -1;
@@ -235,9 +268,12 @@ index 0000000..5d88e96
 +    return (Memory::Read8(state + 0x104) & 0x20) != 0;
 +}
 +
-+uint32_t Call(CpuContext* ctx, uint32_t returnAddress, void (*invoke)(CpuContext*)) {
-+    ctx->lr = returnAddress;
++// Calls a game function from a native; the caller's lr is kept, as the original's prologue does.
++uint32_t Call(CpuContext* ctx, uint32_t target, void (*invoke)(CpuContext*)) {
++    const uint32_t lr = ctx->lr;
++    ctx->lr = target;
 +    invoke(ctx);
++    ctx->lr = lr;
 +    return ctx->gpr[3];
 +}
 +
@@ -249,26 +285,36 @@ index 0000000..5d88e96
 +    return static_cast<int>(Call(ctx, 0x80B4AA38u, InvokeDirectCpu<0x80B4AA38u>));
 +}
 +
-+// Yearly summary of year (0..19), item 0..10: game memory below 10, the store above.
-+int32_t ReadAnnual(uint32_t q, int year, int item) {
-+    if (year >= kOriginalSeasons && year < kMaxSeasons) return g_store.annual[year - kOriginalSeasons][item];
-+    return static_cast<int32_t>(Memory::Read32(q + 44 + static_cast<uint32_t>(year) * 44 + static_cast<uint32_t>(item) * 4));
-+}
-+void WriteAnnual(uint32_t q, int year, int item, int32_t value) {
-+    if (year >= kOriginalSeasons && year < kMaxSeasons) {
-+        g_store.annual[year - kOriginalSeasons][item] = value;
-+        return;
-+    }
-+    Memory::Write32(q + 44 + static_cast<uint32_t>(year) * 44 + static_cast<uint32_t>(item) * 4, static_cast<uint32_t>(value));
++uint32_t AnnualAddress(uint32_t q, int year, int item) {
++    return q + 44 + static_cast<uint32_t>(year) * 44 + static_cast<uint32_t>(item) * 4;
 +}
 +uint32_t MonthlyAddress(uint32_t q, int month, int item) {
 +    return q + 484 + static_cast<uint32_t>(month - 1) * 44 + static_cast<uint32_t>(item) * 4;
 +}
 +
++// Yearly summary of a year, item 0..10, wherever FinanceSlot puts it.
++uint32_t ReadAnnual(uint32_t q, int year, int item, int count) {
++    switch (FinanceSlot(year, count)) {
++    case FinanceWhere::Game: return Memory::Read32(AnnualAddress(q, year, item));
++    case FinanceWhere::Store:
++        return ItemInRange(item) ? static_cast<uint32_t>(g_store.annual[year - kOriginalSeasons][item]) : 0;
++    default: return 0;
++    }
++}
++void WriteAnnual(uint32_t q, int year, int item, uint32_t value, int count) {
++    switch (FinanceSlot(year, count)) {
++    case FinanceWhere::Game: Memory::Write32(AnnualAddress(q, year, item), value); break;
++    case FinanceWhere::Store:
++        if (ItemInRange(item)) g_store.annual[year - kOriginalSeasons][item] = static_cast<int32_t>(value);
++        break;
++    default: break;  // no season or past every table: dropped
++    }
++}
++
 +}  // namespace
 +
 +int Count() {
-+    const int count = CountFor(static_cast<int>(RuntimeConfigFile::MaxSeasons(10)), CurrentIndex(), FinishedFlag());
++    const int count = CountFor(static_cast<int>(RuntimeConfigFile::MaxSeasons(10)), g_extendedSave.load());
 +    static std::atomic<int> logged{0};
 +    if (logged.exchange(count) != count) std::fprintf(stderr, "[season] %d seasons\n", count);
 +    return count;
@@ -277,30 +323,62 @@ index 0000000..5d88e96
 +FinanceStore& Store() { return g_store; }
 +
 +void OnHostFrame() {
++    // Only reads, except right after a season save was read (OnSeasonSaveRead set a pending index).
++    const int index = CurrentIndex();
++    if (!g_loadedInMemory.load() && index == g_loadedIndex.load()) g_loadedInMemory.store(true);
++    if (g_extendedSave.load() && g_loadedInMemory.load() && index >= 0 && index < kOriginalSeasons) {
++        g_extendedSave.store(false);  // a new game is running now
++        g_store = {};
++    }
++    const int pending = g_pendingClearIndex.load();
++    if (pending < 0) return;
++    if (++g_pendingFrames > 600) {  // ten seconds without the save showing up in memory: give up
++        g_pendingClearIndex.store(-1);
++        return;
++    }
++    if (index != pending || !FinishedFlag()) return;
 +    // A save the original game finished after season 10 replays its ending on load; with more seasons
-+    // the flag is cleared as soon as the save is in memory, before the menu reads it. The game's own
-+    // checksum covers it on the next save. (The load-time check does not go through 0x80C0D438.)
++    // the flag goes as soon as the save is in memory, before the menu reads it. The game's checksum
++    // covers it on the next save. (The load-time check does not go through 0x80C0D438.)
 +    const uint32_t state = Memory::Read32(0x8104B5A8u);
-+    if (!state || !Memory::Contains(state, 0x108)) return;
-+    if (!FinishedFlag() || Finished(true, CurrentIndex(), Count())) return;
 +    Memory::Write8(state + 0x104, static_cast<uint8_t>(Memory::Read8(state + 0x104) & ~0x20));
-+    std::fprintf(stderr, "[season] season %d: the ending flag of a shorter game cleared\n", CurrentIndex() + 1);
++    g_pendingClearIndex.store(-1);
++    std::fprintf(stderr, "[season] season %d: the ending flag of a shorter game cleared\n", index + 1);
 +}
 +
 +void OnSeasonSaveRead(uint32_t fileOffset, const uint8_t* data, size_t length) {
-+    // The slot list reads only the header; a load reads the whole file, in chunks.
++    // The slot list reads only the header; a load reads the whole file, in chunks, in order.
 +    static TailReader reader;
-+    FinanceStore loaded;
++    static int fileIndex = -1;
++    static bool fileFinished = false;
++    if (fileOffset == 0) {
++        reader = {};
++        fileIndex = -1;
++        fileFinished = false;
++    }
++    if (fileOffset <= kFileIndexOffset && kFileIndexOffset < fileOffset + length)
++        fileIndex = static_cast<int8_t>(data[kFileIndexOffset - fileOffset]);
++    if (fileOffset <= kFileFlagsOffset && kFileFlagsOffset < fileOffset + length)
++        fileFinished = (data[kFileFlagsOffset - fileOffset] & 0x20) != 0;
 +    const uint32_t tailEnd = kSaveDataSize + static_cast<uint32_t>(kTailBytes);
 +    if (fileOffset >= tailEnd || fileOffset + length <= kSaveDataSize) return;
++    FinanceStore loaded;
 +    const bool ours = reader.Feed(fileOffset, data, length, loaded);
-+    if (fileOffset + length < tailEnd) return;  // the tail is not complete yet
-+    g_store = loaded;                           // empty for a save without our tail
++    if (fileOffset + length < tailEnd) return;  // the tail is not complete yet: this is the end of a load
++    g_loadedInMemory.store(false);
++    g_loadedIndex.store(fileIndex);
++    g_extendedSave.store(SaveIsExtended(fileIndex, ours));
++    g_store = loaded;  // empty for a save without our tail
 +    if (ours) std::fprintf(stderr, "[season] finances of seasons 11-20 read from the save\n");
++    if (ClearStaleFinished(fileFinished, fileIndex, Count())) {
++        g_pendingFrames = 0;
++        g_pendingClearIndex.store(fileIndex);
++    }
 +}
 +
 +void OnSeasonSaveWrite(uint32_t fileOffset, uint8_t* data, size_t length) {
-+    if (CurrentIndex() < kOriginalSeasons) return;  // nothing stored: keep the original file byte for byte
++    // Only a game with 20 seasons past season 10 has stored years; anything else stays byte for byte.
++    if (Count() != kMaxSeasons || CurrentIndex() < kOriginalSeasons) return;
 +    OverlayTail(g_store, fileOffset, data, length);
 +    if (fileOffset + length >= kSaveDataSize + kTailBytes && fileOffset < kSaveDataSize + kTailBytes)
 +        std::fprintf(stderr, "[season] finances of seasons 11-20 written to the save\n");
@@ -318,10 +396,11 @@ index 0000000..5d88e96
 +extern "C" void MLB_SeasonCount_80C06534(CpuContext* ctx) { ctx->gpr[3] = static_cast<uint32_t>(Count()); }
 +PPC_NATIVE_OVERRIDE_VOID(80C06534, MLB_SeasonCount_80C06534, (CpuContext* ctx), (ctx));
 +
-+// 0x80C0D438: has Season mode ended (bit 0x20 of [state + 0x104])? Not when the ending came before
-+// this run's last season, so a save the original finished after season 10 goes on to 2018.
++// 0x80C0D438: has Season mode ended (bit 0x20 of [state + 0x104])? Not for an ending that came before
++// this game's last season.
 +extern "C" void MLB_SeasonFinished_80C0D438(CpuContext* ctx) {
-+    ctx->gpr[3] = Finished(FinishedFlag(), CurrentIndex(), Count()) ? 1u : 0u;
++    const bool flag = FinishedFlag();
++    ctx->gpr[3] = flag && !ClearStaleFinished(flag, CurrentIndex(), Count()) ? 1u : 0u;  // 10 seasons: the raw flag
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80C0D438, MLB_SeasonFinished_80C0D438, (CpuContext* ctx), (ctx));
 +
@@ -330,7 +409,7 @@ index 0000000..5d88e96
 +    const int year = static_cast<int32_t>(ctx->gpr[3]);
 +    const int item = static_cast<int32_t>(ctx->gpr[4]);
 +    const uint32_t q = FinanceBase(ctx);
-+    ctx->gpr[3] = static_cast<uint32_t>(ReadAnnual(q, year, item));
++    ctx->gpr[3] = ReadAnnual(q, year, item, Count());
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80C0D614, MLB_FinanceAnnual_80C0D614, (CpuContext* ctx), (ctx));
 +
@@ -342,25 +421,27 @@ index 0000000..5d88e96
 +    Memory::Write32(MonthlyAddress(q, month, 10), monthBalance);
 +    const uint32_t yearBalance = Balance(ctx);
 +    const int index = CurrentIndex();
-+    ClearAfter(g_store, index);  // a new game or an older save: no stored years past today
-+    WriteAnnual(FinanceBase(ctx), index, 10, static_cast<int32_t>(yearBalance));
++    const int count = Count();
++    if (count == kMaxSeasons) ClearAfter(g_store, index);  // an older save: no stored years past today
++    WriteAnnual(FinanceBase(ctx), index, 10, yearBalance, count);
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80C0D658, MLB_FinanceClose_80C0D658, (CpuContext* ctx), (ctx));
 +
 +// 0x80C0D6D0 / 0x80C0D758 (item, amount): add to this month and this year, move the balance
-+// (0x80C0E820 with -amount and +amount respectively), close.
++// (0x80C0E820 with -amount and +amount respectively), close. Sums wrap like the original's.
 +static void AddFinance(CpuContext* ctx, bool income) {
 +    const int item = static_cast<int32_t>(ctx->gpr[3]);
-+    const int32_t amount = static_cast<int32_t>(ctx->gpr[4]);
++    const uint32_t amount = ctx->gpr[4];
 +    const int month = Month(ctx);
 +    uint32_t q = FinanceBase(ctx);
 +    const uint32_t monthly = MonthlyAddress(q, month, item);
-+    Memory::Write32(monthly, Memory::Read32(monthly) + static_cast<uint32_t>(amount));
++    Memory::Write32(monthly, Memory::Read32(monthly) + amount);
 +    const int index = CurrentIndex();
++    const int count = Count();
 +    q = FinanceBase(ctx);
-+    WriteAnnual(q, index, item, ReadAnnual(q, index, item) + amount);
++    WriteAnnual(q, index, item, ReadAnnual(q, index, item, count) + amount, count);
 +    ctx->gpr[3] = FinanceBase(ctx);
-+    ctx->gpr[4] = static_cast<uint32_t>(income ? amount : -amount);
++    ctx->gpr[4] = income ? amount : 0u - amount;
 +    Call(ctx, 0x80C0E820u, InvokeDirectCpu<0x80C0E820u>);
 +    Call(ctx, 0x80C0D658u, InvokeDirectCpu<0x80C0D658u>);
 +}
@@ -374,16 +455,21 @@ index 0000000..5d88e96
 +    const int year = static_cast<int32_t>(ctx->gpr[3]);
 +    const uint32_t value = ctx->gpr[4];
 +    const uint32_t q = FinanceBase(ctx);
-+    if (year >= kOriginalSeasons && year < kMaxSeasons) g_store.yearly[year - kOriginalSeasons] = static_cast<int32_t>(value);
-+    else Memory::Write32(q + 4 + static_cast<uint32_t>(year) * 4, value);
++    switch (FinanceSlot(year, Count())) {
++    case FinanceWhere::Game: Memory::Write32(q + 4 + static_cast<uint32_t>(year) * 4, value); break;
++    case FinanceWhere::Store: g_store.yearly[year - kOriginalSeasons] = static_cast<int32_t>(value); break;
++    default: break;
++    }
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80C0D818, MLB_FinanceYearlySet_80C0D818, (CpuContext* ctx), (ctx));
 +extern "C" void MLB_FinanceYearlyGet_80C0D85C(CpuContext* ctx) {
 +    const int year = static_cast<int32_t>(ctx->gpr[3]);
 +    const uint32_t q = FinanceBase(ctx);
-+    ctx->gpr[3] = year >= kOriginalSeasons && year < kMaxSeasons
-+                      ? static_cast<uint32_t>(g_store.yearly[year - kOriginalSeasons])
-+                      : Memory::Read32(q + 4 + static_cast<uint32_t>(year) * 4);
++    switch (FinanceSlot(year, Count())) {
++    case FinanceWhere::Game: ctx->gpr[3] = Memory::Read32(q + 4 + static_cast<uint32_t>(year) * 4); break;
++    case FinanceWhere::Store: ctx->gpr[3] = static_cast<uint32_t>(g_store.yearly[year - kOriginalSeasons]); break;
++    default: ctx->gpr[3] = 0; break;
++    }
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80C0D85C, MLB_FinanceYearlyGet_80C0D85C, (CpuContext* ctx), (ctx));
 diff --git a/runtime/src/hle/storage/nand_isfs.cpp b/runtime/src/hle/storage/nand_isfs.cpp
@@ -506,13 +592,13 @@ index d4d9ea6..2498e69 100644
      // its "communications interrupted" prompt without polling pads). Same guest
 diff --git a/runtime/tests/season_cap_tests.cpp b/runtime/tests/season_cap_tests.cpp
 new file mode 100644
-index 0000000..d23243d
+index 0000000..e594af5
 --- /dev/null
 +++ b/runtime/tests/season_cap_tests.cpp
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,99 @@
 +#include "season_cap.h"
-+#include <cstdio>
 +#include <algorithm>
++#include <cstdio>
 +#include <vector>
 +
 +static int failures = 0;
@@ -525,28 +611,45 @@ index 0000000..d23243d
 +
 +int main() {
 +    using namespace season_cap;
-+    Check(CountFor(10, 3, false) == 10, "option 10, season 4: 10");
-+    Check(CountFor(20, 3, false) == 20, "option 20: 20");
-+    Check(CountFor(10, 12, false) == 20, "option 10 but the save is already past season 10: 20");
-+    Check(CountFor(15, 0, false) == 10, "anything but 20 is the original 10");
-+    Check(CountFor(10, 10, true) == 10, "option 10, the original game's finished save: stays finished");
-+    Check(CountFor(10, 10, false) == 20, "option 10, a 2018 season played with 20: 20");
++    // The count is fixed per game (option, or what the loaded save says), never from the live index.
++    Check(CountFor(10, false) == 10, "option 10, an original save: 10");
++    Check(CountFor(20, false) == 20, "option 20: 20");
++    Check(CountFor(10, true) == 20, "option 10 but the loaded save went past season 10 with 20: 20");
++    Check(CountFor(15, false) == 10, "anything but 20 is the original 10");
++    Check(SaveIsExtended(11, false), "a save at season 12 can only come from 20");
++    Check(SaveIsExtended(10, true), "our tail marks a save played with 20");
++    Check(!SaveIsExtended(10, false), "index 10 without our tail: the original's own end state");
++    Check(!SaveIsExtended(3, false), "an early save");
 +
-+    Check(Finished(true, 10, 20) == false, "finished after season 10, now 20 seasons: keep playing");
-+    Check(Finished(true, 10, 10) == true, "finished after season 10 with 10 seasons: the original ending");
-+    Check(Finished(true, 20, 20) == true, "finished after season 20");
-+    Check(Finished(false, 20, 20) == false, "not finished");
++    // The ending flag: the natural end is on 11/01 of the last season (index count - 1).
++    Check(Finished(true, 9, 10), "original: finished in season 10");
++    Check(Finished(true, 10, 10), "original: finished after the rollover");
++    Check(!Finished(true, 9, 20), "season 10 ending, now 20 seasons: not finished");
++    Check(Finished(true, 19, 20), "season 20 ending");
++    Check(!Finished(false, 19, 20), "no flag");
++    Check(ClearStaleFinished(true, 9, 20) && ClearStaleFinished(true, 10, 20), "20 seasons: an earlier ending is cleared");
++    Check(!ClearStaleFinished(true, 9, 10) && !ClearStaleFinished(true, 10, 10), "10 seasons: never cleared");
++    Check(!ClearStaleFinished(true, 19, 20), "the season-20 ending stays");
 +
 +    Check(ImmediateFor(0x80BB4A6Cu, 9, 20) == 19, "last-season compare follows the cap");
 +    Check(ImmediateFor(0x80C0CC0Cu, 10, 20) == 20, "season-count compare follows the cap");
 +    Check(ImmediateFor(0x80BB4A6Cu, 9, 10) == 9, "cap 10 keeps the original");
 +    Check(ImmediateFor(0x80001000u, 9, 20) == 9, "an address not in the list keeps its immediate");
 +
++    // Where a finance year lives.
++    Check(FinanceSlot(9, 20) == FinanceWhere::Game, "year 9: the game's table");
++    Check(FinanceSlot(10, 20) == FinanceWhere::Store, "year 10 with 20 seasons: the store");
++    Check(FinanceSlot(19, 20) == FinanceWhere::Store, "year 19 with 20 seasons: the store");
++    Check(FinanceSlot(20, 20) == FinanceWhere::Nowhere, "year 20: past every table, dropped");
++    Check(FinanceSlot(10, 10) == FinanceWhere::Game, "10 seasons: always the original address, even past the table");
++    Check(FinanceSlot(-1, 20) == FinanceWhere::Nowhere, "no season");
++    Check(ItemInRange(0) && ItemInRange(10) && !ItemInRange(11) && !ItemInRange(-1), "finance items 0..10");
++
 +    FinanceStore store;
 +    Check(store.annual[0][0] == 0 && store.yearly[9] == 0, "a new store is empty");
-+    store.annual[0][10] = 12345;   // year 10 (2018) closing balance
-+    store.annual[9][3] = -7;       // year 19, item 3
-+    store.yearly[4] = 99;          // year 14
++    store.annual[0][10] = 12345;
++    store.annual[9][3] = -7;
++    store.yearly[4] = 99;
 +    std::vector<uint8_t> file(kSaveFileSize, 0);
 +    WriteTail(store, file.data() + kSaveDataSize, kSaveFileSize - kSaveDataSize);
 +    FinanceStore back;
@@ -562,7 +665,6 @@ index 0000000..d23243d
 +    ClearAfter(keep, 0);
 +    Check(keep.annual[0][10] == 0, "a season at year 0 (new game) drops every stored year");
 +
-+    // The game writes and reads the file in chunks: the tail must survive any split.
 +    for (uint32_t chunk : {0x4000u, 0x1000u, 0x120000u, 0x777u}) {
 +        std::vector<uint8_t> out(kSaveFileSize, 0);
 +        for (uint32_t at = 0; at < kSaveFileSize; at += chunk) {
@@ -580,6 +682,13 @@ index 0000000..d23243d
 +        Check(std::all_of(out.begin(), out.begin() + kSaveDataSize, [](uint8_t b) { return b == 0; }),
 +              "the overlay never touches the game's data");
 +    }
++
++    // The loaded file says which season and whether it ended (offsets in the file).
++    std::vector<uint8_t> save(kSaveFileSize, 0);
++    save[kFileIndexOffset] = 11;
++    save[kFileFlagsOffset] = 0x23;
++    Check(FileIndex(save.data()) == 11 && FileFinishedFlag(save.data()), "index and ending flag from the file");
++
 +    Check(IsSeasonSaveName("pm3usse0.dat") && IsSeasonSaveName("pm3usse2.dat"), "season slots");
 +    Check(!IsSeasonSaveName("pm3usma.dat") && !IsSeasonSaveName("pm3usse3.dat") && !IsSeasonSaveName("pm3usse0.dat.tmp"),
 +          "main data, a fourth slot and a scratch file are not season saves");
