@@ -970,7 +970,7 @@ index 0932d99..f9c5f03 100644
  #include "nand_internal.h"
 @@ -479,6 +481,12 @@ extern "C" int32_t NAND_IOS_Close_HLE(uint32_t fd) {
  }
- PPC_NATIVE_OVERRIDE(800CCB94, NAND_IOS_Close_HLE, int32_t, (uint32_t fd), (fd));
+ PPC_NATIVE_OVERRIDE(80193AD8, NAND_IOS_Close_HLE, int32_t, (uint32_t fd), (fd));
  
 +// NANDSafeOpen writes into a scratch sibling; the name that counts is the file it replaces.
 +static bool IsSeasonSaveHandle(const FileHandle& handle) {
