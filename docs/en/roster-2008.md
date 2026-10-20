@@ -92,6 +92,8 @@ With this table 707 of the 729 common players match; without it, only 26. The re
 
 **Skin and eyes** (0x55.4, 4 bits): 2007 has 5 skin tones and adds 5 if the eyes are brown. 2008 added a tone at position 2 and adds 6. That's why 0–1 stay the same, 2–6 go up by 1 and 7–9 go up by 2. 695 of 729 match (272 without the table).
 
+**2008's skin tone in PowerUp+** (October 20, 2026, asked for by a player on Reddit): the editor offers it as **2.5 (2008)**, between 2 and 3. Inside PowerUp+ it is kept as 10 (blue eyes) or 11 (brown eyes), values the 2007 layout leaves free; a 2008 export writes 2 and 8. An export for 2007, which has no such tone, writes 2 instead. The 2008 roster has 27 players with it (1 with blue eyes, 26 with brown): they used to come in as tone 2 and now keep theirs. Checked by importing the `project.bin`, exporting the mod (the game's own values) and switching two players to the new tone (they come out as 2 and 8).
+
 **Review of the remaining fields:** all fields of the 729 players, already converted, were compared with the real 2008 roster. Only the face and skin/eyes had changed catalog numbers. Everything else that differs is new-season data:
 - ratings, stats, hairstyles;
 - 2008 marks most pitchers as "cautious" stealers.
