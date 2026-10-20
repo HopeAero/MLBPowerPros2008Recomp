@@ -1,0 +1,92 @@
+diff --git a/runtime/include/game_profile.h b/runtime/include/game_profile.h
+index 1fbe255..befef60 100644
+--- a/runtime/include/game_profile.h
++++ b/runtime/include/game_profile.h
+@@ -43,6 +43,12 @@ inline constexpr uint32_t kStmSdaOffset = 0x6DDCu;
+ inline constexpr uint32_t kOSLoadContextAddress = 0x8009CD58u;
+ // Mario Kart Wii native hooks are bound to MKW addresses; none apply here yet.
+ inline constexpr bool kMkwNatives = false;
++// setting.txt for a new NAND: Dolphin's NTSC-U defaults for a USA disc.
++inline constexpr const char* kSettingArea = "USA";
++inline constexpr const char* kSettingModel = "RVL-001(USA)";
++inline constexpr const char* kSettingCode = "LU";
++inline constexpr const char* kSettingVideo = "NTSC";
++inline constexpr const char* kSettingGame = "US";
+ #else
+ inline constexpr const char* kDefaultDiscordClientId = kWiiCompiledDiscordClientId;
+ inline constexpr uint32_t kEntryAddress = 0x800060A4u;
+@@ -57,6 +63,11 @@ inline constexpr uint32_t kIosVersion = 0x00240E18u;  // IOS36
+ inline constexpr uint32_t kStmSdaOffset = 0x62CCu;
+ inline constexpr uint32_t kOSLoadContextAddress = 0x801A1F58u;
+ inline constexpr bool kMkwNatives = true;
++inline constexpr const char* kSettingArea = "EUR";
++inline constexpr const char* kSettingModel = "RVL-001(EUR)";
++inline constexpr const char* kSettingCode = "LEH";
++inline constexpr const char* kSettingVideo = "PAL";
++inline constexpr const char* kSettingGame = "EU";
+ #endif
+ 
+ } // namespace GameProfile
+diff --git a/runtime/include/nand_settings.h b/runtime/include/nand_settings.h
+index 055f4c2..fb9b1c0 100644
+--- a/runtime/include/nand_settings.h
++++ b/runtime/include/nand_settings.h
+@@ -10,6 +10,8 @@
+ #include <map>
+ #include <optional>
+ #include <string>
++
++#include "game_profile.h"
+ #include <utility>
+ 
+ #ifdef _WIN32
+@@ -88,10 +90,11 @@ inline std::string GenerateSerial(std::time_t now) {
+     return std::string(9 - digits.size(), '0') + digits;
+ }
+ 
+-// This recompilation targets the European disc. These are Dolphin's PAL boot
+-// defaults; an existing setting.txt always takes precedence, in every region.
++// Dolphin's boot defaults for the game's region (GameProfile); an existing
++// setting.txt always takes precedence, in every region.
+ inline std::optional<std::array<uint8_t, 256>> EncodeNew(const std::string& serial) {
+-    const Settings identity{{"SERNO", serial}, {"CODE", "LEH"}, {"AREA", "EUR"}, {"GAME", "EU"}};
++    const Settings identity{{"SERNO", serial}, {"CODE", GameProfile::kSettingCode},
++                            {"AREA", GameProfile::kSettingArea}, {"GAME", GameProfile::kSettingGame}};
+     if (!HasIdentity(identity)) {
+         return std::nullopt;
+     }
+@@ -102,9 +105,11 @@ inline std::optional<std::array<uint8_t, 256>> EncodeNew(const std::string& seri
+         bytes[position++] = static_cast<uint8_t>(value) ^ static_cast<uint8_t>(key);
+         key = (key << 1) | (key >> 31);
+     };
+-    for (const std::string& line : {std::string("AREA=EUR\r\n"), std::string("MODEL=RVL-001(EUR)\r\n"),
+-             std::string("DVD=0\r\n"), std::string("MPCH=0x7FFE\r\n"), std::string("CODE=LEH\r\n"),
+-             "SERNO=" + serial + "\r\n", std::string("VIDEO=PAL\r\n"), std::string("GAME=EU\r\n")}) {
++    using std::string;
++    for (const string& line : {"AREA=" + string(GameProfile::kSettingArea) + "\r\n",
++             "MODEL=" + string(GameProfile::kSettingModel) + "\r\n", string("DVD=0\r\n"), string("MPCH=0x7FFE\r\n"),
++             "CODE=" + string(GameProfile::kSettingCode) + "\r\n", "SERNO=" + serial + "\r\n",
++             "VIDEO=" + string(GameProfile::kSettingVideo) + "\r\n", "GAME=" + string(GameProfile::kSettingGame) + "\r\n"}) {
+         for (;;) {
+             if (position + line.size() > bytes.size()) {
+                 return std::nullopt;
+diff --git a/runtime/src/hle/storage/nand_fs.cpp b/runtime/src/hle/storage/nand_fs.cpp
+index 3ea0d81..99a7e12 100644
+--- a/runtime/src/hle/storage/nand_fs.cpp
++++ b/runtime/src/hle/storage/nand_fs.cpp
+@@ -92,6 +92,15 @@ std::string CurrentNandDataDir() {
+ const std::filesystem::path& GetNandBasePath() {
+     std::call_once(g_dolphinWiiBaseOnce, []() {
+         g_dolphinWiiBase = RuntimeNandPath::DiscoverNandRootPath();
++        // The running title's data directory exists on a console (ES creates it at launch, as
++        // Dolphin does). MLB lists it before its first save and reports "Save failed" when it
++        // is missing; it never creates it.
++        if (!g_dolphinWiiBase.empty()) {
++            char titleHi[16], titleLo[16];
++            std::snprintf(titleHi, sizeof(titleHi), "%08x", kNandTitleIdHi);
++            std::snprintf(titleLo, sizeof(titleLo), "%08x", kNandTitleIdLo);
++            CreateDirectoryPath(g_dolphinWiiBase / "title" / titleHi / titleLo / "data");
++        }
+     });
+ 
+     return g_dolphinWiiBase;

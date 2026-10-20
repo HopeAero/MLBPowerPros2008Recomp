@@ -18,7 +18,8 @@ public:
     void SeedForTest(const std::filesystem::path& dumpsDir);  // what Start records, without a process
 
 private:
-    void* process_ = nullptr;  // HANDLE
+    void* process_ = nullptr;  // HANDLE (Windows)
+    mutable long long pid_ = 0;  // child pid (POSIX); Running() reaps it
     std::filesystem::path dumps_;
     std::set<std::string> before_;
 };
