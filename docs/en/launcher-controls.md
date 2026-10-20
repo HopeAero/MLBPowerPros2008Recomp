@@ -42,9 +42,16 @@ Back (Esc, Backspace, K or Circle/B) only counts on the frame it is pressed and 
 
 The launcher is in Spanish or English. By default it follows Windows: Spanish when Windows is in Spanish, English otherwise. To change it: **SETTINGS > INTERFACE > IDIOMA / LANGUAGE** (Automatic, Español or English). The change shows right away and is saved in `Config.toml` (`[ui] language = "auto" | "es" | "en"`); the Setup and Texture Studio use the same setting.
 
+## Enhancements
+
+**SETTINGS > ENHANCEMENTS** holds what the Wii game does not have: changes to how it plays or to what it offers. Graphics (FSR, filtering, MSAA) stay in VIDEO, since they change how the game looks, not the game.
+
+- Every enhancement starts as on the Wii: off, or at its original value, until you change it.
+- The ones players are still trying are tagged **EXPERIMENTAL**, and their help asks you to report problems in GitHub Discussions or an issue. Once they have been tried enough, they lose the tag and stay here.
+
 ## Seasons (Season mode)
 
-**SETTINGS > GAME > SEASONS** sets how long Season mode lasts: **10 (original)**, which ends after the 2017 season as on the Wii; **20**, which goes on to 2027; or **No limit**, which never ends. It is saved in `Config.toml` (`[season] max_seasons = 10 | 20 | 0`; 0 is no limit).
+**SETTINGS > ENHANCEMENTS > SEASONS** (experimental) sets how long Season mode lasts: **10 (original)**, which ends after the 2017 season as on the Wii; **20**, which goes on to 2027; or **No limit**, which never ends. It is saved in `Config.toml` (`[season] max_seasons = 10 | 20 | 0`; 0 is no limit).
 
 - With 20 or no limit, a save the original game already finished (after season 10, which replays the ending on load) goes on to 2018.
 - A save already past the chosen cap keeps going, so it is not damaged: one past 10 seasons keeps going with 20, and one past 2027 with no limit.

@@ -1023,23 +1023,38 @@ index 0932d99..f9c5f03 100644
      handle->position += static_cast<uint32_t>(bytesWritten);
      
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index d2dd7e9..23831de 100644
+index d2dd7e9..0297973 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
-@@ -293,7 +293,7 @@ constexpr int kOpenModsFolder = -2;
+@@ -287,13 +287,21 @@ struct Option {
+     int value = 0;
+     bool restart = true;
+     int mod = -1;  // index into the installed mods, or kOpenModsFolder
++    bool experimental = false;  // still being tried by players: tagged in the list and the help
+ };
+ 
+ constexpr int kOpenModsFolder = -2;
  constexpr int kOpenRosterEditor = -3;
  constexpr int kOpenTextureStudio = -4;
  constexpr int kOpenSavesFolder = -5;
 -constexpr int kModsTab = 4;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ; HERRAMIENTAS follows it
-+constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, JUEGO; HERRAMIENTAS follows it
++constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, MEJORAS; HERRAMIENTAS follows it
++
++// Shown with every option tagged experimental (MEJORAS).
++constexpr Phrase kExperimentalNote{
++    "Experimental: aún lo están probando los jugadores. Si algo falla o se ve raro, avísanos en GitHub "
++    "Discussions o en un issue, con tu partida si puedes.",
++    "Experimental: players are still trying it. If something breaks or looks wrong, tell us in GitHub "
++    "Discussions or an issue, with your save if you can."};
  
  constexpr Phrase kModsHelp{
      "Abre la carpeta mods. Cada mod va en su propia carpeta, con un mod.toml opcional "
-@@ -696,6 +696,17 @@ Result Run(int argc, char** argv) {
+@@ -696,6 +704,19 @@ Result Run(int argc, char** argv) {
                               "Shows this screen when the game opens. It can be switched back on with F10."), YesNo(), 1,
                            false};
  
-+    // Changes to how the game plays: off by default, so the game stays as on the Wii.
++    // MEJORAS: what the Wii game does not have (how it plays, what it offers). Each one starts as on the
++    // Wii; the ones still being tried by players are tagged experimental.
 +    Option seasons{Tr("TEMPORADAS", "SEASONS"),
 +                   Tr("Cuántas temporadas dura el modo Temporada. El juego original acaba en la 10.ª (2017); con 20 "
 +                      "sigue hasta 2027, y sin límite no acaba nunca (el juego guarda los 20 años más recientes). "
@@ -1049,19 +1064,20 @@ index d2dd7e9..23831de 100644
 +                      "A save already past the chosen cap keeps going."),
 +                   {Tr("10 (original)", "10 (original)"), "20", Tr("Sin límite", "No limit")},
 +                   RuntimeConfigFile::MaxSeasons(10) == 20 ? 1 : RuntimeConfigFile::MaxSeasons(10) == 0 ? 2 : 0};
++    seasons.experimental = true;
 +
      const std::string savedLanguage = RuntimeConfigFile::UiLanguage("auto");
      Option language{"IDIOMA / LANGUAGE",
                      Tr("Idioma de este launcher, del Setup y del editor de texturas. Automático usa el de Windows.",
-@@ -764,6 +775,7 @@ Result Run(int argc, char** argv) {
+@@ -764,6 +785,7 @@ Result Run(int argc, char** argv) {
          {"AUDIO", {volume, mute}},
          {Tr("CONTROLES", "CONTROLS"), {wiimote}},
          {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
-+        {Tr("JUEGO", "GAME"), {seasons}},
++        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons}},
      };
      tabs.push_back(std::move(modsTab));
      tabs.push_back(std::move(toolsTab));
-@@ -854,6 +866,7 @@ Result Run(int argc, char** argv) {
+@@ -854,6 +876,7 @@ Result Run(int argc, char** argv) {
          if (label == mute.label) RuntimeConfigFile::SetAudioMuted(o.value != 0);
          if (label == wiimote.label) RuntimeConfigFile::SetWiiRemotesEnabled(o.value != 0);
          if (label == launcherOption.label) RuntimeConfigFile::SetLauncherOnStartup(o.value != 0);
@@ -1069,6 +1085,45 @@ index d2dd7e9..23831de 100644
          if (label == language.label) {
              const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
              RuntimeConfigFile::SetUiLanguage(code);
+@@ -920,8 +943,8 @@ Result Run(int argc, char** argv) {
+ 
+     const std::array<const char*, 3> kMenu{Tr("JUGAR", "PLAY"), Tr("AJUSTES", "SETTINGS"), Tr("SALIR", "EXIT")};
+     int menu = 0;
+-    int tab = page && std::strcmp(page, "controls") == 0 ? 2 : toolsPage ? kModsTab + 1 : modsOnly ? kModsTab : 0;
+-    if (tab == 2) settingsOpen = true;
++    int tab = page && std::strcmp(page, "controls") == 0 ? 2 : page && std::strcmp(page, "enhancements") == 0 ? 4 : toolsPage ? kModsTab + 1 : modsOnly ? kModsTab : 0;
++    if (tab == 2 || tab == 4) settingsOpen = true;  // =controls, =enhancements (MEJORAS)
+     int row = 0;
+     // Long lists use the rows that fit at the current size; page controls stay
+     // below the scrollable list. Q/E and L1/R1 switch settings categories.
+diff --git a/runtime/src/launcher_settings.inc b/runtime/src/launcher_settings.inc
+index cd8399f..971f118 100644
+--- a/runtime/src/launcher_settings.inc
++++ b/runtime/src/launcher_settings.inc
+@@ -111,6 +111,7 @@ auto drawSettings = [&] {
+             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width * .51f);
+             if (i == row) ImGui::TextColored(ImVec4(1, .82f, .4f, 1), "%s", opt.label);
+             else ImGui::TextUnformatted(opt.label);
++            if (opt.experimental) ImGui::TextColored(ImVec4(1, .55f, .25f, 1), "EXPERIMENTAL");
+             ImGui::PopTextWrapPos();
+             ImGui::EndGroup();
+             ImGui::SameLine(width * .55f);
+@@ -152,6 +153,7 @@ auto drawSettings = [&] {
+                 const auto& selected = current.options[row];
+                 ImGui::TextColored(ImVec4(1, .79f, .35f, 1), "%s", selected.label);
+                 ImGui::Spacing(); ImGui::TextUnformatted(selected.help); ImGui::Spacing();
++                if (selected.experimental) { ImGui::TextColored(ImVec4(1, .55f, .25f, 1), "%s", kExperimentalNote.get()); ImGui::Spacing(); }
+                 ImGui::TextDisabled("%s", selected.restart ? Tr("Se aplica al iniciar el juego.", "Applies when the game starts.") : Tr("Se aplica al momento.", "Applies right away."));
+             }
+             if (current.footer) { ImGui::Spacing(); ImGui::TextUnformatted(current.footer); }
+@@ -166,6 +168,7 @@ auto drawSettings = [&] {
+                 ImGui::BeginChild("Texto", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()));
+                 ImGui::PushTextWrapPos(0);
+                 ImGui::TextUnformatted(current.options[row].help);
++                if (current.options[row].experimental) { ImGui::Spacing(); ImGui::TextColored(ImVec4(1, .55f, .25f, 1), "%s", kExperimentalNote.get()); }
+                 ImGui::PopTextWrapPos(); ImGui::EndChild();
+                 if (launcher_visuals::PillButton(Tr("Cerrar", "Close")) || ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+                     ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceUp, false))
 diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
 index d4d9ea6..2498e69 100644
 --- a/runtime/src/settings_overlay.cpp
