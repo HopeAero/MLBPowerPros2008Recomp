@@ -54,10 +54,10 @@ index 4cda53f..a74152c 100644
  }
 diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
 new file mode 100644
-index 0000000..99b33af
+index 0000000..b92aead
 --- /dev/null
 +++ b/runtime/include/season_cap.h
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,268 @@
 +#pragma once
 +// Season mode past 10 seasons (launcher option GAME > SEASONS, [season] max_seasons = 10 | 20 | 0).
 +//
@@ -71,6 +71,7 @@ index 0000000..99b33af
 +// moves down one year, the oldest goes to the archive in the tail, and a year offset (also in the
 +// tail) turns the window's years into the real ones (0x80B4A888, 0x80B74C00 and the year sites).
 +// Docs: docs/ingenieria-inversa.md "Año de la temporada".
++#include <algorithm>
 +#include <array>
 +#include <cstddef>
 +#include <cstdint>
@@ -129,6 +130,32 @@ index 0000000..99b33af
 +    if (year < kOriginalSeasons) return table[year];
 +    const int32_t last = table[kOriginalSeasons - 1], step = last - table[kOriginalSeasons - 2];
 +    return last + step * (year - (kOriginalSeasons - 1));
++}
++// The calendar's year pictures (season_schedule.pack: 86 x 37 each, 2007..2028, in a C8 atlas). A
++// later year is made of the game's own pictures by cells: the font is monospaced, with cells of about
++// 19 columns from column 3. "20" is columns 0..41 of any picture; the units digit d is columns 58..85
++// of 2010 + d (its cell and halo); the tens digit is the same glyph one cell to the left. Where halos
++// overlap the brighter index stays (the indices are a ramp from the black background).
++constexpr int kYearPictureWidth = 86, kYearPictureHeight = 37;
++constexpr int kYearPrefixColumns = 42, kYearUnitsColumn = 58, kYearCellColumns = 19;
++using YearPicture = std::array<uint8_t, kYearPictureWidth * kYearPictureHeight>;
++inline YearPicture ComposeYearPicture(int year, const std::array<YearPicture, 10>& units) {  // units[d]: 2010 + d
++    YearPicture out{};
++    for (int y = 0; y < kYearPictureHeight; ++y)
++        for (int x = 0; x < kYearPrefixColumns; ++x) out[y * kYearPictureWidth + x] = units[0][y * kYearPictureWidth + x];
++    const int digits[2][2] = {{(year / 10) % 10, kYearUnitsColumn - kYearCellColumns}, {year % 10, kYearUnitsColumn}};
++    for (const auto& [digit, to] : digits)
++        for (int y = 0; y < kYearPictureHeight; ++y)
++            for (int x = kYearUnitsColumn; x < kYearPictureWidth; ++x) {
++                const int at = to + x - kYearUnitsColumn;
++                uint8_t& texel = out[y * kYearPictureWidth + at];
++                texel = std::max(texel, units[digit][y * kYearPictureWidth + x]);
++            }
++    return out;
++}
++// Byte offset of texel (x, y) in a C8 texture of the given width: GX stores it in 8 x 4 tiles.
++inline uint32_t C8Offset(int x, int y, int width) {
++    return static_cast<uint32_t>(((y / 4) * (width / 8) + x / 8) * 32 + (y % 4) * 8 + x % 8);
 +}
 +inline bool ItemInRange(int item) { return item >= 0 && item < kFinanceItems; }
 +inline bool RecordInRange(int k) { return k >= 0 && k < kRecordsPerYear; }
@@ -301,10 +328,10 @@ index 0000000..99b33af
 +}  // namespace season_cap
 diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
 new file mode 100644
-index 0000000..d18cd29
+index 0000000..865ce2d
 --- /dev/null
 +++ b/runtime/src/hle/mlb/season_cap.cpp
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,623 @@
 +// Season mode past 10 seasons: the cap, years 10..19 of the 10-year tables, and the moving window
 +// with no limit (season_cap.h).
 +#include "season_cap.h"
@@ -316,6 +343,7 @@ index 0000000..d18cd29
 +#include <utility>
 +
 +#include "abi_bridge.h"
++#include "gx_guest_write.h"
 +#include "memory.h"
 +#include "ppc_runtime.h"
 +#include "runtime_config.h"
@@ -606,6 +634,94 @@ index 0000000..d18cd29
 +    ctx->gpr[3] = static_cast<uint32_t>(CurrentIndex() + 8) + YearOffset();
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80B74C00, MLB_SeasonShortYear_80B74C00, (CpuContext* ctx), (ctx));
++
++// The calendar's title (Y in the Season menu): 0x80B9D450 (screen, index, month) shows the year's
++// picture from a table of 20 (0x80E8EB40, 2008..2027) and the month's (0x80E8EB90) through 0x8001DFB8
++// (pane, 1696 = season_schedule.pack, picture). Each picture is a SURF of 0x48 bytes there, 2007..2028
++// in a row, with its rectangle in a 512 x 512 C8 atlas. With seasons that left the window the year is
++// the real one: its picture up to 2028, and past it 2007's (Season mode never shows 2007) repainted
++// with the year, made of the game's pictures by cells (ComposeYearPicture).
++namespace {
++constexpr uint32_t kYearPictures = 0x80E8EB40u, kMonthPictures = 0x80E8EB90u, kSchedulePack = 1696;
++constexpr int kFirstPictureYear = 2007, kLastPictureYear = 2028;
++
++uint32_t ResolvePack(CpuContext* ctx, uint32_t handle) {  // 0x8000BBFC: a pack pointer, or a resolved one as it is
++    ctx->gpr[3] = kSchedulePack;
++    ctx->gpr[4] = handle;
++    return Call(ctx, 0x8000BBFCu, InvokeDirectCpu<0x8000BBFCu>);
++}
++
++uint32_t PictureHandle(int year) {
++    const uint32_t first = Memory::Read32(kYearPictures), step = Memory::Read32(kYearPictures + 4) - first;
++    return first + static_cast<uint32_t>(year - 2008) * step;
++}
++
++// The atlas texels and the picture's corner, after checking it is the layout described above.
++bool PictureTexels(CpuContext* ctx, int year, uint32_t& texels, int& u0, int& v0) {
++    const uint32_t surf = ResolvePack(ctx, PictureHandle(year));
++    if (!Memory::Contains(surf, 0x2C) || Memory::Read32(surf) != 0x53555246u) return false;  // "SURF"
++    const uint32_t rect = ResolvePack(ctx, Memory::Read32(surf + 0x18));
++    const uint32_t set = ResolvePack(ctx, Memory::Read32(surf + 0x1C));
++    if (!Memory::Contains(rect, 20) || !Memory::Contains(set, 8)) return false;
++    const uint32_t list = ResolvePack(ctx, Memory::Read32(set + 4));  // texture set: {n, -> n texture pointers}
++    if (!Memory::Contains(list, 4)) return false;
++    const uint32_t texture = ResolvePack(ctx, Memory::Read32(list));
++    if (!Memory::Contains(texture, 12) || Memory::Read32(texture) != 0x02000200u || Memory::Read32(texture + 4) != 9) return false;
++    u0 = Memory::Read16(rect + 12);
++    v0 = Memory::Read16(rect + 14);
++    if (Memory::Read16(rect + 16) - u0 != kYearPictureWidth || Memory::Read16(rect + 18) - v0 != kYearPictureHeight) return false;
++    texels = ResolvePack(ctx, Memory::Read32(texture + 8));
++    return Memory::Contains(texels, 512 * 512);
++}
++
++bool PaintYearPicture(CpuContext* ctx, int year) {
++    std::array<YearPicture, 10> units{};
++    uint32_t texels = 0;
++    int u0 = 0, v0 = 0;
++    for (int d = 0; d < 10; ++d) {
++        if (!PictureTexels(ctx, 2010 + d, texels, u0, v0)) return false;
++        for (int y = 0; y < kYearPictureHeight; ++y)
++            for (int x = 0; x < kYearPictureWidth; ++x)
++                units[d][y * kYearPictureWidth + x] = Memory::Read8(texels + C8Offset(u0 + x, v0 + y, 512));
++    }
++    if (!PictureTexels(ctx, kFirstPictureYear, texels, u0, v0)) return false;
++    const YearPicture picture = ComposeYearPicture(year, units);
++    for (int y = 0; y < kYearPictureHeight; ++y)
++        for (int x = 0; x < kYearPictureWidth; ++x)
++            Memory::Write8(texels + C8Offset(u0 + x, v0 + y, 512), picture[y * kYearPictureWidth + x]);
++    GxGuestWrite::NotifyWrite(texels, 512 * 512);  // the renderer uploads the atlas again
++    return true;
++}
++}  // namespace
++
++extern "C" void MLB_CalendarTitle_80B9D450(CpuContext* ctx) {
++    const uint32_t screen = ctx->gpr[3];
++    const int index = static_cast<int32_t>(ctx->gpr[4]);
++    const uint32_t month = ctx->gpr[5];
++    uint32_t year = Memory::Read32(kYearPictures + static_cast<uint32_t>(index) * 4);  // the original
++    if (YearOffset() > 0) {
++        const int real = 2008 + index + static_cast<int>(YearOffset());
++        if (real <= kLastPictureYear) {
++            year = PictureHandle(real);
++        } else if (PaintYearPicture(ctx, real)) {
++            year = PictureHandle(kFirstPictureYear);
++        } else {
++            year = PictureHandle(kLastPictureYear);  // not the layout we know (a mod?): the last year there is
++        }
++    }
++    ctx->gpr[3] = Memory::Read32(screen + 356);
++    ctx->gpr[4] = kSchedulePack;
++    ctx->gpr[5] = year;
++    Call(ctx, 0x8001DFB8u, InvokeDirectCpu<0x8001DFB8u>);
++    ctx->gpr[3] = Memory::Read32(screen + 360);
++    ctx->gpr[4] = kSchedulePack;
++    ctx->gpr[5] = Memory::Read32(kMonthPictures + (month - 1) * 4);
++    Call(ctx, 0x8001DFB8u, InvokeDirectCpu<0x8001DFB8u>);
++    ctx->gpr[3] = screen;
++    ctx->gpr[4] = month - 1 > 11 ? 4u : month - 1;  // as the original: an out-of-range month shows May's
++    Call(ctx, 0x80B9D4D8u, InvokeDirectCpu<0x80B9D4D8u>);
++}
++PPC_NATIVE_OVERRIDE_VOID(80B9D450, MLB_CalendarTitle_80B9D450, (CpuContext* ctx), (ctx));
 +
 +// 0x80B74BB4: the next season (index + 1, from the 1/1 rollover 0x80B4E564). With no limit, season 20
 +// moves the window instead, so the index stays 19.
@@ -997,10 +1113,10 @@ index ab135ed..749652e 100644
          _putenv("WIICOMPILED_MATCH_BENCH=");
 diff --git a/runtime/tests/season_cap_tests.cpp b/runtime/tests/season_cap_tests.cpp
 new file mode 100644
-index 0000000..650a431
+index 0000000..570e9cb
 --- /dev/null
 +++ b/runtime/tests/season_cap_tests.cpp
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,154 @@
 +#include "season_cap.h"
 +#include <algorithm>
 +#include <cstdio>
@@ -1131,6 +1247,17 @@ index 0000000..650a431
 +    Check(LuxuryThreshold(thresholds, -1) == 155000 && LuxuryThreshold(thresholds, 9) == 226000, "the game's years");
 +    Check(LuxuryThreshold(thresholds, 10) == 234000 && LuxuryThreshold(thresholds, 21) == 322000,
 +          "later years go on by the last step");
++
++    // A year picture past the game's by cells: "20" from any picture, the units glyph of 2010 + d, and
++    // the same glyph one cell to the left for the tens; overlapping halos keep the brighter index.
++    std::array<YearPicture, 10> units{};
++    for (int d = 0; d < 10; ++d) units[d].fill(static_cast<uint8_t>(10 * (d + 1)));
++    const YearPicture y2047 = ComposeYearPicture(2047, units);
++    auto at = [&](int x) { return y2047[5 * kYearPictureWidth + x]; };
++    Check(at(0) == 10 && at(kYearPrefixColumns - 1 - 3) == 10, "\"20\" comes from the pictures' first columns");
++    Check(at(kYearUnitsColumn - kYearCellColumns) == 50 && at(kYearUnitsColumn - 1) == 50, "tens: 4, one cell left");
++    Check(at(kYearUnitsColumn) == 80 && at(kYearPictureWidth - 1) == 80, "units: 7 (the brighter where they meet)");
++    Check(C8Offset(9, 5, 512) == ((1 * 64) + 1) * 32 + 1 * 8 + 1 && C8Offset(0, 0, 512) == 0, "C8 texels in 8 x 4 tiles");
 +
 +    // The loaded file says which season and whether it ended (offsets in the file).
 +    std::vector<uint8_t> save(kSaveFileSize, 0);

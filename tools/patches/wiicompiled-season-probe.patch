@@ -131,7 +131,7 @@ index 219c7c1..2e6251e 100644
          if (step.hold & 0x10000) status.substickX = 127;
 diff --git a/runtime/src/hle/mlb/season_probe.cpp b/runtime/src/hle/mlb/season_probe.cpp
 new file mode 100644
-index 0000000..473febb
+index 0000000..04a0487
 --- /dev/null
 +++ b/runtime/src/hle/mlb/season_probe.cpp
 @@ -0,0 +1,86 @@
@@ -208,7 +208,7 @@ index 0000000..473febb
 +                // Guest RAM in its own big-endian layout, read inside PADRead while the game waits on it.
 +                const std::filesystem::path base = file.parent_path() / command->name;
 +                Dump(base, 0x80000000u, 0x01800000u, ".mem1");
-+                Dump(base, 0x90000000u, 0x04000000u, ".mem2");
++                Dump(base, 0x90000000u, 0x08000000u, ".mem2");  // the runtime's MEM2 is 128 MB
 +            }
 +            std::fprintf(stderr, "[season] live: %s\n", text.str().c_str());
 +        } else {
