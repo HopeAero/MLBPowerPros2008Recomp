@@ -22,7 +22,7 @@ Una **recompilación estática** de *MLB Power Pros 2008* (Wii, USA, `RL8E54`) a
 |---|---|
 | Arranque → correa → menús | funciona, a 60 FPS |
 | Partidos (Exhibición), Home Run, alineaciones | funcionan; se juegan partidos completos. Partido de prueba automático: 60 FPS con Direct3D 12 y con Vulkan |
-| Temporada, Liga, MLB Life | se alcanzan (MLB Life también con rosters de mods); sin pruebas sistemáticas de cada modo |
+| Temporada, Liga, MLB Life | se alcanzan (MLB Life también con rosters de mods); sin pruebas sistemáticas de cada modo. El modo Temporada puede pasar de sus 10 temporadas (**AJUSTES > MEJORAS > TEMPORADAS**: 20 o sin límite, experimental): una temporada entera simulada en 2029, con la Serie Mundial, hasta 2030 |
 | Gráficos | Direct3D 12 o Vulkan (elección automática), resolución interna de 1x a 4x, panorámico 16:9 real, llenar pantalla sin franjas negras, AMD FSR 1, filtro anisotrópico hasta 16x, interpolación a 120 o 180 FPS (experimental), ajustes de calidad |
 | Audio | completo, comentarista incluido |
 | Mandos | cualquier mando por SDL3, o teclado y ratón, como mando de GameCube; hasta 4 jugadores; reasignación al estilo de Dolphin; nombres de botones de PlayStation o Xbox |
@@ -45,7 +45,7 @@ Una **recompilación estática** de *MLB Power Pros 2008* (Wii, USA, `RL8E54`) a
 
 Requisitos: Windows 10/11 de 64 bits, una GPU con Direct3D 12 o Vulkan, tu copia de *MLB Power Pros 2008* para Wii (USA, `RL8E54`) y unos 2,5 GB libres (el Setup ocupa 900 MB y el juego instalado 1,5 GB).
 
-1. Descarga `MLB-Power-Pros-2008-Setup-v0.1.2.zip` de [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (la última: `v0.1.2` beta) y descomprímelo en una carpeta tuya (no en Archivos de programa).
+1. Descarga `MLB-Power-Pros-2008-Setup-v0.1.3.zip` de [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (la última: `v0.1.3` beta) y descomprímelo en una carpeta tuya (no en Archivos de programa).
 2. Abre `MLBPowerPros2008-Setup.exe`, pulsa **ELEGIR DISCO** y elige tu copia (ISO, NKit, RVZ, WBFS, WIA, GCZ o CISO).
 3. Pulsa **INSTALAR**. El Setup comprueba que sea un volcado limpio de `RL8E54`, lo extrae, traduce el código y lo compila en tu PC.
 4. Pulsa **JUGAR** o usa el acceso directo del escritorio. Antes de cada partida se abre el launcher: API gráfica, pantalla, resolución, audio, controles, mods y herramientas.

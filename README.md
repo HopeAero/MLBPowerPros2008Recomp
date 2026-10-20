@@ -22,7 +22,7 @@ A **static recompilation** of *MLB Power Pros 2008* (Wii, USA, `RL8E54`) into a 
 |---|---|
 | Boot → strap screen → menus | works, at 60 FPS |
 | Matches (Exhibition), Home Run, lineups | work; full matches are played. Automated test match: 60 FPS with Direct3D 12 and with Vulkan |
-| Season, League, MLB Life | reachable (MLB Life also with modded rosters); no systematic tests of each mode |
+| Season, League, MLB Life | reachable (MLB Life also with modded rosters); no systematic tests of each mode. Season mode can go past its 10 seasons (**SETTINGS > ENHANCEMENTS > SEASONS**: 20 or no limit, experimental): one full season simulated in 2029, through the World Series, into 2030 |
 | Graphics | Direct3D 12 or Vulkan (picked automatically), internal resolution 1x to 4x, true 16:9 widescreen, fill screen without black strips, AMD FSR 1, anisotropic filtering up to 16x, frame interpolation to 120 or 180 FPS (experimental), quality presets |
 | Audio | complete, commentator included |
 | Controllers | any controller through SDL3, or keyboard and mouse, as a GameCube controller; up to 4 players; Dolphin-style remapping; PlayStation or Xbox button names |
@@ -45,7 +45,7 @@ A **static recompilation** of *MLB Power Pros 2008* (Wii, USA, `RL8E54`) into a 
 
 Requirements: Windows 10/11 64-bit, a GPU with Direct3D 12 or Vulkan, your copy of *MLB Power Pros 2008* for Wii (USA, `RL8E54`) and about 2.5 GB free (900 MB for the Setup, 1.5 GB for the installed game).
 
-1. Download `MLB-Power-Pros-2008-Setup-v0.1.2.zip` from [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (latest: `v0.1.2` beta) and unzip it into a folder of yours (not Program Files).
+1. Download `MLB-Power-Pros-2008-Setup-v0.1.3.zip` from [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (latest: `v0.1.3` beta) and unzip it into a folder of yours (not Program Files).
 2. Open `MLBPowerPros2008-Setup.exe`, press **CHOOSE DISC** and pick your copy (ISO, NKit, RVZ, WBFS, WIA, GCZ or CISO).
 3. Press **INSTALL**. The Setup checks that it is a clean `RL8E54` dump, extracts it, translates the code and compiles it on your PC.
 4. Press **PLAY** or use the desktop shortcut. The launcher opens before each session: graphics API, display, resolution, audio, controls, mods and tools.
