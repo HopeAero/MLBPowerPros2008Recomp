@@ -42,9 +42,16 @@ Volver (Esc, Retroceso, K o Círculo/B) solo cuenta en el fotograma en que se pu
 
 El launcher está en español o en inglés. Por defecto usa el idioma de Windows: español si Windows está en español e inglés en cualquier otro caso. Para cambiarlo: **AJUSTES > INTERFAZ > IDIOMA / LANGUAGE** (Automático, Español o English). El cambio se ve al momento y se guarda en `Config.toml` (`[ui] language = "auto" | "es" | "en"`); el Setup y el Texture Studio usan el mismo ajuste.
 
+## Mejoras
+
+**AJUSTES > MEJORAS** reúne lo que el juego de la Wii no tiene: cambios en cómo se juega o en lo que ofrece. Lo gráfico (FSR, filtrado, MSAA) se queda en VIDEO porque no cambia el juego, solo cómo se ve.
+
+- Cada mejora empieza como en la Wii: apagada, o en su valor original, hasta que la cambies.
+- Las que todavía están probando los jugadores llevan la etiqueta **EXPERIMENTAL**, y su ayuda pide avisar en GitHub Discussions o en un issue si algo falla. Cuando se hayan probado bastante, pierden la etiqueta y se quedan aquí.
+
 ## Temporadas (modo Temporada)
 
-**AJUSTES > JUEGO > TEMPORADAS** decide cuánto dura el modo Temporada: **10 (original)**, que acaba tras la temporada de 2017 como en la Wii; **20**, que sigue hasta 2027; o **Sin límite**, que no acaba nunca. Se guarda en `Config.toml` (`[season] max_seasons = 10 | 20 | 0`; 0 es sin límite).
+**AJUSTES > MEJORAS > TEMPORADAS** (experimental) decide cuánto dura el modo Temporada: **10 (original)**, que acaba tras la temporada de 2017 como en la Wii; **20**, que sigue hasta 2027; o **Sin límite**, que no acaba nunca. Se guarda en `Config.toml` (`[season] max_seasons = 10 | 20 | 0`; 0 es sin límite).
 
 - Con 20 o sin límite, una partida que el juego original ya dio por terminada (tras la temporada 10, que repite el final al cargarla) sigue en 2018.
 - Una partida que ya pasó del tope elegido sigue igual, para no estropearla: una de más de 10 temporadas sigue con 20, y una de después de 2027 sigue sin límite.
