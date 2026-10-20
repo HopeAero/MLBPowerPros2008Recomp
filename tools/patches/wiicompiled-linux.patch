@@ -71,10 +71,10 @@ index 242e2cc..9d6ceb2 100644
      if (!g_menu) g_menu = g_text;
      if (!g_menuBold) g_menuBold = g_bold;
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index ebdaef4..905258c 100644
+index d2dd7e9..51df1b2 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
-@@ -29,6 +29,7 @@
+@@ -30,6 +30,7 @@
  #include <algorithm>
  #include <array>
  #include <chrono>
@@ -82,7 +82,7 @@ index ebdaef4..905258c 100644
  #include <cmath>
  #include <cstdlib>
  #include <cstring>
-@@ -44,7 +45,12 @@
+@@ -45,7 +46,12 @@
  #include <windows.h>
  #include <shellapi.h>
  #else
@@ -95,7 +95,7 @@ index ebdaef4..905258c 100644
  #endif
  
  namespace launcher {
-@@ -391,6 +397,30 @@ constexpr const char* kRosterEditorPage =
+@@ -394,6 +400,30 @@ constexpr const char* kRosterEditorPage =
  
  #if defined(_WIN32)
  std::wstring Quoted(const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; }
@@ -126,7 +126,7 @@ index ebdaef4..905258c 100644
  #endif
  
  // PowerUp+ ships next to the game in powerupplus/ (tools/powerupplus.ps1 -Publish). It runs in its
-@@ -445,6 +475,71 @@ void OpenRosterEditor() {
+@@ -448,6 +478,71 @@ void OpenRosterEditor() {
      const fs::path page = data / "abrir.html";
      std::ofstream(page, std::ios::binary | std::ios::trunc) << kRosterEditorPage;
      ShellExecuteW(nullptr, L"open", page.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -198,7 +198,7 @@ index ebdaef4..905258c 100644
  #endif
  }
  
-@@ -467,6 +562,20 @@ void OpenTextureStudio() {
+@@ -470,6 +565,20 @@ void OpenTextureStudio() {
                                RuntimeConfigFile::ApplicationDataDirectory().wstring() + L"\" --mods \"" +
                                mods::Directory().wstring() + L"\" --game \"" + std::wstring(self) + L"\"";
      ShellExecuteW(nullptr, L"open", studio.wstring().c_str(), args.c_str(), exeDir->wstring().c_str(), SW_SHOWNORMAL);
@@ -219,7 +219,16 @@ index ebdaef4..905258c 100644
  #endif
  }
  
-@@ -478,6 +587,8 @@ void OpenModsFolder() {
+@@ -482,6 +591,8 @@ void OpenSavesFolder(const std::vector<mods::Mod>& all) {
+     std::filesystem::create_directories(dir, ec);
+ #if defined(_WIN32)
+     ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++#else
++    SpawnDetached({"xdg-open", dir.string()});
+ #endif
+ }
+ 
+@@ -493,6 +604,8 @@ void OpenModsFolder() {
      if (!std::filesystem::exists(readme, ec)) std::ofstream(readme, std::ios::binary) << kModsReadme;
  #if defined(_WIN32)
      ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -228,7 +237,7 @@ index ebdaef4..905258c 100644
  #endif
  }
  
-@@ -676,14 +787,21 @@ Result Run(int argc, char** argv) {
+@@ -708,10 +821,15 @@ Result Run(int argc, char** argv) {
      std::vector<std::string> modHelp;
      modHelp.reserve(installedMods.size());
      Tab modsTab{"MODS", {}, installedMods.empty()
@@ -246,6 +255,10 @@ index ebdaef4..905258c 100644
 +                                            "No mods installed yet. Put them in the mods folder (TOOLS > "
 +                                            "OPEN MODS FOLDER)."))
                                  : nullptr};
+     // The first row says whose saves the game will use; it follows the roster mods switched on here.
+     std::vector<mods::Mod> currentMods = installedMods;
+@@ -732,7 +850,9 @@ Result Run(int argc, char** argv) {
+                                {saveSet()}, 0, false, kOpenSavesFolder});
      Tab toolsTab{Tr("HERRAMIENTAS", "TOOLS"), {}};
      toolsTab.options.push_back({Tr("ABRIR CARPETA DE MODS", "OPEN MODS FOLDER"), kModsHelp, {Tr("Abrir", "Open")}, 0, false, kOpenModsFolder});
 -    toolsTab.options.push_back({Tr("EDITAR ROSTER (PowerUp+)", "EDIT ROSTER (PowerUp+)"), kRosterEditorHelp, {Tr("Abrir", "Open")}, 0, false, kOpenRosterEditor});
