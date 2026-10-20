@@ -12,21 +12,49 @@ Lo que se sabe del juego por dentro, ordenado por sistema: direcciones, estructu
 - **Sin contenido del juego:** este documento no incluye bytes, recursos ni código del juego, solo descripciones.
 - **Cómo generar el PDF:** `python tools/build_re_pdf.py` (lo escribe en `local/docs/`).
 
+## Acceso rápido
+
+Qué buscas y dónde está:
+
+| Busco… | Ir a |
+|---|---|
+| Modo Temporada: fecha, año, temporadas, tablas por año | [Modo Temporada](#9-modo-temporada) |
+| Calendario de partidos (tabla, números de equipo, generador) | [Calendario de partidos](#calendario-de-partidos) |
+| Partida de Temporada (`.dat`) | [Partida guardada de Temporada](#partida-guardada-de-temporada) |
+| Jugadores y roster (`game_data.pack`) | [Roster: `game_data.pack` y formato de jugador](#7-roster-game_datapack-y-formato-de-jugador) |
+| Estadios (modelos, colisión, añadir estadios) | [Estadios: modelos `PJ7M` y tabla `tbl`](#6-estadios-modelos-pj7m-y-tabla-tbl) |
+| Texturas y packs (`PACKWII`) | [Formato `PACKWII`](#formato-packwii) |
+| Archivos del disco (`project.bin`) | [Disco y `project.bin`](#5-disco-y-projectbin) |
+| Menús y escenas | [Escenas, menús y preparación de un partido](#8-escenas-menús-y-preparación-de-un-partido) |
+| Comentarista y sonido | [Motor de sonido y comentarista](#4-motor-de-sonido-y-comentarista) |
+| Cámara del partido | [Cámara del partido](#cámara-del-partido) |
+| Mandos | [Mandos](#11-mandos) |
+| Partidas guardadas, NAND | [Partidas guardadas, NAND, SYSCONF y ES](#12-partidas-guardadas-nand-sysconf-y-es) |
+| Portar el juego: lo que hay que respetar | [Peculiaridades del juego que importan al portarlo](#14-peculiaridades-del-juego-que-importan-al-portarlo) |
+| Herramientas y cómo seguir investigando | [Cómo seguir investigando](#15-cómo-seguir-investigando) |
+
 ## Índice
 
 1. [Ejecutable y mapa de memoria](#1-ejecutable-y-mapa-de-memoria)
 2. [Arranque y sistema operativo](#2-arranque-y-sistema-operativo)
 3. [Hilos y ritmo](#3-hilos-y-ritmo)
 4. [Motor de sonido y comentarista](#4-motor-de-sonido-y-comentarista)
+    [Hilos](#hilos) · [Canales y voces AX](#canales-y-voces-ax) · [Streams del comentarista](#streams-del-comentarista)
 5. [Disco y `project.bin`](#5-disco-y-projectbin)
-6. [Roster: `game_data.pack` y formato de jugador](#6-roster-game_datapack-y-formato-de-jugador)
-7. [Escenas, menús y preparación de un partido](#7-escenas-menús-y-preparación-de-un-partido)
-8. [Gráficos (GX y VI)](#8-gráficos-gx-y-vi)
-9. [Mandos](#9-mandos)
-10. [Partidas guardadas, NAND, SYSCONF y ES](#10-partidas-guardadas-nand-sysconf-y-es)
-11. [Bibliotecas y funciones identificadas](#11-bibliotecas-y-funciones-identificadas)
-12. [Peculiaridades del juego que importan al portarlo](#12-peculiaridades-del-juego-que-importan-al-portarlo)
-13. [Cómo seguir investigando](#13-cómo-seguir-investigando)
+    [Formato `PACKWII`](#formato-packwii)
+6. [Estadios: modelos `PJ7M` y tabla `tbl`](#6-estadios-modelos-pj7m-y-tabla-tbl)
+    [Modelo `PJ7M`](#modelo-pj7m) · [Tabla `tbl`](#tabla-tbl) · [Árboles A y B](#árboles-a-y-b) · [Escribir la colisión](#escribir-la-colisión) · [Escribir estadios](#escribir-estadios) · [Meter un modelo externo](#meter-un-modelo-externo) · [Inventario de campos para escribir packs desde cero](#inventario-de-campos-para-escribir-packs-desde-cero) · [Escribir packs desde cero](#escribir-packs-desde-cero) · [Qué hacen los campos, probado en el visor](#qué-hacen-los-campos-probado-en-el-visor) · [Estadio desde cero en el juego](#estadio-desde-cero-en-el-juego) · [Lista de estadios del juego](#lista-de-estadios-del-juego) · [Pendiente](#pendiente) · [Herramientas](#herramientas)
+7. [Roster: `game_data.pack` y formato de jugador](#7-roster-game_datapack-y-formato-de-jugador)
+8. [Escenas, menús y preparación de un partido](#8-escenas-menús-y-preparación-de-un-partido)
+9. [Modo Temporada](#9-modo-temporada)
+    [Pantallas y menús](#pantallas-y-menús) · [Estado, fecha y año](#estado-fecha-y-año) · [Calendario de partidos](#calendario-de-partidos) · [Paso de año y número de temporadas](#paso-de-año-y-número-de-temporadas) · [Datos por año](#datos-por-año) · [Partida guardada de Temporada](#partida-guardada-de-temporada)
+10. [Gráficos (GX y VI)](#10-gráficos-gx-y-vi)
+    [Cámara del partido](#cámara-del-partido)
+11. [Mandos](#11-mandos)
+12. [Partidas guardadas, NAND, SYSCONF y ES](#12-partidas-guardadas-nand-sysconf-y-es)
+13. [Bibliotecas y funciones identificadas](#13-bibliotecas-y-funciones-identificadas)
+14. [Peculiaridades del juego que importan al portarlo](#14-peculiaridades-del-juego-que-importan-al-portarlo)
+15. [Cómo seguir investigando](#15-cómo-seguir-investigando)
 
 ---
 
@@ -70,7 +98,7 @@ El juego es un DOL pequeño y un módulo REL grande con casi todo el juego.
   - En la cola de MEM2 van, entre otros, búferes de 1 y 2 MB (`0x800329A4`) y el pack de gráficos del estadio (`0x800434B8`). Si una reserva falla, `0x800434B8` la repite sin fin: es el cuelgue en «Preparando partido» con un pack de 32 MB (comprobado con trazas el 18 de octubre de 2026).
   - El recomp sustituye `0x8005AF78` por una versión nativa (`hle/mlb/game_heaps.cpp`, parche `wiicompiled-mlb-mem2-heap`) que da al montón de MEM2 toda la arena: 125,7 MB con los 128 MB de MEM2 del runtime.
 - **Objetos únicos del juego**, punteros dentro del BSS del REL:
-  - `0x81033268`: gestor de escenas (sección 7)
+  - `0x81033268`: gestor de escenas ([sección 8](#8-escenas-menús-y-preparación-de-un-partido))
   - `0x8104E1D8`: configuración del partido
   - `0x8103D118`: datos comunes del partido
 
@@ -308,7 +336,7 @@ Fuentes: desensamblado (`0x80027A54`, `0x80027BF8`, `0x80038E50`-`0x8003A41C`); 
 - **Montaje:** `0x800431E8` monta `/PROJECT.BIN` (cadena en `0x80155DD0`) llamando a `0x80059E7C`.
 - **Gestor de recursos de DVD:** `0x80042C28` solo procesa su cola cuando `DVDGetDriveStatus` dice que la unidad está libre. Al arrancar, el juego lanza `DVDInquiryAsync` y luego consulta el estado.
 - **Entradas conocidas:**
-  - `/game_data.pack` (roster, sección 6)
+  - `/game_data.pack` (roster, [sección 7](#7-roster-game_datapack-y-formato-de-jugador))
   - `/ClaimTheTitle.pack`, `team_logo.pack`
   - `env_title_logo`, `env_mainmenu`, `env_teamnameNN`
   - `PWM_mdl_uniform_MLB_<equipo>_<n>.pack`: uniformes. Cambiar el de CHC por el de NYY pone la gorra "NY" a los Cubs.
@@ -370,7 +398,7 @@ Big-endian, un grafo de objetos con punteros. Verificado sobre las 2.356 entrada
 
 Fuentes: `docs/phase0-report.md`, `docs/mods.md`, `tools/projectbin.py`, `tools/packwii.py`, `wiicompiled-dvd-low-completion.patch`.
 
-### Estadios: modelos `PJ7M` y tabla `tbl`
+## 6. Estadios: modelos `PJ7M` y tabla `tbl`
 
 Cada estadio son dos entradas de `project.bin`:
 - `stadium_<código>.pack`: los gráficos. Entre 50 y 100 modelos `PJ7M` y sus texturas, unos 1,1 MB.
@@ -382,7 +410,9 @@ Verificado (14 de octubre de 2026):
 - `tools/stadium_re.py check` recorre los 47 packs de estadio y cumplen las invariantes de abajo.
 - Cuatro cambios en una copia de Coors Field, cargada como mod en un partido, se ven en el juego (ver «Comprobado en el juego»).
 
-**Modelo `PJ7M`** (big-endian, punteros `0x40000000 | posición`):
+### Modelo `PJ7M`
+
+Big-endian, punteros `0x40000000 | posición`.
 
 | Estructura | Contenido |
 |---|---|
@@ -422,7 +452,8 @@ Verificado (14 de octubre de 2026):
 - **Sin transformación en el modelo:** casi todo está en coordenadas del mundo. Las piezas repetidas (banderas, fuentes) están en coordenadas locales y se colocan con la tabla.
 - **Nombres de pieza:** `DP_ground`, `DP_MIP_turf`, `DP_stand_L1`…`R3`, `DP_fence_L/R`, `DP_score`, `DP_auroravision`, `DP_Audience*`, `DP_FLG_flagNN`, `DP_*_lumine_*`, `DP_EVC_NOUPCAM_outside_*`…
 
-**Tabla `tbl`:**
+### Tabla `tbl`
+
 - **Raíz:** es el último objeto del archivo: u32 número de modelos y 11 punteros. Se encuentra buscando desde el final el número seguido del puntero a `0x20`.
 - **Punteros de la raíz, por orden:**
   1. colocaciones;
@@ -442,7 +473,9 @@ Verificado (14 de octubre de 2026):
   - Coors Field tiene 2.922 triángulos y 2.133 vértices.
   - **Sentido:** la normal (b − a) × (c − a) apunta al lado que golpea la pelota. Todos los suelos (5, 6, 8) miran hacia arriba y casi todas las paredes (0, 1, 2, 9, 15) hacia el plato. En las gradas (11) hay de los dos sentidos.
 
-**Árboles A y B** (14 de octubre de 2026; `tools/stadium_re.py check` los comprueba en los 47 packs):
+### Árboles A y B
+
+14 de octubre de 2026; `tools/stadium_re.py check` los comprueba en los 47 packs.
 - **Nodo de `0x1C` bytes**, en preorden y con el nodo 0 como raíz:
 
 | Offset | Contenido |
@@ -461,7 +494,9 @@ Verificado (14 de octubre de 2026):
 - **Recorrido:** `0x80C860E4` y `0x80C862EC` son recursivas (índice × 28). Llaman a `0x80CCB438` con el plano para decidir qué lados visitan. En cada hoja ponen a 1 `banderas[índice]` en un array de un byte por elemento: no hay un búfer de tamaño fijo.
   - **Leen el número de la hoja con signo** (`lbz` + `extsb`): una hoja con más de 127 entradas no se recorre.
 
-**Escribir la colisión** (14 de octubre de 2026, `tools/blender/powerpros_stadium/tbl_write.py`):
+### Escribir la colisión
+
+14 de octubre de 2026, `tools/blender/powerpros_stadium/tbl_write.py`.
 - **Sitio de los datos:** la colisión, los vértices y los dos árboles nuevos van detrás de la raíz, y se repuntan sus campos. La raíz no se mueve: la tabla de estadios del juego apunta a ella, y el runtime la sigue encontrando al buscar desde el final.
 - **Construcción de los árboles:** planos alineados con los ejes y, en cada nodo, el corte que mejor reparte sin duplicar mucho; hojas de como mucho 127.
   - Con los triángulos de Coors Field sale un árbol de 240 nodos y 6.450 entradas; el del juego tiene 1.086 nodos y 13.047 entradas.
@@ -496,13 +531,17 @@ Verificado (14 de octubre de 2026):
 - Las banderas (`0x500`) son tela que el juego anima desde la colocación, no desde la malla de la pieza: con la pieza vacía siguen ondeando en su sitio. Se dibujan sin prueba de profundidad: bajadas 100 m bajo el campo se veían a través del suelo. Con la escala de la colocación a `1e-4` desaparecen (18 de octubre de 2026).
 - **Pack de menú por estadio:** `env_stadium_menuNN.pack`, con NN el número del estadio (orden de `kStadiumCodes`, Coors Field = 27). Dos texturas C8 con paleta propia de 256 colores: la foto (512 × 256, píxeles en `0x60`) y «Home of…» (512 × 64). Un pack con el mismo tamaño y las dos texturas recodificadas funciona como menú de un estadio nuevo.
 
-**Escribir estadios** (comprobado en partidos de Coors Field, 14 de octubre de 2026):
+### Escribir estadios
+
+Comprobado en partidos de Coors Field, 14 de octubre de 2026.
 - **Datos nuevos al final del pack:** los acepta, con punteros nuevos (`0x40000000 | posición`). Una malla repuntada a una display list nueva de triángulos sueltos (`0x90`) en vez de strips, y a arrays nuevos, se dibuja bien. No hay tabla de reubicación que actualizar.
 - **Tamaño:** un `stadium_col.pack` de 9,5 MB y uno de 21 MB cargan y el partido se juega. Uno de 31,5 MB o de 43 MB se queda en «Preparando partido»: no cabe en el montón de MEM2 (sección 1). Con el montón ampliado (parche `wiicompiled-mlb-mem2-heap`), uno de 32 MB y uno de 80 MB cargan y el partido se juega; con 96 MB el pack se lee, pero el partido no empieza.
 - **Tablas de texturas y paletas:** acaban con una entrada de 8 bytes a cero, en los 82 modelos de Coors Field. El juego las recorre hasta esa entrada: al copiarlas a otro sitio sin ella, las texturas con paleta del modelo salen blancas. Ampliar el array de texmaps o el de materiales (que usan su contador de la escena) funciona. **Límite de texmaps por pieza:** ninguna pieza de los 47 packs pasa de 30. Cada material lleva en `+0` (s16) un índice que `0x800613BC` pasa a `0x800537B4`, que lo usa en una tabla de ranuras de `0x78` bytes; con 82 texmaps en una pieza (un modelo descargado convertido, 18 de octubre de 2026) los índices se salían: `GXLoadTexObj: invalid tex map id`, objetos TLUT corruptos, vallas sin dibujar y lecturas fuera de memoria desde `0x8069CF38` hasta cerrar el juego. Repartidas en piezas de 30 como mucho, el partido va bien. La capacidad exacta de la tabla está sin medir.
 - **Lista de texturas del `tbl`:** entradas {→ textura, → paleta, u32, u32}. Los dos u32 (`0xAC800`, `0xB2540`…) parecen direcciones de TMEM: texturas precargadas. Sin comprobar.
 
-**Meter un modelo externo** (Polo Grounds de SketchUp, 14 y 15 de octubre de 2026; partidos del benchmark):
+### Meter un modelo externo
+
+Polo Grounds de SketchUp, 14 y 15 de octubre de 2026; partidos del benchmark.
 - **Tamaños de los estadios del juego**, en los 47 packs:
   - como mucho 24.768 bytes de display list, 573 vértices por llamada de dibujo, 1.303 posiciones por malla y 29 mallas por modelo;
   - texturas de 32 a 256 píxeles, casi todas de un solo nivel (las piezas `MIP`, como el césped, usan también niveles más pequeños: ver «Inventario de campos…»): 8.135 CI4, 3.130 CI8, 77 RGBA8 y 33 RGB5A3 (`tools/stadium_re.py stats`). El recomp les genera mipmaps al cargarlas (parche `wiicompiled-auto-mipmaps`).
@@ -519,7 +558,9 @@ Verificado (14 de octubre de 2026):
 - **Una textura con paleta de otra pieza:** reutilizarla en una pieza distinta (tablas de textura y paleta ampliadas) la dibujó negra. Convertida a RGB5A3 se ve.
 - **Orden de las piezas:** reconstruir el árbol A como una sola hoja en el orden de la tabla no cambió nada visible.
 
-**Inventario de campos para escribir packs desde cero** (18 de octubre de 2026; recorrido de los 43 packs gráficos y 40 tablas por campo de 2 o 4 bytes):
+### Inventario de campos para escribir packs desde cero
+
+18 de octubre de 2026; recorrido de los 43 packs gráficos y 40 tablas por campo de 2 o 4 bytes.
 - **Modelo `PJ7M`:** todo lo que varía es puntero, contador o tamaño, que se calcula al escribir, salvo:
   - la segunda lista de la escena `{1, → ?}`: apunta a un puntero a la palabra `0x01000000`, igual en los 2.925 modelos de estadio con tabla (lo que se leía detrás eran ceros de relleno y el comienzo de una display list). Solo un modelo de `stadium_common` lleva otra palabra y campos en `+0x10..+0x3C` de la raíz;
   - el material: `+0x00` vale 3 (11.239) o 4 (6); los tres colores RGBA8 de `+0x04` casi siempre son `000000FF`, `CCCCCCFF`/`FFFFFFFF` y `000000FF` (sin efecto visible comprobado); `+0x32` vale 1 (7.567) o 0 (3.678), sin descifrar;
@@ -540,7 +581,9 @@ Verificado (14 de octubre de 2026):
   - `textures` (puntero 10): entradas de `0x10` bytes {→ cabecera de textura, → paleta, u32, u32}, con los dos u32 como direcciones de TMEM (texturas precargadas);
   - `unk_2c`: {u32 n, n × u32 orden} (siempre 8 y 0 a 7) seguido de la lista de texturas, que acaba con una entrada {0, 0, u32, 0}; ese u32 va de `0x692800` a `0x703280` según el estadio (sin descifrar). En `bullpen`, algunas entradas no apuntan a ninguna textura.
 
-**Escribir packs desde cero** (18 de octubre de 2026; `tools/blender/powerpros_stadium/stadium_model.py`, `stadium_read.py` y `stadium_write.py`):
+### Escribir packs desde cero
+
+18 de octubre de 2026; `tools/blender/powerpros_stadium/stadium_model.py`, `stadium_read.py` y `stadium_write.py`.
 - **Descripción:** un estadio como datos (texturas, paletas, modelos, colocaciones, colisión, árbol A y los bloques de la tabla), con índices en lugar de posiciones. El lector la saca de los dos packs del juego; el escritor escribe los dos packs desde búferes vacíos, sin leer ningún pack.
 - **Comprobado fuera del juego** (`tools/test_stadium_writer.py`, 45 s):
   - el lector cubre todos los bytes distintos de cero de los 40 estadios con tabla;
@@ -553,7 +596,9 @@ Verificado (14 de octubre de 2026):
 - **El árbol A recorta por cámara:** reconstruido como una sola hoja (como hace el exportador del complemento), Coors Field visto desde fuera dibujaba las gradas detrás del plato y otras piezas que el original no dibuja desde ahí; desde la vista del bateador no cambiaba nada. El juego recorre ese árbol con la posición de la cámara y descarta las colocaciones de los lados que no visita (`0x80CCB438` decide los lados). Por eso la descripción conserva el árbol A del juego.
 - **Pendiente** (fase 2): qué hace cada flag de colocación, los bloques `unk_20` y `unk_24`, las texturas precargadas, los campos del material y cómo construir un árbol A propio que recorte bien.
 
-**Qué hacen los campos, probado en el visor** (fase 2, 18 de octubre de 2026). Método: Coors Field reconstruido con el escritor, con un solo dato cambiado, comparado en el visor con el reconstruido sin cambios desde las mismas cámaras (`exp.py` del agente, capturas a los 17 y 19 s para ver lo que se anima).
+### Qué hacen los campos, probado en el visor
+
+Fase 2, 18 de octubre de 2026. Método: Coors Field reconstruido con el escritor, con un solo dato cambiado, comparado en el visor con el reconstruido sin cambios desde las mismas cámaras (`exp.py` del agente, capturas a los 17 y 19 s para ver lo que se anima).
 - **Flags de colocación, byte `+0x52` (tipo de pieza).** El código lo lee en `0x80C600C8`, que trata aparte el 17 (vallas) y el 18 (red de detrás del plato). Quitando el tipo (a 0):
   - `0x16` y `0x17` (público tumbado y vertical): el público **deja de animarse** (la diferencia entre dos capturas baja de 1,44 a 0,25 en una escala de 0 a 255) y sigue dibujado;
   - `0x01` (marcador): desaparece lo que el juego dibuja encima en vivo (las filas de resultados salen como bloques negros);
@@ -567,7 +612,9 @@ Verificado (14 de octubre de 2026):
 - **Bits altos:** sin `0x80000000` (`NOUPCAM`), desde una cámara alta fuera del estadio aparecen los edificios y árboles de alrededor que el original esconde: esconde la pieza cuando la cámara está arriba. También la esconde en la vista del bateador (comprobado en la fase 3, en el visor y en un partido). Quitar `0x40000000` o `0x20000000` no cambió nada desde las vistas probadas (bateador, aérea, gradas); dependen de otras cámaras del partido.
 - **`unk_20`:** vaciarlo no cambia nada de día. Sus puntos están dentro de las cajas de las piezas `lumine`, a 46-57 m de altura y girados hacia el campo, un grupo por torre (Coors: 32, 50, 50 y 25): casi seguro son los focos, uno a uno, para la noche. Sin comprobar en un partido de noche.
 
-**Estadio desde cero en el juego** (fase 3, 19 de octubre de 2026; `tools/blender/powerpros_stadium/scratch.py`). Una colección de prueba con un objeto por papel, escrita sin estadio base y abierta en el visor y en un partido:
+### Estadio desde cero en el juego
+
+Fase 3, 19 de octubre de 2026; `tools/blender/powerpros_stadium/scratch.py`. Una colección de prueba con un objeto por papel, escrita sin estadio base y abierta en el visor y en un partido:
 - **Banderas (tipo `0x05`):** todas las banderas del juego son el mismo plano de 10 vértices (5 columnas × 2 filas, mástil en x = 0, tela hacia +x, 32,64 × 23,78 unidades antes de escalar), una pieza por bandera, con la rotación a 0: el sistema de banderas la gira con el viento. Las cuatro banderas de prueba juntas en una pieza de 16 vértices hacían que el sistema escribiera fuera de memoria (6 accesos por pieza; `lr` `0x8005D5A0`, `0x8005BA60`, `0x8005D364`) y el estadio no llegaba a estar listo. Una pieza por bandera carga bien, con el plano del juego o con un rectángulo de 4 vértices; con el plano, la tela se pliega.
 - **Público (tipos `0x16`/`0x17`):** el juego lo anima a través de las **texturas precargadas**. La lista de precarga (`textures` y `unk_2c` de la tabla) tiene siempre 8 entradas con papel fijo, en los 37 estadios con precarga: 0 a 2 marcador (C4), 3 pantalla (el «hueco» RGB5A3 de 8 × 8), 4 y 5 público vertical, 6 y 7 público tumbado (C8 de 128 × 64, o de 8 × 8 en dos estadios, siempre declarado 128 × 64 en el texmap). Las piezas de público que usan esas texturas muestran a las personas del juego y cambian de postura cada pocos segundos, sea cual sea la imagen de la textura (con texturas propias en esas entradas se ven las mismas personas). Sin precarga, Coors Field deja de animar su público; una pieza de público con una textura no precargada se dibuja quieta con su imagen.
 - **`0x80C5DA4C`:** recorre las colocaciones y, según el tipo (`0x13`/`0x17`, `0x14`/`0x16`, `0x15`), escribe en una tabla de visibilidad por pieza (escena `+1720`) tres valores distintos; la pieza con `0x40000000` usa otro (escena `+1973`). Parece la cantidad de público según la asistencia.
@@ -575,7 +622,9 @@ Verificado (14 de octubre de 2026):
 - **`NOUPCAM`:** un edificio de prueba con `0x80000000` no sale ni desde la vista del bateador, en el visor y en el partido; sin el bit, sí.
 - **Sin explicar:** con una cámara libre del visor justo delante del edificio de prueba, a 150 m del plato, no se dibuja ni sin `NOUPCAM`; movido 150 m hacia el campo, sí.
 
-**Lista de estadios del juego** (14 de octubre de 2026, por los datos del REL; para añadir estadios):
+### Lista de estadios del juego
+
+14 de octubre de 2026, por los datos del REL; para añadir estadios.
 - **Números de archivo:** el juego no guarda nombres de archivo. Pide las entradas de `project.bin` por número de registro: Coors Field = 75, su tabla = 76. Hay 4.681 registros, de los que 2.424 tienen nombre: quedan 2.256 libres para archivos nuevos.
 - **Tabla de estadios:** `ovl_main.rel` `+0x92A450` (en memoria `0x80E9F9D0`, sección 5). Son 40 entradas de 12 bytes: {u32 número del pack gráfico, u32 número del `tbl`, puntero a la raíz del `tbl` (`0x40000000 | posición`)}.
   - El juego no busca la raíz del `tbl`: la lee de aquí. Un `tbl` reconstruido debe dejarla en el mismo sitio o actualizar esta tabla.
@@ -631,18 +680,20 @@ Verificado (14 de octubre de 2026):
   - encontrar en la pantalla de elección el número de estadios (36 más «aleatorio»);
   - revisar si hay más tablas por estadio y si las partidas guardan el número de estadio.
 
-**Pendiente:**
+### Pendiente
+
 - los flags de la colocación (`0x500`, `0x1700`, `0x40000000`…);
 - qué elige la mezcla aditiva de las piezas `*_ADD_*`;
 - los bytes del texmap y del material que no varían;
 - para qué usa el juego el árbol A (¿qué piezas se dibujan?) y qué decide `0x80CCB438`;
 - el efecto en el juego de cada ID de superficie. Hipótesis: la 1 marca el home run, la 0 el foul a las gradas y la 2 el límite exterior. Se comprobará con el Polo Grounds.
 
-**Herramientas:**
+### Herramientas
+
 - `tools/stadium_re.py` (`info`, `check`, `stats`);
 - el complemento de Blender `tools/blender/powerpros_stadium` (`docs/stadiums.md`).
 
-## 6. Roster: `game_data.pack` y formato de jugador
+## 7. Roster: `game_data.pack` y formato de jugador
 
 - **`/game_data.pack`** (dentro de `project.bin`, 278.176 bytes): `PACKWII ` + cabecera de `0x20` + **bloque de roster de `0x43E80` bytes**.
   - Es el mismo bloque que guarda MLB Power Pros 2007 en su partida (`pm2maus.dat`, offset `0x68C74`).
@@ -741,7 +792,7 @@ Verificado (14 de octubre de 2026):
 
 Fuentes: `docs/roster-2008.md`, `tools/roster/powerup_to_2008.py`, `tools/roster/align_2007_2008.py --voices`, `wiicompiled-mods.patch`, `wiicompiled-roster-flags.patch`, `wiicompiled-roster-voices.patch`, desensamblado de `ovl_main.rel`.
 
-## 7. Escenas, menús y preparación de un partido
+## 8. Escenas, menús y preparación de un partido
 
 **Gestor de escenas** (puntero en `0x81033268`; objeto con vtable `0x80D4EB88`):
 
@@ -784,15 +835,82 @@ Fuentes: `docs/roster-2008.md`, `tools/roster/powerup_to_2008.py`, `tools/roster
 **Modo Temporada, recorrido con el mando** (19 de octubre de 2026; mando de GameCube por guion, `WIICOMPILED_PAD_SCRIPT`):
 - **Arranque hasta el menú principal:** aviso de la correa (dos A) → «Loading data» → logos de Konami, 2K Sports, licencias y Power Pros Production (se saltan con Start) → título hacia los 32 s → pantalla de mandos («You can use the following Controllers»), que espera una pulsación → menú principal.
 - **Menú principal:** 12 opciones en 3 filas: Exhibition, Success, Home Run, Practice / MLB Life, Season, League, Arrange / Wii Remote, Shop, Baseball Cards, My Data. El cursor empieza en Exhibition. Al cambiar de mando sale «1P Nintendo GameCube Controller detected».
-- **Entrar en Season:** pantalla negra unos segundos y una ventana de ayuda («Starting Play», se cierra con B). Al entrar, el juego intenta abrir `pm3usse0.dat`, `pm3usse1.dat` y `pm3usse2.dat` en la carpeta de partidas: en una partida nueva no existen. Parecen tres huecos de partida del modo Temporada, aparte de `pm3usma.dat`.
-- **Pantallas de una temporada nueva:** From Beginning / Continue → Quick Start / Start → elegir equipo (30 equipos, con estadísticas de 2007 y salario) → opciones (Game Setup, Controller Setup, Season Settings) → aviso de que mejoras, agentes libres, draft y traspasos solo se cambian en ciertos momentos de la pretemporada → charla de presentación con la secretaria (A avanza, L salta, R historial de la charla). Empieza el lunes 24 de marzo de 2008.
-- **Menú del modo Temporada:** a la izquierda, siete pastillas: Daily Progress, Practice, Management, Commands, MLB Data, System, Exit; a la derecha, la clasificación de la división. Arriba, el equipo, la fecha, jugadores en MLB y AAA, puntos del dueño y salario total. Abajo, la barra de ayudas: Start (ayuda), Y (calendario), R (historial), Z (cambiar información).
-- **MLB Data:** pestañas «◄ 2008 ►» (el año, que se cambia con L/R), All-Time/Career y Honors. Dentro de un año: Player Stats (Season Stats, Player Records), Team Stats (Team Stats, Team Records), Schedule (Standings, Matchup Chart, Postseason) y Roster (Player List, Transactions).
+- **Pantallas del modo Temporada** (entrar, temporada nueva, menú, MLB Data): en [Modo Temporada › Pantallas y menús](#pantallas-y-menús).
 - **Para los guiones:** los tiempos varían de un arranque a otro (la charla de presentación empezó entre los 84 y los 160 s), así que un guion de tiempos fijos se descuadra; mejor pulsar L repetidamente hasta pasar la charla.
 
 Fuentes: `wiicompiled-match-benchmark.patch` (`match_benchmark.cpp`), `docs/wiicompiled-feasibility.md`.
 
-## 8. Gráficos (GX y VI)
+## 9. Modo Temporada
+
+Todo lo encontrado sobre el modo Temporada (Season): fecha y año, calendario de partidos, paso de año y número de temporadas, tablas por año y la partida guardada. Investigado del 19 al 20 de octubre de 2026 con el código traducido, la sonda del runtime `wiicompiled-season-probe` (fija la fecha y el año, pulsa botones y vuelca la memoria) y partidas de prueba en un mod aparte.
+
+- **Notación:** P = `[0x8104B5AC]`, X = `[0x8104B5A0]`, Q = `[0x8104B59C]` + 1344. Son punteros del BSS del REL al bloque de datos del modo; X + n es una posición dentro de ese bloque.
+- **Herramientas:** `tools/season_save.py` (compara partidas y volcados), `tools/season_cap_sites.py` (busca en el código las comparaciones y sumas con el año).
+
+### Pantallas y menús
+
+- **Entrar en Season:** pantalla negra unos segundos y una ventana de ayuda («Starting Play», se cierra con B). Al entrar, el juego intenta abrir `pm3usse0.dat`, `pm3usse1.dat` y `pm3usse2.dat` en la carpeta de partidas: en una partida nueva no existen. Parecen tres huecos de partida del modo Temporada, aparte de `pm3usma.dat`.
+- **Pantallas de una temporada nueva:** From Beginning / Continue → Quick Start / Start → elegir equipo (30 equipos, con estadísticas de 2007 y salario) → opciones (Game Setup, Controller Setup, Season Settings) → aviso de que mejoras, agentes libres, draft y traspasos solo se cambian en ciertos momentos de la pretemporada → charla de presentación con la secretaria (A avanza, L salta, R historial de la charla). Empieza el lunes 24 de marzo de 2008.
+- **Menú del modo Temporada:** a la izquierda, siete pastillas: Daily Progress, Practice, Management, Commands, MLB Data, System, Exit; a la derecha, la clasificación de la división. Arriba, el equipo, la fecha, jugadores en MLB y AAA, puntos del dueño y salario total. Abajo, la barra de ayudas: Start (ayuda), Y (calendario), R (historial), Z (cambiar información).
+- **MLB Data:** pestañas «◄ 2008 ►» (el año, que se cambia con L/R), All-Time/Career y Honors. Dentro de un año: Player Stats (Season Stats, Player Records), Team Stats (Team Stats, Team Records), Schedule (Standings, Matchup Chart, Postseason) y Roster (Player List, Transactions).
+
+### Estado, fecha y año
+
+- **Estado:** `[0x8104B5A8]` apunta al estado de la temporada. En +4 está el día de hoy (u16, día del año desde el 1 de enero: 0x54 = 25/3), en +6 el día anterior y en +8 el **índice del año** (byte con signo; año = 2008 + índice). `0x80B74BCC` lee el índice, `0x80B4A888` devuelve el año, `0x80B74BA4` lo fija y `0x80B74BB4` le suma 1.
+- **Modo Temporada o MLB Life:** los dos ponen `[0x8104B5A8]` y `[0x8104B59C]` en su propio bloque. Los distingue el primer número de jugador, el u16 de `[0x8104B608]`: 7001 en Temporada (`0x80C48344`) y 9001 en MLB Life (`0x80A556E0`). El número de temporadas lo lee además `0x80C0C50C` (con `0x80BA0878`, hacia `[0x8104BA2C]`) al entrar en el modo, antes de que se escriba el 7001.
+- **Tramos del año:** tramos de días en `0x80D2A700` (8 bytes por tramo: primer y último día del año). Los tramos 17 a 28 son los meses; `0x80B4AA38` devuelve el mes de hoy. Tramos de la temporada: regular 19/3–1/10, postemporada 2/10–31/10, pretemporada 1/11–14/2. Días de eventos en `0x80D2A7F0` (u32 por evento; el 57 es el 1/11).
+- **Día de la semana:** `0x80B4DADC` lo calcula con una fórmula a partir del año, el mes y el día, así que también vale para años después de 2017.
+- **El año en pantalla y el calendario:** `0x80B4A888` (2008 + índice) se llama siempre (53 sitios). Suman 2008 o 2007 al índice sin llamarla `0x80B4A730` (año de una fecha, como mínimo 2008), `0x8087B668`, `0x8087E224` y `0x80ADC620` (2008 + el año elegido en un selector). El calendario usa el año de dos cifras, índice + 8 (`0x80B74C00`), que el traductor copiaba dentro de 32 funciones; en diez de ellas (`0x80B4AEE4` a `0x80B4CB84`) se limita a 8..28 antes de la fórmula del día de la semana (`li 28` y `cmpwi 28`), y ese límite solo protege la fórmula. Una función reemplazada en el runtime deja de copiarse dentro de otras (el traductor no copia lo que tiene sustituto nativo).
+- **Fechas de eventos y año del calendario** (20 de octubre de 2026): las fechas de los eventos de la temporada (`0x80BAFB8C`, `0x80BAFCC4`, `0x80BAFE40`, `0x80BAFFE8`, y `0x80A38494`) usan la temporada de una fecha (`0x80B4A7DC`) + 8, sin pasar por `0x80B74C00`: 13 sitios más del año (`tools/season_cap_sites.py --years` los busca: `addi r3, 8/2007/2008` justo después de una llamada que da el índice). El título del calendario (Y) es una imagen: `0x80B9D450` (pantalla, índice, mes) pone la del año de una tabla de 20 (`0x80E8EB40`, 2008–2027) y la del mes (`0x80E8EB90`) con `0x8001DFB8` (panel, 1696 = `season_schedule.pack`, imagen). Cada imagen es un `SURF` de `0x48` bytes en el pack, de 2007 a 2028 seguidas, con su rectángulo de 86 × 37 en un atlas C8 de 512 × 512. El pack se carga en MEM2 al abrir el calendario. Con años archivados, un reemplazo nativo pone la imagen del año real hasta 2028 y, pasado 2028, repinta la de 2007 (que el modo Temporada no enseña) con el año compuesto de las imágenes del juego por celdas: «20» de cualquier año, la cifra de las unidades de 2010 + d y la misma cifra una celda (19 columnas) a la izquierda para las decenas. Probado: abril y mayo de 2029, marzo de 2030, y marzo de 2008 con 10 temporadas sin cambios. Se encontró con un watchpoint de lectura sobre el índice al abrir el calendario (única lectura nueva: `0x80B9C034`). Las tablas de años de `0x80D29D18` (1998–2028) y `0x80E65DC4` no son el título.
+
+### Calendario de partidos
+
+- **Calendario de partidos** (20 de octubre de 2026; código traducido y volcados de memoria y partidas): tabla de 245 días × 16 huecos de 16 bytes en X + 10192 (62.720 bytes), que va dentro de la partida (archivo 0x2B8C8). El día 0 es el 1 de marzo (día del año 60). La casilla la da `0x80BA0444` (base, día del año, hueco): base + 10192 + (día − 60) × 256 + hueco × 16, o 0 fuera de los 245 días. Cada partido: u32 local, u32 visitante, u32 hora de inicio en hora del Este (horas × 400 + minutos × 4: 13:05 = 0x1464; al jugarse guarda otros datos), u32 banderas (`0x8000` = nocturno: lo llevan todos los que empiezan a partir de las 18:00 y ninguno antes; en 2008 el resto vale `0x00A06700`). Hueco vacío: equipos 44 y 44. El All-Star de 2008 (15/7, día 136) enfrenta a los equipos 33 y 37.
+  - **Números de equipo** (por división, en el orden de la clasificación final de 2007; sale al comparar los días de cada equipo con el calendario real de 2008, coincidencia de 0,98 a 1,0 en los 30): AL Este 0 BOS, 1 NYY, 2 TOR, 3 BAL, 4 TB; AL Central 5 CLE, 6 DET, 7 MIN, 8 CWS, 9 KC; AL Oeste 10 LAA, 11 SEA, 12 OAK, 13 TEX; NL Este 14 PHI, 15 NYM, 16 ATL, 17 WSH, 18 FLA; NL Central 19 CHC, 20 MIL, 21 STL, 22 HOU, 23 CIN, 24 PIT; NL Oeste 25 ARI, 26 COL, 27 SD, 28 LAD, 29 SF.
+  - **2008 es el calendario oficial:** 2.431 partidos (162 por equipo y el All-Star): el calendario publicado antes de la temporada, sin los cambios por aplazamientos (212 de los 245 días tienen el mismo número de partidos que el calendario jugado; los demás difieren por partidos aplazados). Empieza con Athletics–Red Sox en Tokio el 25 y el 26/3 (12 y 0; Oakland era el local designado) y Nationals–Braves el 30/3 (17 y 16).
+  - **Los años siguientes los genera el juego:** al pasar al 1/1, `0x80B4E564` llama a `0x80B97D68`, que vacía las 245 × 16 casillas (`0x80BA0DAC`). `0x80B97DC4` monta el calendario: vacía, consulta `0x80B97E08` y llama a `0x80B98320` o a `0x80B97EA4` (1.450 líneas, el generador), y luego a `0x80B98294`, `0x80B73E2C` y `0x80B9890C`. `0x80B97E08` solo da 1 con el índice del año en 0 y las seis divisiones iguales a la tabla de `0x80D29060` (deducido del código: el calendario oficial solo vale para 2008 con las divisiones originales). Los calendarios generados tienen 2.491 partidos (166 por equipo; unos 60 llevan otras banderas, `0x00A40000` y parecidas) y cambian cada año (2009 y 2027 solo comparten 7 emparejamientos). Si se salta con la fecha el día en que se genera, el año se queda sin calendario (partidas de prueba de 2017 a 2020 con 0 partidos).
+
+### Paso de año y número de temporadas
+
+- **Paso de año:** `0x80B4E564` se llama al avanzar de día; si el día nuevo cae en enero, suma 1 al índice y prepara la temporada nueva (`0x80B962E8`, `0x80B71B1C`, `0x80B97D68`). Se puede provocar sin jugar: desde el menú de pretemporada, día = 25/12 y «Daily Progress» lleva al 1/1 del año siguiente («These are last year's financials»). Comprobado de 2008 a 2009 y de 2009 a 2010.
+- **El tope de 10 temporadas es una variable:** `[0x8104BA2C]` = 10. La leen `0x80B40580`, `0x80B4065C` (temporadas que quedan, en pantalla), `0x80B4DB78`, `0x80B50948` y `0x80B5C4D4`, que comparan el índice con 10 − 1. Además hay comparaciones fijas con 9 o 10: `0x80BB4A40` (en 9, mensaje 141), `0x80BF24B4`, dos en `0x80BF4BD4` (mensaje 140), `0x80C0CB54`, `0x80BECF40` (lista de años) y `0x80C0D4F8` (bucle de 10 años de las finanzas).
+- **Las comparaciones fijas, instrucción por instrucción** (`tools/season_cap_sites.py`, que busca `bl 0x80B74BCC` seguido de `cmpwi` con 9 o 10 en el código cargado): `0x80BB4A6C` (índice == 9, mensaje 141), `0x80BF2530` (índice < 9, llama a `0x80BF619C`), `0x80BF51BC` y `0x80BF52D0` (eventos de pretemporada si índice < 9), `0x80C0CC0C` (índice < 10). Además hay dos bucles de 10 años con un contador: `0x80BECF8C` recorre una lista de interfaz con 10 huecos (`obj + 11184`, 4 bytes cada uno; no se puede ampliar sin más) y `0x80C0D584` inicializa los 10 años de finanzas.
+- **Final de la temporada 10** (probado con el índice puesto en 9 y la fecha en 25/12): al pasar al 1/1 el índice llega a 10 (en pantalla 2018), sale la despedida («Take care, now»), el resumen de clasificaciones, premios y postemporada (vacío, porque lee el hueco del año 10), los créditos, «Save as Arrange Team» y se guarda. Al cargar esa partida se repite el final. Ni con 10 ni con 20 llega antes: el 1/11 de 2017 (índice 9) solo trae los premios y las retiradas, y el final sale con el paso al 1/1 (probado).
+- **Partida terminada:** el bit 0x20 de `[estado + 0x104]` marca que el modo acabó; una partida con él repite el final al cargarla (comprobado poniéndolo en una partida de 2019). `0x80C0D438` lo lee, pero la comprobación al cargar va por otro camino. La partida lleva suma de control: cambiar ese byte en el archivo la deja «corrupted».
+- **Hasta 20 temporadas** (parche `wiicompiled-season-cap`, opción del launcher): `0x80C06534` (devuelve 10) da el número de temporadas, del que sale `[0x8104BA2C]`; las cinco comparaciones fijas pasan por el runtime (`translation.immediate_overrides` del traductor); las funciones de finanzas por año (`0x80C0D614`, `0x80C0D658`, `0x80C0D6D0`, `0x80C0D758`, `0x80C0D818`, `0x80C0D85C`) se reemplazan y guardan los años 11 a 20 aparte; la marca de terminado de un final anterior se borra en memoria una sola vez, justo después de cargar una partida de Temporada. El número de temporadas se fija al empezar o cargar (opción, o la partida ya jugada con 20: lleva la cola propia o pasa del índice 10), nunca desde el índice en vivo, que pasa por 10 camino del final original. Con 10, las finanzas van siempre a las direcciones del original. Probado: 2016 → 2017 → 2018 sin final, menú y días de la semana de 2018 y 2019, final tras la temporada 20, partida terminada del original seguida en 2018, y con 10 todo igual que antes.
+- **Sin límite de temporadas** (opción «Sin límite», `[season] max_seasons = 0`): el juego sigue con sus 20 años de tablas. Al pasar al 1/1 después de la temporada 20, `0x80B74BB4` (índice + 1, llamado por `0x80B4E564`) no suma: todas las tablas por año bajan un año, el año más antiguo se guarda en la cola de la partida (caben unos 34; luego se descarta el más viejo) y un desfase de años, también en la cola, hace que `0x80B4A888`, `0x80B74C00` y los sitios de año den el año real. Los días de la semana salen del año real (probado: sábado 1/1/2028, lunes 1/1/2029, sábado 8/1/2028). El hueco nuevo de cada tabla queda como un año sin jugar: clasificados a 44, series sin equipos ni victorias, la fila 20 de las clasificaciones (que nunca se juega), el equipo del año que sale, y finanzas y registros a cero. «Annual Results» muestra los 10 últimos años; las imágenes de título solo existen para 2008–2017 y los demás años salen sin título.
+- **Una temporada simulada con «Sin límite»** (2029, desde la partida de 2027 + 2): exhibiciones con Fast Game (pausa > FAST GAME > Z, unos 12 s por partido), temporada regular con el calendario (Y, elegir el último día del mes, «Skip to the end of …?»: un mes en unos 20 s), postemporada y Serie Mundial con Fast Game. Bien: días de la semana, MVP semanales, votaciones del All-Star, draft, clasificación final (162 partidos), cuadro de postemporada, informe del 1/1/2030 (ingresos 114.461 P, saldo +37.281 P, impuesto 0), «Annual Results» de 2029 después del desplazamiento (2010 archivado), y guardar y cargar en 2030 (desfase 3, 3 años archivados).
+
+### Datos por año
+
+- **Datos por año del modo Temporada** (P = `[0x8104B5AC]`, X = `[0x8104B5A0]`, Q = `[0x8104B59C]` + 1344; confirmados en volcados de memoria):
+
+  | Datos | Dónde | Por año | Sitio |
+  |---|---|---|---|
+  | Clasificados de postemporada (8 equipos; 44 = vacío) | P + año × 32 | 32 bytes | 20 años |
+  | Series de postemporada (8 series de 20 bytes) | P + 648 + año × 160 | 160 bytes | 20 años |
+  | Clasificación de las ligas | X + 0x11CD0 + año × 336 | 336 bytes | 21 años |
+  | Un equipo por año, sorteado al crear la partida | X + 0x159A0 + año × 2 | 2 bytes | 20 años |
+  | Valor anual de finanzas | Q + 4 + año × 4 | 4 bytes | **10 años** |
+  | Resumen anual de finanzas (10 conceptos y saldo) | Q + 44 + año × 44 | 44 bytes | **10 años** (detrás va la tabla mensual) |
+  | Registros de los equipos (8 × 16 bytes) | `[0x8104B59C]` + 60 + año × 128 | 128 bytes | **10 años** (detrás van las finanzas) |
+
+  Casi todo tiene sitio para 20 años; solo las finanzas y los registros de los equipos tienen 10. Con el índice en 10, `0x80C0D658` escribe en el saldo del primer mes. El significado exacto de algunos campos es una suposición: las partidas probadas no tienen resultados jugados.
+- **Registros de los equipos por año, otra tabla de 10 años** (20 de octubre de 2026): `[0x8104B59C]` + 60 + año × 128 + k × 16 (8 registros de 16 bytes con campos de bits por año), justo antes de las finanzas (`+ 1344`). La dirección la da `0x80C41BA8` (año, k); escribe `0x80C417A8` (lo llama `0x80C342B4`, desde `0x80BB4A40`, con el índice) y leen doce funciones (`0x80C41800` a `0x80C41B5C`, enteros o multiplicados por el `float` de `0x80D2F7D0`), que usa la pantalla con selector de año `0x80ADC620`. Al crear la partida los 10 años vienen rellenos. Con 20 temporadas, desde la 11 se escribía encima de las finanzas: ahora los años 11 a 20 van aparte, como las finanzas. `0x80BB4A40` no se disparó con los saltos de fecha probados (31/10, 25/12, febrero–marzo).
+- **Impuesto de lujo, una tabla fija de 10 años** (20 de octubre de 2026): `0x80C4764C` calcula el impuesto del mes: (nómina, `0x80C475A4`) − (umbral del año), por una tasa de `0x80D2F9E0` (0,225, 0,30 o 0,40 según `0x80C41CFC`, de 0 a 2; parece el número de años seguidos por encima); `0x80C47720` lo apunta como gasto 9 («Luxury Tax»). El umbral lo da la hoja `0x80C4762C` con la temporada de hoy (`0x80B4A7DC`) de una tabla de 10 en el ejecutable, `0x80D2F9B8`: 155.000, 162.000, 170.000 y luego +8.000 por año hasta 226.000 (2017). Pasado 2017 el juego lee lo que sigue a la tabla (las tasas como enteros, luego otros datos): sin impuesto en 2018–2020 y, desde 2021, un umbral de 0 o negativo. Probado: el informe del 1/2/2029 restaba 480.304.640 P de impuesto. Con más de 10 temporadas el umbral sigue con el último paso de la tabla (+8.000 por año); con 10, igual que el original. También la leen `0x80BC3C3C` y `0x80C4113C` (dos veces). Un barrido de las lecturas de tablas fijas con el índice del año (`0x80B74BCC`, `0x80B4A7DC`, `0x80B4A888`, `0x80B74C00`) no encontró otra.
+- **«Annual Results» (Management):** la monta `0x80BECE70`, con 10 páginas (`[pantalla + 11184]`, una por año) y el título de cada año como imagen (tabla de 10 en `0x80E98850`, de 2008 a 2017, que pone `0x80C10424`). `0x80BECF40` rellena los años pasados y pone el cursor en la página del índice, que pasada la temporada 10 cae fuera de las 10 (el juego se colgaba). `0x80BECFD0` cambia de página. «Monthly Results» (`0x80BCEF7C`) también pone la imagen del año del índice.
+- **No son del modo Temporada:** la tabla de 428 bytes por año de `[0x8104B5C4]` y la de 176 bytes son de MLB Life (sus punteros valen 0 en Temporada). (año + 1) × 10 + 390 en `0x80B3C99C` y (año + 1) × 3 en `0x80BF54BC` son cálculos, no tablas.
+- **Sin encontrar todavía:** un historial de premios o de estadísticas de jugadores por año.
+
+### Partida guardada de Temporada
+
+- **La partida de Temporada** (`pm3usse<hueco>.dat`, 1.179.648 bytes) es una copia de un bloque de memoria; un desplazamiento del archivo es la posición dentro del bloque + 0x8C. El índice del año está en el archivo en 0x47E8C. Cambiar el día en memoria y guardar mueve la fecha de la partida.
+- **Sitio libre en el archivo, no en memoria:** los datos de la partida ocupan 0x119910 bytes; el archivo se rellena con ceros hasta 0x120000 (26.352 bytes libres). Al cargar, el juego lee el archivo a un búfer aparte y copia solo esos datos, así que lo que haya en la cola del archivo no llega a memoria ni impide cargar (probado escribiendo una marca en 0x11F000). La memoria que sigue a los datos la usa otra cosa.
+- **Cargar y guardar una partida de Temporada:** la carga lee el archivo en trozos de 16 KB hasta el trozo que pasa del final de los datos (0x11C000), sin llegar al final del archivo. Al guardar, el juego lee entero el archivo viejo de la ranura, escribe el nuevo y lo vuelve a leer entero para comprobarlo. Por eso el runtime lee la cola por su cuenta cuando una lectura llega al final de los datos, y la descarta si las lecturas siguen más allá.
+
+Fuentes: `wiicompiled-season-probe.patch`, `tools/season_save.py`, volcados en `local/tmp/season/`, `docs/superpowers/specs/2026-10-19-season-archive-findings.md`.
+
+## 10. Gráficos (GX y VI)
 
 - **Panorámico nativo:** el juego consulta `SCGetAspectRatio` (`0x800D3374`) desde `0x8004D994`, `0x80055928`, `0x80062D24` y, en el REL, `0x807AB5D4` y `0x80CCAE3C`, y adapta la imagen a 16:9 (los objetos redondos siguen redondos). Código traducido y observación, `RL8E54`. **Hasta el 17 de octubre de 2026 no se activaba en el recomp:** la respuesta propia de Wiicompiled a `SCGetAspectRatio` lleva la dirección de Mario Kart Wii y no se enganchaba, y la función original lee `IPL.AR` de un SYSCONF que la instalación no tiene, así que devolvía 4:3 y «Forzar 16:9» solo estiraba una imagen 4:3 (lo notó un jugador). Arreglo: nativo `hle/mlb/sc_aspect_ratio.cpp` en `0x800D3374` (parche `wiicompiled-mlb-widescreen`), que contesta según los ajustes de vídeo. Comprobado en el partido de prueba: el juego registra `SCGetAspectRatio -> 16:9`, la bola sale redonda y el texto del HUD con sus proporciones.
 - **Borde negro de la imagen:** el juego configura el VI con 640x480 (`VIConfigure` `0x800B37FC`, `viXOrigin` 40, `viYOrigin` 0) y su copia de pantalla toma las 480 líneas, pero dibuja dentro de un borde negro de 16 líneas arriba y abajo (448 líneas útiles, también en los menús); la línea contigua sale medio oscura. Medido en capturas del partido de prueba y del menú de estadios, `RL8E54`. En una tele el overscan lo escondía; en un monitor eran dos franjas negras (lo pidió un jugador). Opción «Llenar pantalla» (`[video] crop_black_borders`, activada por defecto): la copia de pantalla deja fuera 17 líneas arriba y abajo (`aurora_set_display_crop_lines`, parche `wiicompiled-mlb-fill-screen`) y la imagen ocupa la ventana; en 16:9 queda un 8 % más alta (480/446). Comprobado: sin franjas ni filo oscuro y con el HUD completo.
@@ -859,7 +977,7 @@ Encontrada el 18 de octubre de 2026 para la vista previa de estadios (`runtime/s
 - **El recomp** sustituye `0x80055D24` y `0x80C779D4` por versiones nativas idénticas. Con la vista previa activa, la primera escribe el ojo y el objetivo de la cámara libre en la cámara principal antes del `LookAt`, y la segunda aprende cada cámara fuente por quién la aplica, para mostrar esas tomas. Partido normal comprobado sin cambios: mismas tomas en el mismo orden.
   Con la cámara libre, las cámaras fuente miran a otro lado (desde 10 km bajo el campo) para sacar de pantalla jugadores, pelota y cursor; su ojo, objetivo y vector arriba se guardan y se reponen al elegir una toma. `0x808816C8` también es nativa: en la vista previa, con el estadio ya en pantalla, se salta `0x808661BC` y el partido queda quieto (2 minutos sin accesos fuera de memoria; el partido normal sigue jugando).
 
-## 9. Mandos
+## 11. Mandos
 
 - **Mando de GameCube:**
   - `PADRead` `0x800B76BC`; las llamadas del juego a `PADInit`/`PADRead` están en `0x80040B14` / `0x80040BC8`.
@@ -881,7 +999,7 @@ Encontrada el 18 de octubre de 2026 para la vista previa de estadios (`runtime/s
 
 Fuentes: `wiicompiled-mlb-pad-stick-range.patch`, `config/wiicompiled/rl8e54-data.csv`, `docs/wiicompiled-feasibility.md`.
 
-## 10. Partidas guardadas, NAND, SYSCONF y ES
+## 12. Partidas guardadas, NAND, SYSCONF y ES
 
 - **Título:** `00010000/524c3845` (título de disco). La partida es `title/00010000/524c3845/data/pm3usma.dat`.
 - **IOS:** el TMD del disco pide IOS33 (`tmd.bin` `+0x184` = `0x0000000100000021`). El juego imprime la versión en su `OSReport` de arranque («Firmware: 33.14.24»).
@@ -895,47 +1013,10 @@ Fuentes: `wiicompiled-mlb-pad-stick-range.patch`, `config/wiicompiled/rl8e54-dat
   - ioctlv 29 `ES_GetTitleDir`: `"/title/%08x/%08x/data"`.
   - ioctlv 27 `ES_DIGetTicketView`: `0xD8` bytes. `+0x0C` ID de consola, `+0x10`/`+0x14` ID de título, `+0x18` máscara de acceso `0xFFFF`.
 - **SYSCONF:** sección 2.
-
-- **Año de la temporada** (19 de octubre de 2026; código traducido y pruebas en el juego con `wiicompiled-season-probe`):
-  - **Estado:** `[0x8104B5A8]` apunta al estado de la temporada. En +4 está el día de hoy (u16, día del año desde el 1 de enero: 0x54 = 25/3), en +6 el día anterior y en +8 el **índice del año** (byte con signo; año = 2008 + índice). `0x80B74BCC` lee el índice, `0x80B4A888` devuelve el año, `0x80B74BA4` lo fija y `0x80B74BB4` le suma 1.
-  - **La partida de Temporada** (`pm3usse<hueco>.dat`, 1.179.648 bytes) es una copia de un bloque de memoria; un desplazamiento del archivo es la posición dentro del bloque + 0x8C. El índice del año está en el archivo en 0x47E8C. Cambiar el día en memoria y guardar mueve la fecha de la partida.
-  - **Sitio libre en el archivo, no en memoria:** los datos de la partida ocupan 0x119910 bytes; el archivo se rellena con ceros hasta 0x120000 (26.352 bytes libres). Al cargar, el juego lee el archivo a un búfer aparte y copia solo esos datos, así que lo que haya en la cola del archivo no llega a memoria ni impide cargar (probado escribiendo una marca en 0x11F000). La memoria que sigue a los datos la usa otra cosa.
-  - **Calendario:** tramos de días en `0x80D2A700` (8 bytes por tramo: primer y último día del año). Los tramos 17 a 28 son los meses; `0x80B4AA38` devuelve el mes de hoy. Tramos de la temporada: regular 19/3–1/10, postemporada 2/10–31/10, pretemporada 1/11–14/2. Días de eventos en `0x80D2A7F0` (u32 por evento; el 57 es el 1/11).
-  - **Paso de año:** `0x80B4E564` se llama al avanzar de día; si el día nuevo cae en enero, suma 1 al índice y prepara la temporada nueva (`0x80B962E8`, `0x80B71B1C`, `0x80B97D68`). Se puede provocar sin jugar: desde el menú de pretemporada, día = 25/12 y «Daily Progress» lleva al 1/1 del año siguiente («These are last year's financials»). Comprobado de 2008 a 2009 y de 2009 a 2010.
-  - **Día de la semana:** `0x80B4DADC` lo calcula con una fórmula a partir del año, el mes y el día, así que también vale para años después de 2017.
-  - **El tope de 10 temporadas es una variable:** `[0x8104BA2C]` = 10. La leen `0x80B40580`, `0x80B4065C` (temporadas que quedan, en pantalla), `0x80B4DB78`, `0x80B50948` y `0x80B5C4D4`, que comparan el índice con 10 − 1. Además hay comparaciones fijas con 9 o 10: `0x80BB4A40` (en 9, mensaje 141), `0x80BF24B4`, dos en `0x80BF4BD4` (mensaje 140), `0x80C0CB54`, `0x80BECF40` (lista de años) y `0x80C0D4F8` (bucle de 10 años de las finanzas).
-  - **Las comparaciones fijas, instrucción por instrucción** (`tools/season_cap_sites.py`, que busca `bl 0x80B74BCC` seguido de `cmpwi` con 9 o 10 en el código cargado): `0x80BB4A6C` (índice == 9, mensaje 141), `0x80BF2530` (índice < 9, llama a `0x80BF619C`), `0x80BF51BC` y `0x80BF52D0` (eventos de pretemporada si índice < 9), `0x80C0CC0C` (índice < 10). Además hay dos bucles de 10 años con un contador: `0x80BECF8C` recorre una lista de interfaz con 10 huecos (`obj + 11184`, 4 bytes cada uno; no se puede ampliar sin más) y `0x80C0D584` inicializa los 10 años de finanzas.
-  - **Final de la temporada 10** (probado con el índice puesto en 9 y la fecha en 25/12): al pasar al 1/1 el índice llega a 10 (en pantalla 2018), sale la despedida («Take care, now»), el resumen de clasificaciones, premios y postemporada (vacío, porque lee el hueco del año 10), los créditos, «Save as Arrange Team» y se guarda. Al cargar esa partida se repite el final. Ni con 10 ni con 20 llega antes: el 1/11 de 2017 (índice 9) solo trae los premios y las retiradas, y el final sale con el paso al 1/1 (probado).
-  - **Partida terminada:** el bit 0x20 de `[estado + 0x104]` marca que el modo acabó; una partida con él repite el final al cargarla (comprobado poniéndolo en una partida de 2019). `0x80C0D438` lo lee, pero la comprobación al cargar va por otro camino. La partida lleva suma de control: cambiar ese byte en el archivo la deja «corrupted».
-  - **Hasta 20 temporadas** (parche `wiicompiled-season-cap`, opción del launcher): `0x80C06534` (devuelve 10) da el número de temporadas, del que sale `[0x8104BA2C]`; las cinco comparaciones fijas pasan por el runtime (`translation.immediate_overrides` del traductor); las funciones de finanzas por año (`0x80C0D614`, `0x80C0D658`, `0x80C0D6D0`, `0x80C0D758`, `0x80C0D818`, `0x80C0D85C`) se reemplazan y guardan los años 11 a 20 aparte; la marca de terminado de un final anterior se borra en memoria una sola vez, justo después de cargar una partida de Temporada. El número de temporadas se fija al empezar o cargar (opción, o la partida ya jugada con 20: lleva la cola propia o pasa del índice 10), nunca desde el índice en vivo, que pasa por 10 camino del final original. Con 10, las finanzas van siempre a las direcciones del original. Probado: 2016 → 2017 → 2018 sin final, menú y días de la semana de 2018 y 2019, final tras la temporada 20, partida terminada del original seguida en 2018, y con 10 todo igual que antes.
-  - **Registros de los equipos por año, otra tabla de 10 años** (20 de octubre de 2026): `[0x8104B59C]` + 60 + año × 128 + k × 16 (8 registros de 16 bytes con campos de bits por año), justo antes de las finanzas (`+ 1344`). La dirección la da `0x80C41BA8` (año, k); escribe `0x80C417A8` (lo llama `0x80C342B4`, desde `0x80BB4A40`, con el índice) y leen doce funciones (`0x80C41800` a `0x80C41B5C`, enteros o multiplicados por el `float` de `0x80D2F7D0`), que usa la pantalla con selector de año `0x80ADC620`. Al crear la partida los 10 años vienen rellenos. Con 20 temporadas, desde la 11 se escribía encima de las finanzas: ahora los años 11 a 20 van aparte, como las finanzas. `0x80BB4A40` no se disparó con los saltos de fecha probados (31/10, 25/12, febrero–marzo).
-  - **Modo Temporada o MLB Life:** los dos ponen `[0x8104B5A8]` y `[0x8104B59C]` en su propio bloque. Los distingue el primer número de jugador, el u16 de `[0x8104B608]`: 7001 en Temporada (`0x80C48344`) y 9001 en MLB Life (`0x80A556E0`). El número de temporadas lo lee además `0x80C0C50C` (con `0x80BA0878`, hacia `[0x8104BA2C]`) al entrar en el modo, antes de que se escriba el 7001.
-  - **El año en pantalla y el calendario:** `0x80B4A888` (2008 + índice) se llama siempre (53 sitios). Suman 2008 o 2007 al índice sin llamarla `0x80B4A730` (año de una fecha, como mínimo 2008), `0x8087B668`, `0x8087E224` y `0x80ADC620` (2008 + el año elegido en un selector). El calendario usa el año de dos cifras, índice + 8 (`0x80B74C00`), que el traductor copiaba dentro de 32 funciones; en diez de ellas (`0x80B4AEE4` a `0x80B4CB84`) se limita a 8..28 antes de la fórmula del día de la semana (`li 28` y `cmpwi 28`), y ese límite solo protege la fórmula. Una función reemplazada en el runtime deja de copiarse dentro de otras (el traductor no copia lo que tiene sustituto nativo).
-  - **Cargar y guardar una partida de Temporada:** la carga lee el archivo en trozos de 16 KB hasta el trozo que pasa del final de los datos (0x11C000), sin llegar al final del archivo. Al guardar, el juego lee entero el archivo viejo de la ranura, escribe el nuevo y lo vuelve a leer entero para comprobarlo. Por eso el runtime lee la cola por su cuenta cuando una lectura llega al final de los datos, y la descarta si las lecturas siguen más allá.
-  - **«Annual Results» (Management):** la monta `0x80BECE70`, con 10 páginas (`[pantalla + 11184]`, una por año) y el título de cada año como imagen (tabla de 10 en `0x80E98850`, de 2008 a 2017, que pone `0x80C10424`). `0x80BECF40` rellena los años pasados y pone el cursor en la página del índice, que pasada la temporada 10 cae fuera de las 10 (el juego se colgaba). `0x80BECFD0` cambia de página. «Monthly Results» (`0x80BCEF7C`) también pone la imagen del año del índice.
-  - **Impuesto de lujo, una tabla fija de 10 años** (20 de octubre de 2026): `0x80C4764C` calcula el impuesto del mes: (nómina, `0x80C475A4`) − (umbral del año), por una tasa de `0x80D2F9E0` (0,225, 0,30 o 0,40 según `0x80C41CFC`, de 0 a 2; parece el número de años seguidos por encima); `0x80C47720` lo apunta como gasto 9 («Luxury Tax»). El umbral lo da la hoja `0x80C4762C` con la temporada de hoy (`0x80B4A7DC`) de una tabla de 10 en el ejecutable, `0x80D2F9B8`: 155.000, 162.000, 170.000 y luego +8.000 por año hasta 226.000 (2017). Pasado 2017 el juego lee lo que sigue a la tabla (las tasas como enteros, luego otros datos): sin impuesto en 2018–2020 y, desde 2021, un umbral de 0 o negativo. Probado: el informe del 1/2/2029 restaba 480.304.640 P de impuesto. Con más de 10 temporadas el umbral sigue con el último paso de la tabla (+8.000 por año); con 10, igual que el original. También la leen `0x80BC3C3C` y `0x80C4113C` (dos veces). Un barrido de las lecturas de tablas fijas con el índice del año (`0x80B74BCC`, `0x80B4A7DC`, `0x80B4A888`, `0x80B74C00`) no encontró otra.
-  - **Fechas de eventos y año del calendario** (20 de octubre de 2026): las fechas de los eventos de la temporada (`0x80BAFB8C`, `0x80BAFCC4`, `0x80BAFE40`, `0x80BAFFE8`, y `0x80A38494`) usan la temporada de una fecha (`0x80B4A7DC`) + 8, sin pasar por `0x80B74C00`: 13 sitios más del año (`tools/season_cap_sites.py --years` los busca: `addi r3, 8/2007/2008` justo después de una llamada que da el índice). El título del calendario (Y) es una imagen: `0x80B9D450` (pantalla, índice, mes) pone la del año de una tabla de 20 (`0x80E8EB40`, 2008–2027) y la del mes (`0x80E8EB90`) con `0x8001DFB8` (panel, 1696 = `season_schedule.pack`, imagen). Cada imagen es un `SURF` de `0x48` bytes en el pack, de 2007 a 2028 seguidas, con su rectángulo de 86 × 37 en un atlas C8 de 512 × 512. El pack se carga en MEM2 al abrir el calendario. Con años archivados, un reemplazo nativo pone la imagen del año real hasta 2028 y, pasado 2028, repinta la de 2007 (que el modo Temporada no enseña) con el año compuesto de las imágenes del juego por celdas: «20» de cualquier año, la cifra de las unidades de 2010 + d y la misma cifra una celda (19 columnas) a la izquierda para las decenas. Probado: abril y mayo de 2029, marzo de 2030, y marzo de 2008 con 10 temporadas sin cambios. Se encontró con un watchpoint de lectura sobre el índice al abrir el calendario (única lectura nueva: `0x80B9C034`). Las tablas de años de `0x80D29D18` (1998–2028) y `0x80E65DC4` no son el título.
-  - **Una temporada simulada con «Sin límite»** (2029, desde la partida de 2027 + 2): exhibiciones con Fast Game (pausa > FAST GAME > Z, unos 12 s por partido), temporada regular con el calendario (Y, elegir el último día del mes, «Skip to the end of …?»: un mes en unos 20 s), postemporada y Serie Mundial con Fast Game. Bien: días de la semana, MVP semanales, votaciones del All-Star, draft, clasificación final (162 partidos), cuadro de postemporada, informe del 1/1/2030 (ingresos 114.461 P, saldo +37.281 P, impuesto 0), «Annual Results» de 2029 después del desplazamiento (2010 archivado), y guardar y cargar en 2030 (desfase 3, 3 años archivados).
-  - **Sin límite de temporadas** (opción «Sin límite», `[season] max_seasons = 0`): el juego sigue con sus 20 años de tablas. Al pasar al 1/1 después de la temporada 20, `0x80B74BB4` (índice + 1, llamado por `0x80B4E564`) no suma: todas las tablas por año bajan un año, el año más antiguo se guarda en la cola de la partida (caben unos 34; luego se descarta el más viejo) y un desfase de años, también en la cola, hace que `0x80B4A888`, `0x80B74C00` y los sitios de año den el año real. Los días de la semana salen del año real (probado: sábado 1/1/2028, lunes 1/1/2029, sábado 8/1/2028). El hueco nuevo de cada tabla queda como un año sin jugar: clasificados a 44, series sin equipos ni victorias, la fila 20 de las clasificaciones (que nunca se juega), el equipo del año que sale, y finanzas y registros a cero. «Annual Results» muestra los 10 últimos años; las imágenes de título solo existen para 2008–2017 y los demás años salen sin título.
-  - **Datos por año del modo Temporada** (P = `[0x8104B5AC]`, X = `[0x8104B5A0]`, Q = `[0x8104B59C]` + 1344; confirmados en volcados de memoria):
-
-    | Datos | Dónde | Por año | Sitio |
-    |---|---|---|---|
-    | Clasificados de postemporada (8 equipos; 44 = vacío) | P + año × 32 | 32 bytes | 20 años |
-    | Series de postemporada (8 series de 20 bytes) | P + 648 + año × 160 | 160 bytes | 20 años |
-    | Clasificación de las ligas | X + 0x11CD0 + año × 336 | 336 bytes | 21 años |
-    | Un equipo por año, sorteado al crear la partida | X + 0x159A0 + año × 2 | 2 bytes | 20 años |
-    | Valor anual de finanzas | Q + 4 + año × 4 | 4 bytes | **10 años** |
-    | Resumen anual de finanzas (10 conceptos y saldo) | Q + 44 + año × 44 | 44 bytes | **10 años** (detrás va la tabla mensual) |
-    | Registros de los equipos (8 × 16 bytes) | `[0x8104B59C]` + 60 + año × 128 | 128 bytes | **10 años** (detrás van las finanzas) |
-
-    Casi todo tiene sitio para 20 años; solo las finanzas y los registros de los equipos tienen 10. Con el índice en 10, `0x80C0D658` escribe en el saldo del primer mes. El significado exacto de algunos campos es una suposición: las partidas probadas no tienen resultados jugados.
-  - **No son del modo Temporada:** la tabla de 428 bytes por año de `[0x8104B5C4]` y la de 176 bytes son de MLB Life (sus punteros valen 0 en Temporada). (año + 1) × 10 + 390 en `0x80B3C99C` y (año + 1) × 3 en `0x80BF54BC` son cálculos, no tablas.
-  - **Sin encontrar todavía:** un historial de premios o de estadísticas de jugadores por año.
-Fuentes: `wiicompiled-season-probe.patch`, `tools/season_save.py`, volcados en `local/tmp/season/`, `docs/superpowers/specs/2026-10-19-season-archive-findings.md`.
+- **Partida del modo Temporada** (`pm3usse<hueco>.dat`): formato, sitio libre, carga y guardado en [Modo Temporada › Partida guardada de Temporada](#partida-guardada-de-temporada).
 Fuentes de la sección: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_status.cpp`, `docs/mods.md`.
 
-## 11. Bibliotecas y funciones identificadas
+## 13. Bibliotecas y funciones identificadas
 
 **Fechas de compilación de los módulos del SDK** (etiquetas en el binario):
 
@@ -963,7 +1044,7 @@ Fuentes de la sección: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_statu
 - **Equivalencias con Mario Kart Wii** (útiles para portar código o ganchos de MKW): `InsertAlarm` `0x8009B448`, `OSSaveContext` `0x8009CCD8`, `__OSThreadInit` `0x800A3C0C`, `__OSTimeToSystemTime` `0x800A53A4`, `OSLoadContext` `0x8009CD58`. `config/wiicompiled/rl8e54-data.csv` traduce 65 direcciones de datos de MKW a MLB, cada una con la instrucción que lo demuestra.
 - **Sin dirección todavía:** `VIInit`/`VIConfigure`, `PADInit`, `OSInitAudioSystem`, `__OSInterruptInit`, `OSGetCurrentThread` y algunas más. Algunas pueden no existir porque el enlazador las eliminó.
 
-## 12. Peculiaridades del juego que importan al portarlo
+## 14. Peculiaridades del juego que importan al portarlo
 
 | Peculiaridad | Consecuencia |
 |---|---|
@@ -977,7 +1058,7 @@ Fuentes de la sección: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_statu
 | Stick de GC dividido entre 88/64 | Un mando moderno necesita escalar el recorrido |
 | `OSInit` espera al SYSCONF y `RFLWaitAsync` gira en bucle | Los callbacks de IOS deben llegar mientras el juego espera |
 
-## 13. Cómo seguir investigando
+## 15. Cómo seguir investigando
 
 - **Mapa de funciones:** `config/wiicompiled/rl8e54-functions.map`. Añadir un nombre al mapa lo lleva al código traducido la próxima vez que se traduce.
 - **Datos del SDK de MKW a MLB:** `config/wiicompiled/rl8e54-data.csv`, con la prueba de cada fila.

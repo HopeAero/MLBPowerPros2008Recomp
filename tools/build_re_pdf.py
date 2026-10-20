@@ -14,6 +14,7 @@ import sys
 import tempfile
 
 import markdown
+from markdown.extensions.toc import slugify_unicode
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BROWSERS = [
@@ -51,7 +52,9 @@ def main() -> None:
     output = (pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else ROOT / "local" / "docs" / name).resolve()  # Chrome needs it absolute
     # GitHub nests lists at 2 spaces; Python-Markdown needs 4.
     text = re.sub(r"^( +)(?=[-*] |\d+\. )", lambda m: m[1] * 2, source.read_text(encoding="utf-8"), flags=re.M)
-    body = markdown.markdown(text, extensions=["tables", "fenced_code", "toc", "sane_lists"])
+    # Keep accents in heading ids, as GitHub does, so the index links (#escenas-menús-…) resolve.
+    body = markdown.markdown(text, extensions=["tables", "fenced_code", "toc", "sane_lists"],
+                             extension_configs={"toc": {"slugify": slugify_unicode}})
     html = f"<!doctype html><html lang='{"en" if english else "es"}'><head><meta charset='utf-8'><style>{CSS}</style></head><body>{body}</body></html>"
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:

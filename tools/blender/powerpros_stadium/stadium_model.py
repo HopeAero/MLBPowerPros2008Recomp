@@ -3,7 +3,7 @@
 scratch (stadium_write.py), read from the game's packs by stadium_read.py or built by hand.
 
 Indices, never file offsets, tie the parts together. Fields whose meaning is not known yet keep a
-provisional name (unk_*); docs/ingenieria-inversa.md, section 5, has the format.
+provisional name (unk_*); docs/ingenieria-inversa.md, section 6, has the format.
 Units are the game's: decimetres, Y up, home plate at the origin, centre field towards -Z.
 """
 from dataclasses import dataclass, field

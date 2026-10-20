@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Write a stadium_model.Stadium as its two packs, from empty buffers: nothing is read from an existing
-pack. The layout follows docs/ingenieria-inversa.md, section 5 ("Estadios", "Inventario de campos para
+pack. The layout follows docs/ingenieria-inversa.md, section 6 ("Estadios", "Inventario de campos para
 escribir packs desde cero"): pointers are 0x40000000 | offset in their own file; display lists, vertex
 arrays, texels and palette colours on 32 bytes, everything else on 4.
 """

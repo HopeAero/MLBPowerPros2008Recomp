@@ -83,7 +83,7 @@ index 0000000..cf0aac9
 +// stadium it knows; only its files and menu pictures differ:
 +//   - ShowStadium loads and shows the new stadium's menu pack in place of the base's;
 +//   - GetStadiumFiles returns the new stadium's files when it was the one picked (Exhibition).
-+// docs/ingenieria-inversa.md, section 5, "Lista de estadios del juego".
++// docs/ingenieria-inversa.md, section 6, "Lista de estadios del juego".
 +#include <algorithm>
 +#include <cstdint>
 +#include <cstdio>
