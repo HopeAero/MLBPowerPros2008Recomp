@@ -92,6 +92,8 @@ Con esta tabla coinciden 707 de los 729 jugadores comunes; sin ella, solo 26. Lo
 
 **Piel y ojos** (0x55.4, 4 bits): 2007 tiene 5 tonos de piel y suma 5 si los ojos son marrones. 2008 agregó un tono en la posición 2 y suma 6. Por eso 0–1 quedan igual, 2–6 suben 1 y 7–9 suben 2. Coinciden 695 de 729 (272 sin la tabla).
 
+**El tono de piel de 2008 en PowerUp+** (20 de octubre de 2026, a petición de un jugador en Reddit): el editor lo ofrece como **2.5 (2008)**, entre el 2 y el 3. Dentro de PowerUp+ se guarda como 10 (ojos azules) u 11 (marrones), valores que el formato de 2007 tiene libres; al exportar a 2008 son 2 y 8. Una exportación para el 2007, que no tiene ese tono, pone el 2. El roster de 2008 trae 27 jugadores con él (1 con ojos azules y 26 con marrones): antes se importaban con el tono 2 y ahora conservan el suyo. Comprobado importando el `project.bin`, exportando el mod (mismos valores que el juego) y cambiando dos jugadores al tono nuevo (salen 2 y 8).
+
 **Revisión del resto de campos:** se compararon todos los campos de los 729 jugadores, ya convertidos, con el roster real de 2008. Solo la cara y la piel/ojos tenían números de catálogo cambiados. Lo demás que difiere son datos de la nueva temporada:
 - ratings, estadísticas, peinados;
 - 2008 marca a la mayoría de los pitchers como robadores "cautelosos".

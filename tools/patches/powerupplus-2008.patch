@@ -226,6 +226,19 @@ index 3d5fb22..66ef446 100644
          onChange={e => setState(p => ({...p, selectedFile: e.target.files![0]}))} 
        />
      </div>
+diff --git a/PowerUp/PowerUp.ElectronUI/electron/src/app/playerEditor/appearanceEditor.tsx b/PowerUp/PowerUp.ElectronUI/electron/src/app/playerEditor/appearanceEditor.tsx
+index 1a01319..e101ec4 100644
+--- a/PowerUp/PowerUp.ElectronUI/electron/src/app/playerEditor/appearanceEditor.tsx
++++ b/PowerUp/PowerUp.ElectronUI/electron/src/app/playerEditor/appearanceEditor.tsx
+@@ -268,6 +268,8 @@ function getComplexion(key: string): string | undefined {
+       return 'hsl(12deg 91% 83%)';
+     case 'Two':
+       return 'hsl(30deg 94% 73%)';
++    case 'Extra2008':
++      return 'hsl(26deg 72% 63%)';
+     case 'Three':
+       return 'hsl(21 49% 54%)';
+     case 'Four':
 diff --git a/PowerUp/PowerUp.ElectronUI/electron/src/app/playerEditor/loadPlayerEditorApiClient.ts b/PowerUp/PowerUp.ElectronUI/electron/src/app/playerEditor/loadPlayerEditorApiClient.ts
 index 5a6966f..4841c7f 100644
 --- a/PowerUp/PowerUp.ElectronUI/electron/src/app/playerEditor/loadPlayerEditorApiClient.ts
@@ -439,6 +452,102 @@ index ef7adb8..b7dea6e 100644
    async function exportRosterAsCsv() {
      const csvFile = await exportApiClientRef.current.executeCsv({
        rosterId: rosterId,
+diff --git a/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008SkinTests.cs b/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008SkinTests.cs
+new file mode 100644
+index 0000000..49d5477
+--- /dev/null
++++ b/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008SkinTests.cs
+@@ -0,0 +1,54 @@
++using NUnit.Framework;
++using PowerUp.GameSave.PowerPros2008;
++using PowerUp.Mappers.Players;
++using Shouldly;
++
++namespace PowerUp.Tests.GameSave.PowerPros2008
++{
++  public class PowerPros2008SkinTests
++  {
++    // 2007 keeps 5 complexions (+5 for brown eyes); 2008 inserted one at 2 (+6 for brown eyes). In
++    // PowerUp+'s 2007 layout that 2008 complexion is 10 (blue eyes) / 11 (brown eyes).
++    [Test]
++    [TestCase(0, 0)]
++    [TestCase(1, 1)]
++    [TestCase(2, 3)]
++    [TestCase(4, 5)]
++    [TestCase(5, 6)]
++    [TestCase(6, 7)]
++    [TestCase(7, 9)]
++    [TestCase(9, 11)]
++    [TestCase(10, 2)]
++    [TestCase(11, 8)]
++    public void Skin2008_ShouldMapEvery2007LayoutValue(int value, int expected)
++    {
++      PowerPros2008Roster.Skin2008(value).ShouldBe(expected);
++    }
++
++    [Test]
++    [TestCase(0, 0)]
++    [TestCase(1, 1)]
++    [TestCase(2, 10)]
++    [TestCase(3, 2)]
++    [TestCase(5, 4)]
++    [TestCase(6, 5)]
++    [TestCase(7, 6)]
++    [TestCase(8, 11)]
++    [TestCase(9, 7)]
++    [TestCase(11, 9)]
++    public void Skin2007_ShouldKeepThe2008OnlyComplexion(int value, int expected)
++    {
++      PowerPros2008Roster.Skin2007(value).ShouldBe(expected);
++    }
++
++    [Test]
++    [TestCase(0, 0)]
++    [TestCase(9, 9)]
++    [TestCase(10, 1)]
++    [TestCase(11, 6)]
++    public void SkinFor2007Game_ShouldGiveThe2008OnlyComplexionTheClosestOne(int value, int expected)
++    {
++      AppearanceMapper.SkinFor2007Game((ushort)value).ShouldBe((ushort)expected);
++    }
++  }
++}
+diff --git a/PowerUp/PowerUp.Tests/Mappers/Players/PlayerMapper_GSPlayerToPlayerTests.cs b/PowerUp/PowerUp.Tests/Mappers/Players/PlayerMapper_GSPlayerToPlayerTests.cs
+index 9c73085..14457ce 100644
+--- a/PowerUp/PowerUp.Tests/Mappers/Players/PlayerMapper_GSPlayerToPlayerTests.cs
++++ b/PowerUp/PowerUp.Tests/Mappers/Players/PlayerMapper_GSPlayerToPlayerTests.cs
+@@ -446,6 +446,8 @@ namespace PowerUp.Tests.Mappers.Players
+     [TestCase( 177, 0, Complexion.One)]
+     [TestCase( 200, 3, Complexion.Four)]
+     [TestCase( 232, 6, Complexion.Two)]
++    [TestCase( 177, 10, Complexion.Extra2008)]
++    [TestCase( 232, 11, Complexion.Extra2008)]
+     public void MapToPlayer_ShouldMapComplexion(int faceId, int skinAndEyesValue, Complexion? expectedValue)
+     {
+       gsPlayer.Face = (ushort)faceId;
+@@ -459,6 +461,8 @@ namespace PowerUp.Tests.Mappers.Players
+     [TestCase(177, 0, EyeColor.Blue)]
+     [TestCase(193, 3, null)]
+     [TestCase(232, 6, EyeColor.Brown)]
++    [TestCase(177, 10, EyeColor.Blue)]
++    [TestCase(232, 11, EyeColor.Brown)]
+     public void MapToPlayer_ShouldMapEyeColor(int faceId, int skinAndEyesValue, EyeColor? expectedValue)
+     {
+       gsPlayer.Face = (ushort)faceId;
+diff --git a/PowerUp/PowerUp.Tests/Mappers/Players/PlayerMapper_PlayerToGSPlayerTests.cs b/PowerUp/PowerUp.Tests/Mappers/Players/PlayerMapper_PlayerToGSPlayerTests.cs
+index adeb2ed..a5b64af 100644
+--- a/PowerUp/PowerUp.Tests/Mappers/Players/PlayerMapper_PlayerToGSPlayerTests.cs
++++ b/PowerUp/PowerUp.Tests/Mappers/Players/PlayerMapper_PlayerToGSPlayerTests.cs
+@@ -219,6 +219,9 @@ namespace PowerUp.Tests.Mappers.Players
+     [TestCase(Complexion.One, EyeColor.Blue, 0)]
+     [TestCase(Complexion.Five, EyeColor.Brown, 9)]
+     [TestCase(Complexion.Five, EyeColor.Blue, 4)]
++    [TestCase(Complexion.Extra2008, EyeColor.Blue, 10)]
++    [TestCase(Complexion.Extra2008, EyeColor.Brown, 11)]
++    [TestCase(Complexion.Extra2008, null, 10)]
+     public void MapToGSPlayer_ShouldMapSkinAndEyes(Complexion? skin, EyeColor? eyeColor, int exptectedValue)
+     {
+       player.Appearance.Complexion = skin;
 diff --git a/PowerUp/PowerUp/Dependencies.cs b/PowerUp/PowerUp/Dependencies.cs
 index 6ab259b..4cbcf00 100644
 --- a/PowerUp/PowerUp/Dependencies.cs
@@ -519,6 +628,36 @@ index 1a9895c..c0b4fab 100644
    }
  
    public class HitterSpecialAbilitiesParameters
+diff --git a/PowerUp/PowerUp/Entities/Players/Appearance.cs b/PowerUp/PowerUp/Entities/Players/Appearance.cs
+index a6dcfde..1ce323f 100644
+--- a/PowerUp/PowerUp/Entities/Players/Appearance.cs
++++ b/PowerUp/PowerUp/Entities/Players/Appearance.cs
+@@ -3,15 +3,24 @@
+   public enum Complexion 
+   { 
+     [DisplayName("1")]
++    [Order(1)]
+     One, 
+     [DisplayName("2")]
++    [Order(2)]
+     Two, 
+     [DisplayName("3")]
++    [Order(4)]
+     Three, 
+     [DisplayName("4")]
++    [Order(5)]
+     Four, 
+     [DisplayName("5")]
+-    Five 
++    [Order(6)]
++    Five,
++    // MLB Power Pros 2008 only: the complexion it inserted between 2 and 3. Exported as 2 to 2007.
++    [DisplayName("2.5 (2008)")]
++    [Order(3)]
++    Extra2008
+   }
+   public enum EyeColor { Brown, Blue }
+   public enum EyebrowThickness { Thick, Thin }
 diff --git a/PowerUp/PowerUp/Entities/Players/SpecialAbilities.cs b/PowerUp/PowerUp/Entities/Players/SpecialAbilities.cs
 index 3feda07..408468e 100644
 --- a/PowerUp/PowerUp/Entities/Players/SpecialAbilities.cs
@@ -582,7 +721,7 @@ index 8431233..c1dd6f3 100644
          {
            Stream = stream,
 diff --git a/PowerUp/PowerUp/GameSave/Api/RosterExportApi.cs b/PowerUp/PowerUp/GameSave/Api/RosterExportApi.cs
-index e06c584..6125075 100644
+index e06c584..95885e0 100644
 --- a/PowerUp/PowerUp/GameSave/Api/RosterExportApi.cs
 +++ b/PowerUp/PowerUp/GameSave/Api/RosterExportApi.cs
 @@ -1,10 +1,13 @@
@@ -874,6 +1013,16 @@ index e06c584..6125075 100644
      private void WriteRosterToFile(Roster roster, string filePath, int gameSaveId)
      {
        // CHRISTODO: Don't hard code endian-ness
+@@ -122,6 +379,9 @@ namespace PowerUp.GameSave.Api
+ 
+         var mappedFAs = freeAgents.Select(fa => _playerMapper.MapToGSPlayer(fa.player, MLBPPTeam.NationalLeagueAllStars, (ushort)ppIdByExportId[fa.playerExportId]));
+         gsPlayers.AddRange(mappedFAs);
++        // The 2007 game has no 2008-only complexion: it gets the closest one.
++        foreach (var gsPlayer in gsPlayers)
++          gsPlayer.SkinAndEyes = AppearanceMapper.SkinFor2007Game(gsPlayer.SkinAndEyes ?? 0);
+ 
+         var blankFreeAgentSpots = new List<GSFreeAgent>();
+         for (var i = freeAgents.Count(); i < 15; i++)
 diff --git a/PowerUp/PowerUp/GameSave/Api/RosterImportApi.cs b/PowerUp/PowerUp/GameSave/Api/RosterImportApi.cs
 index fe3d726..bb53e58 100644
 --- a/PowerUp/PowerUp/GameSave/Api/RosterImportApi.cs
@@ -1231,16 +1380,17 @@ index 0000000..e330a50
 +}
 diff --git a/PowerUp/PowerUp/GameSave/PowerPros2008/PowerPros2008Roster.cs b/PowerUp/PowerUp/GameSave/PowerPros2008/PowerPros2008Roster.cs
 new file mode 100644
-index 0000000..eaf46f6
+index 0000000..010c9a4
 --- /dev/null
 +++ b/PowerUp/PowerUp/GameSave/PowerPros2008/PowerPros2008Roster.cs
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,338 @@
 +﻿using System;
 +using System.Collections.Generic;
 +using System.IO;
 +using System.Linq;
 +using System.Text;
 +using PowerUp.Libraries;
++using PowerUp.Mappers.Players;
 +
 +namespace PowerUp.GameSave.PowerPros2008
 +{
@@ -1364,12 +1514,16 @@ index 0000000..eaf46f6
 +
 +    /// <summary>
 +    /// 2007 SkinAndEyes -> 2008's: 2007 has 5 complexions and adds 5 for brown eyes; 2008 inserted
-+    /// a complexion at 2 and adds 6 (695 of the 729 common players match this way).
++    /// a complexion at 2 and adds 6 (695 of the 729 common players match this way). PowerUp+ keeps
++    /// that 2008-only complexion as 10 / 11 (blue / brown eyes; AppearanceMapper.EXTRA_2008_SKIN).
 +    /// </summary>
-+    public static int Skin2008(int value) => value + (value < 2 ? 0 : value < 7 ? 1 : 2);
++    public static int Skin2008(int value) => value >= AppearanceMapper.EXTRA_2008_SKIN
++      ? 2 + (value - AppearanceMapper.EXTRA_2008_SKIN) * 6
++      : value + (value < 2 ? 0 : value < 7 ? 1 : 2);
 +
-+    /// <summary>2008 SkinAndEyes -> 2007's; 2008's new complexion becomes the one before it.</summary>
-+    public static int Skin2007(int value) => Enumerable.Range(0, 16).Last(v => Skin2008(v) <= value);
++    /// <summary>2008 SkinAndEyes -> PowerUp+'s 2007 layout (the inverse of Skin2008).</summary>
++    /// A value past 2008's twelve (not seen in the game) maps like the 2007 ones, as before.
++    public static int Skin2007(int value) => value > 11 ? value - 2 : Enumerable.Range(0, 12).First(v => Skin2008(v) == value);
 +
 +    /// <summary>
 +    /// 2007 face id -> 2008's: 2008 inserted faces after 27, 105, 160 and 176 (707 of the 729
@@ -1636,8 +1790,40 @@ index 42fd76a..68b2ffa 100644
  
      protected override string ParseKey(string keyString) => keyString.Replace("_"," ");
      protected override int ParseValue(string valueString) =>  int.Parse(valueString);
+diff --git a/PowerUp/PowerUp/Mappers/Players/AppearanceMapper.cs b/PowerUp/PowerUp/Mappers/Players/AppearanceMapper.cs
+index 05d995c..fcbbfd2 100644
+--- a/PowerUp/PowerUp/Mappers/Players/AppearanceMapper.cs
++++ b/PowerUp/PowerUp/Mappers/Players/AppearanceMapper.cs
+@@ -8,6 +8,13 @@ namespace PowerUp.Mappers.Players
+     public const int THICK_EYEBROW_OFFSET = 18;
+     public const int EYE_COLOR_OFFSET = 5;
+     public const int EYEWEAR_OFFSET = 3;
++    // The 2008-only complexion in the 2007 layout (4 bits, 2007 itself uses 0..9); see
++    // PowerPros2008Roster.Skin2008. A 2007 save gets complexion 2 instead (SkinFor2007Game).
++    public const int EXTRA_2008_SKIN = 10;
++
++    public static ushort SkinFor2007Game(ushort skinAndEyes) => skinAndEyes >= EXTRA_2008_SKIN
++      ? (ushort)((int)Complexion.Two + (skinAndEyes - EXTRA_2008_SKIN) * EYE_COLOR_OFFSET)
++      : skinAndEyes;
+ 
+     public static Appearance GetAppearance(IGSPlayer player)
+     {
+@@ -26,9 +33,11 @@ namespace PowerUp.Mappers.Players
+           : null,
+         Complexion = faceType == FaceType.Player || faceType == FaceType.Other
+           ? null
+-          : (Complexion)(player.SkinAndEyes!.Value % EYE_COLOR_OFFSET),
++          : player.SkinAndEyes >= EXTRA_2008_SKIN ? Complexion.Extra2008 : (Complexion)(player.SkinAndEyes!.Value % EYE_COLOR_OFFSET),
+         EyeColor = faceType == FaceType.Standard || faceType == FaceType.Anime
+-          ? player.SkinAndEyes >= EYE_COLOR_OFFSET ? EyeColor.Brown : EyeColor.Blue
++          ? player.SkinAndEyes >= EXTRA_2008_SKIN
++            ? player.SkinAndEyes > EXTRA_2008_SKIN ? EyeColor.Brown : EyeColor.Blue
++            : player.SkinAndEyes >= EYE_COLOR_OFFSET ? EyeColor.Brown : EyeColor.Blue
+           : null,
+         HairStyle = player.Hair != 0
+           ? (HairStyle)player.Hair!.Value
 diff --git a/PowerUp/PowerUp/Mappers/Players/PlayerMapper.cs b/PowerUp/PowerUp/Mappers/Players/PlayerMapper.cs
-index 091a11f..affcdcf 100644
+index 091a11f..bd8109a 100644
 --- a/PowerUp/PowerUp/Mappers/Players/PlayerMapper.cs
 +++ b/PowerUp/PowerUp/Mappers/Players/PlayerMapper.cs
 @@ -11,6 +11,8 @@ namespace PowerUp.Mappers.Players
@@ -1668,6 +1854,21 @@ index 091a11f..affcdcf 100644
        };
      }
  
+@@ -157,9 +160,11 @@ namespace PowerUp.Mappers.Players
+         Face = appearance.EyebrowThickness == EyebrowThickness.Thin
+           ? (ushort)(appearance.FaceId + AppearanceMapper.THICK_EYEBROW_OFFSET)
+           : (ushort)appearance.FaceId,
+-        SkinAndEyes = appearance.EyeColor == EyeColor.Brown
+-          ? (ushort)(complexionValue + AppearanceMapper.EYE_COLOR_OFFSET)
+-          : (ushort)complexionValue,
++        SkinAndEyes = appearance.Complexion == Complexion.Extra2008
++          ? (ushort)(AppearanceMapper.EXTRA_2008_SKIN + (appearance.EyeColor == EyeColor.Brown ? 1 : 0))
++          : appearance.EyeColor == EyeColor.Brown
++            ? (ushort)(complexionValue + AppearanceMapper.EYE_COLOR_OFFSET)
++            : (ushort)complexionValue,
+         Hair = (ushort?)appearance.HairStyle ?? 0,
+         HairColor = (ushort?)appearance.HairColor ?? 0,
+         FacialHair = (ushort?)appearance.FacialHairStyle ?? 0,
 diff --git a/PowerUp/PowerUp/Mappers/Players/SpecialAbilitiesMapper.cs b/PowerUp/PowerUp/Mappers/Players/SpecialAbilitiesMapper.cs
 index 26b5b64..dc807e4 100644
 --- a/PowerUp/PowerUp/Mappers/Players/SpecialAbilitiesMapper.cs
