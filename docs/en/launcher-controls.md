@@ -44,11 +44,12 @@ The launcher is in Spanish or English. By default it follows Windows: Spanish wh
 
 ## Seasons (Season mode)
 
-**SETTINGS > GAME > SEASONS** sets how long Season mode lasts: **10 (original)**, which ends after the 2017 season as on the Wii, or **20**, which goes on to 2027. It is saved in `Config.toml` (`[season] max_seasons = 10 | 20`).
+**SETTINGS > GAME > SEASONS** sets how long Season mode lasts: **10 (original)**, which ends after the 2017 season as on the Wii; **20**, which goes on to 2027; or **No limit**, which never ends. It is saved in `Config.toml` (`[season] max_seasons = 10 | 20 | 0`; 0 is no limit).
 
-- With 20, a save the original game already finished (after season 10, which replays the ending on load) goes on to 2018.
-- A save already past 10 seasons keeps going with 20 even if the option is set to 10, so it is not damaged.
-- The game keeps 10 years of finances; years 11 to 20 go in the free part at the end of the save file (`pm3usse<slot>.dat`). With 10, the save stays byte for byte as the original writes it.
+- With 20 or no limit, a save the original game already finished (after season 10, which replays the ending on load) goes on to 2018.
+- A save already past the chosen cap keeps going, so it is not damaged: one past 10 seasons keeps going with 20, and one past 2027 with no limit.
+- The game keeps 10 years of finances and team records; years 11 to 20 go in the free part at the end of the save file (`pm3usse<slot>.dat`). With 10, the save stays byte for byte as the original writes it.
+- **No limit:** the game's tables hold 20 years. After each season from 2027 on, the oldest year leaves them and goes to an archive of old seasons inside the same save (about 34 fit; after that the oldest is dropped). The game's screens show the latest 20 years, with the real year and that year's days of the week.
 - The ending's farewell text says «10 years» even after 20.
 
 Details in `docs/en/reverse-engineering.md` («Season year») and `docs/superpowers/plans/2026-10-19-season-20-build.md`.

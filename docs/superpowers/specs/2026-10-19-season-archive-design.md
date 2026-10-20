@@ -83,6 +83,17 @@ La investigación ([hallazgos](2026-10-19-season-archive-findings.md)) mostró q
 
 Lo demás de este diseño (partidas terminadas que siguen, días de la semana del año real, nada de logos, todo con el mando) sigue valiendo para la fase 2.
 
+## Sin límite (20 de octubre de 2026)
+
+El usuario pidió seguir con lo pendiente y ver si se podían hacer años ilimitados. Se hizo la parte de la ventana de este diseño, con una ventana de 20 años en lugar de 10 (las tablas del juego tienen sitio para 20; las dos de 10 años, finanzas y registros de los equipos, guardan los años 11 a 20 aparte):
+
+- Opción «Sin límite» del launcher (`[season] max_seasons = 0`).
+- Después de la temporada 20, cada paso de año desplaza las tablas un año. El año más antiguo se archiva en la cola de la partida, donde caben unas 34 temporadas; cuando se llena, se descarta la más vieja.
+- Un desfase guardado en la cola da el año real y los días de la semana de ese año.
+- Detalles en `docs/ingenieria-inversa.md` («Año de la temporada»).
+
+Queda para después la pantalla Archive: los datos de los años archivados ya se guardan, pero no hay pantalla que los muestre. Las imágenes de título de «Annual Results» solo existen para 2008–2017; los demás años salen sin título.
+
 ## Lo que queda al constructor
 
 - Formato del archivo (cómo se guarda cada año), mientras sea robusto y permita añadir años.

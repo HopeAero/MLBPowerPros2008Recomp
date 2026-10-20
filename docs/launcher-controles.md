@@ -44,11 +44,12 @@ El launcher está en español o en inglés. Por defecto usa el idioma de Windows
 
 ## Temporadas (modo Temporada)
 
-**AJUSTES > JUEGO > TEMPORADAS** decide cuánto dura el modo Temporada: **10 (original)**, que acaba tras la temporada de 2017 como en la Wii, o **20**, que sigue hasta 2027. Se guarda en `Config.toml` (`[season] max_seasons = 10 | 20`).
+**AJUSTES > JUEGO > TEMPORADAS** decide cuánto dura el modo Temporada: **10 (original)**, que acaba tras la temporada de 2017 como en la Wii; **20**, que sigue hasta 2027; o **Sin límite**, que no acaba nunca. Se guarda en `Config.toml` (`[season] max_seasons = 10 | 20 | 0`; 0 es sin límite).
 
-- Con 20, una partida que el juego original ya dio por terminada (tras la temporada 10, que repite el final al cargarla) sigue en 2018.
-- Una partida que ya pasó de 10 temporadas sigue con 20 aunque la opción esté en 10, para no estropearla.
-- El juego guarda 10 años de finanzas; las de los años 11 a 20 van en la parte libre del final del archivo de la partida (`pm3usse<hueco>.dat`). Con 10, la partida queda igual byte a byte que la del original.
+- Con 20 o sin límite, una partida que el juego original ya dio por terminada (tras la temporada 10, que repite el final al cargarla) sigue en 2018.
+- Una partida que ya pasó del tope elegido sigue igual, para no estropearla: una de más de 10 temporadas sigue con 20, y una de después de 2027 sigue sin límite.
+- El juego guarda 10 años de finanzas y de registros de los equipos; los años 11 a 20 van en la parte libre del final del archivo de la partida (`pm3usse<hueco>.dat`). Con 10, la partida queda igual byte a byte que la del original.
+- **Sin límite:** las tablas del juego guardan 20 años. Al acabar cada temporada a partir de 2027, el año más antiguo sale de ellas y se guarda en un archivo de temporadas viejas dentro de la misma partida (caben unas 34; después se descarta la más antigua). Las pantallas del juego muestran los 20 años más recientes, con el año real y los días de la semana de ese año.
 - El texto de la despedida del final dice «10 years» aunque hayan pasado 20.
 
 Detalles en `docs/ingenieria-inversa.md` («Año de la temporada») y `docs/superpowers/plans/2026-10-19-season-20-build.md`.

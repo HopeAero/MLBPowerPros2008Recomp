@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from season_cap_sites import GET_INDEX, sites_in
+from season_cap_sites import GET_INDEX, sites_in, year_sites_in
 
 failures = []
 
@@ -36,5 +36,15 @@ check(sites_in(*code(B, bl(B, GET_INDEX), 0x2C030000)) == [], "compare with 0 is
 check(sites_in(*code(B, bl(B, 0x80B74BA4), 0x2C030009)) == [], "another call before cmpwi 9")
 check(sites_in(*code(B, bl(B, GET_INDEX), 0x38600000, 0x38600000, 0x38600000, 0x2C030009)) == [],
       "compare too far from the read")
+
+# Year sites: addi rD, rA, 2008 (rA != 0) adds the season index to 2008, li/cmpwi 2008 clamp it; the calendar clamps the
+# 2-digit year to 28 with li rD, 28 and cmpwi rA, 28.
+F = 0x80B4B300
+check(year_sites_in(*code(F, 0x38030000 | 2008), wanted=(2008,)) == [(F, "addi", 2008)], "addi r0, r3, 2008")
+check(year_sites_in(*code(F, 0x38000000 | 2008, 0x2C000000 | 2008), wanted=(2007, 2008)) == [(F, "li", 2008), (F + 4, "cmpwi", 2008)],
+      "li r0, 2008; cmpwi r0, 2008 (the at-least-2008 clamp)")
+check(year_sites_in(*code(F, 0x3800001C, 0x2C03001C), wanted=(28,)) == [(F, "li", 28), (F + 4, "cmpwi", 28)],
+      "li r0, 28; cmpwi r3, 28")
+check(year_sites_in(*code(F, 0x2C03001C), wanted=(2008,)) == [], "only the wanted immediates")
 
 sys.exit(1 if failures else 0)

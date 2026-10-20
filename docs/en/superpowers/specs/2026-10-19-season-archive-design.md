@@ -83,6 +83,17 @@ The research ([findings](2026-10-19-season-archive-findings.md)) showed that alm
 
 The rest of this design (finished saves continue, real-year weekdays, no logos, everything with the controller) still applies to phase 2.
 
+## No limit (October 20, 2026)
+
+The user asked to carry on with what was pending and to see whether unlimited years were possible. The window part of this design was built, with a 20-year window instead of 10 (the game's tables have room for 20; the two 10-year ones, finances and team records, keep years 11 to 20 apart):
+
+- Launcher option "No limit" (`[season] max_seasons = 0`).
+- After season 20, each rollover moves the tables down one year. The oldest year is archived in the save's tail, which holds about 34 seasons; once it is full, the oldest is dropped.
+- A year offset kept in the tail gives the real year and that year's days of the week.
+- Details in `docs/en/reverse-engineering.md` («Season year»).
+
+The Archive screen is left for later: the archived years' data is kept, but no screen shows it yet. "Annual Results" title pictures exist only for 2008–2017; other years have no title.
+
 ## Left to the builder
 
 - The archive's file format, as long as it is robust and allows adding years.

@@ -1,5 +1,5 @@
 diff --git a/runtime/include/ppc_runtime.h b/runtime/include/ppc_runtime.h
-index 4816c8c..167daa0 100644
+index 4816c8c..0649cee 100644
 --- a/runtime/include/ppc_runtime.h
 +++ b/runtime/include/ppc_runtime.h
 @@ -12,3 +12,7 @@
@@ -7,7 +7,7 @@ index 4816c8c..167daa0 100644
  #include "isa/ppc_isa_float.h"
  #include "isa/ppc_isa_quantized.h"
 +
-+// translation.immediate_overrides (translator): a listed cmpwi/cmplwi compares against the value
++// translation.immediate_overrides (translator): a listed cmpwi/cmplwi/addi/li uses the value
 +// this returns instead of its immediate; original is the immediate in the instruction.
 +extern "C" int32_t WiicompiledImmediate(uint32_t address, int32_t original);
 diff --git a/translator/src/Translator.Cli/Program.cs b/translator/src/Translator.Cli/Program.cs
@@ -31,7 +31,7 @@ index 67cb216..591085c 100644
          // matched save/restore pair inside the emitted body of a single-return
          // leaf, so a partial mod chunk that only carries one half of an ABI
 diff --git a/translator/src/Translator.Cli/TranslationProjectConfig.cs b/translator/src/Translator.Cli/TranslationProjectConfig.cs
-index 980c432..e22c71d 100644
+index 980c432..4c03331 100644
 --- a/translator/src/Translator.Cli/TranslationProjectConfig.cs
 +++ b/translator/src/Translator.Cli/TranslationProjectConfig.cs
 @@ -95,10 +95,22 @@ internal sealed class TranslationProjectConfig
@@ -65,7 +65,7 @@ index 980c432..e22c71d 100644
 +        public List<ImmediateOverrideDto>? ImmediateOverrides { get; init; }
 +    }
 +
-+    // A cmpwi/cmplwi whose immediate the runtime supplies (WiicompiledImmediate); expect is the
++    // A cmpwi/cmplwi/addi/li whose immediate the runtime supplies (WiicompiledImmediate); expect is the
 +    // original immediate, checked against the instruction so a wrong address fails the build.
 +    private sealed class ImmediateOverrideDto
 +    {
@@ -119,7 +119,7 @@ index 9e3866c..d63d272 100644
  
  public sealed record IrBasicBlock(string Label, IReadOnlyList<IrInstruction> Instructions);
 diff --git a/translator/src/Translator.Core/Lifting/PpcLifter.cs b/translator/src/Translator.Core/Lifting/PpcLifter.cs
-index 4d41475..afdba9f 100644
+index 4d41475..9971015 100644
 --- a/translator/src/Translator.Core/Lifting/PpcLifter.cs
 +++ b/translator/src/Translator.Core/Lifting/PpcLifter.cs
 @@ -16,7 +16,8 @@ public sealed partial class PpcLifter
@@ -146,7 +146,7 @@ index 4d41475..afdba9f 100644
          return args;
      }
  
-+    private static IrValue CompareImmediate(PpcInstruction ins, long value, IReadOnlyDictionary<uint, long>? overrides)
++    private static IrValue OverridableImmediate(PpcInstruction ins, long value, IReadOnlyDictionary<uint, long>? overrides)
 +    {
 +        if (overrides is null || !overrides.TryGetValue(ins.Address, out var expected))
 +        {
@@ -172,12 +172,30 @@ index 4d41475..afdba9f 100644
      {
          var mnemonic = ins.Mnemonic.ToLowerInvariant();
          var ops = ins.Operands ?? Array.Empty<PpcOperand>();
+@@ -120,7 +137,7 @@ public sealed partial class PpcLifter
+                 }
+ 
+             case "li" when ops.Count == 2:
+-                return new[] { new IrAssign(Reg(0), IrValue.Imm(SignExtend16(Imm(1)))) };
++                return new[] { new IrAssign(Reg(0), OverridableImmediate(ins, SignExtend16(Imm(1)), immediateOverrides)) };
+ 
+             case "lis" when ops.Count == 2:
+                 {
+@@ -130,7 +147,7 @@ public sealed partial class PpcLifter
+                 }
+ 
+             case "addi" when ops.Count == 3:
+-                return new[] { new IrBinary(Reg(0), BaseOrZero(Reg(1)), IrValue.Imm(SignExtend16(Imm(2))), "add") };
++                return new[] { new IrBinary(Reg(0), BaseOrZero(Reg(1)), OverridableImmediate(ins, SignExtend16(Imm(2)), immediateOverrides), "add") };
+ 
+             case "mr":
+             case "or" when operands.Count == 3 && operands[1] == operands[2]:
 @@ -841,7 +858,7 @@ public sealed partial class PpcLifter
                      var dest = operands.Count == 3 ? operands[0] : "cr0";
                      var rA = operands.Count == 3 ? operands[1] : operands[0];
                      var uimm = operands.Count == 3 ? operands[2] : operands[1];
 -                    return LiftCompare(dest, IrValue.Register(rA), IrValue.Imm(MaskUimm(ParseImmediate(uimm))), "sub_u", isUnsigned: true);
-+                    return LiftCompare(dest, IrValue.Register(rA), CompareImmediate(ins, MaskUimm(ParseImmediate(uimm)), immediateOverrides), "sub_u", isUnsigned: true);
++                    return LiftCompare(dest, IrValue.Register(rA), OverridableImmediate(ins, MaskUimm(ParseImmediate(uimm)), immediateOverrides), "sub_u", isUnsigned: true);
                  }
  
              case "cmpwi" when operands.Count >= 2:
@@ -186,12 +204,12 @@ index 4d41475..afdba9f 100644
                      var rA = operands.Count == 3 ? operands[1] : operands[0];
                      var simm = operands.Count == 3 ? operands[2] : operands[1];
 -                    return LiftCompare(dest, IrValue.Register(rA), IrValue.Imm(SignExtend16(ParseImmediate(simm))), "sub", isUnsigned: false);
-+                    return LiftCompare(dest, IrValue.Register(rA), CompareImmediate(ins, SignExtend16(ParseImmediate(simm)), immediateOverrides), "sub", isUnsigned: false);
++                    return LiftCompare(dest, IrValue.Register(rA), OverridableImmediate(ins, SignExtend16(ParseImmediate(simm)), immediateOverrides), "sub", isUnsigned: false);
                  }
  
              case "cmplw" when operands.Count == 2:
 diff --git a/translator/src/Translator.Core/Translation/FunctionTranslator.cs b/translator/src/Translator.Core/Translation/FunctionTranslator.cs
-index 34bb2aa..71f467e 100644
+index 34bb2aa..f72b208 100644
 --- a/translator/src/Translator.Core/Translation/FunctionTranslator.cs
 +++ b/translator/src/Translator.Core/Translation/FunctionTranslator.cs
 @@ -70,7 +70,12 @@ public sealed record TranslationOptions(
@@ -201,7 +219,7 @@ index 34bb2aa..71f467e 100644
 -    bool LeafInliningAllowMultiBlockCallees = true)
 +    bool LeafInliningAllowMultiBlockCallees = true,
 +    /// <summary>
-+    /// Compare instructions (cmpwi/cmplwi) whose immediate the runtime decides: address to the
++    /// Instructions (cmpwi/cmplwi/addi/li) whose immediate the runtime decides: address to the
 +    /// expected original immediate. They emit <c>WiicompiledImmediate(address, original)</c>.
 +    /// </summary>
 +    IReadOnlyDictionary<uint, long>? ImmediateOverrides = null)
@@ -220,10 +238,10 @@ index 34bb2aa..71f467e 100644
              var unsupported = 0;
 diff --git a/translator/tests/Translator.Tests/ImmediateOverrideTests.cs b/translator/tests/Translator.Tests/ImmediateOverrideTests.cs
 new file mode 100644
-index 0000000..9c57946
+index 0000000..99f2b4f
 --- /dev/null
 +++ b/translator/tests/Translator.Tests/ImmediateOverrideTests.cs
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,77 @@
 +using System;
 +using System.Collections.Generic;
 +using Translator.Core.Translation;
@@ -231,19 +249,22 @@ index 0000000..9c57946
 +
 +namespace Translator.Tests;
 +
-+// translation.immediate_overrides: a listed cmpwi/cmplwi reads its immediate from the runtime
++// translation.immediate_overrides: a listed cmpwi/cmplwi/addi/li reads its immediate from the runtime
 +// (WiicompiledImmediate(address, original)) instead of the constant in the instruction.
 +public sealed class ImmediateOverrideTests
 +{
 +    private const uint Entry = 0x80001000;
 +
-+    private static string Translate(IReadOnlyDictionary<uint, long>? overrides)
-+    {
-+        var image = TranslatorCppTestHarness.CreateImage(
++    private static string Translate(IReadOnlyDictionary<uint, long>? overrides) =>
++        Translate(overrides,
 +            (Entry + 0x00, 0x2C030009), // cmpwi r3, 9
 +            (Entry + 0x04, 0x41820008), // beq +8
 +            (Entry + 0x08, 0x38600001), // li r3, 1
 +            (Entry + 0x0C, 0x4E800020)); // blr
++
++    private static string Translate(IReadOnlyDictionary<uint, long>? overrides, params (uint, uint)[] words)
++    {
++        var image = TranslatorCppTestHarness.CreateImage(words);
 +        return new FunctionTranslator(image).Translate(
 +            Entry,
 +            TranslationOptions.Default with
@@ -259,6 +280,29 @@ index 0000000..9c57946
 +    {
 +        var code = Translate(new Dictionary<uint, long> { [Entry] = 9 });
 +        Assert.Contains("WiicompiledImmediate(0x80001000u, 9)", code, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void ListedAddiAddsTheRuntimeImmediate()
++    {
++        var code = Translate(new Dictionary<uint, long> { [Entry + 4] = 2008 },
++            (Entry + 0x00, 0x80630008), // lwz r3, 8(r3)
++            (Entry + 0x04, 0x386307D8), // addi r3, r3, 2008
++            (Entry + 0x08, 0x4E800020)); // blr
++        Assert.Contains("WiicompiledImmediate(0x80001004u, 2008)", code, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void ListedLiLoadsTheRuntimeImmediate()
++    {
++        var code = Translate(new Dictionary<uint, long> { [Entry] = 28 },
++            (Entry + 0x00, 0x3800001C), // li r0, 28
++            (Entry + 0x04, 0x7C030000), // cmpw r3, r0
++            (Entry + 0x08, 0x41810008), // bgt +8
++            (Entry + 0x0C, 0x7C601B78), // mr r0, r3
++            (Entry + 0x10, 0x7C030378), // mr r3, r0
++            (Entry + 0x14, 0x4E800020)); // blr
++        Assert.Contains("WiicompiledImmediate(0x80001000u, 28)", code, StringComparison.Ordinal);
 +    }
 +
 +    [Fact]

@@ -46,6 +46,36 @@ translation:
     - {address: 0x80BF51BC, expect: 9}    # off-season events, index < 9
     - {address: 0x80BF52D0, expect: 9}    # off-season events, index < 9
     - {address: 0x80C0CC0C, expect: 10}   # index < 10
+    # Year sites (tools/season_cap_sites.py --years): with no limit they move with the year offset.
+    # 0x80B4A730, the season's year for a date: 2007 or 2008 + index, at least 2008.
+    - {address: 0x80B4A7A0, expect: 2007}
+    - {address: 0x80B4A7AC, expect: 2008}
+    - {address: 0x80B4A7B0, expect: 2008}
+    - {address: 0x80B4A7B4, expect: 2008}
+    - {address: 0x8087B808, expect: 2008}  # 2008 + index into a UI object
+    - {address: 0x8087E3B8, expect: 2008}  # same
+    - {address: 0x80ADC658, expect: 2008}  # a year picker: 2008 + the picked index
+    # The calendar clamps the 2-digit year (index + 8) to 28 before its day-of-week formula.
+    - {address: 0x80B4AF20, expect: 28}
+    - {address: 0x80B4AF24, expect: 28}
+    - {address: 0x80B4B148, expect: 28}
+    - {address: 0x80B4B14C, expect: 28}
+    - {address: 0x80B4B30C, expect: 28}
+    - {address: 0x80B4B310, expect: 28}
+    - {address: 0x80B4B644, expect: 28}
+    - {address: 0x80B4B648, expect: 28}
+    - {address: 0x80B4B7E8, expect: 28}
+    - {address: 0x80B4B7EC, expect: 28}
+    - {address: 0x80B4BF60, expect: 28}
+    - {address: 0x80B4BF64, expect: 28}
+    - {address: 0x80B4C0F8, expect: 28}
+    - {address: 0x80B4C0FC, expect: 28}
+    - {address: 0x80B4C8C0, expect: 28}
+    - {address: 0x80B4C8C4, expect: 28}
+    - {address: 0x80B4CA44, expect: 28}
+    - {address: 0x80B4CA48, expect: 28}
+    - {address: 0x80B4CBC8, expect: 28}
+    - {address: 0x80B4CBCC, expect: 28}
 
 runtime:
   # Rebound by tools/wiicompiled_rebind.py; unbound hooks are invisible here.
