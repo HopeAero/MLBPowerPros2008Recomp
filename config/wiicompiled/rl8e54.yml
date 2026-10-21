@@ -93,6 +93,10 @@ translation:
     - {address: 0x80BB0054, expect: 8}
     - {address: 0x80BB0080, expect: 8}
     - {address: 0x80A3873C, expect: 8}    # the same in 0x80A38494
+    # MLB Life paydays (0x80980348): the shown year == / > 2008 (the first season).
+    - {address: 0x809803B0, expect: 2008}
+    - {address: 0x80980634, expect: 2008}
+    - {address: 0x80A02F5C, expect: 107}  # MLB Life draft history entry: 2007 - 1900 (+ the pack's start shift)
 
 runtime:
   # Rebound by tools/wiicompiled_rebind.py; unbound hooks are invisible here.

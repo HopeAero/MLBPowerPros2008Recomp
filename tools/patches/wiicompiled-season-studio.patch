@@ -38,6 +38,33 @@ index 20913af..b43309c 100644
      std::filesystem::path root;
      bool textures = false;
      bool disc = false;
+diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
+index 02f6f01..94be030 100644
+--- a/runtime/include/season_cap.h
++++ b/runtime/include/season_cap.h
+@@ -124,6 +124,13 @@ inline bool IsCapCompare(uint32_t address) {
+ 
+ // The year sites (tools/season_cap_sites.py --years): 2007/2008 + index, and the calendar's clamp of
+ // the 2-digit year (index + 8) to 28 before its day-of-week formula. Both move with the year offset.
++// MLB Life's draft entry in a new career's history (0x80A02F40: 6/7/2007, li 107, from 0x80A247C4):
++// it is made before the new game is set up (so before the year offset) and follows the enabled pack's
++// start year. The birth-date picker of MLB Career / Created Player (0x80979E88) is left as it is: it
++// shows "19" and two digits, so it cannot show years from 2000; the created player is shifted with
++// the rest of the player table when the career begins (BeginNewGame).
++inline bool IsLifeCreationYearSite(uint32_t address) { return address == 0x80A02F5Cu; }
++
+ inline bool IsYearSite(uint32_t address) {
+     switch (address) {
+     case 0x80B4A7A0u: case 0x80B4A7ACu: case 0x80B4A7B0u: case 0x80B4A7B4u:  // 0x80B4A730
+@@ -137,6 +144,8 @@ inline bool IsYearSite(uint32_t address) {
+     case 0x80BAFD74u: case 0x80BAFE6Cu: case 0x80BAFEACu: case 0x80BAFED8u: case 0x80BB0014u:
+     case 0x80BB0054u: case 0x80BB0080u:
+     case 0x80A3873Cu:  // the same in 0x80A38494 (its branch that reads 0x80B4A7DC)
++    // MLB Life's paydays (0x80980348): the shown year (0x80B4A888) against 2008, the first season
++    case 0x809803B0u: case 0x80980634u:
+         return true;
+     default:
+         return false;
 diff --git a/runtime/include/season_pack.h b/runtime/include/season_pack.h
 new file mode 100644
 index 0000000..0d18e04
@@ -405,7 +432,7 @@ index 0000000..6485bf0
 +
 +}  // namespace season_text
 diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
-index 56abe07..23ac50e 100644
+index 56abe07..ae1acd5 100644
 --- a/runtime/src/hle/mlb/season_cap.cpp
 +++ b/runtime/src/hle/mlb/season_cap.cpp
 @@ -233,13 +233,14 @@ void ShiftBirthYears(uint32_t shift) {
@@ -427,6 +454,23 @@ index 56abe07..23ac50e 100644
  }
  
  // MLB Life: the wife and children were born against the game's 2007 dates; same age in the year shown.
+@@ -386,6 +387,16 @@ using namespace season_cap;
+ // The cap compares are in Season mode's own code, like 0x80C06534: no need to tell the modes apart
+ // (and 0x80C0C50C reads 0x80C06534 when the mode starts, before [0x8104B608] says Season mode).
+ extern "C" int32_t WiicompiledImmediate(uint32_t address, int32_t original) {
++    if (IsLifeCreationYearSite(address)) {
++        // A new MLB Life career is made before the new game is set up (0x80BB0B78, where the year
++        // offset is set): its draft and its birth-date picker follow the enabled pack's start year.
++        static const int32_t shift = [] {
++            for (const auto& mod : mods::Discover())
++                if (mod.enabled && mod.startYear) return mod.startYear > 2008 ? mod.startYear - 2008 : 0;
++            return 0;
++        }();
++        return LifeModeActive() ? original + shift : original;
++    }
+     return ImmediateFor(address, original, SeasonCount(), YearOffset(), IsDhSite(address) && UniversalDh());
+ }
+ 
 diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
 index 3218ecd..d6046a3 100644
 --- a/runtime/src/hle/mlb/season_schedule.cpp
@@ -930,6 +974,19 @@ index 8a63325..0c3ee8b 100644
                  if (document.contains("divisions") && document.at("divisions").is_table()) {
                      static constexpr const char* kKeys[6] = {"al_east", "al_central", "al_west",
                                                               "nl_east", "nl_central", "nl_west"};
+diff --git a/runtime/tests/season_cap_tests.cpp b/runtime/tests/season_cap_tests.cpp
+index 3e5dd2c..530ee04 100644
+--- a/runtime/tests/season_cap_tests.cpp
++++ b/runtime/tests/season_cap_tests.cpp
+@@ -51,6 +51,8 @@ int main() {
+     Check(ImmediateFor(0x80B4AF24u, 28, kUnlimitedSeasons, 0) == 28, "no offset: the original clamp");
+     Check(ImmediateFor(0x80BAFBF0u, 8, kUnlimitedSeasons, 2) == 10 && ImmediateFor(0x80A3873Cu, 8, kUnlimitedSeasons, 2) == 10,
+           "the event dates' 2-digit year (season of the date + 8) moves with the year");
++    Check(ImmediateFor(0x809803B0u, 2008, 10, 18) == 2026 && ImmediateFor(0x80980634u, 2008, 10, 0) == 2008,
++          "MLB Life's first-season payday follows the start year");
+     Check(ImmediateFor(0x80001000u, 9, 20, 5) == 9, "an address not in the lists keeps its immediate");
+     Check(ImmediateFor(kSeasonNoDhSite, 0, 10, 0) == 0, "Season mode: no DH in an NL park, as the original");
+     Check(ImmediateFor(kSeasonNoDhSite, 0, 10, 0, true) == 1 && ImmediateFor(kSeasonDhStore, 0, 10, 0, true) == 1,
 diff --git a/runtime/tests/season_pack_tests.cpp b/runtime/tests/season_pack_tests.cpp
 new file mode 100644
 index 0000000..c3ba2fb
