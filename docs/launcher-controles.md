@@ -78,6 +78,7 @@ Detalles en `docs/ingenieria-inversa.md` («DH en ambas ligas»).
 - Vale para las temporadas nuevas del modo Temporada y las carreras nuevas de MLB Life; las partidas ya empezadas siguen como estaban.
 - Con 15 y 15 el generador de calendarios del juego deja calendarios desiguales (de 142 a 162 partidos por equipo), así que el runtime usa uno propio con el formato de las Grandes Ligas desde 2023: 162 partidos por equipo, 13 contra cada rival de división (52), 6 o 7 contra el resto de la liga (64) y 46 de interliga (3 contra cada equipo de la otra liga y 4 contra el rival natural: Yankees–Mets, Cubs–White Sox, Dodgers–Angels…), en series de 2 a 4 partidos, unos 81 en casa, del 25 de marzo a finales de septiembre. Las fechas y los cruces no son los del calendario real de un año: para eso, un paquete de temporada con `schedule/<año>.csv`.
 - Un paquete de temporada con `[divisions]` usa sus divisiones aunque aquí esté en No (`docs/mods.md`).
+- Con Start (en vez de Quick Start), la pantalla Custom League se abre ya en 15/15 y deja confirmar 15 y 15 (el juego original solo admite ligas pares). Si cambias ahí la distribución y la confirmas, se juega la tuya; la mejora solo cambia las ligas de 2008 tal cual.
 
 ## Calendarios reales (HERRAMIENTAS)
 

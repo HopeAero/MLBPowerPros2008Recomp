@@ -1,0 +1,311 @@
+diff --git a/runtime/include/season_schedule.h b/runtime/include/season_schedule.h
+index d3ade4e..621dea3 100644
+--- a/runtime/include/season_schedule.h
++++ b/runtime/include/season_schedule.h
+@@ -45,6 +45,12 @@ inline constexpr TeamCode kTeamCodes[] = {
+     {"AZ", 25},  {"COL", 26}, {"SD", 27},  {"SDP", 27}, {"LAD", 28}, {"SF", 29},  {"SFG", 29},
+ };
+ 
++// The game's own team codes (1..30, in bits 23..8 of a team's word and in the Custom League screen's
++// slots): by division, alphabetical within it (1 BAL, 2 BOS, ... 22 HOU, 23 MIL, ... 30 SF). The team
++// number of code c is kCodeTeam[c - 1].
++inline constexpr int kCodeTeam[30] = {3,  0,  1,  4,  2,  8,  5,  6,  9,  7,  10, 12, 11, 13, 16,
++                                      18, 15, 14, 17, 19, 23, 22, 20, 24, 21, 25, 26, 28, 27, 29};
++
+ inline int TeamNumber(std::string_view code) {
+     std::string upper;
+     for (char c : code) upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
+index 249a2c4..3218ecd 100644
+--- a/runtime/src/hle/mlb/season_schedule.cpp
++++ b/runtime/src/hle/mlb/season_schedule.cpp
+@@ -67,26 +67,72 @@ const mods::Mod* DivisionsMod(const std::vector<mods::Mod>& all) {
+     return nullptr;
+ }
+ 
++// The divisions wanted: a pack's [divisions], else the MEJORAS option (today's leagues, Houston in
++// the AL West). False with neither.
++bool WantedDivisions(std::vector<std::string> (&listed)[6], std::string& source) {
++    const auto all = mods::Discover();
++    if (const mods::Mod* mod = DivisionsMod(all)) {
++        for (int d = 0; d < 6; ++d) listed[d] = mod->divisions[d];
++        source = "mod \"" + mod->name + "\"";
++        return true;
++    }
++    if (!RuntimeConfigFile::ModernLeagues(false)) return false;
++    for (auto& d : listed) d.clear();
++    listed[2] = {"HOU"};
++    source = "the 15/15 option";
++    return true;
++}
++
++// 2008's division (league * 3 + division) of each team number (kTeamCodes).
++int DefaultDivision(int team) {
++    static constexpr int kFirst[6] = {0, 5, 10, 14, 19, 25};
++    int d = 5;
++    while (team < kFirst[d]) --d;
++    return d;
++}
++
++// Where each team number (kTeamCodes, 2008's order) is in the season's team words: each word keeps
++// its team's code (kCodeTeam) in bits 23..8. A Custom League (Season > Start)
++// renumbers the teams in the order of its screen; Quick Start keeps 2008's. 2008's order when the
++// codes are not the 30 teams.
++std::array<int, kTeams> TeamSlots() {
++    std::array<int, kTeams> slot{};
++    for (int t = 0; t < kTeams; ++t) slot[t] = t;
++    const uint32_t words = Memory::Read32(0x8104B5A0u) + 128;
++    if (!Memory::Contains(words, kTeams * 4)) return slot;
++    std::array<int, kTeams> found;
++    found.fill(-1);
++    for (int t = 0; t < kTeams; ++t) {
++        const int code = static_cast<int>((Memory::Read32(words + 4 * t) >> 8) & 0xFFFF);
++        if (code < 1 || code > kTeams || found[kCodeTeam[code - 1]] >= 0) return slot;
++        found[kCodeTeam[code - 1]] = t;
++    }
++    return found;
++}
++
+ // A new game, before the game lays out its standings (0x80BAF2B4): puts the teams in the mod's
+ // divisions (their words) and has the game rebuild its division and league lists (0x80B719EC, whose
+ // argument only gives the team count at +4). The standings, the schedule generator's check
+-// (0x80B97E08) and the screens then follow the lists.
++// (0x80B97E08) and the screens then follow the lists. Only over 2008's leagues: a layout made in
++// the Custom League screen is the player's and stays.
+ void ApplyDivisions(CpuContext* ctx) {
+-    const auto all = mods::Discover();
+-    const mods::Mod* mod = DivisionsMod(all);
+-    // Without a pack's divisions, the MEJORAS option: today's leagues, Houston in the AL West.
+-    std::vector<std::string> modern[6];
+-    modern[2] = {"HOU"};
+-    const bool option = !mod && RuntimeConfigFile::ModernLeagues(false);
+-    if (!mod && !option) return;
+-    const std::string source = mod ? "mod \"" + mod->name + "\"" : std::string("the 15/15 option");
+-    const auto& listed = mod ? mod->divisions : modern;
++    std::vector<std::string> listed[6];
++    std::string source;
++    if (!WantedDivisions(listed, source)) return;
+     const uint32_t words = Memory::Read32(0x8104B5A0u) + 128;
+     if (!Memory::Contains(words, kTeams * 4)) return;
++    const std::array<int, kTeams> slot = TeamSlots();
+     std::array<int, kTeams> current{};
++    bool original = true;
+     for (int t = 0; t < kTeams; ++t) {
+-        const uint32_t word = Memory::Read32(words + 4 * t);
++        const uint32_t word = Memory::Read32(words + 4 * slot[t]);
+         current[t] = static_cast<int>((word >> 24) & 0xF) * 3 + static_cast<int>(word >> 28);
++        original = original && current[t] == DefaultDivision(t);
++    }
++    if (!original) {
++        std::fprintf(stderr, "[season] divisions of %s not used: the leagues were set in Custom League\n",
++                     source.c_str());
++        return;
+     }
+     const Realignment realigned = Realign(current, listed);
+     if (!realigned.error.empty()) {
+@@ -94,7 +140,7 @@ void ApplyDivisions(CpuContext* ctx) {
+         return;
+     }
+     for (int t = 0; t < kTeams; ++t) {
+-        const uint32_t at = words + 4 * t;
++        const uint32_t at = words + 4 * slot[t];
+         Memory::Write32(at, TeamWordWithDivision(Memory::Read32(at), realigned.division[t]));
+     }
+     // A team count object for 0x80B719EC, on the guest stack below the caller's frame.
+@@ -131,12 +177,12 @@ struct Slot {
+     std::array<uint32_t, 4> words{};
+ };
+ 
+-// Each team's league * 3 + division (bits 27..24 and 31..28 of its word at X + 128 + team * 4).
+-std::array<int, kTeams> Divisions() {
++// Each team number's league * 3 + division (bits 27..24 and 31..28 of its word at X + 128 + slot * 4).
++std::array<int, kTeams> Divisions(const std::array<int, kTeams>& slot) {
+     std::array<int, kTeams> division{};
+     const uint32_t words = Memory::Read32(0x8104B5A0u) + 128;
+     for (int t = 0; t < kTeams; ++t) {
+-        const uint32_t word = Memory::Read32(words + 4 * t);
++        const uint32_t word = Memory::Read32(words + 4 * slot[t]);
+         division[t] = static_cast<int>((word >> 24) & 0xF) * 3 + static_cast<int>(word >> 28);
+     }
+     return division;
+@@ -173,7 +219,7 @@ void Apply(bool official) {
+                 break;
+             }
+         }
+-        games = GenerateOddLeagues(Divisions(), year, DayIndex(3, 25), asgDay);
++        games = GenerateOddLeagues(Divisions(TeamSlots()), year, DayIndex(3, 25), asgDay);
+         if (games.empty()) return;  // even leagues: the game's own generator is right
+         source = "the 15/15 generator";
+     } else {
+@@ -202,8 +248,9 @@ void Apply(bool official) {
+     std::array<int, kDays> taken{};
+     for (int day = 0; day < kDays; ++day) taken[day] = static_cast<int>(days[day].size());
+     const FitResult fitted = Fit(games, taken);
++    const std::array<int, kTeams> slot = TeamSlots();  // team numbers to the season's teams
+     for (const Game& game : fitted.games) {
+-        days[game.day].push_back(Slot{{static_cast<uint32_t>(game.home), static_cast<uint32_t>(game.away),
++        days[game.day].push_back(Slot{{static_cast<uint32_t>(slot[game.home]), static_cast<uint32_t>(slot[game.away]),
+                                        TimeWord(game.minutes), FlagsWord(game.minutes)}});
+     }
+     for (int day = 0; day < kDays; ++day) {
+@@ -270,3 +317,130 @@ extern "C" void MLB_NewSeasonGame_80BB0B78(CpuContext* ctx) {
+     Call(ctx, 0x80BB0CF8u, InvokeDirectCpu<0x80BB0CF8u>);
+ }
+ PPC_NATIVE_OVERRIDE_VOID(80BB0B78, MLB_NewSeasonGame_80BB0B78, (CpuContext* ctx), (ctx));
++
++// The Custom League screen (Season > Start > Major League Mode; object at r3): 42 slots of 0x24 bytes at
++// +0x2FD8, 7 a division, league * 3 + division; a slot has its team's code (1..30, 0 empty) at +0, its
++// league at +8, its division at +0xC. The screen's start (0x80BB8AEC) fills them from the leagues
++// set so far and calls 0x80BB8FC4, which every move calls too.
++namespace season_schedule {
++namespace {
++namespace custom_league {
++
++constexpr uint32_t kSlots = 0x2FD8, kSlotBytes = 0x24;
++constexpr int kDivisionSlots = 7, kScreenSlots = 42;
++
++uint32_t SlotAt(uint32_t screen, int slot) { return screen + kSlots + static_cast<uint32_t>(slot) * kSlotBytes; }
++
++// The screen opens on 2008's leagues: with a pack's divisions or the 15/15 option, it opens on those.
++void Prefill(CpuContext* ctx, uint32_t screen) {
++    std::vector<std::string> listed[6];
++    std::string source;
++    if (!WantedDivisions(listed, source)) return;
++    std::array<int, kTeams> current;
++    current.fill(-1);
++    for (int s = 0; s < kScreenSlots; ++s) {
++        const int code = static_cast<int>(Memory::Read32(SlotAt(screen, s)));
++        if (code >= 1 && code <= kTeams) current[kCodeTeam[code - 1]] = s / kDivisionSlots;
++    }
++    for (int t = 0; t < kTeams; ++t) {
++        if (current[t] != DefaultDivision(t)) return;  // not 2008's leagues (or not the 30 teams): as they are
++    }
++    const Realignment realigned = Realign(current, listed);
++    if (!realigned.error.empty()) return;
++    // Each division's teams in their order, those that come in after those that stay.
++    std::array<std::vector<std::array<uint8_t, kSlotBytes>>, 6> divisions;
++    for (int pass = 0; pass < 2; ++pass) {
++        for (int s = 0; s < kScreenSlots; ++s) {
++            const uint32_t at = SlotAt(screen, s);
++            const int code = static_cast<int>(Memory::Read32(at));
++            if (code < 1 || code > kTeams) continue;
++            const int to = realigned.division[kCodeTeam[code - 1]];
++            if ((to == s / kDivisionSlots) != (pass == 0)) continue;
++            std::array<uint8_t, kSlotBytes> bytes;
++            for (uint32_t i = 0; i < kSlotBytes; ++i) bytes[i] = Memory::Read8(at + i);
++            divisions[to].push_back(bytes);
++        }
++    }
++    for (int d = 0; d < 6; ++d) {
++        for (int i = 0; i < kDivisionSlots; ++i) {
++            const uint32_t at = SlotAt(screen, d * kDivisionSlots + i);
++            if (i < static_cast<int>(divisions[d].size())) {
++                for (uint32_t b = 0; b < kSlotBytes; ++b) Memory::Write8(at + b, divisions[d][i][b]);
++            } else {
++                Memory::Write32(at, 0);  // an empty slot, as the screen's start leaves one
++            }
++            Memory::Write32(at + 8, static_cast<uint32_t>(d / 3));
++            Memory::Write32(at + 12, static_cast<uint32_t>(d % 3));
++        }
++    }
++    // Redrawn as the screen's start draws them: each slot (0x80BB8E6C), each division (0x80BB8EF8).
++    for (int s = 0; s < kScreenSlots; ++s) {
++        ctx->gpr[3] = screen, ctx->gpr[4] = static_cast<uint32_t>(s), ctx->gpr[5] = 0;
++        Call(ctx, 0x80BB8E6Cu, InvokeDirectCpu<0x80BB8E6Cu>);
++    }
++    for (int d = 0; d < 6; ++d) {
++        ctx->gpr[3] = screen, ctx->gpr[4] = static_cast<uint32_t>(d * kDivisionSlots);
++        Call(ctx, 0x80BB8EF8u, InvokeDirectCpu<0x80BB8EF8u>);
++    }
++    std::fprintf(stderr, "[season] Custom League opens on the divisions of %s\n", source.c_str());
++}
++
++}  // namespace custom_league
++
++}  // namespace
++
++}  // namespace season_schedule
++
++// 0x80BB8FC4 (Custom League screen): checks the leagues after each move. As the original: every
++// division needs 4 teams and the American League an even number (the game's schedule is made for
++// even leagues), or OK is off and, for an odd league, a message says so. 15 and 15 also pass with a
++// pack's divisions or the 15/15 option, whose schedule generator makes them a season. Called by the
++// screen's start (return 0x80BB8C44), it first puts the teams in those divisions.
++extern "C" void MLB_CustomLeagueCheck_80BB8FC4(CpuContext* ctx) {
++    using namespace season_schedule;
++    using custom_league::SlotAt;
++    const uint32_t screen = ctx->gpr[3];
++    if (ctx->lr == 0x80BB8C44u) custom_league::Prefill(ctx, screen);
++    bool invalid = false;
++    int american = 0;
++    for (int d = 0; d < 6; ++d) {
++        int teams = 0;
++        for (int i = 0; i < custom_league::kDivisionSlots; ++i)
++            teams += Memory::Read32(SlotAt(screen, d * custom_league::kDivisionSlots + i)) != 0;
++        invalid = invalid || teams < 4;
++        if (d < 3) american += teams;
++    }
++    std::vector<std::string> listed[6];
++    std::string source;
++    const bool odd = american % 2 != 0 && !(american == kTeams / 2 && WantedDivisions(listed, source));
++    invalid = invalid || odd;
++    // The player's team (code at +0x2FD0, +0x2FD4 against a slot's +0x14) is drawn again where it is;
++    // the reset button is on when a slot differs from the screen's start (copies at +0x35C0).
++    bool unchanged = true;
++    for (int s = 0; s < custom_league::kScreenSlots; ++s) {
++        const uint32_t at = SlotAt(screen, s);
++        if (Memory::Read32(screen + 0x2FD0) == Memory::Read32(at) && Memory::Read32(screen + 0x2FD4) == Memory::Read32(at + 0x14)) {
++            const uint32_t leagues = Call(ctx, 0x80C12F20u, InvokeDirectCpu<0x80C12F20u>);
++            ctx->gpr[3] = leagues, ctx->gpr[4] = at;
++            const uint32_t team = Call(ctx, 0x80C14254u, InvokeDirectCpu<0x80C14254u>);
++            ctx->gpr[3] = Memory::Read32(screen + 0x3BCC), ctx->gpr[4] = team, ctx->gpr[5] = Memory::Read32(at + 8);
++            ctx->gpr[6] = Memory::Read32(at + 0x10), ctx->gpr[7] = Memory::Read32(at + 0x14) & 0xFF;
++            Call(ctx, 0x80B2EC80u, InvokeDirectCpu<0x80B2EC80u>);
++        }
++        if (Memory::Read32(at + 0x5E8) != Memory::Read32(at) || Memory::Read32(at + 0x5FC) != Memory::Read32(at + 0x14))
++            unchanged = false;
++    }
++    ctx->gpr[3] = Memory::Read32(screen + 0x3C78), ctx->gpr[4] = odd;  // the odd league message
++    {
++        const uint32_t target = Memory::Read32(Memory::Read32(ctx->gpr[3]) + 0x10);
++        const uint32_t lr = ctx->lr;
++        ctx->ctr = target, ctx->lr = target;
++        InvokeIndirectCpu(target, ctx);
++        ctx->lr = lr;
++    }
++    ctx->gpr[3] = Memory::Read32(screen + 0x3BC4), ctx->gpr[4] = invalid;  // OK off
++    Call(ctx, 0x80AB49C8u, InvokeDirectCpu<0x80AB49C8u>);
++    ctx->gpr[3] = Memory::Read32(screen + 0x3BC8), ctx->gpr[4] = unchanged;
++    Call(ctx, 0x80AB49C8u, InvokeDirectCpu<0x80AB49C8u>);
++}
++PPC_NATIVE_OVERRIDE_VOID(80BB8FC4, MLB_CustomLeagueCheck_80BB8FC4, (CpuContext* ctx), (ctx));
+diff --git a/runtime/tests/season_schedule_tests.cpp b/runtime/tests/season_schedule_tests.cpp
+index c8d97ca..1cf2429 100644
+--- a/runtime/tests/season_schedule_tests.cpp
++++ b/runtime/tests/season_schedule_tests.cpp
+@@ -105,6 +105,25 @@ int main() {
+         Check(last + kFirstDay <= 274, "the season ends by October 1");
+     }
+ 
++    // The game's team codes: every team once, by division (codes 1-5 the AL East, ...), HOU 22.
++    {
++        static constexpr int kFirst[7] = {0, 5, 10, 14, 19, 25, 30};
++        bool seen[kTeams] = {}, byDivision = true;
++        for (int d = 0; d < 6; ++d) {
++            for (int c = kFirst[d]; c < kFirst[d + 1]; ++c) {
++                const int team = kCodeTeam[c];
++                seen[team] = true;
++                byDivision = byDivision && team >= kFirst[d] && team < kFirst[d + 1];
++            }
++        }
++        bool all = true;
++        for (bool s : seen) all = all && s;
++        Check(all && byDivision, "team codes: each team once, in its division");
++        Check(kCodeTeam[22 - 1] == TeamNumber("HOU") && kCodeTeam[23 - 1] == TeamNumber("MIL") &&
++                  kCodeTeam[1 - 1] == TeamNumber("BAL"),
++              "team codes: 1 BAL, 22 HOU, 23 MIL");
++    }
++
+     if (failures) return 1;
+     std::printf("season_schedule_tests: ok\n");
+     return 0;
