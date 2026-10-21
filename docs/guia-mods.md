@@ -152,6 +152,7 @@ Más en [roster-2008.md](roster-2008.md).
 
 - [mods.md](mods.md): referencia de mods (carpetas, `project.bin`, partidas por roster).
 - [texture-studio.md](texture-studio.md): Texture Studio.
+- [season-studio.md](season-studio.md): Editor de temporada (año de inicio, DH, ligas, calendarios reales).
 - [stadiums.md](stadiums.md): estadios en Blender.
 - [roster-2008.md](roster-2008.md): rosters y PowerUp+.
 - [ingenieria-inversa.md](ingenieria-inversa.md): formatos del juego, para quien quiera ir más allá.

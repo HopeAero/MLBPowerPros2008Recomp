@@ -103,6 +103,12 @@ $studioBuild = Join-Path $root 'local\build\texture-studio'
 & "$root\tools\texture-studio\build.ps1" -Source $Source -Output $studioBuild
 Copy-Item "$studioBuild\TextureStudio.exe" $workspace
 
+Write-Host 'Season Studio...'
+# Power Pros Wii 2008 Season Studio (tools/season-studio): season settings and schedules, next to the game.
+$seasonBuild = Join-Path $root 'local\build\season-studio'
+& "$root\tools\season-studio\build.ps1" -Source $Source -Output $seasonBuild
+Copy-Item "$seasonBuild\SeasonStudio.exe" $workspace
+
 Write-Host 'Licenses...'
 New-Item -ItemType Directory -Force "$Output\licenses" | Out-Null
 Copy-Item "$root\LICENSE" "$Output\licenses\MLBPowerPros2008Recomp-LICENSE.txt"

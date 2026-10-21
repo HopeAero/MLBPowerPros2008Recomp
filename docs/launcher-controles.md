@@ -80,18 +80,9 @@ Detalles en `docs/ingenieria-inversa.md` («DH en ambas ligas»).
 - Un paquete de temporada con `[divisions]` usa sus divisiones aunque aquí esté en No (`docs/mods.md`).
 - Con Start (en vez de Quick Start), la pantalla Custom League se abre ya en 15/15 y deja confirmar 15 y 15 (el juego original solo admite ligas pares). Si cambias ahí la distribución y la confirmas, se juega la tuya; la mejora solo cambia las ligas de 2008 tal cual.
 
-## Temporada (MODS > TEMPORADA)
+## Editor de temporada (HERRAMIENTAS)
 
-**MODS > TEMPORADA** reúne en un sitio lo que usa una temporada nueva del modo Temporada o una carrera nueva de MLB Life:
-
-1. **RESUMEN (SOLO INFORMA)**: no cambia nada, solo resume. Dice el año en que empieza y de qué mod sale, de qué temporada son las edades, qué años tienen calendario real (y de qué mod) y cuáles uno generado por el juego, si hay DH en ambas ligas y cómo quedan las ligas, cada cosa con su origen (un mod o MEJORAS). Si dos mods activos piden cosas distintas (dos años de inicio, dos calendarios distintos del mismo año, dos tablas de divisiones), sale «¡aviso!» y la ayuda explica cuál se usa: el primero por nombre, como hace el juego. El mismo resumen, corto, sale al pie de **MEJORAS**, porque lo que trae un mod manda sobre esas opciones.
-2. **MOD DE TEMPORADA**: el mod cuyos ajustes se ven y se cambian debajo, y donde se guardan los calendarios. «Nuevo: Calendarios MLB» crea `mods/MLBSchedules` (y lo activa) en cuanto cambias algo o descargas. Si el mod elegido está desactivado en MODS, el pie lo dice.
-3. **AÑO DE INICIO** (`start_year`), **AÑO DEL ROSTER (EDADES)** (`roster_year`, de qué año es el roster para calcular las edades; «Mismo que el inicio» por defecto), **DH EN AMBAS LIGAS** (en ambas ligas `dh = "both"`, u original `dh = "original"`: solo en estadios de la Liga Americana) y **LIGAS 15 Y 15** (15 y 15: `[divisions]` con Houston en la AL West; original: `leagues = "original"`, las de 2008): se escriben en el `mod.toml` del mod, sin tocar lo demás. «Como en MEJORAS» deja que decida la opción de MEJORAS; «Original» deja el juego como se programó aunque MEJORAS diga Sí. Un mod con otras divisiones en su `mod.toml` sale como «Propias» y se cambia ahí.
-4. **CALENDARIOS: DESDE / HASTA** y **DESCARGAR CALENDARIOS**: descarga los calendarios reales de esos años (de 2002 a 2026, sin 2020: tenía 60 partidos por equipo, desde julio; antes de 2002 los datos de la web de MLB no cuadran a 162 por equipo) desde la web pública de MLB (statsapi.mlb.com) y los guarda en el mod como `schedule/<año>.csv`. Cada año tarda unos segundos. Si el mod no tenía año de inicio, se le pone el primero descargado. Abajo sale el resultado, por ejemplo «2025: 2430 partidos (162 por equipo), se juega 1 día después; 2026: …».
-
-Los cambios valen para las partidas nuevas; las empezadas siguen como estaban.
-
-El juego juega la temporada regular del 19 de marzo al 1 de octubre y como mucho 16 partidos por día. Si una temporada empezó antes o acabó después, se juega los días justos antes o después (mismo orden, otras fechas; pasa en 2004, 2005, 2009, 2010, 2012, 2015, 2016, 2021, 2022 y 2025). Un partido de un día con más de 16 pasa al día libre más cercano de los dos equipos. Ningún año pierde partidos. Solo hace falta internet al descargar.
+**HERRAMIENTAS > EDITOR DE TEMPORADA** abre el Editor de temporada en su propia ventana (`docs/season-studio.md`). Desde ahí se ve qué usará una partida nueva del modo Temporada o de MLB Life, se ajusta cada mod (año de inicio, edades del roster, DH y ligas, con «Original» para dejarlo como el juego), se descargan calendarios reales y se ven mes a mes. El pie de **MEJORAS** resume en una línea con qué empezará la próxima partida nueva, porque lo que trae un mod manda sobre esas opciones.
 
 ## Guardado
 

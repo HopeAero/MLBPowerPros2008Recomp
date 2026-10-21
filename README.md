@@ -92,12 +92,13 @@ Every change to the runtime is a **reproducible patch** on Wiicompiled's pinned 
 - Video: graphics API, window or fullscreen, internal resolution, AMD FSR 1, anisotropic filtering, force 16:9, fill screen, frame interpolation, quality presets.
 - Audio, Dolphin-style controls (stick gates, dead zone, stick test) and interface options.
 - Mods: one switch per folder.
-- Tools: opens the roster editor and Texture Studio.
+- Tools: opens the roster editor, Texture Studio and the Season Editor.
 - Original art from the MoonInning UI pack (not game content).
 
 **Included tools**
 - **Roster editor** (PowerUp+ adapted to 2008): imports and exports 2008 rosters. See [docs/en/roster-2008.md](docs/en/roster-2008.md).
 - **Power Pros Wii 2008 Texture Studio**: makes texture mods, HD too, and captures textures from the running game. See [docs/en/texture-studio.md](docs/en/texture-studio.md).
+- **Season Editor** (Season Studio): what a new Season mode or MLB Life game will use, each mod's start year, roster ages, DH and leagues, real MLB schedules (2002-2026) and a month view. See [docs/en/season-studio.md](docs/en/season-studio.md).
 - **Blender add-on** (4.2 LTS or later): imports and exports stadiums, with their collision, and creates new stadiums. See [docs/en/stadiums.md](docs/en/stadiums.md).
 
 **Mods**: textures, `project.bin` files, rosters and stadiums in `mods/<folder>`; saves made with a modded roster are kept apart. See [docs/en/mods.md](docs/en/mods.md).
@@ -142,6 +143,7 @@ For developers. Requirements: PowerShell 5.1, Git, the .NET 8 SDK and Python 3.1
 | [docs/en/mods.md](docs/en/mods.md) | Kinds of mods and how to install them |
 | [docs/en/roster-2008.md](docs/en/roster-2008.md) | 2008 rosters and the PowerUp+ editor |
 | [docs/en/texture-studio.md](docs/en/texture-studio.md) | Texture Studio |
+| [docs/en/season-studio.md](docs/en/season-studio.md) | Season Editor: start year, DH, leagues, real schedules |
 | [docs/en/stadiums.md](docs/en/stadiums.md) | Stadiums with Blender and how to make one from scratch |
 | [docs/en/linux.md](docs/en/linux.md) | Linux and Steam Deck: building, installing, what was tested |
 | [docs/en/reverse-engineering-tools.md](docs/en/reverse-engineering-tools.md) | Ghidra and dtk |
@@ -155,7 +157,7 @@ The Spanish originals are in [docs/](docs/).
 | `tools/` | translation, building, Setup, launcher, mods and analysis |
 | `tools/patches/` | reproducible patches on Wiicompiled and PowerUp+ |
 | `tools/setup/` | the Setup (`setup.cpp`), what runs on the player's PC (`LocalBuild.ps1`) and packaging |
-| `tools/texture-studio/`, `tools/blender/`, `tools/roster/` | Texture Studio, the Blender add-on and roster conversion |
+| `tools/texture-studio/`, `tools/season-studio/`, `tools/blender/`, `tools/roster/` | Texture Studio, the Season Editor, the Blender add-on and roster conversion |
 | `config/` | game identity, function map and pinned versions |
 | `assets/launcher/` | the launcher's own art (not game content) |
 | `docs/` | technical notes and verifiable results; `docs/en/` in English |

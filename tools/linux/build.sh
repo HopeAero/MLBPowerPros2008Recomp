@@ -290,6 +290,16 @@ if (( ! skip_studio )); then
     fi
 fi
 
+if (( ! skip_studio )); then   # same SDL and ImGui; its own season headers and toml11 come from the runtime
+    step "Building Season Studio"
+    if cmake -S tools/season-studio -B "${studio_build/texture-studio/season-studio}" -G Ninja -DCMAKE_BUILD_TYPE=Release             -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++             -DSDL_SOURCE_DIR="$build/_deps/sdl-src" -DIMGUI_SOURCE_DIR="$build/_deps/imgui-src"             -DUI_INCLUDE_DIR="$src/runtime/include" -DTOML_INCLUDE_DIR="$src/runtime/third_party/toml11" "${sdl_flags[@]}"             > local/analysis/linux${log_tag}-season-studio.log 2>&1 &&
+       cmake --build "${studio_build/texture-studio/season-studio}" --parallel "$jobs" >> local/analysis/linux${log_tag}-season-studio.log 2>&1; then
+        :
+    else
+        echo "warning: Season Studio failed to build (local/analysis/linux${log_tag}-season-studio.log); the game is unaffected" >&2
+    fi
+fi
+
 if (( ! skip_roster )); then
     # PowerUp+ (the roster editor), as tools/powerupplus.ps1 -Publish builds it for Windows: the pinned
     # commit with tools/patches/powerupplus-*.patch, its web UI and a self-contained server, and its
@@ -355,6 +365,7 @@ done
 mkdir -p "$install_dir/launcher" "$install_dir/mods" "$install_dir/UserData"
 cp -f assets/launcher/*.png "$install_dir/launcher/"
 (( skip_studio )) || cp -f "$studio_build/TextureStudio" "$install_dir/"
+[[ -f ${studio_build/texture-studio/season-studio}/SeasonStudio ]] && cp -f "${studio_build/texture-studio/season-studio}/SeasonStudio" "$install_dir/"
 if (( ! skip_roster )); then   # the launcher's TOOLS > EDIT ROSTER starts it; its database lives in UserData
     rm -rf "$install_dir/powerupplus"
     cp -r "$roster_build" "$install_dir/powerupplus"

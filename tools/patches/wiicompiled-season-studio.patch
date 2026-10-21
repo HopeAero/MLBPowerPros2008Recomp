@@ -40,10 +40,10 @@ index 20913af..b43309c 100644
      bool disc = false;
 diff --git a/runtime/include/season_pack.h b/runtime/include/season_pack.h
 new file mode 100644
-index 0000000..e4273b0
+index 0000000..0d18e04
 --- /dev/null
 +++ b/runtime/include/season_pack.h
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,219 @@
 +#pragma once
 +
 +// What a new Season mode game or MLB Life career will use, from the enabled mods and the MEJORAS
@@ -56,6 +56,8 @@ index 0000000..e4273b0
 +
 +#include <cstdlib>
 +#include <filesystem>
++#include <fstream>
++#include <iterator>
 +#include <map>
 +#include <string>
 +#include <string_view>
@@ -152,6 +154,21 @@ index 0000000..e4273b0
 +    return plan;
 +}
 +
++// The same schedule file in two mods (downloaded twice) is not a conflict. `rootOf(name)` gives the
++// folder of the mod with that name.
++template <typename RootOf>
++void DropSameSchedules(Plan& plan, RootOf rootOf) {
++    auto read = [](const std::filesystem::path& path) {
++        std::ifstream in(path, std::ios::binary);
++        return in ? std::string(std::istreambuf_iterator<char>(in), {}) : std::string();
++    };
++    std::erase_if(plan.conflicts, [&](const Plan::Conflict& c) {
++        if (c.what != "schedule") return false;
++        const std::string file = std::to_string(c.year) + ".csv";
++        return read(rootOf(c.loser) / "schedule" / file) == read(rootOf(c.winner) / "schedule" / file);
++    });
++}
++
 +// The years from `first` a season-mode game reaches without a schedule file (it then has a generated
 +// one), up to `last`.
 +inline std::vector<int> GeneratedYears(const Plan& plan, int first, int last) {
@@ -246,333 +263,28 @@ index 0000000..e4273b0
 +}
 +
 +}  // namespace season_pack
-diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
-index 56abe07..23ac50e 100644
---- a/runtime/src/hle/mlb/season_cap.cpp
-+++ b/runtime/src/hle/mlb/season_cap.cpp
-@@ -233,13 +233,14 @@ void ShiftBirthYears(uint32_t shift) {
- 
- bool UniversalDh() {
-     // Mods are read once at start-up, as the rest of the runtime does.
--    static const bool fromMod = [] {
-+    // The first enabled mod (by name) with dh = "both" or "original" decides; else the option.
-+    static const int fromMod = [] {
-         for (const auto& mod : mods::Discover()) {
--            if (mod.enabled && mod.universalDh) return true;
-+            if (mod.enabled && (mod.universalDh || mod.originalDh)) return mod.universalDh ? 1 : 0;
-         }
--        return false;
-+        return -1;
-     }();
--    return fromMod || RuntimeConfigFile::UniversalDh(false);
-+    return fromMod >= 0 ? fromMod == 1 : RuntimeConfigFile::UniversalDh(false);
- }
- 
- // MLB Life: the wife and children were born against the game's 2007 dates; same age in the year shown.
-diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
-index 3218ecd..6ddfe1c 100644
---- a/runtime/src/hle/mlb/season_schedule.cpp
-+++ b/runtime/src/hle/mlb/season_schedule.cpp
-@@ -59,10 +59,10 @@ int StartYear() {
-     return 0;
- }
- 
--// The first enabled mod (by name) with a [divisions] table, or null.
-+// The first enabled mod (by name) with a [divisions] table or leagues = "original", or null.
- const mods::Mod* DivisionsMod(const std::vector<mods::Mod>& all) {
-     for (const auto& mod : all) {
--        if (mod.enabled && mod.hasDivisions) return &mod;
-+        if (mod.enabled && (mod.hasDivisions || mod.originalLeagues)) return &mod;
-     }
-     return nullptr;
- }
-@@ -72,6 +72,7 @@ const mods::Mod* DivisionsMod(const std::vector<mods::Mod>& all) {
- bool WantedDivisions(std::vector<std::string> (&listed)[6], std::string& source) {
-     const auto all = mods::Discover();
-     if (const mods::Mod* mod = DivisionsMod(all)) {
-+        if (!mod->hasDivisions) return false;  // leagues = "original": 2008's, whatever the option
-         for (int d = 0; d < 6; ++d) listed[d] = mod->divisions[d];
-         source = "mod \"" + mod->name + "\"";
-         return true;
-diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index baf9872..eff031a 100644
---- a/runtime/src/launcher.cpp
-+++ b/runtime/src/launcher.cpp
-@@ -18,6 +18,7 @@
- #include "runtime_log.h"
- #include "season_schedule.h"
- #include "season_schedule_mlb.h"
+diff --git a/runtime/include/season_text.h b/runtime/include/season_text.h
+new file mode 100644
+index 0000000..6485bf0
+--- /dev/null
++++ b/runtime/include/season_text.h
+@@ -0,0 +1,106 @@
++#pragma once
++
++// The words for a season_pack::Plan: what a new Season mode game or MLB Life career will use, in the
++// player's language. Shared by the launcher (MEJORAS' foot) and the Season Studio (its summary).
++
++#include <string>
++#include <vector>
++
++#include "power_pros_ui.h"
 +#include "season_pack.h"
- 
- #include <aurora/aurora.h>
- #include <imgui.h>
-@@ -298,6 +299,8 @@ constexpr int kOpenTextureStudio = -4;
- constexpr int kOpenSavesFolder = -5;
- constexpr int kDownloadSchedule = -6;
- constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, MEJORAS; HERRAMIENTAS follows it
-+constexpr int kSeasonTab = kModsTab + 2;  // TEMPORADA, after HERRAMIENTAS
-+constexpr int kEnhancementsTab = 4;
- 
- // Shown with every option tagged experimental (MEJORAS).
- constexpr Phrase kExperimentalNote{
-@@ -497,35 +500,109 @@ void OpenSavesFolder(const std::vector<mods::Mod>& all) {
- }
- 
- constexpr Phrase kScheduleHelp{
--    "Descarga el calendario real de una temporada de las Grandes Ligas (de la web pública de MLB, "
--    "statsapi.mlb.com) y lo guarda en un mod como schedule/<año>.csv. El juego lo usa en la temporada "
--    "que lleva ese año, en el modo Temporada y en MLB Life.\n\n"
--    "Con «Nuevo: Calendarios MLB» se crea ese mod con el año elegido como primera temporada (start_year) "
--    "y se activa: una temporada nueva empieza en ese año con su calendario. Con un mod tuyo (por ejemplo tu "
--    "roster), el archivo se añade a los suyos; si el mod no tenía año inicial, se le pone ese año (start_year "
--    "en su mod.toml, sin tocar lo demás), porque el juego usa el calendario de un año en la temporada que "
--    "lleva ese año.\n\n"
--    "Años: de 2002 a 2026, sin 2020 (60 partidos). Si una temporada empezó antes del 19 de marzo o acabó "
--    "después del 1 de octubre, el juego la juega unos días antes o después; los partidos de un día con "
--    "más de 16 pasan a un día cercano.\n\n"
--    "Necesita conexión a internet solo al descargar.",
--    "Downloads a major league season's real schedule (from MLB's public site, statsapi.mlb.com) and saves "
--    "it in a mod as schedule/<year>.csv. The game uses it in the season that carries that year, in Season "
--    "mode and in MLB Life.\n\n"
--    "With «New: MLB Schedules» that mod is created with the chosen year as its first season (start_year) "
--    "and switched on: a new season starts in that year with its schedule. With a mod of yours (your roster, "
--    "for example), the file is added to its own; if the mod had no start year, it gets that year (start_year "
--    "in its mod.toml, the rest left as it is), because the game uses a year's schedule in the season that "
--    "carries that year.\n\n"
--    "Years: 2002 to 2026, not 2020 (60 games). If a season started before March 19 or ended after "
--    "October 1, the game plays it a few days earlier or later; games on a day with more than 16 move to a "
--    "nearby day.\n\n"
--    "It needs an internet connection only to download."};
--
--// Downloads `year`'s schedule with the system's curl (Windows 10 and later, Linux) into
--// <mod>/schedule/<year>.csv; a new mod gets a mod.toml with that first season. Returns what to show.
--// ponytail: blocks the launcher for the download (a few seconds); a thread if it ever needs to be longer.
--std::string DownloadSchedule(int year, const std::filesystem::path& modDir, bool newMod) {
-+    "Descarga los calendarios reales de las Grandes Ligas, de un año o de varios seguidos.\n\n"
-+    "- DESDE y HASTA: los años (de 2002 a 2026; 2020 no está porque tuvo 60 partidos).\n"
-+    "- DESCARGAR: los baja y los guarda en el mod elegido arriba.\n\n"
-+    "Cada año se usa en la temporada de ese año, en el modo Temporada y en MLB Life. Un año sin calendario "
-+    "descargado tiene uno inventado por el juego.\n\n"
-+    "Si el mod no tenía año de inicio, se le pone el primer año descargado.\n\n"
-+    "Hace falta internet solo para descargar. Cada año tarda unos segundos.",
-+    "Downloads the major leagues' real schedules, for one year or several in a row.\n\n"
-+    "- FROM and TO: the years (2002 to 2026; 2020 is missing because it had 60 games).\n"
-+    "- DOWNLOAD: gets them and saves them in the mod chosen above.\n\n"
-+    "Each year is used in that year's season, in Season mode and in MLB Life. A year with no downloaded "
-+    "schedule gets one made up by the game.\n\n"
-+    "If the mod had no start year, it gets the first year downloaded.\n\n"
-+    "Internet is only needed to download. Each year takes a few seconds."};
 +
-+constexpr Phrase kSeasonModHelp{
-+    "Elige el mod que quieres ajustar.\n\n"
-+    "Las filas de abajo muestran y cambian los ajustes de temporada de ese mod, y los calendarios se "
-+    "descargan en él.\n\n"
-+    "«Nuevo: Calendarios MLB» crea un mod nuevo solo para esto en cuanto cambias algo o descargas, y lo "
-+    "activa.",
-+    "Choose the mod you want to set up.\n\n"
-+    "The rows below show and change that mod's season settings, and schedules are downloaded into it.\n\n"
-+    "«New: MLB Schedules» creates a new mod just for this as soon as you change something or download, "
-+    "and switches it on."};
-+constexpr Phrase kStartYearHelp{
-+    "En qué año empieza una partida nueva con este mod.\n\n"
-+    "Vale para el modo Temporada y para MLB Life.\n\n"
-+    "- 2008 (original): como el juego.\n"
-+    "- Otro año: la temporada empieza en ese año.\n\n"
-+    "Las partidas ya empezadas siguen en su año.",
-+    "Which year a new game with this mod starts in.\n\n"
-+    "It applies to Season mode and to MLB Life.\n\n"
-+    "- 2008 (original): as the game.\n"
-+    "- Another year: the season starts in that year.\n\n"
-+    "Games already started stay in their year."};
-+constexpr Phrase kRosterYearHelp{
-+    "¿De qué año es el roster de este mod?\n\n"
-+    "Sirve solo para que las edades de los jugadores salgan bien.\n\n"
-+    "- Mismo que el inicio: el roster es del año en que empieza la partida. Es lo normal: un roster de 2025 "
-+    "que empieza en 2025.\n"
-+    "- Un año: el roster es de otro año. Ejemplo: un roster de 2023 jugado desde 2026 lleva 2023, y así "
-+    "cada jugador tiene en 2026 la edad que le toca.",
-+    "Which year is this mod's roster from?\n\n"
-+    "It is only used so the players' ages come out right.\n\n"
-+    "- Same as the start: the roster is from the year the game starts in. The usual case: a 2025 roster "
-+    "starting in 2025.\n"
-+    "- A year: the roster is from another year. Example: a 2023 roster played from 2026 takes 2023, so "
-+    "each player has the right age in 2026."};
-+constexpr Phrase kModDhHelp{
-+    "El bateador designado con este mod (modo Temporada y MLB Life).\n\n"
-+    "- Como en MEJORAS: lo decide la opción DH EN AMBAS LIGAS de MEJORAS.\n"
-+    "- En ambas ligas: DH en todos los partidos, como desde 2022.\n"
-+    "- Original (Liga Americana): como el juego, DH solo en los estadios de la Liga Americana.\n\n"
-+    "Las dos últimas valen aunque MEJORAS diga otra cosa.",
-+    "The designated hitter with this mod (Season mode and MLB Life).\n\n"
-+    "- As in ENHANCEMENTS: the DH IN BOTH LEAGUES option in ENHANCEMENTS decides.\n"
-+    "- In both leagues: the DH in every game, as since 2022.\n"
-+    "- Original (American League): as the game, the DH only in American League parks.\n\n"
-+    "The last two apply whatever ENHANCEMENTS says."};
-+constexpr Phrase kModLeaguesHelp{
-+    "Las ligas de una partida nueva con este mod.\n\n"
-+    "- Como en MEJORAS: lo decide la opción LIGAS 15 Y 15 de MEJORAS.\n"
-+    "- 15 y 15: Houston en la AL West, como desde 2013.\n"
-+    "- Original (14 y 16): las divisiones de 2008, como el juego.\n\n"
-+    "Las dos últimas valen aunque MEJORAS diga otra cosa.\n\n"
-+    "«Propias» sale cuando el mod trae otras divisiones en su mod.toml; se cambian ahí.",
-+    "The leagues of a new game with this mod.\n\n"
-+    "- As in ENHANCEMENTS: the 15 AND 15 LEAGUES option in ENHANCEMENTS decides.\n"
-+    "- 15 and 15: Houston in the AL West, as since 2013.\n"
-+    "- Original (14 and 16): 2008's divisions, as the game.\n\n"
-+    "The last two apply whatever ENHANCEMENTS says.\n\n"
-+    "«Its own» shows when the mod has other divisions in its mod.toml; they are changed there."};
++namespace season_text {
++using power_pros_ui::Tr;
 +
-+// The launcher's own season mod (TEMPORADA > «New: MLB Schedules»).
-+constexpr const char* kSeasonModId = "MLBSchedules";
-+
-+std::string ReadFile(const std::filesystem::path& path) {
-+    std::ifstream in(path, std::ios::binary);
-+    return in ? std::string(std::istreambuf_iterator<char>(in), {}) : std::string();
-+}
-+
-+std::string ReadManifest(const std::filesystem::path& modDir) {
-+    std::ifstream in(modDir / "mod.toml", std::ios::binary);
-+    return in ? std::string(std::istreambuf_iterator<char>(in), {}) : std::string();
-+}
-+
-+// Creates mods/MLBSchedules (a mod.toml with its name) switched on, if it is not there.
-+void MakeSeasonMod(const std::filesystem::path& modDir) {
-+    std::error_code ec;
-+    std::filesystem::create_directories(modDir, ec);
-+    if (!std::filesystem::exists(modDir / "mod.toml", ec))
-+        std::ofstream(modDir / "mod.toml", std::ios::binary)
-+            << "name = \"" << Tr("Calendarios MLB", "MLB Schedules") << "\"\n"
-+            << "description = \"" << Tr("Temporada hecha desde el launcher (TEMPORADA).", "Season made in the launcher (SEASON).")
-+            << "\"\n";
-+    mods::SetEnabled(RuntimeConfigFile::PathToUtf8(modDir.filename()), true);
-+}
-+
-+// One year's schedule with the system's curl (Windows 10 and later, Linux) into
-+// <mod>/schedule/<year>.csv. Returns a short line for the year, or sets `error`.
-+// ponytail: blocks the launcher for the download (a few seconds a year); a thread if it ever needs to be longer.
-+std::string FetchSchedule(int year, const std::filesystem::path& modDir, std::string& error) {
-     namespace fs = std::filesystem;
-     std::error_code ec;
-     fs::create_directories(modDir / "schedule", ec);
-@@ -551,69 +628,163 @@ std::string DownloadSchedule(int year, const std::filesystem::path& modDir, bool
-     const std::string json((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-     input.close();
-     fs::remove(temp, ec);
--    if (json.empty())
--        return Tr("No se pudo descargar el calendario. Comprueba la conexión a internet.",
--                  "The schedule could not be downloaded. Check the internet connection.");
-+    if (json.empty()) {
-+        error = Tr("No se pudo descargar el calendario. Comprueba la conexión a internet.",
-+                   "The schedule could not be downloaded. Check the internet connection.");
-+        return {};
-+    }
-     const season_schedule_mlb::Converted converted = season_schedule_mlb::ToCsv(json, year);
--    if (!converted.error.empty()) return std::string(Tr("Calendario no válido: ", "Not a valid schedule: ")) + converted.error;
--    std::ofstream(modDir / "schedule" / (std::to_string(year) + ".csv"), std::ios::binary) << converted.csv;
--    if (newMod && !fs::exists(modDir / "mod.toml", ec)) {
--        std::ofstream(modDir / "mod.toml", std::ios::binary)
--            << "name = \"" << Tr("Calendarios MLB", "MLB Schedules") << "\"\n"
--            << "description = \"" << Tr("Calendarios reales descargados desde el launcher.", "Real schedules downloaded from the launcher.")
--            << "\"\nstart_year = " << year << "\n";
--        mods::SetEnabled(RuntimeConfigFile::PathToUtf8(modDir.filename()), true);
-+    if (!converted.error.empty()) {
-+        error = std::string(Tr("Calendario no válido: ", "Not a valid schedule: ")) + converted.error;
-+        return {};
-     }
-+    std::ofstream(modDir / "schedule" / (std::to_string(year) + ".csv"), std::ios::binary) << converted.csv;
-     // What the game will do with it (the same fit the runtime makes, without the All-Star Game).
-     const auto fitted = season_schedule::Fit(season_schedule::Parse(converted.csv).games);
--    std::string message = std::to_string(year) + ": " + std::to_string(converted.games) + Tr(" partidos (", " games (") +
--                          std::to_string(converted.minPerTeam) +
--                          (converted.minPerTeam == converted.maxPerTeam ? "" : "-" + std::to_string(converted.maxPerTeam)) +
--                          Tr(" por equipo), guardado en ", " a team), saved in ") +
--                          RuntimeConfigFile::PathToUtf8(modDir.filename()) + "/schedule/" + std::to_string(year) + ".csv.";
-+    std::string line = std::to_string(year) + ": " + std::to_string(converted.games) + Tr(" partidos (", " games (") +
-+                       std::to_string(converted.minPerTeam) +
-+                       (converted.minPerTeam == converted.maxPerTeam ? "" : "-" + std::to_string(converted.maxPerTeam)) +
-+                       Tr(" por equipo)", " a team)");
-     if (fitted.shift)
--        message += std::string(Tr(" El juego lo juega ", " The game plays it ")) + std::to_string(std::abs(fitted.shift)) +
--                   (std::abs(fitted.shift) == 1 ? Tr(" día", " day") : Tr(" días", " days")) +
--                   (fitted.shift < 0 ? Tr(" antes para acabar el 1 de octubre.", " earlier to end on October 1.")
--                                     : Tr(" después para empezar el 19 de marzo.", " later to start on March 19."));
--    if (fitted.moved) message += " " + std::to_string(fitted.moved) + Tr(" partidos pasan a un día cercano.", " games move to a nearby day.");
--    if (newMod) {
--        message += Tr(" El mod está activado: empieza una temporada nueva.", " The mod is switched on: start a new season.");
--        return message;
-+        line += std::string(Tr(", se juega ", ", played ")) + std::to_string(std::abs(fitted.shift)) +
-+                (std::abs(fitted.shift) == 1 ? Tr(" día", " day") : Tr(" días", " days")) +
-+                (fitted.shift < 0 ? Tr(" antes", " earlier") : Tr(" después", " later"));
-+    if (fitted.moved) line += ", " + std::to_string(fitted.moved) + Tr(" a un día cercano", " moved to a nearby day");
-+    return line;
-+}
-+
-+// The schedules of `from`..`to` (the years offered) into a mod; a mod with no start year gets the first.
-+std::string DownloadSchedules(int from, int to, const std::filesystem::path& modDir) {
-+    if (from > to) std::swap(from, to);
-+    const auto offered = season_schedule_mlb::OfferedYears();
-+    std::string message, error;
-+    int first = 0, saved = 0;
-+    for (int year = from; year <= to; ++year) {
-+        if (std::find(offered.begin(), offered.end(), year) == offered.end()) continue;
-+        std::string failed;
-+        const std::string line = FetchSchedule(year, modDir, failed);
-+        if (!failed.empty()) {
-+            error = std::to_string(year) + ": " + failed;
-+            break;  // the next years would fail the same way
-+        }
-+        message += (message.empty() ? "" : "; ") + line;
-+        if (!first) first = year;
-+        ++saved;
-     }
--    // A mod of the user's: the game uses schedule/<year>.csv in the season it shows as <year>, so a mod
--    // with no first season of its own (it starts in 2008) gets this year as its start_year, appended to
--    // its mod.toml (the rest of the file is left as it is).
-+    if (!saved) return error;
-+    message = std::string(Tr("Guardado en ", "Saved in ")) + RuntimeConfigFile::PathToUtf8(modDir.filename()) + "/schedule: " +
-+              message + ".";
-+    if (!error.empty()) message += " " + error;
-     int startYear = 0;
-     for (const auto& m : mods::Discover())
-         if (m.root == modDir) startYear = m.startYear;
--    if (startYear == 0 && year != 2008) {
--        const fs::path manifest = modDir / "mod.toml";
--        std::string text;
--        if (std::ifstream in{manifest, std::ios::binary}) text.assign(std::istreambuf_iterator<char>(in), {});
--        // Before any [table], where a top-level key has to go.
--        const size_t table = text.find("\n[");
--        const std::string line = "start_year = " + std::to_string(year) + "\n";
--        if (text.empty()) text = "name = \"" + RuntimeConfigFile::PathToUtf8(modDir.filename()) + "\"\n" + line;
--        else if (table != std::string::npos) text.insert(table + 1, line);
--        else text += (text.back() == '\n' ? "" : "\n") + line;
--        std::ofstream(manifest, std::ios::binary) << text;
--        startYear = year;
--        message += std::string(Tr(" Se añadió start_year = ", " Added start_year = ")) + std::to_string(year) +
--                   Tr(" al mod.toml: una temporada nueva con este mod empieza en ese año (las partidas ya empezadas siguen "
--                      "como estaban).",
--                      " to its mod.toml: a new season with this mod starts in that year (games already started stay as "
--                      "they were).");
--    } else if (startYear != 0 && year < startYear) {
-+    if (startYear == 0 && first != 2008) {
-+        const std::string text = season_pack::SetKey(ReadManifest(modDir), "start_year", std::to_string(first));  // before the file is truncated
-+        std::ofstream(modDir / "mod.toml", std::ios::binary) << text;
-+        message += std::string(Tr(" Año de inicio del mod: ", " The mod's start year: ")) + std::to_string(first) + ".";
-+    } else if (startYear != 0 && to < startYear) {
-         message += std::string(Tr(" Ojo: este mod empieza en ", " Note: this mod starts in ")) + std::to_string(startYear) +
--                   Tr(", así que este calendario no se usará.", ", so this schedule will not be used.");
--    } else if (startYear != 0 && year > startYear) {
--        message += std::string(Tr(" Se usará en la temporada ", " It will be used in the season ")) + std::to_string(year) +
--                   Tr(" de las partidas con este mod.", " of games with this mod.");
-+                   Tr(", así que no se usarán.", ", so they will not be used.");
-+    } else if (startYear != 0 && first < startYear) {
-+        message += std::string(Tr(" Los años antes de ", " The years before ")) + std::to_string(startYear) +
-+                   Tr(" no se usan: el mod empieza en ese año.", " are not used: the mod starts in that year.");
-     }
-     return message;
- }
- 
 +// "2025, 2026-2028" from sorted years.
-+std::string YearRanges(const std::vector<int>& years) {
++inline std::string YearRanges(const std::vector<int>& years) {
 +    std::string out;
 +    for (size_t i = 0; i < years.size();) {
 +        size_t j = i;
@@ -583,14 +295,14 @@ index baf9872..eff031a 100644
 +    return out;
 +}
 +
-+// TEMPORADA's first row and the MEJORAS footer: what a new season will use, and the settings of one
-+// mod that another overrides.
++// The Season Studio's summary and the MEJORAS footer: what a new season will use, and the settings of
++// one mod that another overrides.
 +struct SeasonText {
-+    std::string choice;  // "2025 · calendario real"
++    std::string choice;  // "Empieza en 2025, calendario real"
 +    std::string help;    // the whole picture
 +    std::string footer;  // a line for MEJORAS
 +};
-+SeasonText DescribeSeason(const season_pack::Plan& plan, int maxSeasons) {
++inline SeasonText DescribeSeason(const season_pack::Plan& plan, int maxSeasons) {
 +    SeasonText out;
 +    auto from = [](const std::string& mod) { return std::string(Tr(" (mod «", " (mod «")) + mod + "»)"; };
 +    const int last = plan.startYear + (maxSeasons ? maxSeasons : 20) - 1;
@@ -598,12 +310,10 @@ index baf9872..eff031a 100644
 +    for (const auto& [year, mod] : plan.schedules)
 +        if (year >= plan.startYear && year <= last) real.push_back(year);
 +    std::string& h = out.help;
-+    h = Tr("Solo informa: aquí no se cambia nada.\n\n"
-+           "Así empezará una partida nueva del modo Temporada o de MLB Life, con los mods activos y MEJORAS. "
-+           "Lo de cada mod se cambia en las filas de abajo.\n\n",
-+           "Info only: nothing is changed here.\n\n"
-+           "This is how a new Season mode or MLB Life game will start, with the enabled mods and ENHANCEMENTS. "
-+           "Each mod's settings are changed in the rows below.\n\n");
++    h = Tr("Así empezará una partida nueva del modo Temporada o de MLB Life, con los mods activos y las "
++           "opciones de MEJORAS del launcher:\n\n",
++           "This is how a new Season mode or MLB Life game will start, with the enabled mods and the launcher's "
++           "ENHANCEMENTS options:\n\n");
 +    h += std::string(Tr("- Año: ", "- Year: ")) + std::to_string(plan.startYear) +
 +         (plan.startFrom.empty() ? std::string(Tr(" (el del juego)", " (the game's)")) : from(plan.startFrom)) + "\n";
 +    if (plan.rosterYear != plan.startYear)
@@ -660,14 +370,267 @@ index baf9872..eff031a 100644
 +                      ? std::string()
 +                      : std::string(Tr(". Lo que viene de un mod manda sobre estas opciones", ". What comes from a mod overrides these options"))) +
 +                 (plan.conflicts.empty() ? "" : Tr(". Hay avisos", ". There are warnings")) +
-+                 Tr(". Detalles en MODS > TEMPORADA.", ". Details in MODS > SEASON.");
++                 Tr(". Detalles y ajustes en HERRAMIENTAS > EDITOR DE TEMPORADA.", ". Details and settings in TOOLS > SEASON EDITOR.");
 +    return out;
 +}
 +
++}  // namespace season_text
+diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
+index 56abe07..23ac50e 100644
+--- a/runtime/src/hle/mlb/season_cap.cpp
++++ b/runtime/src/hle/mlb/season_cap.cpp
+@@ -233,13 +233,14 @@ void ShiftBirthYears(uint32_t shift) {
+ 
+ bool UniversalDh() {
+     // Mods are read once at start-up, as the rest of the runtime does.
+-    static const bool fromMod = [] {
++    // The first enabled mod (by name) with dh = "both" or "original" decides; else the option.
++    static const int fromMod = [] {
+         for (const auto& mod : mods::Discover()) {
+-            if (mod.enabled && mod.universalDh) return true;
++            if (mod.enabled && (mod.universalDh || mod.originalDh)) return mod.universalDh ? 1 : 0;
+         }
+-        return false;
++        return -1;
+     }();
+-    return fromMod || RuntimeConfigFile::UniversalDh(false);
++    return fromMod >= 0 ? fromMod == 1 : RuntimeConfigFile::UniversalDh(false);
+ }
+ 
+ // MLB Life: the wife and children were born against the game's 2007 dates; same age in the year shown.
+diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
+index 3218ecd..6ddfe1c 100644
+--- a/runtime/src/hle/mlb/season_schedule.cpp
++++ b/runtime/src/hle/mlb/season_schedule.cpp
+@@ -59,10 +59,10 @@ int StartYear() {
+     return 0;
+ }
+ 
+-// The first enabled mod (by name) with a [divisions] table, or null.
++// The first enabled mod (by name) with a [divisions] table or leagues = "original", or null.
+ const mods::Mod* DivisionsMod(const std::vector<mods::Mod>& all) {
+     for (const auto& mod : all) {
+-        if (mod.enabled && mod.hasDivisions) return &mod;
++        if (mod.enabled && (mod.hasDivisions || mod.originalLeagues)) return &mod;
+     }
+     return nullptr;
+ }
+@@ -72,6 +72,7 @@ const mods::Mod* DivisionsMod(const std::vector<mods::Mod>& all) {
+ bool WantedDivisions(std::vector<std::string> (&listed)[6], std::string& source) {
+     const auto all = mods::Discover();
+     if (const mods::Mod* mod = DivisionsMod(all)) {
++        if (!mod->hasDivisions) return false;  // leagues = "original": 2008's, whatever the option
+         for (int d = 0; d < 6; ++d) listed[d] = mod->divisions[d];
+         source = "mod \"" + mod->name + "\"";
+         return true;
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index baf9872..59a4a01 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -16,8 +16,8 @@
+ #include "aurora_events.h"
+ #include "runtime_config.h"
+ #include "runtime_log.h"
+-#include "season_schedule.h"
+-#include "season_schedule_mlb.h"
++#include "season_pack.h"
++#include "season_text.h"
+ 
+ #include <aurora/aurora.h>
+ #include <imgui.h>
+@@ -296,8 +296,9 @@ constexpr int kOpenModsFolder = -2;
+ constexpr int kOpenRosterEditor = -3;
+ constexpr int kOpenTextureStudio = -4;
+ constexpr int kOpenSavesFolder = -5;
+-constexpr int kDownloadSchedule = -6;
++constexpr int kOpenSeasonStudio = -6;
+ constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, MEJORAS; HERRAMIENTAS follows it
++constexpr int kEnhancementsTab = 4;
+ 
+ // Shown with every option tagged experimental (MEJORAS).
+ constexpr Phrase kExperimentalNote{
+@@ -380,6 +381,22 @@ constexpr Phrase kTextureStudioHelp{
+     "Opens Power Pros Wii 2008 Texture Studio: browse the game's textures, export them to edit them "
+     "(Photoshop, HD upscaling) and save them as a texture mod without touching the game."};
+ 
++constexpr Phrase kSeasonStudioHelp{
++    "Abre el Editor de temporada, en su propia ventana:\n\n"
++    "- Qué tendrá una partida nueva del modo Temporada o de MLB Life (año, calendario, DH, ligas) y de qué mod "
++    "sale cada cosa, con avisos si dos mods chocan.\n"
++    "- Los ajustes de temporada de cada mod: año de inicio, edades del roster, DH y ligas, con «Original» "
++    "para dejarlo como el juego.\n"
++    "- Descargar calendarios reales de las Grandes Ligas (2002 a 2026).\n"
++    "- Ver el calendario de un año, mes a mes y por equipo.",
++    "Opens the Season Editor, in its own window:\n\n"
++    "- What a new Season mode or MLB Life game will have (year, schedule, DH, leagues) and which mod each "
++    "comes from, with warnings when two mods clash.\n"
++    "- Each mod's season settings: start year, roster ages, DH and leagues, with «Original» to keep the "
++    "game's.\n"
++    "- Download the major leagues' real schedules (2002 to 2026).\n"
++    "- See a year's schedule, month by month and by team."};
++
+ constexpr Phrase kRosterPlayersLabel{"JUGADORES DEL ROSTER", "ROSTER PLAYERS"};
+ constexpr Phrase kRosterPlayersHelp{
+     "Cómo entran los jugadores de los mods de roster.\n\n"
+@@ -464,15 +481,15 @@ void OpenRosterEditor() {
+ 
+ // Power Pros Wii 2008 Texture Studio (tools/texture-studio) ships next to the game. It gets this
+ // copy's config, user data, mods folder and executable, so it works for portable and installed copies.
+-void OpenTextureStudio() {
++// Opens a studio next to the game (TextureStudio.exe, SeasonStudio.exe) with the game's folders.
++void OpenStudio(const wchar_t* exe) {
+ #if defined(_WIN32)
+     const auto exeDir = RuntimeConfigFile::ExecutableDirectory();
+     if (!exeDir) return;
+-    const std::filesystem::path studio = *exeDir / "TextureStudio.exe";
++    const std::filesystem::path studio = *exeDir / exe;
+     std::error_code ec;
+     if (!std::filesystem::exists(studio, ec)) {
+-        RT_LOG(RT_TAG_RUNTIME) << "launcher: Texture Studio is not installed (" << RuntimeConfigFile::PathToUtf8(studio) << ")"
+-                               << std::endl;
++        RT_LOG(RT_TAG_RUNTIME) << "launcher: " << RuntimeConfigFile::PathToUtf8(studio) << " is not installed" << std::endl;
+         return;
+     }
+     wchar_t self[MAX_PATH]{};
+@@ -481,8 +498,12 @@ void OpenTextureStudio() {
+                               RuntimeConfigFile::ApplicationDataDirectory().wstring() + L"\" --mods \"" +
+                               mods::Directory().wstring() + L"\" --game \"" + std::wstring(self) + L"\"";
+     ShellExecuteW(nullptr, L"open", studio.wstring().c_str(), args.c_str(), exeDir->wstring().c_str(), SW_SHOWNORMAL);
++#else
++    (void)exe;
+ #endif
+ }
++void OpenTextureStudio() { OpenStudio(L"TextureStudio.exe"); }
++void OpenSeasonStudio() { OpenStudio(L"SeasonStudio.exe"); }
+ 
+ // The folder whose saves the game uses with these mods: <user data>\ModSaves\<mods> for roster mods,
+ // else the NAND's own save folder.
+@@ -496,124 +517,6 @@ void OpenSavesFolder(const std::vector<mods::Mod>& all) {
+ #endif
+ }
+ 
+-constexpr Phrase kScheduleHelp{
+-    "Descarga el calendario real de una temporada de las Grandes Ligas (de la web pública de MLB, "
+-    "statsapi.mlb.com) y lo guarda en un mod como schedule/<año>.csv. El juego lo usa en la temporada "
+-    "que lleva ese año, en el modo Temporada y en MLB Life.\n\n"
+-    "Con «Nuevo: Calendarios MLB» se crea ese mod con el año elegido como primera temporada (start_year) "
+-    "y se activa: una temporada nueva empieza en ese año con su calendario. Con un mod tuyo (por ejemplo tu "
+-    "roster), el archivo se añade a los suyos; si el mod no tenía año inicial, se le pone ese año (start_year "
+-    "en su mod.toml, sin tocar lo demás), porque el juego usa el calendario de un año en la temporada que "
+-    "lleva ese año.\n\n"
+-    "Años: de 2002 a 2026, sin 2020 (60 partidos). Si una temporada empezó antes del 19 de marzo o acabó "
+-    "después del 1 de octubre, el juego la juega unos días antes o después; los partidos de un día con "
+-    "más de 16 pasan a un día cercano.\n\n"
+-    "Necesita conexión a internet solo al descargar.",
+-    "Downloads a major league season's real schedule (from MLB's public site, statsapi.mlb.com) and saves "
+-    "it in a mod as schedule/<year>.csv. The game uses it in the season that carries that year, in Season "
+-    "mode and in MLB Life.\n\n"
+-    "With «New: MLB Schedules» that mod is created with the chosen year as its first season (start_year) "
+-    "and switched on: a new season starts in that year with its schedule. With a mod of yours (your roster, "
+-    "for example), the file is added to its own; if the mod had no start year, it gets that year (start_year "
+-    "in its mod.toml, the rest left as it is), because the game uses a year's schedule in the season that "
+-    "carries that year.\n\n"
+-    "Years: 2002 to 2026, not 2020 (60 games). If a season started before March 19 or ended after "
+-    "October 1, the game plays it a few days earlier or later; games on a day with more than 16 move to a "
+-    "nearby day.\n\n"
+-    "It needs an internet connection only to download."};
+-
+-// Downloads `year`'s schedule with the system's curl (Windows 10 and later, Linux) into
+-// <mod>/schedule/<year>.csv; a new mod gets a mod.toml with that first season. Returns what to show.
+-// ponytail: blocks the launcher for the download (a few seconds); a thread if it ever needs to be longer.
+-std::string DownloadSchedule(int year, const std::filesystem::path& modDir, bool newMod) {
+-    namespace fs = std::filesystem;
+-    std::error_code ec;
+-    fs::create_directories(modDir / "schedule", ec);
+-    const fs::path temp = modDir / "schedule" / ".download.json";
+-    fs::remove(temp, ec);
+-    const std::string url = season_schedule_mlb::Url(year);
+-#if defined(_WIN32)
+-    std::wstring command = L"curl.exe -sSfL --max-time 60 -o \"" + temp.wstring() + L"\" \"" +
+-                           std::wstring(url.begin(), url.end()) + L"\"";
+-    STARTUPINFOW startup{sizeof(startup)};
+-    PROCESS_INFORMATION process{};
+-    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+-                       &process)) {
+-        WaitForSingleObject(process.hProcess, 90000);
+-        CloseHandle(process.hThread);
+-        CloseHandle(process.hProcess);
+-    }
+-#else
+-    const std::string command = "curl -sSfL --max-time 60 -o '" + temp.string() + "' '" + url + "'";
+-    (void)std::system(command.c_str());
+-#endif
+-    std::ifstream input(temp, std::ios::binary);
+-    const std::string json((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+-    input.close();
+-    fs::remove(temp, ec);
+-    if (json.empty())
+-        return Tr("No se pudo descargar el calendario. Comprueba la conexión a internet.",
+-                  "The schedule could not be downloaded. Check the internet connection.");
+-    const season_schedule_mlb::Converted converted = season_schedule_mlb::ToCsv(json, year);
+-    if (!converted.error.empty()) return std::string(Tr("Calendario no válido: ", "Not a valid schedule: ")) + converted.error;
+-    std::ofstream(modDir / "schedule" / (std::to_string(year) + ".csv"), std::ios::binary) << converted.csv;
+-    if (newMod && !fs::exists(modDir / "mod.toml", ec)) {
+-        std::ofstream(modDir / "mod.toml", std::ios::binary)
+-            << "name = \"" << Tr("Calendarios MLB", "MLB Schedules") << "\"\n"
+-            << "description = \"" << Tr("Calendarios reales descargados desde el launcher.", "Real schedules downloaded from the launcher.")
+-            << "\"\nstart_year = " << year << "\n";
+-        mods::SetEnabled(RuntimeConfigFile::PathToUtf8(modDir.filename()), true);
+-    }
+-    // What the game will do with it (the same fit the runtime makes, without the All-Star Game).
+-    const auto fitted = season_schedule::Fit(season_schedule::Parse(converted.csv).games);
+-    std::string message = std::to_string(year) + ": " + std::to_string(converted.games) + Tr(" partidos (", " games (") +
+-                          std::to_string(converted.minPerTeam) +
+-                          (converted.minPerTeam == converted.maxPerTeam ? "" : "-" + std::to_string(converted.maxPerTeam)) +
+-                          Tr(" por equipo), guardado en ", " a team), saved in ") +
+-                          RuntimeConfigFile::PathToUtf8(modDir.filename()) + "/schedule/" + std::to_string(year) + ".csv.";
+-    if (fitted.shift)
+-        message += std::string(Tr(" El juego lo juega ", " The game plays it ")) + std::to_string(std::abs(fitted.shift)) +
+-                   (std::abs(fitted.shift) == 1 ? Tr(" día", " day") : Tr(" días", " days")) +
+-                   (fitted.shift < 0 ? Tr(" antes para acabar el 1 de octubre.", " earlier to end on October 1.")
+-                                     : Tr(" después para empezar el 19 de marzo.", " later to start on March 19."));
+-    if (fitted.moved) message += " " + std::to_string(fitted.moved) + Tr(" partidos pasan a un día cercano.", " games move to a nearby day.");
+-    if (newMod) {
+-        message += Tr(" El mod está activado: empieza una temporada nueva.", " The mod is switched on: start a new season.");
+-        return message;
+-    }
+-    // A mod of the user's: the game uses schedule/<year>.csv in the season it shows as <year>, so a mod
+-    // with no first season of its own (it starts in 2008) gets this year as its start_year, appended to
+-    // its mod.toml (the rest of the file is left as it is).
+-    int startYear = 0;
+-    for (const auto& m : mods::Discover())
+-        if (m.root == modDir) startYear = m.startYear;
+-    if (startYear == 0 && year != 2008) {
+-        const fs::path manifest = modDir / "mod.toml";
+-        std::string text;
+-        if (std::ifstream in{manifest, std::ios::binary}) text.assign(std::istreambuf_iterator<char>(in), {});
+-        // Before any [table], where a top-level key has to go.
+-        const size_t table = text.find("\n[");
+-        const std::string line = "start_year = " + std::to_string(year) + "\n";
+-        if (text.empty()) text = "name = \"" + RuntimeConfigFile::PathToUtf8(modDir.filename()) + "\"\n" + line;
+-        else if (table != std::string::npos) text.insert(table + 1, line);
+-        else text += (text.back() == '\n' ? "" : "\n") + line;
+-        std::ofstream(manifest, std::ios::binary) << text;
+-        startYear = year;
+-        message += std::string(Tr(" Se añadió start_year = ", " Added start_year = ")) + std::to_string(year) +
+-                   Tr(" al mod.toml: una temporada nueva con este mod empieza en ese año (las partidas ya empezadas siguen "
+-                      "como estaban).",
+-                      " to its mod.toml: a new season with this mod starts in that year (games already started stay as "
+-                      "they were).");
+-    } else if (startYear != 0 && year < startYear) {
+-        message += std::string(Tr(" Ojo: este mod empieza en ", " Note: this mod starts in ")) + std::to_string(startYear) +
+-                   Tr(", así que este calendario no se usará.", ", so this schedule will not be used.");
+-    } else if (startYear != 0 && year > startYear) {
+-        message += std::string(Tr(" Se usará en la temporada ", " It will be used in the season ")) + std::to_string(year) +
+-                   Tr(" de las partidas con este mod.", " of games with this mod.");
+-    }
+-    return message;
+-}
+-
  void OpenModsFolder() {
      const std::filesystem::path dir = mods::Directory();
      std::error_code ec;
-@@ -839,21 +1010,21 @@ Result Run(int argc, char** argv) {
+@@ -839,21 +742,21 @@ Result Run(int argc, char** argv) {
      seasons.experimental = true;
      Option universalDh{Tr("DH EN AMBAS LIGAS", "DH IN BOTH LEAGUES"),
                         Tr("El bateador designado en todos los partidos del modo Temporada y de MLB Life, como en las Grandes "
@@ -696,7 +659,7 @@ index baf9872..eff031a 100644
                           YesNo(), RuntimeConfigFile::ModernLeagues(false) ? 1 : 0};
      modernLeagues.experimental = true;
  
-@@ -895,16 +1066,6 @@ Result Run(int argc, char** argv) {
+@@ -895,16 +798,7 @@ Result Run(int argc, char** argv) {
      toolsTab.options.push_back({Tr("ABRIR CARPETA DE MODS", "OPEN MODS FOLDER"), kModsHelp, {Tr("Abrir", "Open")}, 0, false, kOpenModsFolder});
      toolsTab.options.push_back({Tr("EDITAR ROSTER (PowerUp+)", "EDIT ROSTER (PowerUp+)"), kRosterEditorHelp, {Tr("Abrir", "Open")}, 0, false, kOpenRosterEditor});
      toolsTab.options.push_back({Tr("EDITOR DE TEXTURAS", "TEXTURE EDITOR"), kTextureStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenTextureStudio});
@@ -710,117 +673,32 @@ index baf9872..eff031a 100644
 -    toolsTab.options.push_back({Tr("DESCARGAR CALENDARIO", "DOWNLOAD SCHEDULE"), kScheduleHelp, {Tr("Descargar", "Download")}, 0,
 -                                false, kDownloadSchedule});
 -    std::string scheduleNotice;
++    toolsTab.options.push_back({Tr("EDITOR DE TEMPORADA", "SEASON EDITOR"), kSeasonStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenSeasonStudio});
      toolsTab.options.push_back({kRosterPlayersLabel, kRosterPlayersHelp, {Tr("Nativos", "Native"), Tr("Como en el editor", "As in the editor")},
                                  RuntimeConfigFile::NativeRoster(true) ? 0 : 1});
      for (size_t i = 0; i < installedMods.size(); ++i) {
-@@ -930,6 +1091,53 @@ Result Run(int argc, char** argv) {
-                                    static_cast<int>(i)});
-     }
- 
-+    // TEMPORADA: what a new season will use, one mod's season settings (its mod.toml) and the real
-+    // schedules' download.
-+    enum SeasonRow { kRowNext, kRowMod, kRowStart, kRowRoster, kRowDh, kRowLeagues, kRowFrom, kRowTo, kRowDownload };
-+    std::vector<std::string> seasonTargets;
-+    std::vector<std::filesystem::path> seasonRoots;
-+    if (std::none_of(installedMods.begin(), installedMods.end(), [](const mods::Mod& m) { return m.id == kSeasonModId; })) {
-+        seasonTargets.push_back(Tr("Nuevo: Calendarios MLB", "New: MLB Schedules"));
-+        seasonRoots.push_back(mods::Directory() / kSeasonModId);
-+    }
-+    for (const auto& m : installedMods) seasonTargets.push_back(m.name), seasonRoots.push_back(m.root);
-+    std::vector<std::string> startYears{"2008 (original)"};
-+    for (int y = 2009; y <= 2030; ++y) startYears.push_back(std::to_string(y));
-+    std::vector<std::string> rosterYears{Tr("Mismo que el inicio", "Same as the start")};
-+    for (int y = 2008; y <= 2030; ++y) rosterYears.push_back(std::to_string(y));
-+    std::vector<std::string> scheduleYears;
-+    for (int y : season_schedule_mlb::OfferedYears()) scheduleYears.insert(scheduleYears.begin(), std::to_string(y));
-+    const std::vector<std::string> modDh{Tr("Como en MEJORAS", "As in ENHANCEMENTS"), Tr("En ambas ligas", "In both leagues"),
-+                                         Tr("Original (Liga Americana)", "Original (American League)")};
-+    const std::vector<std::string> modLeagues{Tr("Como en MEJORAS", "As in ENHANCEMENTS"), Tr("15 y 15", "15 and 15"),
-+                                              Tr("Original (14 y 16)", "Original (14 and 16)")};
-+    SeasonText seasonText;
-+    std::string seasonNotice, seasonFooter;
-+    const int latestYear = static_cast<int>(scheduleYears.size()) - 1;
-+    Tab seasonTab{Tr("TEMPORADA", "SEASON"), {}};
-+    seasonTab.options = {
-+        {Tr("RESUMEN (SOLO INFORMA)", "SUMMARY (INFO ONLY)"), "", {""}, 0, false},
-+        {Tr("MOD DE TEMPORADA", "SEASON MOD"), kSeasonModHelp, seasonTargets, 0, false},
-+        {Tr("AÑO DE INICIO", "START YEAR"), kStartYearHelp, startYears, 0, true},
-+        {Tr("AÑO DEL ROSTER (EDADES)", "ROSTER YEAR (AGES)"), kRosterYearHelp, rosterYears, 0, true},
-+        {Tr("DH EN AMBAS LIGAS", "DH IN BOTH LEAGUES"), kModDhHelp, modDh, 0, true},
-+        {Tr("LIGAS 15 Y 15", "15 AND 15 LEAGUES"), kModLeaguesHelp, modLeagues, 0, true},
-+        {Tr("CALENDARIOS: DESDE", "SCHEDULES: FROM"), kScheduleHelp, scheduleYears, latestYear, false},
-+        {Tr("CALENDARIOS: HASTA", "SCHEDULES: TO"), kScheduleHelp, scheduleYears, latestYear, false},
-+        {Tr("DESCARGAR CALENDARIOS", "DOWNLOAD SCHEDULES"), kScheduleHelp, {Tr("Descargar", "Download")}, 0, false,
-+         kDownloadSchedule},
-+    };
-+    // The mod row starts on the mod that gives the start year, else the launcher's own season mod.
-+    {
-+        const auto all = mods::Discover();
-+        const auto plan = season_pack::Make(all, false, false, [](const mods::Mod&) { return std::vector<int>{}; });
-+        for (size_t i = 0; i < seasonRoots.size(); ++i) {
-+            for (const auto& m : all)
-+                if (m.root == seasonRoots[i] && (m.name == plan.startFrom || (plan.startFrom.empty() && m.id == kSeasonModId)))
-+                    seasonTab.options[kRowMod].value = static_cast<int>(i);
-+        }
-+    }
-+
-     std::vector<Tab> tabs{
-         {"VIDEO", {api, quality, display, resolution, fsr, filtering, mipmaps, msaa, aspect, fill, interpolation, fps}},
-         {"AUDIO", {volume, mute}},
-@@ -939,7 +1147,52 @@ Result Run(int argc, char** argv) {
-     };
+@@ -940,6 +834,20 @@ Result Run(int argc, char** argv) {
      tabs.push_back(std::move(modsTab));
      tabs.push_back(std::move(toolsTab));
-+    tabs.push_back(std::move(seasonTab));
      auto option = [&](int tab, int index) -> Option& { return tabs[static_cast<size_t>(tab)].options[static_cast<size_t>(index)]; };
-+    auto seasonRow = [&](int r) -> Option& { return option(kSeasonTab, r); };
-+    // TEMPORADA again from the disk and the options: the summary (also MEJORAS' footer) and the chosen
-+    // mod's settings.
++    // MEJORAS' footer: what a new season will use with the enabled mods and these options.
++    season_text::SeasonText seasonText;
 +    auto refreshSeason = [&] {
 +        const auto all = mods::Discover();
 +        auto plan = season_pack::Make(all, RuntimeConfigFile::UniversalDh(false), RuntimeConfigFile::ModernLeagues(false),
-+                                            [](const mods::Mod& m) { return season_pack::ScheduleYears(m.root); });
-+        // The same schedule file in two mods (downloaded twice) is not a conflict.
-+        auto csv = [&](const std::string& name, int year) {
++                                      [](const mods::Mod& m) { return season_pack::ScheduleYears(m.root); });
++        season_pack::DropSameSchedules(plan, [&](const std::string& name) {
 +            for (const auto& m : all)
-+                if (m.name == name) return ReadFile(m.root / "schedule" / (std::to_string(year) + ".csv"));
-+            return std::string();
-+        };
-+        std::erase_if(plan.conflicts, [&](const season_pack::Plan::Conflict& c) {
-+            return c.what == "schedule" && csv(c.loser, c.year) == csv(c.winner, c.year);
++                if (m.name == name) return m.root;
++            return std::filesystem::path();
 +        });
-+        seasonText = DescribeSeason(plan, RuntimeConfigFile::MaxSeasons(10));
-+        seasonRow(kRowNext).choices = {seasonText.choice};
-+        seasonRow(kRowNext).help = seasonText.help.c_str();
++        seasonText = season_text::DescribeSeason(plan, RuntimeConfigFile::MaxSeasons(10));
 +        tabs[kEnhancementsTab].footer = seasonText.footer.c_str();
-+        const std::filesystem::path& root = seasonRoots[static_cast<size_t>(seasonRow(kRowMod).value)];
-+        const mods::Mod* mod = nullptr;
-+        for (const auto& m : all)
-+            if (m.root == root) mod = &m;
-+        const int startChoices = static_cast<int>(seasonRow(kRowStart).choices.size());
-+        const int rosterChoices = static_cast<int>(seasonRow(kRowRoster).choices.size());
-+        seasonRow(kRowStart).value = mod && mod->startYear > 2008 ? std::min(mod->startYear - 2008, startChoices - 1) : 0;
-+        seasonRow(kRowRoster).choices[0] = std::string(Tr("Mismo que el inicio (", "Same as the start (")) +
-+                                          std::to_string(mod && mod->startYear ? mod->startYear : 2008) + ")";
-+        seasonRow(kRowRoster).value = mod && mod->rosterYear ? std::clamp(mod->rosterYear - 2007, 1, rosterChoices - 1) : 0;
-+        seasonRow(kRowDh).value = mod && mod->universalDh ? 1 : mod && mod->originalDh ? 2 : 0;
-+        const bool own = mod && mod->hasDivisions && !season_pack::HouOnly(*mod);
-+        seasonRow(kRowLeagues).choices = own ? std::vector<std::string>{Tr("Propias (mod.toml)", "Its own (mod.toml)")} : modLeagues;
-+        seasonRow(kRowLeagues).value = own ? 0 : mod && mod->hasDivisions ? 1 : mod && mod->originalLeagues ? 2 : 0;
-+        seasonFooter.clear();
-+        if (!mod)
-+            seasonFooter = Tr("«Nuevo: Calendarios MLB» se crea (y se activa) al cambiar un ajuste o descargar.",
-+                              "«New: MLB Schedules» is created (and switched on) when you change a setting or download.");
-+        else if (!mod->enabled)
-+            seasonFooter = "«" + mod->name + Tr("» está desactivado en MODS: sus ajustes no se usan hasta que lo actives.",
-+                                                "» is switched off in MODS: its settings are not used until you switch it on.");
-+        if (!seasonNotice.empty()) seasonFooter += (seasonFooter.empty() ? "" : "\n\n") + seasonNotice;
-+        tabs[kSeasonTab].footer = seasonFooter.empty() ? nullptr : seasonFooter.c_str();
 +    };
  
      // Quality presets: {resolution index, FSR, filtering index}. CALIDAD shows the one the current
      // values match, or Personalizada.
-@@ -960,11 +1213,39 @@ Result Run(int argc, char** argv) {
+@@ -960,6 +868,7 @@ Result Run(int argc, char** argv) {
          }
      };
      matchPreset();
@@ -828,39 +706,7 @@ index baf9872..eff031a 100644
  
      bool restart = false;
      bool languageChanged = false;
-     auto apply = [&](int tab, int index) {
-         const Option& o = option(tab, index);
-+        if (tab == kSeasonTab) {
-+            const std::filesystem::path root = seasonRoots[static_cast<size_t>(seasonRow(kRowMod).value)];
-+            const bool ownMod = root.filename() == kSeasonModId;
-+            if (index == kRowDownload) {
-+                if (ownMod) MakeSeasonMod(root);
-+                const auto year = [&](int r) { return std::atoi(seasonRow(r).choices[static_cast<size_t>(seasonRow(r).value)].c_str()); };
-+                seasonNotice = DownloadSchedules(year(kRowFrom), year(kRowTo), root);
-+                restart = true;
-+            } else if (index >= kRowStart && index <= kRowLeagues && !(index == kRowLeagues && o.choices.size() == 1)) {
-+                if (ownMod) MakeSeasonMod(root);
-+                std::string text = ReadManifest(root);
-+                if (index == kRowStart) text = season_pack::SetKey(text, "start_year", o.value ? std::to_string(2008 + o.value) : "");
-+                if (index == kRowRoster) text = season_pack::SetKey(text, "roster_year", o.value ? std::to_string(2007 + o.value) : "");
-+                if (index == kRowDh) text = season_pack::SetKey(text, "dh", o.value == 1 ? "\"both\"" : o.value == 2 ? "\"original\"" : "");
-+                if (index == kRowLeagues) {
-+                    text = season_pack::SetModernDivisions(text, o.value == 1);
-+                    text = season_pack::SetKey(text, "leagues", o.value == 2 ? "\"original\"" : "");
-+                }
-+                std::ofstream(root / "mod.toml", std::ios::binary) << text;
-+                seasonNotice.clear();
-+                restart = true;
-+            } else if (index == kRowMod) {
-+                seasonNotice.clear();
-+            }
-+            refreshSeason();
-+            return;
-+        }
-         if (o.mod == kOpenModsFolder) {
-             OpenModsFolder();
-             return;
-@@ -981,21 +1262,6 @@ Result Run(int argc, char** argv) {
+@@ -981,19 +890,8 @@ Result Run(int argc, char** argv) {
              OpenTextureStudio();
              return;
          }
@@ -877,44 +723,29 @@ index baf9872..eff031a 100644
 -            scheduleNotice = DownloadSchedule(year, dir, newMod);
 -            tabs[kModsTab + 1].footer = scheduleNotice.c_str();
 -            if (newMod) restart = true;  // a new mod is read when the game starts
--            return;
--        }
++        if (o.mod == kOpenSeasonStudio) {
++            OpenSeasonStudio();
+             return;
+         }
          if (o.mod >= 0) {
-             mods::Mod& m = currentMods[static_cast<size_t>(o.mod)];
-             mods::SetEnabled(m.id, o.value != 0);
-@@ -1059,6 +1325,7 @@ Result Run(int argc, char** argv) {
+@@ -1059,6 +957,7 @@ Result Run(int argc, char** argv) {
          const int n = static_cast<int>(o.choices.size());
          o.value = ((o.value + delta) % n + n) % n;
          apply(tab, index);
-+        if (tab != kSeasonTab) refreshSeason();  // MEJORAS and MODS change what a new season uses
++        refreshSeason();  // MEJORAS and MODS change what a new season uses
      };
  
      bool discReady = false;
-@@ -1087,9 +1354,10 @@ Result Run(int argc, char** argv) {
-     const char* page = std::getenv("WIICOMPILED_LAUNCHER_PAGE");
-     // (=mods / =tools open the MODS screen on its MODS or HERRAMIENTAS tab.)
-     const bool toolsPage = page != nullptr && std::strcmp(page, "tools") == 0;
--    bool settingsOpen = page != nullptr && (std::strcmp(page, "settings") == 0 || std::strcmp(page, "mods") == 0 || toolsPage);
-+    const bool seasonPage = page != nullptr && std::strcmp(page, "season") == 0;
-+    bool settingsOpen = page != nullptr && (std::strcmp(page, "settings") == 0 || std::strcmp(page, "mods") == 0 || toolsPage || seasonPage);
-     // With the MoonInning art, MODS is its own screen (the settings panel showing MODS and HERRAMIENTAS).
--    bool modsOnly = page != nullptr && (std::strcmp(page, "mods") == 0 || toolsPage);
-+    bool modsOnly = page != nullptr && (std::strcmp(page, "mods") == 0 || toolsPage || seasonPage);
-     const char* unfocused = std::getenv("WIICOMPILED_LAUNCHER_UNFOCUSED_INPUT");
-     const bool unfocusedInput = unfocused != nullptr && std::strcmp(unfocused, "1") == 0;
-     // Scripted tests without key input: WIICOMPILED_LAUNCHER_ROW selects a row of the open page and
-@@ -1097,26 +1365,37 @@ Result Run(int argc, char** argv) {
+@@ -1097,27 +996,7 @@ Result Run(int argc, char** argv) {
      const char* testAction = std::getenv("WIICOMPILED_LAUNCHER_ACTION");
      if (testAction != nullptr && std::strcmp(testAction, "roster-editor") == 0) OpenRosterEditor();
      if (testAction != nullptr && std::strcmp(testAction, "texture-studio") == 0) OpenTextureStudio();
 -    // schedule-<year>[@<mod folder>]: TOOLS > SCHEDULE for that year into a new mod (or that mod), as the
 -    // button does.
-+    // schedule-<from>[-<to>][@<mod folder>]: TEMPORADA > DOWNLOAD SCHEDULES for those years into the
-+    // launcher's season mod (or that mod), as the button does.
-     if (testAction != nullptr && std::strncmp(testAction, "schedule-", 9) == 0) {
+-    if (testAction != nullptr && std::strncmp(testAction, "schedule-", 9) == 0) {
 -        Tab& tools = tabs[kModsTab + 1];
-         const std::string spec = testAction + 9;
-         const size_t at = spec.find('@');
+-        const std::string spec = testAction + 9;
+-        const size_t at = spec.find('@');
 -        const std::string yearText = spec.substr(0, at);
 -        int target = 0;
 -        for (size_t m = 0; m < installedMods.size() && at != std::string::npos; ++m)
@@ -925,47 +756,15 @@ index baf9872..eff031a 100644
 -                for (size_t c = 0; c < t.choices.size(); ++c)
 -                    if (t.choices[c] == yearText) t.value = static_cast<int>(c);
 -            if (std::strcmp(t.label, Tr("CALENDARIO: GUARDAR EN", "SCHEDULE: SAVE IN")) == 0) t.value = target;
-+        const std::string years = spec.substr(0, at);
-+        const size_t dash = years.find('-');
-+        for (size_t m = 0; m < seasonRoots.size() && at != std::string::npos; ++m)
-+            if (seasonRoots[m].filename() == spec.substr(at + 1)) seasonRow(kRowMod).value = static_cast<int>(m);
-+        auto pick = [&](int r, const std::string& year) {
-+            for (size_t c = 0; c < seasonRow(r).choices.size(); ++c)
-+                if (seasonRow(r).choices[c] == year) seasonRow(r).value = static_cast<int>(c);
-+        };
-+        pick(kRowFrom, years.substr(0, dash));
-+        pick(kRowTo, dash == std::string::npos ? years : years.substr(dash + 1));
-+        apply(kSeasonTab, kRowDownload);
-+        std::fprintf(stderr, "launcher: %s\n", seasonNotice.c_str());
-+    }
-+    // season-<row>-<value>[@<mod folder>]: TEMPORADA's row (2 start year ... 5 leagues) set to that
-+    // choice for the chosen mod (or that one), as a press does.
-+    if (testAction != nullptr && std::strncmp(testAction, "season-", 7) == 0) {
-+        const int r = std::atoi(testAction + 7);
-+        const char* dash = std::strchr(testAction + 7, '-');
-+        if (const char* at = std::strchr(testAction, '@'))
-+            for (size_t m = 0; m < seasonRoots.size(); ++m)
-+                if (seasonRoots[m].filename() == at + 1) seasonRow(kRowMod).value = static_cast<int>(m), refreshSeason();
-+        if (dash && r > kRowMod && r <= kRowLeagues) {
-+            seasonRow(r).value = std::clamp(std::atoi(dash + 1), 0, static_cast<int>(seasonRow(r).choices.size()) - 1);
-+            apply(kSeasonTab, r);
-         }
+-        }
 -        for (int i = 0; i < static_cast<int>(tools.options.size()); ++i)
 -            if (tools.options[static_cast<size_t>(i)].mod == kDownloadSchedule) apply(kModsTab + 1, i);
 -        std::fprintf(stderr, "launcher: %s\n", scheduleNotice.c_str());
-+        std::fprintf(stderr, "launcher: %s\n", seasonText.help.c_str());
-     }
+-    }
++    if (testAction != nullptr && std::strcmp(testAction, "season-studio") == 0) OpenSeasonStudio();
      // =language-es / =language-en: switch the language once, as if chosen in INTERFAZ (the launcher is
      // rebuilt on the same page; the rebuilt one finds the language already set and does nothing).
-@@ -1131,7 +1410,7 @@ Result Run(int argc, char** argv) {
- 
-     const std::array<const char*, 3> kMenu{Tr("JUGAR", "PLAY"), Tr("AJUSTES", "SETTINGS"), Tr("SALIR", "EXIT")};
-     int menu = 0;
--    int tab = page && std::strcmp(page, "controls") == 0 ? 2 : page && std::strcmp(page, "enhancements") == 0 ? 4 : toolsPage ? kModsTab + 1 : modsOnly ? kModsTab : 0;
-+    int tab = page && std::strcmp(page, "controls") == 0 ? 2 : page && std::strcmp(page, "enhancements") == 0 ? 4 : toolsPage ? kModsTab + 1 : seasonPage ? kSeasonTab : modsOnly ? kModsTab : 0;
-     if (tab == 2 || tab == 4) settingsOpen = true;  // =controls, =enhancements (MEJORAS)
-     int row = 0;
-     // Long lists use the rows that fit at the current size; page controls stay
+     if (testAction != nullptr && std::strncmp(testAction, "language-", 9) == 0) {
 diff --git a/runtime/src/launcher_settings.inc b/runtime/src/launcher_settings.inc
 index 971f118..f5b2879 100644
 --- a/runtime/src/launcher_settings.inc

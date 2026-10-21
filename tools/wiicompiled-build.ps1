@@ -62,6 +62,10 @@ if ($text -match '(?m)^dvd_root\s*=') {
 powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tools\texture-studio\build.ps1') | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Warning 'Texture Studio build failed (tools\texture-studio\build.ps1)' }
 else { Copy-Item (Join-Path $root 'local\build\texture-studio\TextureStudio.exe') $build -Force }
+# Season Studio too (the launcher's EDITOR DE TEMPORADA).
+powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tools\season-studio\build.ps1') | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Warning 'Season Studio build failed (tools\season-studio\build.ps1)' }
+else { Copy-Item (Join-Path $root 'local\build\season-studio\SeasonStudio.exe') $build -Force }
 
 if ($RunSeconds -gt 0) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'

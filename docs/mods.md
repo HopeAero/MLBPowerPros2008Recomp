@@ -48,7 +48,7 @@ description = "Uniformes redibujados a 4x."
 - **`schedule/`**: calendarios de partidos del modo Temporada, uno por año: `schedule/2026.csv` sustituye los partidos de la temporada que el juego llama 2026 cuando el juego monta el calendario de ese año, es decir, al empezar la partida (el primer año) o al pasar de año. Una temporada ya empezada no cambia.
   - Formato: una línea por partido, `fecha,local,visitante,hora`. La fecha es `AAAA-MM-DD` (o `MM-DD`), los equipos van por código (`BOS`, `NYY`, `LAD`…; valen `MIA`/`FLA`, `ATH`/`OAK`, `TBR`, `CHW`, `WSN`…) y la hora es la de inicio en hora del Este, `HH:MM` (si falta, 19:05). Se ignoran las líneas vacías, las que empiezan por `#` y la cabecera `date,...`.
   - Límites del juego: del 1 de marzo al 31 de octubre y 16 partidos por día; lo que no cabe se descarta y el registro (`console.log`) lo dice. La temporada regular del juego va del 19 de marzo al 1 de octubre. El All-Star del juego se queda en su día.
-  - El calendario real de un año se descarga desde el launcher (MODS > TEMPORADA, de 2002 a 2026) o con `python tools/season_schedule.py mlb 2026 mimod/schedule/2026.csv`. Si no cabe en la temporada del juego (19/3 a 1/10, 16 partidos por día), el juego lo coloca unos días antes o después sin perder partidos. Para jugar el calendario de 2026 en el primer año, guárdalo como `schedule/2008.csv`, o mejor haz un paquete de temporada (abajo).
+  - El calendario real de un año se descarga desde el launcher (HERRAMIENTAS > EDITOR DE TEMPORADA, `docs/season-studio.md`, de 2002 a 2026) o con `python tools/season_schedule.py mlb 2026 mimod/schedule/2026.csv`. Si no cabe en la temporada del juego (19/3 a 1/10, 16 partidos por día), el juego lo coloca unos días antes o después sin perder partidos. Para jugar el calendario de 2026 en el primer año, guárdalo como `schedule/2008.csv`, o mejor haz un paquete de temporada (abajo).
   - El calendario no cambia las divisiones: para que Houston cuente en la AL West hace falta `[divisions]` en un paquete de temporada (abajo). El DH en las dos ligas es aparte (`dh = "both"` o la opción del launcher). Detalles en `docs/ingenieria-inversa.md`, «Calendario de partidos».
 - **`riivolution/`**: XML de Riivolution (`<wiidisc>`) válidos para `RL8E54`. La carpeta del mod hace de raíz de la SD.
   - Los parches de archivos funcionan.
@@ -117,7 +117,7 @@ base = "atl"             # estadio cuyos datos de juego usa (medidas, menú, par
 
 ## Paquetes de temporada
 
-Un mod que trae un roster y los calendarios de unos años puede ser un **paquete de temporada**: con `start_year` en su `mod.toml`, una temporada nueva empieza en ese año. Estas claves (`start_year`, `roster_year`, `dh`, `[divisions]` 15/15) también se cambian desde el launcher, en MODS > TEMPORADA, que además muestra qué usará la próxima partida nueva y avisa si dos mods chocan.
+Un mod que trae un roster y los calendarios de unos años puede ser un **paquete de temporada**: con `start_year` en su `mod.toml`, una temporada nueva empieza en ese año. Estas claves (`start_year`, `roster_year`, `dh`, `[divisions]` 15/15) también se cambian desde el launcher, en HERRAMIENTAS > EDITOR DE TEMPORADA, `docs/season-studio.md`, que además muestra qué usará la próxima partida nueva y avisa si dos mods chocan.
 
 ```toml
 name = "Temporada 2026"
