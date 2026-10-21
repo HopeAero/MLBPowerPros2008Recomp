@@ -71,6 +71,14 @@ Detalles en `docs/ingenieria-inversa.md` («Año de la temporada») y `docs/supe
 
 Detalles en `docs/ingenieria-inversa.md` («DH en ambas ligas»).
 
+## Ligas 15 y 15 (Temporada y MLB Life)
+
+**AJUSTES > MEJORAS > LIGAS 15 Y 15** (experimental): Houston pasa a la División Oeste de la Liga Americana, como desde 2013, y las dos ligas quedan con 15 equipos. Se guarda en `Config.toml` (`[season] modern_leagues = true`).
+
+- Vale para las temporadas nuevas del modo Temporada y las carreras nuevas de MLB Life; las partidas ya empezadas siguen como estaban.
+- Con 15 y 15 el generador de calendarios del juego deja calendarios desiguales (de 142 a 162 partidos por equipo), así que el runtime usa uno propio: 162 partidos por equipo en series de 3, tres vueltas a la propia liga, interliga todas las semanas (con 15 equipos siempre sobra uno por liga) y casa/fuera equilibrado. No es el calendario real: los rivales de división no se enfrentan más que el resto. Un paquete de temporada con `schedule/<año>.csv` pone el real.
+- Un paquete de temporada con `[divisions]` usa sus divisiones aunque aquí esté en No (`docs/mods.md`).
+
 ## Guardado
 
 Se mantienen los archivos de mapeo existentes y la sección `[controller]` de `Config.toml`. Los ajustes adicionales se guardan bajo `UserData` en instalaciones portátiles:

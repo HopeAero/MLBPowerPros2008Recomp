@@ -1,0 +1,335 @@
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index 83ace1c..549417e 100644
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -44,6 +44,7 @@ struct RuntimeUserConfig {
+     std::optional<uint32_t> msaa;
+     std::optional<uint32_t> maxSeasons;  // [season] max_seasons: 10 (original), 20 or 0 (no limit)
+     std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
++    std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
+     std::optional<int32_t> windowPosX;
+     std::optional<int32_t> windowPosY;
+     std::optional<uint32_t> windowWidth;
+@@ -475,6 +476,7 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
+         config.maxSeasons = *value;
+     }
+     config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
++    config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
+     config.windowPosX = FindConfigInt(document, "video", "window_x");
+     config.windowPosY = FindConfigInt(document, "video", "window_y");
+     if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
+@@ -956,6 +958,15 @@ inline uint32_t MaxSeasons(uint32_t fallback = 10) {
+     return Get().maxSeasons.value_or(fallback);
+ }
+ 
++inline bool ModernLeagues(bool fallback = false) {
++    return Get().modernLeagues.value_or(fallback);
++}
++
++inline bool SetModernLeagues(bool value) {
++    Mutable().modernLeagues = value;
++    return WriteSetting("season", "modern_leagues", value ? "true" : "false");
++}
++
+ inline bool UniversalDh(bool fallback = false) {
+     return Get().universalDh.value_or(fallback);
+ }
+diff --git a/runtime/include/season_schedule.h b/runtime/include/season_schedule.h
+index ec89cfe..8add69a 100644
+--- a/runtime/include/season_schedule.h
++++ b/runtime/include/season_schedule.h
+@@ -193,4 +193,80 @@ inline ParseResult Parse(std::string_view text) {
+     return result;
+ }
+ 
++// A schedule for leagues of odd size (15 and 15), which the game's generator (0x80B98320, made for even
++// leagues) leaves uneven. 54 rounds of 3-game series, every team in every round: 45 league rounds
++// (three round robins of the league, 15 rounds each; the team left over in each league plays the
++// other league's) and 9 interleague rounds (AL team i at NL team i + r). An off day after every 3
++// rounds, none from asgDay - 1 to asgDay + 2. 162 games a team; each series at the home of the team
++// with fewer home series so far, so home and away stay even. Not the
++// real one (division rivals are not played more): packs bring schedule/<year>.csv for that.
++// league[t] is 0 or 1, both of 15 teams; days from March 1; empty when the leagues are not 15 and 15.
++inline std::vector<Game> GenerateOddLeagues(const std::array<int, kTeams>& league, int year, int firstDay,
++                                            int asgDay) {
++    std::vector<int> members[2];
++    for (int t = 0; t < kTeams; ++t) members[league[t] & 1].push_back(t);
++    if (members[0].size() != 15 || members[1].size() != 15) return {};
++    struct Series {
++        int home, away;
++    };
++    using Round = std::vector<Series>;
++    // Round r of a 15-team round robin by the circle method (team 15 a bye): pairs and the one left over.
++    auto circle = [](int r, std::vector<std::pair<int, int>>& pairs) {
++        int bye = -1;
++        std::array<int, 16> slot{};
++        slot[0] = 15;
++        for (int i = 1; i < 16; ++i) slot[i] = (r + i - 1) % 15;
++        for (int i = 0; i < 8; ++i) {
++            const int a = slot[i], b = slot[15 - i];
++            if (a == 15 || b == 15) bye = a == 15 ? b : a;
++            else pairs.push_back({a, b});
++        }
++        return bye;
++    };
++    std::vector<Round> leagueRounds, interRounds;
++    for (int cycle = 0; cycle < 3; ++cycle) {
++        for (int r = 0; r < 15; ++r) {
++            Round round;
++            int byes[2];
++            for (int l = 0; l < 2; ++l) {
++                std::vector<std::pair<int, int>> pairs;
++                byes[l] = circle((r + year + l) % 15, pairs);
++                for (auto [a, b] : pairs) {
++                    const bool flip = ((a + b + cycle + r) & 1) != 0;
++                    round.push_back({members[l][flip ? b : a], members[l][flip ? a : b]});
++                }
++            }
++            const bool alHome = ((r + cycle) & 1) == 0;
++            round.push_back({members[alHome ? 0 : 1][byes[alHome ? 0 : 1]], members[alHome ? 1 : 0][byes[alHome ? 1 : 0]]});
++            leagueRounds.push_back(round);
++        }
++    }
++    for (int r = 0; r < 9; ++r) {
++        Round round;
++        for (int i = 0; i < 15; ++i) {
++            const int al = members[0][i], nl = members[1][(i + r + year) % 15];
++            round.push_back(((i + r) & 1) == 0 ? Series{al, nl} : Series{nl, al});
++        }
++        interRounds.push_back(round);
++    }
++    std::vector<Game> games;
++    std::array<int, kTeams> homeSeries{};
++    int day = firstDay, played = 0;
++    for (int k = 0; k < 54; ++k) {
++        Round round = k % 6 == 5 ? interRounds[k / 6] : leagueRounds[k - k / 6];  // inter every 6th
++        // Home goes to the team with fewer home series so far (the pairing's own order on a tie).
++        for (auto& s : round) {
++            if (homeSeries[s.away] < homeSeries[s.home]) std::swap(s.home, s.away);
++            ++homeSeries[s.home];
++        }
++        for (int g = 0; g < 3; ++g) {
++            while (day >= asgDay - 1 && day <= asgDay + 2) ++day;
++            for (const auto& s : round) games.push_back(Game{day, s.home, s.away, kDefaultTime});
++            ++day;
++        }
++        if (++played % 3 == 0) ++day;  // an off day for everyone
++    }
++    return games;
++}
++
+ }  // namespace season_schedule
+diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
+index 269d323..6e7f1e3 100644
+--- a/runtime/src/hle/mlb/season_schedule.cpp
++++ b/runtime/src/hle/mlb/season_schedule.cpp
+@@ -13,6 +13,7 @@
+ #include "memory.h"
+ #include "mods.h"
+ #include "ppc_runtime.h"
++#include "runtime_config.h"
+ #include "season_cap.h"
+ 
+ namespace season_schedule {
+@@ -73,7 +74,13 @@ const mods::Mod* DivisionsMod(const std::vector<mods::Mod>& all) {
+ void ApplyDivisions(CpuContext* ctx) {
+     const auto all = mods::Discover();
+     const mods::Mod* mod = DivisionsMod(all);
+-    if (!mod) return;
++    // Without a pack's divisions, the MEJORAS option: today's leagues, Houston in the AL West.
++    std::vector<std::string> modern[6];
++    modern[2] = {"HOU"};
++    const bool option = !mod && RuntimeConfigFile::ModernLeagues(false);
++    if (!mod && !option) return;
++    const std::string source = mod ? "mod \"" + mod->name + "\"" : std::string("the 15/15 option");
++    const auto& listed = mod ? mod->divisions : modern;
+     const uint32_t words = Memory::Read32(0x8104B5A0u) + 128;
+     if (!Memory::Contains(words, kTeams * 4)) return;
+     std::array<int, kTeams> current{};
+@@ -81,10 +88,9 @@ void ApplyDivisions(CpuContext* ctx) {
+         const uint32_t word = Memory::Read32(words + 4 * t);
+         current[t] = static_cast<int>((word >> 24) & 0xF) * 3 + static_cast<int>(word >> 28);
+     }
+-    const Realignment realigned = Realign(current, mod->divisions);
++    const Realignment realigned = Realign(current, listed);
+     if (!realigned.error.empty()) {
+-        std::fprintf(stderr, "[season] divisions of mod \"%s\" not used: %s\n", mod->name.c_str(),
+-                     realigned.error.c_str());
++        std::fprintf(stderr, "[season] divisions of %s not used: %s\n", source.c_str(), realigned.error.c_str());
+         return;
+     }
+     for (int t = 0; t < kTeams; ++t) {
+@@ -101,8 +107,8 @@ void ApplyDivisions(CpuContext* ctx) {
+     ctx->gpr[1] = sp;
+     std::array<int, 2> perLeague{};
+     for (int d : realigned.division) ++perLeague[d / 3];
+-    std::fprintf(stderr, "[season] divisions from mod \"%s\": %d American League teams, %d National League\n",
+-                 mod->name.c_str(), perLeague[0], perLeague[1]);
++    std::fprintf(stderr, "[season] divisions from %s: %d American League teams, %d National League\n",
++                 source.c_str(), perLeague[0], perLeague[1]);
+ }
+ 
+ // Whether a mod has schedule/<year>.csv for the year being built.
+@@ -125,24 +131,51 @@ struct Slot {
+     std::array<uint32_t, 4> words{};
+ };
+ 
++// Each team's league (bits 27..24 of its word at X + 128 + team * 4).
++std::array<int, kTeams> Leagues() {
++    std::array<int, kTeams> league{};
++    const uint32_t words = Memory::Read32(0x8104B5A0u) + 128;
++    for (int t = 0; t < kTeams; ++t) league[t] = static_cast<int>((Memory::Read32(words + 4 * t) >> 24) & 0xF);
++    return league;
++}
++
+ void Apply(bool official) {
+     const int year = Year();
++    if (!year) return;
++    const uint32_t table = Memory::Read32(0x8104B5A0u) + kTableOffset;
++    if (!Memory::Contains(table, kDays * kSlots * kSlotBytes)) return;
+     std::filesystem::path path;
+-    std::string modName;
+-    if (!year || !FindSchedule(year, path, modName)) return;
+-    std::ifstream input(path, std::ios::binary);
+-    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+-    const ParseResult parsed = Parse(text);
+-    for (size_t i = 0; i < parsed.errors.size() && i < 10; ++i) {
+-        std::fprintf(stderr, "[season] schedule %d (%s): %s\n", year, modName.c_str(), parsed.errors[i].c_str());
+-    }
+-    if (parsed.games.empty()) {
+-        std::fprintf(stderr, "[season] schedule %d (%s): no games, the game's schedule is kept\n", year, modName.c_str());
++    std::string source;
++    std::vector<Game> games;
++    if (FindSchedule(year, path, source)) {
++        source = "mod \"" + source + "\"";
++        std::ifstream input(path, std::ios::binary);
++        const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
++        ParseResult parsed = Parse(text);
++        for (size_t i = 0; i < parsed.errors.size() && i < 10; ++i) {
++            std::fprintf(stderr, "[season] schedule %d (%s): %s\n", year, source.c_str(), parsed.errors[i].c_str());
++        }
++        if (parsed.games.empty()) {
++            std::fprintf(stderr, "[season] schedule %d (%s): no games, the game's schedule is kept\n", year, source.c_str());
++            return;
++        }
++        games = std::move(parsed.games);
++    } else if (!official) {
++        // Leagues of 15 and 15 (the option or a pack's divisions): the game's generator leaves them uneven.
++        int asgDay = 136;  // 7/15; the game's All-Star Game, if it put one
++        for (int i = 0; i < kDays * kSlots; ++i) {
++            const uint32_t home = Memory::Read32(table + static_cast<uint32_t>(i) * kSlotBytes);
++            if (home >= kTeams && home != kEmptyTeam) {
++                asgDay = i / kSlots;
++                break;
++            }
++        }
++        games = GenerateOddLeagues(Leagues(), year, DayIndex(3, 26), asgDay);
++        if (games.empty()) return;  // even leagues: the game's own generator is right
++        source = "the 15/15 generator";
++    } else {
+         return;
+     }
+-
+-    const uint32_t table = Memory::Read32(0x8104B5A0u) + kTableOffset;
+-    if (!Memory::Contains(table, kDays * kSlots * kSlotBytes)) return;
+     auto address = [&](int day, int slot) {
+         return table + static_cast<uint32_t>(day * kSlots + slot) * kSlotBytes;
+     };
+@@ -163,7 +196,7 @@ void Apply(bool official) {
+         }
+     }
+     int dropped = 0;
+-    for (const Game& game : parsed.games) {
++    for (const Game& game : games) {
+         if (days[game.day].size() >= static_cast<size_t>(kSlots)) {
+             ++dropped;
+             continue;
+@@ -177,8 +210,8 @@ void Apply(bool official) {
+             for (int w = 0; w < 4; ++w) Memory::Write32(address(day, slot) + 4 * w, entry.words[w]);
+         }
+     }
+-    std::fprintf(stderr, "[season] schedule %d: %zu games from mod \"%s\" replace the %s one%s\n", year,
+-                 parsed.games.size() - dropped, modName.c_str(), official ? "official" : "generated",
++    std::fprintf(stderr, "[season] schedule %d: %zu games from %s replace the %s one%s\n", year,
++                 games.size() - dropped, source.c_str(), official ? "official" : "generated",
+                  dropped ? (" (" + std::to_string(dropped) + " dropped: more than 16 on a day)").c_str() : "");
+ }
+ 
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 02f149c..ad97aa2 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -725,6 +725,16 @@ Result Run(int argc, char** argv) {
+                           "turn it on even when this says No."),
+                        YesNo(), RuntimeConfigFile::UniversalDh(false) ? 1 : 0};
+     universalDh.experimental = true;
++    Option modernLeagues{Tr("LIGAS 15 Y 15", "15 AND 15 LEAGUES"),
++                         Tr("Houston pasa a la División Oeste de la Liga Americana, como desde 2013: las dos ligas "
++                            "quedan con 15 equipos. Vale para las temporadas nuevas del modo Temporada y las carreras "
++                            "nuevas de MLB Life; las partidas ya empezadas siguen como estaban. Los paquetes de "
++                            "temporada con [divisions] usan las suyas.",
++                            "Houston moves to the American League West, as since 2013: both leagues have 15 teams. "
++                            "It applies to new Season mode games and new MLB Life careers; games already started stay "
++                            "as they were. Season packs with [divisions] use theirs."),
++                         YesNo(), RuntimeConfigFile::ModernLeagues(false) ? 1 : 0};
++    modernLeagues.experimental = true;
+ 
+     const std::string savedLanguage = RuntimeConfigFile::UiLanguage("auto");
+     Option language{"IDIOMA / LANGUAGE",
+@@ -794,7 +804,7 @@ Result Run(int argc, char** argv) {
+         {"AUDIO", {volume, mute}},
+         {Tr("CONTROLES", "CONTROLS"), {wiimote}},
+         {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
+-        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh}},
++        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh, modernLeagues}},
+     };
+     tabs.push_back(std::move(modsTab));
+     tabs.push_back(std::move(toolsTab));
+@@ -887,6 +897,7 @@ Result Run(int argc, char** argv) {
+         if (label == launcherOption.label) RuntimeConfigFile::SetLauncherOnStartup(o.value != 0);
+         if (label == seasons.label) RuntimeConfigFile::SetMaxSeasons(o.value == 1 ? 20 : o.value == 2 ? 0 : 10);
+         if (label == universalDh.label) RuntimeConfigFile::SetUniversalDh(o.value != 0);
++        if (label == modernLeagues.label) RuntimeConfigFile::SetModernLeagues(o.value != 0);
+         if (label == language.label) {
+             const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
+             RuntimeConfigFile::SetUiLanguage(code);
+diff --git a/runtime/tests/season_schedule_tests.cpp b/runtime/tests/season_schedule_tests.cpp
+index f0c2fda..3307a2b 100644
+--- a/runtime/tests/season_schedule_tests.cpp
++++ b/runtime/tests/season_schedule_tests.cpp
+@@ -63,6 +63,35 @@ int main() {
+     Check(TeamWordWithDivision(0x110016A8u, 2) == 0x200016A8u, "Houston's word: AL West, rest kept");
+     Check(TeamWordWithDivision(0x20000E25u, 4) == 0x11000E25u, "Texas's word to the NL Central");
+ 
++    // Leagues of 15 and 15: our generator gives every team 162 games, one a day at most.
++    std::array<int, kTeams> leagues{};
++    for (int t = 0; t < kTeams; ++t) leagues[t] = t < 14 ? 0 : 1;
++    leagues[22] = 0;  // Houston to the AL
++    Check(GenerateOddLeagues(std::array<int, kTeams>{}, 2026, 25, 136).empty(), "30 and 0: not ours");
++    for (int year : {2026, 2027}) {
++        const auto games = GenerateOddLeagues(leagues, year, DayIndex(3, 26), 136);
++        std::array<int, kTeams> count{}, home{}, inter{};
++        std::array<std::array<int, kDays>, kTeams> perDay{};
++        int last = 0, onBreak = 0, twice = 0;
++        for (const auto& g : games) {
++            ++count[g.home], ++count[g.away], ++home[g.home];
++            if (leagues[g.home] != leagues[g.away]) ++inter[g.home], ++inter[g.away];
++            if (++perDay[g.home][g.day] > 1 || ++perDay[g.away][g.day] > 1) ++twice;
++            if (g.day >= 135 && g.day <= 138) ++onBreak;
++            last = std::max(last, g.day);
++        }
++        bool all162 = true, homeEven = true, someInter = true;
++        for (int t = 0; t < kTeams; ++t) {
++            all162 = all162 && count[t] == 162;
++            homeEven = homeEven && home[t] >= 75 && home[t] <= 87;
++            someInter = someInter && inter[t] >= 27;
++        }
++        Check(games.size() == 2430 && all162, "2430 games, 162 a team");
++        Check(twice == 0 && onBreak == 0, "one game a day, none at the All-Star break");
++        Check(homeEven && someInter, "home and away about even, interleague for everyone");
++        Check(last + kFirstDay <= 274, "the season ends by October 1");
++    }
++
+     if (failures) return 1;
+     std::printf("season_schedule_tests: ok\n");
+     return 0;
