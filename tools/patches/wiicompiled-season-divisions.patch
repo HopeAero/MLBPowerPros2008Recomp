@@ -1,0 +1,279 @@
+diff --git a/runtime/include/mods.h b/runtime/include/mods.h
+index 3fd681b..c069b1a 100644
+--- a/runtime/include/mods.h
++++ b/runtime/include/mods.h
+@@ -19,7 +19,8 @@
+ //                  2008's game_data.pack on the player's PC; it applies to every mode, MLB Life too.
+ //   schedule/      Season mode game schedules, <year>.csv (season_schedule.h).
+ // mod.toml may also set start_year (a season pack: a new Season mode game starts in that year) and
+-// dh = "both" (the DH in every Season mode game, as since 2022).
++// dh = "both" (the DH in every Season mode game, as since 2022) and a [divisions] table
++// (al_east, al_central, al_west, nl_east, nl_central, nl_west = ["BOS", ...]) for a new game.
+ // Enabled folders are listed in Config.toml under [mods] enabled. Everything is read once at
+ // start-up, so toggling a mod needs a restart (the launcher relaunches).
+ //
+@@ -48,6 +49,8 @@ struct Mod {
+     std::string rosterIds;  // "2008" when roster/*.dat voice and face ids follow 2008's numbering
+     int startYear = 0;      // start_year: a new Season mode game's first season (0: 2008, the game's)
+     bool universalDh = false;  // dh = "both"
++    std::vector<std::string> divisions[6];  // [divisions] al_east ... nl_west: team codes (empty: unchanged)
++    bool hasDivisions = false;
+     std::filesystem::path root;
+     bool textures = false;
+     bool disc = false;
+diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
+index c03b17b..aaf0c42 100644
+--- a/runtime/include/season_cap.h
++++ b/runtime/include/season_cap.h
+@@ -287,7 +287,7 @@ int SeasonCount();         // this game's number of seasons
+ int Count();               // the same, 10 outside Season mode (for code MLB Life shares)
+ uint32_t YearOffset();     // years shown past 2008 + index: seasons that left the window plus a season
+                            // pack's start year (0 outside Season mode)
+-void BeginNewGame(int startYear);  // a new Season mode game is building its first schedule (0: 2008)
++bool BeginNewGame(int startYear);  // true for a new Season mode game building its first schedule (0: 2008)
+ bool UniversalDh();                // [season] universal_dh, or an enabled mod with dh = "both"
+ void OnHostFrame();        // settings_overlay.cpp, once per presented frame
+ // nand_isfs.cpp hooks for the season saves (IsSeasonSaveName): a read of `length` bytes at
+diff --git a/runtime/include/season_schedule.h b/runtime/include/season_schedule.h
+index 6188177..ec89cfe 100644
+--- a/runtime/include/season_schedule.h
++++ b/runtime/include/season_schedule.h
+@@ -61,6 +61,48 @@ inline int DayIndex(int month, int day) {
+     return index >= 0 && index < kDays ? index : -1;
+ }
+ 
++// Divisions: league 0 (American) or 1 (National), division 0 East, 1 Central, 2 West; index =
++// league * 3 + division, as in mod.toml's [divisions] keys (kDivisionKeys). Each team's word at
++// X + 128 + team * 4 carries its division in bits 31..28 and its league in bits 27..24; 0x80B719EC
++// rebuilds the division and league lists (up to 7 teams a division) from those words.
++inline constexpr const char* kDivisionKeys[6] = {"al_east", "al_central", "al_west",
++                                                 "nl_east", "nl_central", "nl_west"};
++constexpr int kMaxDivisionTeams = 7;
++inline uint32_t TeamWordWithDivision(uint32_t word, int index) {
++    const uint32_t league = static_cast<uint32_t>(index / 3), division = static_cast<uint32_t>(index % 3);
++    return (word & 0x00FFFFFFu) | (division << 28) | (league << 24);
++}
++// The division (0..5) of every team after a realignment: listed[i] holds division i's team codes;
++// unlisted teams keep `current`. Empty with an error when a code is unknown or repeated, or a
++// division ends up with more than kMaxDivisionTeams or none.
++struct Realignment {
++    std::array<int, kTeams> division{};
++    std::string error;
++};
++inline Realignment Realign(const std::array<int, kTeams>& current, const std::vector<std::string> (&listed)[6]) {
++    Realignment out;
++    out.division = current;
++    std::array<bool, kTeams> seen{};
++    for (int d = 0; d < 6; ++d) {
++        for (const auto& code : listed[d]) {
++            const int team = TeamNumber(code);
++            if (team < 0) { out.error = "unknown team '" + code + "'"; return out; }
++            if (seen[team]) { out.error = "team '" + code + "' listed twice"; return out; }
++            seen[team] = true;
++            out.division[team] = d;
++        }
++    }
++    std::array<int, 6> count{};
++    for (int d : out.division) ++count[d];
++    for (int d = 0; d < 6; ++d) {
++        if (count[d] == 0 || count[d] > kMaxDivisionTeams) {
++            out.error = std::string(kDivisionKeys[d]) + " would have " + std::to_string(count[d]) + " teams";
++            return out;
++        }
++    }
++    return out;
++}
++
+ inline uint32_t TimeWord(int minutes) { return static_cast<uint32_t>((minutes / 60) * 400 + (minutes % 60) * 4); }
+ inline uint32_t FlagsWord(int minutes) { return kGameFlags | (minutes >= kNightFrom ? kNightFlag : 0u); }
+ 
+diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
+index 7808897..10dd283 100644
+--- a/runtime/src/hle/mlb/season_cap.cpp
++++ b/runtime/src/hle/mlb/season_cap.cpp
+@@ -221,13 +221,15 @@ bool UniversalDh() {
+     return fromMod || RuntimeConfigFile::UniversalDh(false);
+ }
+ 
+-void BeginNewGame(int startYear) {
+-    if (!SeasonModeActive() || CurrentIndex() != 0) return;  // only a new game builds a schedule at index 0
++bool BeginNewGame(int startYear) {
++    if (!SeasonModeActive() || CurrentIndex() != 0) return false;  // only a new game builds a schedule at index 0
+     g_tail = {};
+     g_tail.startShift = startYear > 2008 ? static_cast<uint32_t>(startYear - 2008) : 0;
+-    if (!g_tail.startShift) return;
+-    std::fprintf(stderr, "[season] new game: the first season is %d\n", startYear);
+-    ShiftBirthYears(g_tail.startShift);
++    if (g_tail.startShift) {
++        std::fprintf(stderr, "[season] new game: the first season is %d\n", startYear);
++        ShiftBirthYears(g_tail.startShift);
++    }
++    return true;
+ }
+ 
+ static void TakeLoad();
+diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
+index e34463b..cb9ffa1 100644
+--- a/runtime/src/hle/mlb/season_schedule.cpp
++++ b/runtime/src/hle/mlb/season_schedule.cpp
+@@ -58,6 +58,61 @@ int StartYear() {
+     return 0;
+ }
+ 
++// The first enabled mod (by name) with a [divisions] table, or null.
++const mods::Mod* DivisionsMod(const std::vector<mods::Mod>& all) {
++    for (const auto& mod : all) {
++        if (mod.enabled && mod.hasDivisions) return &mod;
++    }
++    return nullptr;
++}
++
++// A new game, before the game lays out its standings (0x80BAF2B4): puts the teams in the mod's
++// divisions (their words) and has the game rebuild its division and league lists (0x80B719EC, whose
++// argument only gives the team count at +4). The standings, the schedule generator's check
++// (0x80B97E08) and the screens then follow the lists.
++void ApplyDivisions(CpuContext* ctx) {
++    const auto all = mods::Discover();
++    const mods::Mod* mod = DivisionsMod(all);
++    if (!mod) return;
++    const uint32_t words = Memory::Read32(0x8104B5A0u) + 128;
++    if (!Memory::Contains(words, kTeams * 4)) return;
++    std::array<int, kTeams> current{};
++    for (int t = 0; t < kTeams; ++t) {
++        const uint32_t word = Memory::Read32(words + 4 * t);
++        current[t] = static_cast<int>((word >> 24) & 0xF) * 3 + static_cast<int>(word >> 28);
++    }
++    const Realignment realigned = Realign(current, mod->divisions);
++    if (!realigned.error.empty()) {
++        std::fprintf(stderr, "[season] divisions of mod \"%s\" not used: %s\n", mod->name.c_str(),
++                     realigned.error.c_str());
++        return;
++    }
++    for (int t = 0; t < kTeams; ++t) {
++        const uint32_t at = words + 4 * t;
++        Memory::Write32(at, TeamWordWithDivision(Memory::Read32(at), realigned.division[t]));
++    }
++    // A team count object for 0x80B719EC, on the guest stack below the caller's frame.
++    const uint32_t sp = ctx->gpr[1];
++    ctx->gpr[1] = sp - 64;
++    Memory::Write32(sp - 64, sp);  // back chain, as a frame would have
++    Memory::Write32(sp - 32 + 4, static_cast<uint32_t>(kTeams));
++    ctx->gpr[3] = sp - 32;
++    Call(ctx, 0x80B719ECu, InvokeDirectCpu<0x80B719ECu>);
++    ctx->gpr[1] = sp;
++    std::array<int, 2> perLeague{};
++    for (int d : realigned.division) ++perLeague[d / 3];
++    std::fprintf(stderr, "[season] divisions from mod \"%s\": %d American League teams, %d National League\n",
++                 mod->name.c_str(), perLeague[0], perLeague[1]);
++}
++
++// Whether a mod has schedule/<year>.csv for the year being built.
++bool HasSchedule() {
++    std::filesystem::path path;
++    std::string name;
++    const int year = Year();
++    return year && FindSchedule(year, path, name);
++}
++
+ struct Slot {
+     std::array<uint32_t, 4> words{};
+ };
+@@ -126,13 +181,14 @@ void Apply(bool official) {
+ // 0x80B97DC4: builds the year's schedule. As the original, with the mod's schedule put in between.
+ extern "C" void MLB_BuildSchedule_80B97DC4(CpuContext* ctx) {
+     using season_schedule::Call;
+-    season_cap::BeginNewGame(season_schedule::StartYear());  // at index 0 only: a new game
++    season_cap::BeginNewGame(season_schedule::StartYear());
+     Call(ctx, 0x80B97D68u, InvokeDirectCpu<0x80B97D68u>);  // empty every slot
+-    // 2008 with the original divisions: the official schedule; otherwise one is generated.
++    // 2008 with the original divisions: the official schedule; otherwise one is generated, unless a
++    // mod brings this year's (the generator is the game's, made for leagues of even size).
+     const bool official = Call(ctx, 0x80B97E08u, InvokeDirectCpu<0x80B97E08u>) != 0;
+     if (official) {
+         Call(ctx, 0x80B97EA4u, InvokeDirectCpu<0x80B97EA4u>);
+-    } else {
++    } else if (!season_schedule::HasSchedule()) {
+         Call(ctx, 0x80B98320u, InvokeDirectCpu<0x80B98320u>);
+     }
+     season_schedule::Apply(official);
+@@ -141,3 +197,30 @@ extern "C" void MLB_BuildSchedule_80B97DC4(CpuContext* ctx) {
+     Call(ctx, 0x80B9890Cu, InvokeDirectCpu<0x80B9890Cu>);
+ }
+ PPC_NATIVE_OVERRIDE_VOID(80B97DC4, MLB_BuildSchedule_80B97DC4, (CpuContext* ctx), (ctx));
++
++// 0x80BB0B78 (Season mode's game object): sets up a new Season mode game. As the original, with a
++// mod's divisions applied before the standings are laid out (0x80BAF2B4).
++extern "C" void MLB_NewSeasonGame_80BB0B78(CpuContext* ctx) {
++    using season_schedule::Call;
++    const uint32_t game = ctx->gpr[3];
++    ctx->gpr[3] = Memory::Read32(game + 68);
++    Call(ctx, 0x80B86AE0u, InvokeDirectCpu<0x80B86AE0u>);
++    Call(ctx, 0x80B7AF8Cu, InvokeDirectCpu<0x80B7AF8Cu>);
++    const uint32_t r3 = ctx->gpr[3];
++    season_schedule::ApplyDivisions(ctx);
++    ctx->gpr[3] = r3;
++    Call(ctx, 0x80BAF2B4u, InvokeDirectCpu<0x80BAF2B4u>);
++    ctx->gpr[3] = game;
++    Call(ctx, 0x80BB0BE0u, InvokeDirectCpu<0x80BB0BE0u>);
++    Call(ctx, 0x80BAE81Cu, InvokeDirectCpu<0x80BAE81Cu>);
++    Call(ctx, 0x80AF2DD4u, InvokeDirectCpu<0x80AF2DD4u>);
++    Call(ctx, 0x80B34590u, InvokeDirectCpu<0x80B34590u>);
++    Call(ctx, 0x80AF4528u, InvokeDirectCpu<0x80AF4528u>);
++    Call(ctx, 0x80BA1020u, InvokeDirectCpu<0x80BA1020u>);
++    Call(ctx, 0x80B3BAB0u, InvokeDirectCpu<0x80B3BAB0u>);
++    Call(ctx, 0x80B74A0Cu, InvokeDirectCpu<0x80B74A0Cu>);
++    Call(ctx, 0x80B8315Cu, InvokeDirectCpu<0x80B8315Cu>);
++    ctx->gpr[3] = game;
++    Call(ctx, 0x80BB0CF8u, InvokeDirectCpu<0x80BB0CF8u>);
++}
++PPC_NATIVE_OVERRIDE_VOID(80BB0B78, MLB_NewSeasonGame_80BB0B78, (CpuContext* ctx), (ctx));
+diff --git a/runtime/src/mods.cpp b/runtime/src/mods.cpp
+index 964d651..5e9c0ca 100644
+--- a/runtime/src/mods.cpp
++++ b/runtime/src/mods.cpp
+@@ -234,6 +234,15 @@ std::vector<Mod> Discover() {
+                 const int64_t startYear = toml::find_or<int64_t>(document, "start_year", 0);
+                 if (startYear >= 2008 && startYear <= 2099) mod.startYear = static_cast<int>(startYear);
+                 mod.universalDh = Lower(toml::find_or<std::string>(document, "dh", "")) == "both";
++                if (document.contains("divisions") && document.at("divisions").is_table()) {
++                    static constexpr const char* kKeys[6] = {"al_east", "al_central", "al_west",
++                                                             "nl_east", "nl_central", "nl_west"};
++                    const toml::value& table = document.at("divisions");
++                    for (int d = 0; d < 6; ++d) {
++                        mod.divisions[d] = toml::find_or<std::vector<std::string>>(table, kKeys[d], {});
++                        mod.hasDivisions = mod.hasDivisions || !mod.divisions[d].empty();
++                    }
++                }
+                 if (document.contains("stadium") && document.at("stadium").is_array()) {
+                     for (const toml::value& entry : document.at("stadium").as_array()) {
+                         if (!entry.is_table()) continue;
+diff --git a/runtime/tests/season_schedule_tests.cpp b/runtime/tests/season_schedule_tests.cpp
+index 735567e..f0c2fda 100644
+--- a/runtime/tests/season_schedule_tests.cpp
++++ b/runtime/tests/season_schedule_tests.cpp
+@@ -44,6 +44,25 @@ int main() {
+     }
+     if (!parsed.errors.empty()) Check(parsed.errors[0].rfind("line 7:", 0) == 0, "errors name their line");
+ 
++    // Realignment: Houston to the AL West (15 and 15), the rest as in 2008.
++    std::array<int, kTeams> current{};
++    const int sizes[6] = {5, 5, 4, 5, 6, 5};
++    for (int d = 0, t = 0; d < 6; ++d)
++        for (int i = 0; i < sizes[d]; ++i) current[t++] = d;
++    std::vector<std::string> listed[6];
++    listed[2] = {"LAA", "SEA", "OAK", "TEX", "HOU"};
++    const Realignment ok = Realign(current, listed);
++    Check(ok.error.empty() && ok.division[22] == 2 && ok.division[0] == 0 && ok.division[21] == 4, "Houston moves, others stay");
++    listed[4] = {"HOU"};
++    Check(!Realign(current, listed).error.empty(), "a team listed twice is refused");
++    listed[4] = {};
++    listed[0] = {"BOS", "NYY", "TOR", "BAL", "TB", "CLE", "DET", "MIN"};
++    Check(!Realign(current, listed).error.empty(), "more than 7 in a division is refused");
++    listed[0] = {"XYZ"};
++    Check(!Realign(current, listed).error.empty(), "an unknown code is refused");
++    Check(TeamWordWithDivision(0x110016A8u, 2) == 0x200016A8u, "Houston's word: AL West, rest kept");
++    Check(TeamWordWithDivision(0x20000E25u, 4) == 0x11000E25u, "Texas's word to the NL Central");
++
+     if (failures) return 1;
+     std::printf("season_schedule_tests: ok\n");
+     return 0;
