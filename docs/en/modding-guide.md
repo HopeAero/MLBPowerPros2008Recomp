@@ -124,8 +124,9 @@ Players you make in Success are shared with a 156-character password. In the ori
 
 - **Copy:** open My Data › View or Delete Custom Players › the player › Password Display and press the orange **Copy password** button (on the bottom bar) or **Ctrl+C**. The password is on the clipboard as text, in groups of 3 and rows of 18 as on the screen, to paste in a message, a forum or a file.
 - **Paste:** open My Data › Password Input, press the **Paste password** button (under OK / INSERT / EXIT) or **Ctrl+V** and then OK. The player is saved as if you had typed it.
-- **Export to a file:** on Password Display, the blue **Export file** button opens your system's save window; the player goes into a `.txt` wherever you want, to share or keep.
-- **Import a file:** on Password Input, the blue **Import file** button opens the open window; pick the `.txt` and then OK. It also works without a clipboard.
+- **Export to a file:** on Password Display, the blue **Export file** button opens your system's save window, with the player's name (`S. Ohtani.txt`) in the `Players` folder of your user data; you can save it anywhere.
+- **Import a file:** on Password Input, the blue **Import file** button opens a list of the `.txt` files in `Players` (newest first); pick one and then OK. **Browse...** opens the open window for a file in another folder. It also works without a clipboard.
+- **With a controller:** on those screens **X** presses the first button (Copy / Paste) and **Y** the second (Export / Import). With a controller, Export saves straight into `Players` with no window, and the Import list is driven with the D-pad, **A** to import and **B** to cancel. (Not with the Wii Remote yet.)
 
 When pasting, spaces and line breaks are skipped, and stand-ins are taken for the symbols that are not on the keyboard: `-` (−), `/` (÷), `!=` (≠), `@` (◎), `^` (△), `*` (☆), `->` (⇒), `<->` (⇔), `■` (□), `▼` (▽), `◆` (◇), `0` (O). A notice at the bottom shows the result. A Success player also has the right age in MLB Life with a season pack.
 

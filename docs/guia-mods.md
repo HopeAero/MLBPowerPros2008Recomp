@@ -124,8 +124,9 @@ Los jugadores que creas en Success se comparten con una contraseña de 156 carac
 
 - **Copiar:** abre My Data › View or Delete Custom Players › el jugador › Password Display y pulsa el botón naranja **Copy password** (en la barra de abajo) o **Ctrl+C**. La contraseña queda en el portapapeles como texto, en grupos de 3 y filas de 18 como en la pantalla, para pegarla en un mensaje, un foro o un archivo.
 - **Pegar:** abre My Data › Password Input, pulsa el botón **Paste password** (bajo OK / INSERT / EXIT) o **Ctrl+V** y luego OK. El jugador queda guardado como si lo hubieras escrito.
-- **Exportar a un archivo:** en Password Display, el botón azul **Export file** abre la ventana de guardar de tu sistema; el jugador queda en un `.txt` donde quieras, para compartirlo o guardarlo.
-- **Importar un archivo:** en Password Input, el botón azul **Import file** abre la ventana de abrir; elige el `.txt` y luego OK. Sirve también sin portapapeles.
+- **Exportar a un archivo:** en Password Display, el botón azul **Export file** abre la ventana de guardar de tu sistema, con el nombre del jugador (`S. Ohtani.txt`) en la carpeta `Players` de tus datos de usuario; puedes guardarlo donde quieras.
+- **Importar un archivo:** en Password Input, el botón azul **Import file** abre una lista con los `.txt` de `Players` (los más nuevos arriba); elige uno y luego OK. **Browse...** abre la ventana de abrir para un archivo en otra carpeta. Sirve también sin portapapeles.
+- **Con control:** en esas pantallas **X** pulsa el primer botón (Copy / Paste) y **Y** el segundo (Export / Import). Con control, Export guarda directo en `Players` sin ventana, y la lista de Import se maneja con la cruceta, **A** para importar y **B** para cancelar. (Con el Wii Remote todavía no.)
 
 Al pegar se ignoran los espacios y saltos de línea, y se aceptan equivalentes para los símbolos que no están en el teclado: `-` (−), `/` (÷), `!=` (≠), `@` (◎), `^` (△), `*` (☆), `->` (⇒), `<->` (⇔), `■` (□), `▼` (▽), `◆` (◇), `0` (O). Abajo sale un aviso con el resultado. Un jugador de Success también tiene la edad correcta en MLB Life con un paquete de temporada.
 
