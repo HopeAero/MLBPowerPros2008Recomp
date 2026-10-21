@@ -35,92 +35,221 @@ index 83ace1c..549417e 100644
      return Get().universalDh.value_or(fallback);
  }
 diff --git a/runtime/include/season_schedule.h b/runtime/include/season_schedule.h
-index ec89cfe..8add69a 100644
+index ec89cfe..13c9cef 100644
 --- a/runtime/include/season_schedule.h
 +++ b/runtime/include/season_schedule.h
-@@ -193,4 +193,80 @@ inline ParseResult Parse(std::string_view text) {
+@@ -15,6 +15,8 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <initializer_list>
++#include <functional>
+ #include <cctype>
+ #include <cstdint>
+ #include <cstdio>
+@@ -193,4 +195,200 @@ inline ParseResult Parse(std::string_view text) {
      return result;
  }
  
 +// A schedule for leagues of odd size (15 and 15), which the game's generator (0x80B98320, made for even
-+// leagues) leaves uneven. 54 rounds of 3-game series, every team in every round: 45 league rounds
-+// (three round robins of the league, 15 rounds each; the team left over in each league plays the
-+// other league's) and 9 interleague rounds (AL team i at NL team i + r). An off day after every 3
-+// rounds, none from asgDay - 1 to asgDay + 2. 162 games a team; each series at the home of the team
-+// with fewer home series so far, so home and away stay even. Not the
-+// real one (division rivals are not played more): packs bring schedule/<year>.csv for that.
-+// league[t] is 0 or 1, both of 15 teams; days from March 1; empty when the leagues are not 15 and 15.
-+inline std::vector<Game> GenerateOddLeagues(const std::array<int, kTeams>& league, int year, int firstDay,
++// leagues) leaves uneven. Today's format (since 2023), 162 games a team:
++//   division rivals 13 each (3+3+3+4 series), 52;
++//   the other 10 league teams 6 or 7 (3+3 or 3+4; 7 against 2 teams of each other division, by year), 64;
++//   interleague 3 against each of the 14 other teams and 4 (2+2) against the natural rival, 46.
++// Series are put in rounds where every team plays one series (a round lasts as long as its longest
++// series; shorter ones leave an off day). An off day for everyone after every 4 rounds and none from
++// asgDay - 1 to asgDay + 2. division[t] is league * 3 + division (0..5); days from March 1; empty
++// when the leagues are not 15 and 15 or no round layout was found.
++inline std::vector<Game> GenerateOddLeagues(const std::array<int, kTeams>& division, int year, int firstDay,
 +                                            int asgDay) {
-+    std::vector<int> members[2];
-+    for (int t = 0; t < kTeams; ++t) members[league[t] & 1].push_back(t);
-+    if (members[0].size() != 15 || members[1].size() != 15) return {};
++    std::vector<int> byDivision[6], byLeague[2];
++    for (int t = 0; t < kTeams; ++t) {
++        if (division[t] < 0 || division[t] > 5) return {};
++        byDivision[division[t]].push_back(t);
++        byLeague[division[t] / 3].push_back(t);
++    }
++    if (byLeague[0].size() != 15 || byLeague[1].size() != 15) return {};
++    for (const auto& d : byDivision)
++        if (d.size() != 5) return {};
++
++    // Natural rivals: today's pairs when both teams are in different leagues, else the same slot of the
++    // same division in the other league.
++    static constexpr const char* kRivals[15][2] = {
++        {"NYY", "NYM"}, {"BOS", "ATL"}, {"BAL", "WSH"}, {"TB", "FLA"}, {"TOR", "PHI"},
++        {"CWS", "CHC"}, {"CLE", "CIN"}, {"DET", "PIT"}, {"KC", "STL"}, {"MIN", "MIL"},
++        {"HOU", "COL"}, {"LAA", "LAD"}, {"OAK", "SF"},  {"SEA", "SD"},  {"TEX", "ARI"}};
++    std::array<int, kTeams> rival;
++    rival.fill(-1);
++    bool realRivals = true;
++    for (const auto& pair : kRivals) {
++        const int a = TeamNumber(pair[0]), b = TeamNumber(pair[1]);
++        if (division[a] / 3 == division[b] / 3) realRivals = false;
++        rival[a] = b, rival[b] = a;
++    }
++    if (!realRivals) {
++        for (int d = 0; d < 3; ++d)
++            for (int i = 0; i < 5; ++i) rival[byDivision[d][i]] = byDivision[d + 3][i], rival[byDivision[d + 3][i]] = byDivision[d][i];
++    }
++
++    // Every pair's series (lengths).
 +    struct Series {
-+        int home, away;
++        int a, b, length;
 +    };
-+    using Round = std::vector<Series>;
-+    // Round r of a 15-team round robin by the circle method (team 15 a bye): pairs and the one left over.
-+    auto circle = [](int r, std::vector<std::pair<int, int>>& pairs) {
-+        int bye = -1;
-+        std::array<int, 16> slot{};
-+        slot[0] = 15;
-+        for (int i = 1; i < 16; ++i) slot[i] = (r + i - 1) % 15;
-+        for (int i = 0; i < 8; ++i) {
-+            const int a = slot[i], b = slot[15 - i];
-+            if (a == 15 || b == 15) bye = a == 15 ? b : a;
-+            else pairs.push_back({a, b});
++    std::vector<Series> all;
++    uint32_t seed = static_cast<uint32_t>(year) * 2654435761u + 12345u;
++    auto next = [&seed] { seed = seed * 1103515245u + 12345u; return seed >> 8; };
++    // Home alternates within a pair; afterwards whole pairs are flipped while that brings every team's
++    // home games closer to 81.
++    std::vector<std::pair<size_t, size_t>> pairs;  // [first, last) series of each pair in `all`
++    auto add = [&](int a, int b, std::initializer_list<int> lengths) {
++        bool aHome = ((a + b + year) & 1) != 0;
++        const size_t first = all.size();
++        for (int length : lengths) {
++            all.push_back(aHome ? Series{a, b, length} : Series{b, a, length});
++            aHome = !aHome;
 +        }
-+        return bye;
++        pairs.push_back({first, all.size()});
 +    };
-+    std::vector<Round> leagueRounds, interRounds;
-+    for (int cycle = 0; cycle < 3; ++cycle) {
-+        for (int r = 0; r < 15; ++r) {
-+            Round round;
-+            int byes[2];
-+            for (int l = 0; l < 2; ++l) {
-+                std::vector<std::pair<int, int>> pairs;
-+                byes[l] = circle((r + year + l) % 15, pairs);
-+                for (auto [a, b] : pairs) {
-+                    const bool flip = ((a + b + cycle + r) & 1) != 0;
-+                    round.push_back({members[l][flip ? b : a], members[l][flip ? a : b]});
-+                }
++    for (int l = 0; l < 2; ++l) {
++        for (int d = 0; d < 3; ++d) {
++            const auto& own = byDivision[l * 3 + d];
++            for (int i = 0; i < 5; ++i)
++                for (int j = i + 1; j < 5; ++j) add(own[i], own[j], {3, 3, 3, 4});
++            for (int e = d + 1; e < 3; ++e) {
++                const auto& other = byDivision[l * 3 + e];
++                const int k = (year + d + e) % 5;  // 7 games: i against other[i + k] and other[i + k + 1]
++                for (int i = 0; i < 5; ++i)
++                    for (int j = 0; j < 5; ++j) {
++                        const int off = (j - i - k + 10) % 5;
++                        if (off == 0 || off == 1) add(own[i], other[j], {3, 4});
++                        else add(own[i], other[j], {3, 3});
++                    }
 +            }
-+            const bool alHome = ((r + cycle) & 1) == 0;
-+            round.push_back({members[alHome ? 0 : 1][byes[alHome ? 0 : 1]], members[alHome ? 1 : 0][byes[alHome ? 1 : 0]]});
-+            leagueRounds.push_back(round);
 +        }
 +    }
-+    for (int r = 0; r < 9; ++r) {
-+        Round round;
-+        for (int i = 0; i < 15; ++i) {
-+            const int al = members[0][i], nl = members[1][(i + r + year) % 15];
-+            round.push_back(((i + r) & 1) == 0 ? Series{al, nl} : Series{nl, al});
++    for (int a : byLeague[0])
++        for (int b : byLeague[1]) {
++            if (rival[a] == b) add(a, b, {2, 2});
++            else add(a, b, {3});
 +        }
-+        interRounds.push_back(round);
++
++    std::array<int, kTeams> homeGames{};
++    for (const auto& x : all) homeGames[x.a] += x.length;
++    for (bool changed = true; changed;) {
++        changed = false;
++        for (const auto& [first, last] : pairs) {
++            int delta[kTeams] = {};
++            for (size_t i = first; i < last; ++i) delta[all[i].a] -= all[i].length, delta[all[i].b] += all[i].length;
++            const int a = all[first].a, b = all[first].b;
++            const auto cost = [](int h) { return (h - 81) * (h - 81); };
++            if (cost(homeGames[a] + delta[a]) + cost(homeGames[b] + delta[b]) < cost(homeGames[a]) + cost(homeGames[b])) {
++                for (size_t i = first; i < last; ++i) std::swap(all[i].a, all[i].b);
++                homeGames[a] += delta[a], homeGames[b] += delta[b];
++                changed = true;
++            }
++        }
 +    }
-+    std::vector<Game> games;
-+    std::array<int, kTeams> homeSeries{};
-+    int day = firstDay, played = 0;
-+    for (int k = 0; k < 54; ++k) {
-+        Round round = k % 6 == 5 ? interRounds[k / 6] : leagueRounds[k - k / 6];  // inter every 6th
-+        // Home goes to the team with fewer home series so far (the pairing's own order on a tie).
-+        for (auto& s : round) {
-+            if (homeSeries[s.away] < homeSeries[s.home]) std::swap(s.home, s.away);
-+            ++homeSeries[s.home];
++
++    // Rounds: every team plays one series of the round's length (a shorter one, leaving an off day, only
++    // where the leagues' odd size needs it), found by depth-first search with the most constrained
++    // team first. 4- and 2-game rounds are spread through the season. If a layout is not found, or
++    // the season would end after October 1, another order is tried.
++    for (int attempt = 0; attempt < 40; ++attempt) {
++        std::vector<Series> left = all;
++        for (size_t i = left.size(); i > 1; --i) std::swap(left[i - 1], left[next() % i]);
++        std::vector<std::vector<Series>> rounds;
++        bool failed = false;
++        while (!left.empty() && !failed) {
++            const int k = static_cast<int>(rounds.size());
++            int count[5] = {};
++            for (const auto& x : left) ++count[x.length];
++            int length = count[3] ? 3 : count[4] ? 4 : 2;
++            if (count[4] && k % 6 == 0) length = 4;
++            if (count[2] && (k == 18 || k == 36 || (!count[3] && !count[4]))) length = 2;
++            std::array<std::vector<int>, kTeams> options;  // indices into left, longest first
++            for (int len = length; len >= 2; --len)
++                for (int x = 0; x < static_cast<int>(left.size()); ++x)
++                    if (left[x].length == len) options[left[x].a].push_back(x), options[left[x].b].push_back(x);
++            std::array<int, kTeams> chosen;
++            std::vector<int> picked;
++            bool found = false;
++            // Fewest teams sitting out first, then fewest shorter series (sitting out only happens near
++            // the end, when what is left cannot pair everyone).
++            for (int step = 0; step < 16 * 16 && !found; ++step) {
++                const int maxIdle = step / 16 * 2, maxShort = step % 16;
++                chosen.fill(-1);
++                picked.clear();
++                int budget = 4000, shortUsed = 0, idleUsed = 0;
++                // Teams with nothing of this length or shorter left sit out; the rest must all play.
++                std::function<bool()> search = [&]() -> bool {
++                    if (--budget < 0) return false;
++                    int best = -1;
++                    size_t fewest = SIZE_MAX;
++                    for (int t = 0; t < kTeams; ++t) {
++                        if (chosen[t] != -1 || options[t].empty()) continue;
++                        size_t n = 0;
++                        for (int x : options[t]) n += chosen[left[x].a == t ? left[x].b : left[x].a] == -1;
++                        if (n < fewest) fewest = n, best = t;
++                    }
++                    if (best == -1) return true;
++                    for (int x : options[best]) {
++                        const int other = left[x].a == best ? left[x].b : left[x].a;
++                        const bool isShort = left[x].length < length;
++                        if (chosen[other] != -1 || (isShort && shortUsed >= maxShort)) continue;
++                        chosen[best] = chosen[other] = x;
++                        picked.push_back(x);
++                        shortUsed += isShort;
++                        if (search()) return true;
++                        shortUsed -= isShort;
++                        picked.pop_back();
++                        chosen[best] = chosen[other] = -1;
++                    }
++                    if (idleUsed >= maxIdle) return false;
++                    chosen[best] = -2;  // sits out this round
++                    ++idleUsed;
++                    if (search()) return true;
++                    --idleUsed;
++                    chosen[best] = -1;
++                    return false;
++                };
++                found = search();
++            }
++            if (!found) {
++                failed = true;
++                break;
++            }
++            std::vector<Series> round;
++            std::sort(picked.begin(), picked.end(), std::greater<int>());
++            for (int s : picked) {
++                round.push_back(left[s]);
++                left.erase(left.begin() + s);
++            }
++            rounds.push_back(round);
 +        }
-+        for (int g = 0; g < 3; ++g) {
-+            while (day >= asgDay - 1 && day <= asgDay + 2) ++day;
-+            for (const auto& s : round) games.push_back(Game{day, s.home, s.away, kDefaultTime});
-+            ++day;
++        if (failed) { std::fprintf(stderr, "attempt %d: no round layout (%zu rounds, %zu series left)\n", attempt, rounds.size(), left.size()); continue; }
++
++        std::vector<Game> games;
++        int day = firstDay;
++        for (size_t r = 0; r < rounds.size(); ++r) {
++            int longest = 0;
++            for (const auto& s : rounds[r]) longest = std::max(longest, s.length);
++            for (int g = 0; g < longest; ++g) {
++                while (day >= asgDay - 1 && day <= asgDay + 2) ++day;
++                for (const auto& s : rounds[r])
++                    if (g < s.length) games.push_back(Game{day, s.a, s.b, kDefaultTime});
++                ++day;
++            }
++            if (r % 4 == 3) ++day;  // an off day for everyone
 +        }
-+        if (++played % 3 == 0) ++day;  // an off day for everyone
++        if (day - 1 + kFirstDay > 274) { std::fprintf(stderr, "attempt %d: %zu rounds, ends day %d\n", attempt, rounds.size(), day - 1 + kFirstDay); continue; }
++        return games;
 +    }
-+    return games;
++    return {};
 +}
 +
  }  // namespace season_schedule
 diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
-index 269d323..6e7f1e3 100644
+index 269d323..c5fafcd 100644
 --- a/runtime/src/hle/mlb/season_schedule.cpp
 +++ b/runtime/src/hle/mlb/season_schedule.cpp
 @@ -13,6 +13,7 @@
@@ -170,16 +299,19 @@ index 269d323..6e7f1e3 100644
  }
  
  // Whether a mod has schedule/<year>.csv for the year being built.
-@@ -125,24 +131,51 @@ struct Slot {
+@@ -125,24 +131,54 @@ struct Slot {
      std::array<uint32_t, 4> words{};
  };
  
-+// Each team's league (bits 27..24 of its word at X + 128 + team * 4).
-+std::array<int, kTeams> Leagues() {
-+    std::array<int, kTeams> league{};
++// Each team's league * 3 + division (bits 27..24 and 31..28 of its word at X + 128 + team * 4).
++std::array<int, kTeams> Divisions() {
++    std::array<int, kTeams> division{};
 +    const uint32_t words = Memory::Read32(0x8104B5A0u) + 128;
-+    for (int t = 0; t < kTeams; ++t) league[t] = static_cast<int>((Memory::Read32(words + 4 * t) >> 24) & 0xF);
-+    return league;
++    for (int t = 0; t < kTeams; ++t) {
++        const uint32_t word = Memory::Read32(words + 4 * t);
++        division[t] = static_cast<int>((word >> 24) & 0xF) * 3 + static_cast<int>(word >> 28);
++    }
++    return division;
 +}
 +
  void Apply(bool official) {
@@ -223,7 +355,7 @@ index 269d323..6e7f1e3 100644
 +                break;
 +            }
 +        }
-+        games = GenerateOddLeagues(Leagues(), year, DayIndex(3, 26), asgDay);
++        games = GenerateOddLeagues(Divisions(), year, DayIndex(3, 25), asgDay);
 +        if (games.empty()) return;  // even leagues: the game's own generator is right
 +        source = "the 15/15 generator";
 +    } else {
@@ -235,7 +367,7 @@ index 269d323..6e7f1e3 100644
      auto address = [&](int day, int slot) {
          return table + static_cast<uint32_t>(day * kSlots + slot) * kSlotBytes;
      };
-@@ -163,7 +196,7 @@ void Apply(bool official) {
+@@ -163,7 +199,7 @@ void Apply(bool official) {
          }
      }
      int dropped = 0;
@@ -244,7 +376,7 @@ index 269d323..6e7f1e3 100644
          if (days[game.day].size() >= static_cast<size_t>(kSlots)) {
              ++dropped;
              continue;
-@@ -177,8 +210,8 @@ void Apply(bool official) {
+@@ -177,8 +213,8 @@ void Apply(bool official) {
              for (int w = 0; w < 4; ++w) Memory::Write32(address(day, slot) + 4 * w, entry.words[w]);
          }
      }
@@ -294,39 +426,52 @@ index 02f149c..ad97aa2 100644
              const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
              RuntimeConfigFile::SetUiLanguage(code);
 diff --git a/runtime/tests/season_schedule_tests.cpp b/runtime/tests/season_schedule_tests.cpp
-index f0c2fda..3307a2b 100644
+index f0c2fda..c8d97ca 100644
 --- a/runtime/tests/season_schedule_tests.cpp
 +++ b/runtime/tests/season_schedule_tests.cpp
-@@ -63,6 +63,35 @@ int main() {
+@@ -63,6 +63,48 @@ int main() {
      Check(TeamWordWithDivision(0x110016A8u, 2) == 0x200016A8u, "Houston's word: AL West, rest kept");
      Check(TeamWordWithDivision(0x20000E25u, 4) == 0x11000E25u, "Texas's word to the NL Central");
  
-+    // Leagues of 15 and 15: our generator gives every team 162 games, one a day at most.
-+    std::array<int, kTeams> leagues{};
-+    for (int t = 0; t < kTeams; ++t) leagues[t] = t < 14 ? 0 : 1;
-+    leagues[22] = 0;  // Houston to the AL
-+    Check(GenerateOddLeagues(std::array<int, kTeams>{}, 2026, 25, 136).empty(), "30 and 0: not ours");
-+    for (int year : {2026, 2027}) {
-+        const auto games = GenerateOddLeagues(leagues, year, DayIndex(3, 26), 136);
-+        std::array<int, kTeams> count{}, home{}, inter{};
++    // Leagues of 15 and 15: today's format, 162 games a team.
++    std::array<int, kTeams> divisions{};
++    const int sizes2[6] = {5, 5, 4, 5, 6, 5};
++    for (int d = 0, t = 0; d < 6; ++d)
++        for (int i = 0; i < sizes2[d]; ++i) divisions[t++] = d;
++    Check(GenerateOddLeagues(divisions, 2026, 25, 136).empty(), "2008's leagues (14 and 16): not ours");
++    divisions[22] = 2;  // Houston to the AL West
++    for (int year = 2026; year < 2046; ++year) {
++        const auto games = GenerateOddLeagues(divisions, year, DayIndex(3, 25), 136);
++        std::array<int, kTeams> count{}, home{}, div{}, league{}, inter{};
++        std::array<std::array<int, kTeams>, kTeams> pair{};
 +        std::array<std::array<int, kDays>, kTeams> perDay{};
 +        int last = 0, onBreak = 0, twice = 0;
 +        for (const auto& g : games) {
 +            ++count[g.home], ++count[g.away], ++home[g.home];
-+            if (leagues[g.home] != leagues[g.away]) ++inter[g.home], ++inter[g.away];
++            ++pair[g.home][g.away], ++pair[g.away][g.home];
++            const bool sameDiv = divisions[g.home] == divisions[g.away];
++            const bool sameLeague = divisions[g.home] / 3 == divisions[g.away] / 3;
++            for (int t : {g.home, g.away}) (sameDiv ? div : sameLeague ? league : inter)[t]++;
 +            if (++perDay[g.home][g.day] > 1 || ++perDay[g.away][g.day] > 1) ++twice;
 +            if (g.day >= 135 && g.day <= 138) ++onBreak;
 +            last = std::max(last, g.day);
 +        }
-+        bool all162 = true, homeEven = true, someInter = true;
++        bool format = true, homeEven = true, pairsOk = true;
 +        for (int t = 0; t < kTeams; ++t) {
-+            all162 = all162 && count[t] == 162;
-+            homeEven = homeEven && home[t] >= 75 && home[t] <= 87;
-+            someInter = someInter && inter[t] >= 27;
++            format = format && count[t] == 162 && div[t] == 52 && league[t] == 64 && inter[t] == 46;
++            homeEven = homeEven && home[t] >= 78 && home[t] <= 84;
++            for (int u = 0; u < kTeams; ++u) {
++                if (u == t) continue;
++                const bool sd = divisions[t] == divisions[u], sl = divisions[t] / 3 == divisions[u] / 3;
++                const int n = pair[t][u];
++                pairsOk = pairsOk && (sd ? n == 13 : sl ? (n == 6 || n == 7) : (n == 3 || n == 4));
++            }
 +        }
-+        Check(games.size() == 2430 && all162, "2430 games, 162 a team");
++        if (!(games.size() == 2430 && format && pairsOk)) std::fprintf(stderr, "year %d\n", year);
++        Check(games.size() == 2430 && format, "2430 games: 52 division, 64 league, 46 interleague a team");
++        Check(pairsOk, "13 against each division rival, 6 or 7 in the league, 3 or 4 interleague");
 +        Check(twice == 0 && onBreak == 0, "one game a day, none at the All-Star break");
-+        Check(homeEven && someInter, "home and away about even, interleague for everyone");
++        Check(homeEven, "home and away even");
 +        Check(last + kFirstDay <= 274, "the season ends by October 1");
 +    }
 +
