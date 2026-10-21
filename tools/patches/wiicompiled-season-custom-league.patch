@@ -279,6 +279,24 @@ index 249a2c4..3218ecd 100644
 +    Call(ctx, 0x80AB49C8u, InvokeDirectCpu<0x80AB49C8u>);
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80BB8FC4, MLB_CustomLeagueCheck_80BB8FC4, (CpuContext* ctx), (ctx));
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 3bdb836..baf9872 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -838,10 +838,10 @@ Result Run(int argc, char** argv) {
+                    RuntimeConfigFile::MaxSeasons(10) == 20 ? 1 : RuntimeConfigFile::MaxSeasons(10) == 0 ? 2 : 0};
+     seasons.experimental = true;
+     Option universalDh{Tr("DH EN AMBAS LIGAS", "DH IN BOTH LEAGUES"),
+-                       Tr("El bateador designado en todos los partidos del modo Temporada, como en las Grandes Ligas desde "
+-                          "2022. El juego original solo lo usa en los estadios de la Liga Americana. Los paquetes de "
++                       Tr("El bateador designado en todos los partidos del modo Temporada y de MLB Life, como en las Grandes "
++                          "Ligas desde 2022. El juego original solo lo usa en los estadios de la Liga Americana. Los paquetes de "
+                           "temporada con dh = \"both\" lo activan aunque aquí esté en No.",
+-                          "The designated hitter in every Season mode game, as in the major leagues since 2022. The "
++                          "The designated hitter in every Season mode and MLB Life game, as in the major leagues since 2022. The "
+                           "original game only uses it in American League parks. Season packs with dh = \"both\" "
+                           "turn it on even when this says No."),
+                        YesNo(), RuntimeConfigFile::UniversalDh(false) ? 1 : 0};
 diff --git a/runtime/tests/season_schedule_tests.cpp b/runtime/tests/season_schedule_tests.cpp
 index c8d97ca..1cf2429 100644
 --- a/runtime/tests/season_schedule_tests.cpp
