@@ -48,7 +48,7 @@ description = "Uniformes redibujados a 4x."
 - **`schedule/`**: calendarios de partidos del modo Temporada, uno por año: `schedule/2026.csv` sustituye los partidos de la temporada que el juego llama 2026 cuando el juego monta el calendario de ese año, es decir, al empezar la partida (el primer año) o al pasar de año. Una temporada ya empezada no cambia.
   - Formato: una línea por partido, `fecha,local,visitante,hora`. La fecha es `AAAA-MM-DD` (o `MM-DD`), los equipos van por código (`BOS`, `NYY`, `LAD`…; valen `MIA`/`FLA`, `ATH`/`OAK`, `TBR`, `CHW`, `WSN`…) y la hora es la de inicio en hora del Este, `HH:MM` (si falta, 19:05). Se ignoran las líneas vacías, las que empiezan por `#` y la cabecera `date,...`.
   - Límites del juego: del 1 de marzo al 31 de octubre y 16 partidos por día; lo que no cabe se descarta y el registro (`console.log`) lo dice. La temporada regular del juego va del 19 de marzo al 1 de octubre. El All-Star del juego se queda en su día.
-  - El calendario real de un año sale de la API pública de MLB: `python tools/season_schedule.py mlb 2026 mimod/schedule/2026.csv`. Para jugar el calendario de 2026 en el primer año, guárdalo como `schedule/2008.csv`.
+  - El calendario real de un año sale de la API pública de MLB: `python tools/season_schedule.py mlb 2026 mimod/schedule/2026.csv`. Para jugar el calendario de 2026 en el primer año, guárdalo como `schedule/2008.csv`, o mejor haz un paquete de temporada (abajo).
   - Las divisiones, las clasificaciones y el DH siguen siendo los de 2008: Houston, por ejemplo, juega el calendario de 2026 pero cuenta en la División Central de la Nacional. Detalles en `docs/ingenieria-inversa.md`, «Calendario de partidos».
 - **`riivolution/`**: XML de Riivolution (`<wiidisc>`) válidos para `RL8E54`. La carpeta del mod hace de raíz de la SD.
   - Los parches de archivos funcionan.
@@ -114,6 +114,30 @@ base = "atl"             # estadio cuyos datos de juego usa (medidas, menú, par
 - Por ahora solo en Exhibición.
 - El rótulo con el nombre sale de `project/env_stadium_name_<código>.pack` si el mod lo trae (formato en `docs/ingenieria-inversa.md`). Si no, el runtime lo dibuja con el `name` del mod y una fuente del sistema.
 - Los archivos nuevos reciben números libres de `project.bin` (desde 4388), que el juego no usa.
+
+## Paquetes de temporada
+
+Un mod que trae un roster y los calendarios de unos años puede ser un **paquete de temporada**: con `start_year` en su `mod.toml`, una temporada nueva empieza en ese año.
+
+```toml
+name = "Temporada 2026"
+start_year = 2026
+```
+
+```
+mods\
+  Temporada2026\
+    mod.toml
+    roster\      el roster de 2026 (.dat de PowerUp+)
+    schedule\    2026.csv, 2027.csv…
+```
+
+- Al empezar una temporada nueva con el paquete activo, el primer año es 2026: la fecha, los días de la semana, el calendario (Y) y la lista de partidas lo dicen, y `schedule/2026.csv` es el que se usa. Los años siguientes son 2027, 2028…
+- **Edades:** el roster guarda la edad de cada jugador para su primera temporada (PowerUp calcula el año de nacimiento a partir de la edad). Al empezar en 2026, los jugadores del roster nacen 18 años más tarde y conservan esa edad; la fecha de nacimiento que se ve es la que corresponde a esa edad. Los jugadores que crea el juego después (draft) ya usan el año que se ve.
+- **Lo que no cambia:** la economía del juego (salarios, impuesto de lujo) sigue la de sus temporadas 1, 2, 3…, como en 2008. Las divisiones y el DH siguen siendo los de 2008.
+- El año inicial se fija al crear la partida y va dentro de ella: una partida de 2026 sigue en 2026 aunque luego se desactive el paquete, y las partidas sin paquete no cambian.
+- Con varios paquetes activos manda el primero, por nombre, que tenga `start_year`.
+- Texturas, uniformes y estadios mejor en mods aparte: se combinan con el paquete al activarlos a la vez.
 
 ## Partidas por roster
 

@@ -1,0 +1,298 @@
+diff --git a/runtime/include/mods.h b/runtime/include/mods.h
+index bf3b031..f599b80 100644
+--- a/runtime/include/mods.h
++++ b/runtime/include/mods.h
+@@ -17,6 +17,8 @@
+ //                  per-user PROJECT.BIN with them and serves it instead of the disc's,
+ //   roster/        a PowerUp / PowerUp+ roster (MLB Power Pros 2007 Wii save, *.dat), converted to
+ //                  2008's game_data.pack on the player's PC; it applies to every mode, MLB Life too.
++//   schedule/      Season mode game schedules, <year>.csv (season_schedule.h).
++// mod.toml may also set start_year (a season pack: a new Season mode game starts in that year).
+ // Enabled folders are listed in Config.toml under [mods] enabled. Everything is read once at
+ // start-up, so toggling a mod needs a restart (the launcher relaunches).
+ //
+@@ -43,6 +45,7 @@ struct Mod {
+     std::string version;
+     std::string description;
+     std::string rosterIds;  // "2008" when roster/*.dat voice and face ids follow 2008's numbering
++    int startYear = 0;      // start_year: a new Season mode game's first season (0: 2008, the game's)
+     std::filesystem::path root;
+     bool textures = false;
+     bool disc = false;
+diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
+index b92aead..b81c6db 100644
+--- a/runtime/include/season_cap.h
++++ b/runtime/include/season_cap.h
+@@ -10,6 +10,8 @@
+ // With no limit (0) the game keeps a window of 20 years: when season 20 ends, every per-year table
+ // moves down one year, the oldest goes to the archive in the tail, and a year offset (also in the
+ // tail) turns the window's years into the real ones (0x80B4A888, 0x80B74C00 and the year sites).
++// A season pack (a mod with start_year in mod.toml) shifts the years shown the same way from a new
++// game on: its first season is start_year. The game's own tables and economy stay by season index.
+ // Docs: docs/ingenieria-inversa.md "Año de la temporada".
+ #include <algorithm>
+ #include <array>
+@@ -172,16 +174,21 @@ constexpr size_t kArchiveYearBytes = 2 + 32 + 160 + 336 + 2 + kAnnualBytes + kYe
+ using ArchivedYear = std::array<uint8_t, kArchiveYearBytes>;
+ 
+ struct SeasonTail {
+-    uint32_t yearOffset = 0;  // seasons that left the window: the real year is 2008 + offset + index
++    uint32_t yearOffset = 0;  // seasons that left the window
++    uint32_t startShift = 0;  // a season pack's start_year - 2008; the year shown is 2008 + both + index
++    bool pastTen = false;     // written for a game past season 10 (stored years, archive), not only for the start year
+     YearStore store;
+     std::vector<ArchivedYear> archive;  // oldest first
+ };
++inline uint32_t ShownOffset(const SeasonTail& tail) { return tail.yearOffset + tail.startShift; }
+ 
+-// Tail layout: "PPSEASON", u32 version 2, u32 year offset, the store, u32 archive count, the archive
+-// (all big-endian); the rest of the tail stays zero.
++// Tail layout: "PPSEASON", u32 version 3, u32 year offset, u32 start shift, u32 flags (1: past
++// season 10), the store, u32 archive count, the archive (all big-endian); the rest stays zero.
++// Version 2 had no start shift and flags, and was only written past season 10.
+ constexpr char kTailMagic[8] = {'P', 'P', 'S', 'E', 'A', 'S', 'O', 'N'};
+-constexpr uint32_t kTailVersion = 2;
+-constexpr size_t kTailHeader = 8 + 4 + 4 + sizeof(YearStore) + 4;
++constexpr uint32_t kTailVersion = 3;
++constexpr size_t kTailHeaderV2 = 8 + 4 + 4 + sizeof(YearStore) + 4;
++constexpr size_t kTailHeader = 8 + 4 + 4 + 4 + 4 + sizeof(YearStore) + 4;
+ constexpr size_t kArchiveCapacity = (kTailSize - kTailHeader) / kArchiveYearBytes;
+ 
+ // Keeps the newest kArchiveCapacity seasons.
+@@ -204,9 +211,11 @@ inline void WriteTail(const SeasonTail& tail, uint8_t* out) {
+     std::memcpy(out, kTailMagic, 8);
+     PutBe32(out + 8, kTailVersion);
+     PutBe32(out + 12, tail.yearOffset);
+-    std::memcpy(out + 16, &tail.store, sizeof(YearStore));
++    PutBe32(out + 16, tail.startShift);
++    PutBe32(out + 20, tail.pastTen ? 1u : 0u);
++    std::memcpy(out + 24, &tail.store, sizeof(YearStore));
+     const size_t count = tail.archive.size() < kArchiveCapacity ? tail.archive.size() : kArchiveCapacity;
+-    PutBe32(out + 16 + sizeof(YearStore), static_cast<uint32_t>(count));
++    PutBe32(out + 24 + sizeof(YearStore), static_cast<uint32_t>(count));
+     for (size_t i = 0; i < count; ++i)
+         std::memcpy(out + kTailHeader + i * kArchiveYearBytes, tail.archive[tail.archive.size() - count + i].data(),
+                     kArchiveYearBytes);
+@@ -215,13 +224,24 @@ inline void WriteTail(const SeasonTail& tail, uint8_t* out) {
+ // False (and nothing stored) when the tail is not ours, e.g. the game's own zero padding.
+ inline bool ReadTail(const uint8_t* in, size_t size, SeasonTail& tail) {
+     tail = {};
+-    if (size < kTailSize || std::memcmp(in, kTailMagic, 8) != 0 || GetBe32(in + 8) != kTailVersion) return false;
++    if (size < kTailSize || std::memcmp(in, kTailMagic, 8) != 0) return false;
++    const uint32_t version = GetBe32(in + 8);
++    if (version != 2 && version != kTailVersion) return false;
+     tail.yearOffset = GetBe32(in + 12);
+-    std::memcpy(&tail.store, in + 16, sizeof(YearStore));
+-    const uint32_t count = GetBe32(in + 16 + sizeof(YearStore));
++    size_t at = 16;
++    if (version == 2) {
++        tail.pastTen = true;
++    } else {
++        tail.startShift = GetBe32(in + 16);
++        tail.pastTen = (GetBe32(in + 20) & 1) != 0;
++        at = 24;
++    }
++    std::memcpy(&tail.store, in + at, sizeof(YearStore));
++    const uint32_t count = GetBe32(in + at + sizeof(YearStore));
++    const size_t header = version == 2 ? kTailHeaderV2 : kTailHeader;
+     for (uint32_t i = 0; i < count && i < kArchiveCapacity; ++i) {
+         ArchivedYear year;
+-        std::memcpy(year.data(), in + kTailHeader + i * kArchiveYearBytes, kArchiveYearBytes);
++        std::memcpy(year.data(), in + header + i * kArchiveYearBytes, kArchiveYearBytes);
+         tail.archive.push_back(year);
+     }
+     return true;
+@@ -256,7 +276,9 @@ inline bool IsSeasonSaveName(const char* fileName) {
+ // Runtime side (hle/mlb/season_cap.cpp).
+ int SeasonCount();         // this game's number of seasons
+ int Count();               // the same, 10 outside Season mode (for code MLB Life shares)
+-uint32_t YearOffset();     // seasons that left the window (0 outside Season mode)
++uint32_t YearOffset();     // years shown past 2008 + index: seasons that left the window plus a season
++                           // pack's start year (0 outside Season mode)
++void BeginNewGame(int startYear);  // a new Season mode game is building its first schedule (0: 2008)
+ void OnHostFrame();        // settings_overlay.cpp, once per presented frame
+ // nand_isfs.cpp hooks for the season saves (IsSeasonSaveName): a read of `length` bytes at
+ // fileOffset landed in data, and `tail` (kTailSize bytes, from the file) comes with the chunk that
+diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
+index 865ce2d..8c29db9 100644
+--- a/runtime/src/hle/mlb/season_cap.cpp
++++ b/runtime/src/hle/mlb/season_cap.cpp
+@@ -186,7 +186,37 @@ int SeasonCount() {
+ 
+ int Count() { return SeasonModeActive() ? SeasonCount() : kOriginalSeasons; }
+ 
+-uint32_t YearOffset() { return SeasonModeActive() ? g_tail.yearOffset : 0; }
++uint32_t YearOffset() { return SeasonModeActive() ? ShownOffset(g_tail) : 0; }
++
++// The game's own players (ids 7001..8500, 1500 records of 0xB0 at [0x8104B59C] + 0x3564) carry the
++// roster's birth years, made for 2008; ages come from the year shown (0x80B861B0: 0x80B4A888 and the
++// birth date, 11 bits from bit 1 of word +0x80, getter 0x8082B544). With a later start year they are
++// born that much later, so the roster's ages stay; players the game makes later already use the year shown.
++void ShiftBirthYears(uint32_t shift) {
++    constexpr uint32_t kPlayers = 0x3564, kSlots = 1500, kRecord = 0xB0;
++    const uint32_t table = Memory::Read32(0x8104B59Cu) + kPlayers;
++    if (!Memory::Contains(table, kSlots * kRecord)) return;
++    int moved = 0;
++    for (uint32_t i = 0; i < kSlots; ++i) {
++        const uint32_t record = table + i * kRecord;
++        const uint16_t id = Memory::Read16(record);
++        if (id < 7001 || id > 8500) continue;
++        const uint32_t word = Memory::Read32(record + 0x80);
++        const uint32_t year = ((word >> 1) & 0x7FFu) + shift;
++        Memory::Write32(record + 0x80, (word & ~(0x7FFu << 1)) | ((year & 0x7FFu) << 1));
++        ++moved;
++    }
++    std::fprintf(stderr, "[season] %d players born %u years later\n", moved, shift);
++}
++
++void BeginNewGame(int startYear) {
++    if (!SeasonModeActive() || CurrentIndex() != 0) return;  // only a new game builds a schedule at index 0
++    g_tail = {};
++    g_tail.startShift = startYear > 2008 ? static_cast<uint32_t>(startYear - 2008) : 0;
++    if (!g_tail.startShift) return;
++    std::fprintf(stderr, "[season] new game: the first season is %d\n", startYear);
++    ShiftBirthYears(g_tail.startShift);
++}
+ 
+ static void TakeLoad();
+ 
+@@ -198,7 +228,9 @@ void OnHostFrame() {
+     if (!g_loadedInMemory.load() && index == g_loadedIndex.load()) g_loadedInMemory.store(true);
+     if (g_needed.load() > kOriginalSeasons && g_loadedInMemory.load() && index >= 0 && index < kOriginalSeasons) {
+         g_needed.store(kOriginalSeasons);  // a new game is running now
++        const uint32_t shift = g_tail.startShift;  // set by BeginNewGame, which may come first
+         g_tail = {};
++        g_tail.startShift = shift;
+     }
+     const int pending = g_pendingIndex.load();
+     if (pending < 0) return;
+@@ -249,20 +281,25 @@ static void TakeLoad() {
+     g_candidate.set = false;
+     g_loadedInMemory.store(false);
+     g_loadedIndex.store(g_candidate.index);
+-    g_needed.store(NeededCount(g_candidate.index, g_candidate.ours, g_candidate.tail.yearOffset));
++    g_needed.store(NeededCount(g_candidate.index, g_candidate.ours && g_candidate.tail.pastTen, g_candidate.tail.yearOffset));
+     g_tail = std::move(g_candidate.tail);  // empty for a save without our tail
+-    std::fprintf(stderr, "[season] season %d loaded; %s, year offset %u, %zu archived seasons\n", g_candidate.index + 1,
+-                 g_candidate.ours ? "our tail" : "no tail", g_tail.yearOffset, g_tail.archive.size());
++    std::fprintf(stderr, "[season] season %d loaded; %s, year offset %u, start shift %u, %zu archived seasons\n",
++                 g_candidate.index + 1,
++                 g_candidate.ours ? "our tail" : "no tail", g_tail.yearOffset, g_tail.startShift,
++                 g_tail.archive.size());
+     g_pendingFrames = 0;
+     g_pendingIndex.store(g_candidate.index);
+ }
+ 
+ void OnSeasonSaveWrite(uint32_t fileOffset, uint8_t* data, size_t length) {
+-    // Only a game past season 10 has stored years; anything else stays byte for byte.
+-    if (Count() <= kOriginalSeasons || (CurrentIndex() < kOriginalSeasons && g_tail.yearOffset == 0)) return;
++    // Only a game past season 10 (stored years) or from a season pack (its start year) needs the tail;
++    // anything else stays byte for byte.
++    g_tail.pastTen = Count() > kOriginalSeasons && (CurrentIndex() >= kOriginalSeasons || g_tail.yearOffset > 0);
++    if (!g_tail.pastTen && g_tail.startShift == 0) return;
+     OverlayTail(g_tail, fileOffset, data, length);
+     if (fileOffset + length >= kSaveFileSize && fileOffset < kSaveFileSize)
+-        std::fprintf(stderr, "[season] tail written: year offset %u\n", g_tail.yearOffset);
++        std::fprintf(stderr, "[season] tail written: year offset %u, start shift %u\n", g_tail.yearOffset,
++                     g_tail.startShift);
+ }
+ 
+ }  // namespace season_cap
+@@ -420,7 +457,9 @@ extern "C" void MLB_LuxuryThreshold_80C4762C(CpuContext* ctx) {
+     }
+     int32_t table[kOriginalSeasons];
+     for (int i = 0; i < kOriginalSeasons; ++i) table[i] = static_cast<int32_t>(Memory::Read32(kTable + i * 4u));
+-    ctx->gpr[3] = static_cast<uint32_t>(LuxuryThreshold(table, year + static_cast<int>(YearOffset())));
++    // By season index, as the game's economy: a season pack's start year does not move it.
++    const int archived = SeasonModeActive() ? static_cast<int>(g_tail.yearOffset) : 0;
++    ctx->gpr[3] = static_cast<uint32_t>(LuxuryThreshold(table, year + archived));
+ }
+ PPC_NATIVE_OVERRIDE_VOID(80C4762C, MLB_LuxuryThreshold_80C4762C, (CpuContext* ctx), (ctx));
+ 
+diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
+index 6b21f6b..e34463b 100644
+--- a/runtime/src/hle/mlb/season_schedule.cpp
++++ b/runtime/src/hle/mlb/season_schedule.cpp
+@@ -50,6 +50,14 @@ bool FindSchedule(int year, std::filesystem::path& path, std::string& modName) {
+     return false;
+ }
+ 
++// start_year of the first enabled mod (by name) that sets it, or 0.
++int StartYear() {
++    for (const auto& mod : mods::Discover()) {
++        if (mod.enabled && mod.startYear) return mod.startYear;
++    }
++    return 0;
++}
++
+ struct Slot {
+     std::array<uint32_t, 4> words{};
+ };
+@@ -118,6 +126,7 @@ void Apply(bool official) {
+ // 0x80B97DC4: builds the year's schedule. As the original, with the mod's schedule put in between.
+ extern "C" void MLB_BuildSchedule_80B97DC4(CpuContext* ctx) {
+     using season_schedule::Call;
++    season_cap::BeginNewGame(season_schedule::StartYear());  // at index 0 only: a new game
+     Call(ctx, 0x80B97D68u, InvokeDirectCpu<0x80B97D68u>);  // empty every slot
+     // 2008 with the original divisions: the official schedule; otherwise one is generated.
+     const bool official = Call(ctx, 0x80B97E08u, InvokeDirectCpu<0x80B97E08u>) != 0;
+diff --git a/runtime/src/mods.cpp b/runtime/src/mods.cpp
+index cb9402b..2a9b480 100644
+--- a/runtime/src/mods.cpp
++++ b/runtime/src/mods.cpp
+@@ -231,6 +231,8 @@ std::vector<Mod> Discover() {
+                 text("version", mod.version);
+                 text("description", mod.description);
+                 text("roster_ids", mod.rosterIds);
++                const int64_t startYear = toml::find_or<int64_t>(document, "start_year", 0);
++                if (startYear >= 2008 && startYear <= 2099) mod.startYear = static_cast<int>(startYear);
+                 if (document.contains("stadium") && document.at("stadium").is_array()) {
+                     for (const toml::value& entry : document.at("stadium").as_array()) {
+                         if (!entry.is_table()) continue;
+diff --git a/runtime/tests/season_cap_tests.cpp b/runtime/tests/season_cap_tests.cpp
+index 570e9cb..17dc64f 100644
+--- a/runtime/tests/season_cap_tests.cpp
++++ b/runtime/tests/season_cap_tests.cpp
+@@ -1,6 +1,7 @@
+ #include "season_cap.h"
+ #include <algorithm>
+ #include <cstdio>
++#include <cstring>
+ #include <vector>
+ 
+ static int failures = 0;
+@@ -78,6 +79,34 @@ int main() {
+     Check(back.yearOffset == 7 && back.store.annual[0][43] == 0x39 && back.store.records[9][127] == 0xAB &&
+               back.store.yearly[4][0] == 0x80, "offset and stored years survive");
+     Check(back.archive.size() == 2 && back.archive[0][1] == 0xD8 && back.archive[1][1] == 0xD9, "archive, oldest first");
++    Check(back.startShift == 0 && !back.pastTen && ShownOffset(back) == 7, "no start year");
++
++    // A season pack's start year travels in the tail (version 3) and only moves the years shown.
++    SeasonTail pack;
++    pack.startShift = 18;  // start_year 2026
++    pack.pastTen = false;
++    std::vector<uint8_t> packTail(kTailSize, 0);
++    WriteTail(pack, packTail.data());
++    Check(ReadTail(packTail.data(), kTailSize, back) && back.startShift == 18 && !back.pastTen && back.yearOffset == 0,
++          "start shift and flags read back");
++    Check(ShownOffset(back) == 18 && NeededCount(3, back.pastTen, back.yearOffset) == 10,
++          "a 2026 pack's save at season 4 shows 2029 and still needs only 10 seasons");
++    pack.pastTen = true;
++    pack.yearOffset = 2;
++    WriteTail(pack, packTail.data());
++    Check(ReadTail(packTail.data(), kTailSize, back) && back.pastTen && ShownOffset(back) == 20, "both offsets add up");
++
++    // A version 2 tail (before start years): written only past season 10, no start shift.
++    std::vector<uint8_t> v2(kTailSize, 0);
++    std::memcpy(v2.data(), kTailMagic, 8);
++    PutBe32(v2.data() + 8, 2);
++    PutBe32(v2.data() + 12, 5);
++    v2[16 + 43] = 0x39;                            // store.annual[0][43]
++    PutBe32(v2.data() + 16 + sizeof(YearStore), 1);  // one archived year
++    v2[kTailHeaderV2 + 1] = 0xD8;
++    Check(ReadTail(v2.data(), kTailSize, back) && back.yearOffset == 5 && back.startShift == 0 && back.pastTen &&
++              back.store.annual[0][43] == 0x39 && back.archive.size() == 1 && back.archive[0][1] == 0xD8,
++          "a version 2 tail still reads");
+     std::vector<uint8_t> zeros(kTailSize, 0);
+     Check(!ReadTail(zeros.data(), zeros.size(), back) && back.yearOffset == 0 && back.archive.empty(),
+           "the game's zero tail: nothing stored");
