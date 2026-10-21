@@ -1,0 +1,604 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index a460964..d774d47 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -425,6 +425,10 @@ add_executable(mkw_season_schedule_tests "${CMAKE_CURRENT_LIST_DIR}/tests/season
+ target_compile_features(mkw_season_schedule_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_season_schedule_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+ add_test(NAME mkw_season_schedule_tests COMMAND mkw_season_schedule_tests)
++add_executable(mkw_season_schedule_mlb_tests "${CMAKE_CURRENT_LIST_DIR}/tests/season_schedule_mlb_tests.cpp")
++target_compile_features(mkw_season_schedule_mlb_tests PRIVATE cxx_std_20)
++target_include_directories(mkw_season_schedule_mlb_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
++add_test(NAME mkw_season_schedule_mlb_tests COMMAND mkw_season_schedule_mlb_tests)
+ add_executable(mkw_game_camera_tests "${CMAKE_CURRENT_LIST_DIR}/tests/game_camera_tests.cpp")
+ target_compile_features(mkw_game_camera_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_game_camera_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+diff --git a/runtime/include/season_schedule.h b/runtime/include/season_schedule.h
+index 13c9cef..d3ade4e 100644
+--- a/runtime/include/season_schedule.h
++++ b/runtime/include/season_schedule.h
+@@ -391,4 +391,72 @@ inline std::vector<Game> GenerateOddLeagues(const std::array<int, kTeams>& divis
+     return {};
+ }
+ 
++
++// Fits a real year's schedule to the game: its regular season runs from March 19 to October 1 (slot
++// days 18..214) and a day holds 16 games, the game's own entries (the All-Star Game) included. A
++// schedule that starts earlier or ends later moves by the days needed (same order, other dates);
++// a game on a full day moves to the nearest day where there is room and neither team plays.
++constexpr int kRegularFirst = 18, kRegularLast = 214;
++struct FitResult {
++    std::vector<Game> games;
++    int shift = 0;  // days the whole schedule moved (negative: earlier)
++    int moved = 0;  // games moved off a full day
++    int dropped = 0;
++};
++inline FitResult Fit(std::vector<Game> games, const std::array<int, kDays>& taken = {}) {
++    FitResult out;
++    if (games.empty()) return out;
++    int first = kDays, last = -1;
++    for (const auto& g : games) first = std::min(first, g.day), last = std::max(last, g.day);
++    if (first < kRegularFirst) out.shift = kRegularFirst - first;
++    if (last + out.shift > kRegularLast) out.shift = kRegularLast - last;
++    std::array<int, kDays> count = taken;
++    std::array<std::array<bool, kDays>, kTeams> plays{};
++    std::vector<size_t> overflow;
++    for (size_t i = 0; i < games.size(); ++i) {
++        Game& g = games[i];
++        g.day = std::clamp(g.day + out.shift, 0, kDays - 1);
++        if (count[g.day] >= kSlots) {
++            overflow.push_back(i);
++            continue;
++        }
++        ++count[g.day];
++        plays[g.home][g.day] = plays[g.away][g.day] = true;
++    }
++    std::vector<bool> keep(games.size(), true);
++    for (size_t i : overflow) {
++        Game& g = games[i];
++        int to = -1;
++        for (int d = 1; d <= kRegularLast - kRegularFirst && to < 0; ++d)
++            for (int day : {g.day - d, g.day + d})
++                if (to < 0 && day >= kRegularFirst && day <= kRegularLast && count[day] < kSlots &&
++                    !plays[g.home][day] && !plays[g.away][day])
++                    to = day;
++        if (to < 0) {
++            keep[i] = false;
++            ++out.dropped;
++            continue;
++        }
++        g.day = to;
++        ++count[to];
++        plays[g.home][to] = plays[g.away][to] = true;
++        ++out.moved;
++    }
++    for (size_t i = 0; i < games.size(); ++i)
++        if (keep[i]) out.games.push_back(games[i]);
++    std::stable_sort(out.games.begin(), out.games.end(), [](const Game& a, const Game& b) {
++        return a.day != b.day ? a.day < b.day : a.minutes < b.minutes;
++    });
++    return out;
++}
++
++// Month and day of a slot day (the game's 366-day year).
++inline void MonthDay(int index, int& month, int& day) {
++    static constexpr int kMonthDays[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
++    int d = index + kFirstDay;
++    month = 1;
++    while (month <= 12 && d >= kMonthDays[month - 1]) d -= kMonthDays[month - 1], ++month;
++    day = d + 1;
++}
++
+ }  // namespace season_schedule
+diff --git a/runtime/include/season_schedule_mlb.h b/runtime/include/season_schedule_mlb.h
+new file mode 100644
+index 0000000..bb2abe0
+--- /dev/null
++++ b/runtime/include/season_schedule_mlb.h
+@@ -0,0 +1,234 @@
++#pragma once
++
++// A year's regular season from MLB's public schedule (statsapi.mlb.com/api/v1/schedule) as the CSV of
++// season_schedule.h: the launcher's TOOLS > SCHEDULE. Same rules as tools/season_schedule.py: regular
++// season games only, postponed games on the day they were scheduled (their make-ups and suspended
++// games' resumptions left out), start times in US Eastern time.
++
++#include <algorithm>
++#include <cctype>
++#include <cstdint>
++#include <cstdio>
++#include <map>
++#include <memory>
++#include <set>
++#include <string>
++#include <string_view>
++#include <tuple>
++#include <vector>
++
++namespace season_schedule_mlb {
++
++// The years the launcher offers: 30 teams and 162 games (2002-2026), not 2020 (60 games, from July).
++// 1998-2001 are left out: the API's data for them does not add up to 162 a team.
++inline std::vector<int> OfferedYears() {
++    std::vector<int> years;
++    for (int y = 2026; y >= 2002; --y)
++        if (y != 2020) years.push_back(y);
++    return years;
++}
++
++inline std::string Url(int year) {
++    return "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=" + std::to_string(year) +
++           "-03-01&endDate=" + std::to_string(year) + "-10-31";
++}
++
++// A small JSON reader: enough for the schedule response.
++struct Json {
++    enum Kind { Null, Bool, Number, String, Array, Object } kind = Null;
++    bool boolean = false;
++    double number = 0;
++    std::string text;
++    std::vector<Json> items;
++    std::vector<std::pair<std::string, Json>> fields;
++    const Json& operator[](std::string_view key) const {
++        static const Json none;
++        for (const auto& [k, v] : fields)
++            if (k == key) return v;
++        return none;
++    }
++};
++
++class JsonReader {
++public:
++    explicit JsonReader(std::string_view s) : s_(s) {}
++    bool Parse(Json& out) {
++        if (!Value(out)) return false;
++        Space();
++        return at_ == s_.size();
++    }
++
++private:
++    void Space() {
++        while (at_ < s_.size() && (s_[at_] == ' ' || s_[at_] == '\n' || s_[at_] == '\r' || s_[at_] == '\t')) ++at_;
++    }
++    bool Literal(std::string_view word) {
++        if (s_.substr(at_, word.size()) != word) return false;
++        at_ += word.size();
++        return true;
++    }
++    bool Str(std::string& out) {
++        if (at_ >= s_.size() || s_[at_] != '"') return false;
++        ++at_;
++        while (at_ < s_.size() && s_[at_] != '"') {
++            char c = s_[at_++];
++            if (c == '\\' && at_ < s_.size()) {
++                const char e = s_[at_++];
++                if (e == 'u') {
++                    if (at_ + 4 > s_.size()) return false;
++                    const unsigned code = static_cast<unsigned>(std::stoul(std::string(s_.substr(at_, 4)), nullptr, 16));
++                    at_ += 4;
++                    // UTF-8 for the basic plane (names with accents); surrogates are not needed here.
++                    if (code < 0x80) out += static_cast<char>(code);
++                    else if (code < 0x800) out += static_cast<char>(0xC0 | (code >> 6)), out += static_cast<char>(0x80 | (code & 0x3F));
++                    else out += static_cast<char>(0xE0 | (code >> 12)), out += static_cast<char>(0x80 | ((code >> 6) & 0x3F)),
++                         out += static_cast<char>(0x80 | (code & 0x3F));
++                    continue;
++                }
++                c = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == 'b' ? '\b' : e == 'f' ? '\f' : e;
++            }
++            out += c;
++        }
++        if (at_ >= s_.size()) return false;
++        ++at_;
++        return true;
++    }
++    bool Value(Json& out) {
++        Space();
++        if (at_ >= s_.size()) return false;
++        const char c = s_[at_];
++        if (c == '{') {
++            out.kind = Json::Object;
++            ++at_;
++            Space();
++            if (at_ < s_.size() && s_[at_] == '}') return ++at_, true;
++            while (true) {
++                Space();
++                std::string key;
++                if (!Str(key)) return false;
++                Space();
++                if (at_ >= s_.size() || s_[at_++] != ':') return false;
++                Json value;
++                if (!Value(value)) return false;
++                out.fields.emplace_back(std::move(key), std::move(value));
++                Space();
++                if (at_ < s_.size() && s_[at_] == ',') { ++at_; continue; }
++                if (at_ < s_.size() && s_[at_] == '}') return ++at_, true;
++                return false;
++            }
++        }
++        if (c == '[') {
++            out.kind = Json::Array;
++            ++at_;
++            Space();
++            if (at_ < s_.size() && s_[at_] == ']') return ++at_, true;
++            while (true) {
++                Json value;
++                if (!Value(value)) return false;
++                out.items.push_back(std::move(value));
++                Space();
++                if (at_ < s_.size() && s_[at_] == ',') { ++at_; continue; }
++                if (at_ < s_.size() && s_[at_] == ']') return ++at_, true;
++                return false;
++            }
++        }
++        if (c == '"') return out.kind = Json::String, Str(out.text);
++        if (Literal("true")) return out.kind = Json::Bool, out.boolean = true, true;
++        if (Literal("false")) return out.kind = Json::Bool, true;
++        if (Literal("null")) return true;
++        const size_t start = at_;
++        while (at_ < s_.size() && (std::isdigit(static_cast<unsigned char>(s_[at_])) || s_[at_] == '-' || s_[at_] == '+' ||
++                                   s_[at_] == '.' || s_[at_] == 'e' || s_[at_] == 'E'))
++            ++at_;
++        if (at_ == start) return false;
++        out.kind = Json::Number;
++        out.number = std::stod(std::string(s_.substr(start, at_ - start)));
++        return true;
++    }
++    std::string_view s_;
++    size_t at_ = 0;
++};
++
++// MLB team ids -> the codes season_schedule.h knows.
++inline const char* TeamCode(int id) {
++    static const std::map<int, const char*> kTeams = {
++        {108, "LAA"}, {109, "ARI"}, {110, "BAL"}, {111, "BOS"}, {112, "CHC"}, {113, "CIN"}, {114, "CLE"}, {115, "COL"},
++        {116, "DET"}, {117, "HOU"}, {118, "KC"},  {119, "LAD"}, {120, "WSH"}, {121, "NYM"}, {133, "OAK"}, {134, "PIT"},
++        {135, "SD"},  {136, "SEA"}, {137, "SF"},  {138, "STL"}, {139, "TB"},  {140, "TEX"}, {141, "TOR"}, {142, "MIN"},
++        {143, "PHI"}, {144, "ATL"}, {145, "CWS"}, {146, "MIA"}, {147, "NYY"}, {158, "MIL"}};
++    const auto it = kTeams.find(id);
++    return it == kTeams.end() ? nullptr : it->second;
++}
++
++// Days from 1970-01-01 for a civil date, and its weekday (0 = Sunday).
++inline int DaysFromCivil(int y, int m, int d) {
++    y -= m <= 2;
++    const int era = (y >= 0 ? y : y - 399) / 400;
++    const int yoe = y - era * 400;
++    const int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
++    return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
++}
++inline int Weekday(int y, int m, int d) { return ((DaysFromCivil(y, m, d) % 7) + 11) % 7; }
++
++// Hours to add to UTC for US Eastern time: daylight time from the 2nd Sunday of March to the 1st of
++// November, 2:00 local (7:00 and 6:00 UTC).
++inline int EasternOffset(int y, int m, int d, int hour) {
++    const int marchSunday = 1 + (7 - Weekday(y, 3, 1)) % 7 + 7;
++    const int novemberSunday = 1 + (7 - Weekday(y, 11, 1)) % 7;
++    const auto at = [](int mm, int dd, int hh) { return std::make_tuple(mm, dd, hh); };
++    const auto now = at(m, d, hour);
++    return now >= at(3, marchSunday, 7) && now < at(11, novemberSunday, 6) ? -4 : -5;
++}
++
++struct Converted {
++    std::string csv;  // "date,home,away,time" lines with a header
++    int games = 0;
++    int minPerTeam = 0, maxPerTeam = 0;
++    std::string error;
++};
++
++inline Converted ToCsv(std::string_view json, int year) {
++    Converted out;
++    Json root;
++    if (!JsonReader(json).Parse(root) || root.kind != Json::Object) {
++        out.error = "the answer is not the schedule (JSON)";
++        return out;
++    }
++    std::set<std::tuple<std::string, std::string, std::string, std::string>> rows;
++    std::map<std::string, int> perTeam;
++    for (const Json& day : root["dates"].items) {
++        const std::string& date = day["date"].text;
++        for (const Json& game : day["games"].items) {
++            if (game["gameType"].text != "R" || game["rescheduledFrom"].kind != Json::Null ||
++                game["resumedFrom"].kind != Json::Null)
++                continue;  // not regular season, a postponed game's make-up or a suspended game's resumption
++            const char* home = TeamCode(static_cast<int>(game["teams"]["home"]["team"]["id"].number));
++            const char* away = TeamCode(static_cast<int>(game["teams"]["away"]["team"]["id"].number));
++            if (!home || !away) continue;
++            std::string time;
++            const std::string& utc = game["gameDate"].text;  // 2026-04-02T02:10:00Z
++            int y = 0, mo = 0, d = 0, h = 0, mi = 0;
++            if (!game["status"]["startTimeTBD"].boolean &&
++                std::sscanf(utc.c_str(), "%d-%d-%dT%d:%d", &y, &mo, &d, &h, &mi) == 5) {
++                int hour = h + EasternOffset(y, mo, d, h);
++                if (hour < 0) hour += 24;
++                char buffer[8];
++                std::snprintf(buffer, sizeof buffer, "%02d:%02d", hour, mi);
++                time = buffer;
++            }
++            if (rows.insert({date, home, away, time}).second) ++perTeam[home], ++perTeam[away];
++        }
++    }
++    if (rows.empty()) {
++        out.error = "no regular season games for " + std::to_string(year);
++        return out;
++    }
++    out.csv = "# MLB " + std::to_string(year) + " regular season, from statsapi.mlb.com\ndate,home,away,time\n";
++    for (const auto& [date, home, away, time] : rows) out.csv += date + "," + home + "," + away + "," + time + "\n";
++    out.games = static_cast<int>(rows.size());
++    out.minPerTeam = 1 << 30;
++    for (const auto& [team, n] : perTeam) out.minPerTeam = std::min(out.minPerTeam, n), out.maxPerTeam = std::max(out.maxPerTeam, n);
++    return out;
++}
++
++}  // namespace season_schedule_mlb
+diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
+index c5fafcd..249a2c4 100644
+--- a/runtime/src/hle/mlb/season_schedule.cpp
++++ b/runtime/src/hle/mlb/season_schedule.cpp
+@@ -198,12 +198,11 @@ void Apply(bool official) {
+             }
+         }
+     }
+-    int dropped = 0;
+-    for (const Game& game : games) {
+-        if (days[game.day].size() >= static_cast<size_t>(kSlots)) {
+-            ++dropped;
+-            continue;
+-        }
++    // Fitted to the game's season and 16 games a day (with what the game keeps, the All-Star Game).
++    std::array<int, kDays> taken{};
++    for (int day = 0; day < kDays; ++day) taken[day] = static_cast<int>(days[day].size());
++    const FitResult fitted = Fit(games, taken);
++    for (const Game& game : fitted.games) {
+         days[game.day].push_back(Slot{{static_cast<uint32_t>(game.home), static_cast<uint32_t>(game.away),
+                                        TimeWord(game.minutes), FlagsWord(game.minutes)}});
+     }
+@@ -213,9 +212,11 @@ void Apply(bool official) {
+             for (int w = 0; w < 4; ++w) Memory::Write32(address(day, slot) + 4 * w, entry.words[w]);
+         }
+     }
+-    std::fprintf(stderr, "[season] schedule %d: %zu games from %s replace the %s one%s\n", year,
+-                 games.size() - dropped, source.c_str(), official ? "official" : "generated",
+-                 dropped ? (" (" + std::to_string(dropped) + " dropped: more than 16 on a day)").c_str() : "");
++    std::fprintf(stderr,
++                 "[season] schedule %d: %zu games from %s replace the %s one (moved %d days, %d games off full days, "
++                 "%d dropped)\n",
++                 year, fitted.games.size(), source.c_str(), official ? "official" : "generated", fitted.shift,
++                 fitted.moved, fitted.dropped);
+ }
+ 
+ }  // namespace
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index ad97aa2..0135020 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -16,6 +16,8 @@
+ #include "aurora_events.h"
+ #include "runtime_config.h"
+ #include "runtime_log.h"
++#include "season_schedule.h"
++#include "season_schedule_mlb.h"
+ 
+ #include <aurora/aurora.h>
+ #include <imgui.h>
+@@ -294,6 +296,7 @@ constexpr int kOpenModsFolder = -2;
+ constexpr int kOpenRosterEditor = -3;
+ constexpr int kOpenTextureStudio = -4;
+ constexpr int kOpenSavesFolder = -5;
++constexpr int kDownloadSchedule = -6;
+ constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, MEJORAS; HERRAMIENTAS follows it
+ 
+ // Shown with every option tagged experimental (MEJORAS).
+@@ -493,6 +496,86 @@ void OpenSavesFolder(const std::vector<mods::Mod>& all) {
+ #endif
+ }
+ 
++constexpr Phrase kScheduleHelp{
++    "Descarga el calendario real de una temporada de las Grandes Ligas (de la web pública de MLB, "
++    "statsapi.mlb.com) y lo guarda en un mod como schedule/<año>.csv. El juego lo usa en la temporada "
++    "que lleva ese año, en el modo Temporada y en MLB Life.\n\n"
++    "Con «Nuevo: Calendarios MLB» se crea ese mod con el año elegido como primera temporada (start_year) "
++    "y se activa: una temporada nueva empieza en ese año con su calendario. Con un mod tuyo (un paquete de "
++    "temporada), el archivo se añade a los suyos.\n\n"
++    "Años: de 2002 a 2026, sin 2020 (60 partidos). Si una temporada empezó antes del 19 de marzo o acabó "
++    "después del 1 de octubre, el juego la juega unos días antes o después; los partidos de un día con "
++    "más de 16 pasan a un día cercano.\n\n"
++    "Necesita conexión a internet solo al descargar.",
++    "Downloads a major league season's real schedule (from MLB's public site, statsapi.mlb.com) and saves "
++    "it in a mod as schedule/<year>.csv. The game uses it in the season that carries that year, in Season "
++    "mode and in MLB Life.\n\n"
++    "With «New: MLB Schedules» that mod is created with the chosen year as its first season (start_year) "
++    "and switched on: a new season starts in that year with its schedule. With a mod of yours (a season "
++    "pack), the file is added to its own.\n\n"
++    "Years: 2002 to 2026, not 2020 (60 games). If a season started before March 19 or ended after "
++    "October 1, the game plays it a few days earlier or later; games on a day with more than 16 move to a "
++    "nearby day.\n\n"
++    "It needs an internet connection only to download."};
++
++// Downloads `year`'s schedule with the system's curl (Windows 10 and later, Linux) into
++// <mod>/schedule/<year>.csv; a new mod gets a mod.toml with that first season. Returns what to show.
++// ponytail: blocks the launcher for the download (a few seconds); a thread if it ever needs to be longer.
++std::string DownloadSchedule(int year, const std::filesystem::path& modDir, bool newMod) {
++    namespace fs = std::filesystem;
++    std::error_code ec;
++    fs::create_directories(modDir / "schedule", ec);
++    const fs::path temp = modDir / "schedule" / ".download.json";
++    fs::remove(temp, ec);
++    const std::string url = season_schedule_mlb::Url(year);
++#if defined(_WIN32)
++    std::wstring command = L"curl.exe -sSfL --max-time 60 -o \"" + temp.wstring() + L"\" \"" +
++                           std::wstring(url.begin(), url.end()) + L"\"";
++    STARTUPINFOW startup{sizeof(startup)};
++    PROCESS_INFORMATION process{};
++    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
++                       &process)) {
++        WaitForSingleObject(process.hProcess, 90000);
++        CloseHandle(process.hThread);
++        CloseHandle(process.hProcess);
++    }
++#else
++    const std::string command = "curl -sSfL --max-time 60 -o '" + temp.string() + "' '" + url + "'";
++    (void)std::system(command.c_str());
++#endif
++    std::ifstream input(temp, std::ios::binary);
++    const std::string json((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
++    input.close();
++    fs::remove(temp, ec);
++    if (json.empty())
++        return Tr("No se pudo descargar el calendario. Comprueba la conexión a internet.",
++                  "The schedule could not be downloaded. Check the internet connection.");
++    const season_schedule_mlb::Converted converted = season_schedule_mlb::ToCsv(json, year);
++    if (!converted.error.empty()) return std::string(Tr("Calendario no válido: ", "Not a valid schedule: ")) + converted.error;
++    std::ofstream(modDir / "schedule" / (std::to_string(year) + ".csv"), std::ios::binary) << converted.csv;
++    if (newMod && !fs::exists(modDir / "mod.toml", ec)) {
++        std::ofstream(modDir / "mod.toml", std::ios::binary)
++            << "name = \"" << Tr("Calendarios MLB", "MLB Schedules") << "\"\n"
++            << "description = \"" << Tr("Calendarios reales descargados desde el launcher.", "Real schedules downloaded from the launcher.")
++            << "\"\nstart_year = " << year << "\n";
++        mods::SetEnabled(RuntimeConfigFile::PathToUtf8(modDir.filename()), true);
++    }
++    // What the game will do with it (the same fit the runtime makes, without the All-Star Game).
++    const auto fitted = season_schedule::Fit(season_schedule::Parse(converted.csv).games);
++    std::string message = std::to_string(year) + ": " + std::to_string(converted.games) + Tr(" partidos (", " games (") +
++                          std::to_string(converted.minPerTeam) +
++                          (converted.minPerTeam == converted.maxPerTeam ? "" : "-" + std::to_string(converted.maxPerTeam)) +
++                          Tr(" por equipo), guardado en ", " a team), saved in ") +
++                          RuntimeConfigFile::PathToUtf8(modDir.filename()) + "/schedule/" + std::to_string(year) + ".csv.";
++    if (fitted.shift)
++        message += std::string(Tr(" El juego lo juega ", " The game plays it ")) + std::to_string(std::abs(fitted.shift)) +
++                   (fitted.shift < 0 ? Tr(" días antes para acabar el 1 de octubre.", " days earlier to end on October 1.")
++                                     : Tr(" días después para empezar el 19 de marzo.", " days later to start on March 19."));
++    if (fitted.moved) message += " " + std::to_string(fitted.moved) + Tr(" partidos pasan a un día cercano.", " games move to a nearby day.");
++    if (newMod) message += Tr(" El mod está activado: empieza una temporada nueva.", " The mod is switched on: start a new season.");
++    return message;
++}
++
+ void OpenModsFolder() {
+     const std::filesystem::path dir = mods::Directory();
+     std::error_code ec;
+@@ -774,6 +857,16 @@ Result Run(int argc, char** argv) {
+     toolsTab.options.push_back({Tr("ABRIR CARPETA DE MODS", "OPEN MODS FOLDER"), kModsHelp, {Tr("Abrir", "Open")}, 0, false, kOpenModsFolder});
+     toolsTab.options.push_back({Tr("EDITAR ROSTER (PowerUp+)", "EDIT ROSTER (PowerUp+)"), kRosterEditorHelp, {Tr("Abrir", "Open")}, 0, false, kOpenRosterEditor});
+     toolsTab.options.push_back({Tr("EDITOR DE TEXTURAS", "TEXTURE EDITOR"), kTextureStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenTextureStudio});
++    // The schedule download: a year, where to save it, and the button.
++    std::vector<std::string> scheduleYears;
++    for (int y : season_schedule_mlb::OfferedYears()) scheduleYears.push_back(std::to_string(y));
++    std::vector<std::string> scheduleTargets{Tr("Nuevo: Calendarios MLB", "New: MLB Schedules")};
++    for (const auto& m : installedMods) scheduleTargets.push_back(m.name);
++    toolsTab.options.push_back({Tr("CALENDARIO: AÑO", "SCHEDULE: YEAR"), kScheduleHelp, scheduleYears, 0, false});
++    toolsTab.options.push_back({Tr("CALENDARIO: GUARDAR EN", "SCHEDULE: SAVE IN"), kScheduleHelp, scheduleTargets, 0, false});
++    toolsTab.options.push_back({Tr("DESCARGAR CALENDARIO", "DOWNLOAD SCHEDULE"), kScheduleHelp, {Tr("Descargar", "Download")}, 0,
++                                false, kDownloadSchedule});
++    std::string scheduleNotice;
+     toolsTab.options.push_back({kRosterPlayersLabel, kRosterPlayersHelp, {Tr("Nativos", "Native"), Tr("Como en el editor", "As in the editor")},
+                                 RuntimeConfigFile::NativeRoster(true) ? 0 : 1});
+     for (size_t i = 0; i < installedMods.size(); ++i) {
+@@ -850,6 +943,21 @@ Result Run(int argc, char** argv) {
+             OpenTextureStudio();
+             return;
+         }
++        if (o.mod == kDownloadSchedule) {
++            const Tab& tools = tabs[kModsTab + 1];
++            int year = 0, target = 0;
++            for (const Option& t : tools.options) {
++                if (std::strcmp(t.label, Tr("CALENDARIO: AÑO", "SCHEDULE: YEAR")) == 0) year = std::atoi(t.choices[t.value].c_str());
++                if (std::strcmp(t.label, Tr("CALENDARIO: GUARDAR EN", "SCHEDULE: SAVE IN")) == 0) target = t.value;
++            }
++            const bool newMod = target == 0;
++            const std::filesystem::path dir =
++                newMod ? mods::Directory() / "MLBSchedules" : installedMods[static_cast<size_t>(target - 1)].root;
++            scheduleNotice = DownloadSchedule(year, dir, newMod);
++            tabs[kModsTab + 1].footer = scheduleNotice.c_str();
++            if (newMod) restart = true;  // a new mod is read when the game starts
++            return;
++        }
+         if (o.mod >= 0) {
+             mods::Mod& m = currentMods[static_cast<size_t>(o.mod)];
+             mods::SetEnabled(m.id, o.value != 0);
+@@ -951,6 +1059,20 @@ Result Run(int argc, char** argv) {
+     const char* testAction = std::getenv("WIICOMPILED_LAUNCHER_ACTION");
+     if (testAction != nullptr && std::strcmp(testAction, "roster-editor") == 0) OpenRosterEditor();
+     if (testAction != nullptr && std::strcmp(testAction, "texture-studio") == 0) OpenTextureStudio();
++    // schedule-<year>: TOOLS > SCHEDULE for that year into a new mod, as the button does.
++    if (testAction != nullptr && std::strncmp(testAction, "schedule-", 9) == 0) {
++        Tab& tools = tabs[kModsTab + 1];
++        for (int i = 0; i < static_cast<int>(tools.options.size()); ++i) {
++            Option& t = tools.options[static_cast<size_t>(i)];
++            if (std::strcmp(t.label, Tr("CALENDARIO: AÑO", "SCHEDULE: YEAR")) == 0)
++                for (size_t c = 0; c < t.choices.size(); ++c)
++                    if (t.choices[c] == testAction + 9) t.value = static_cast<int>(c);
++            if (std::strcmp(t.label, Tr("CALENDARIO: GUARDAR EN", "SCHEDULE: SAVE IN")) == 0) t.value = 0;
++        }
++        for (int i = 0; i < static_cast<int>(tools.options.size()); ++i)
++            if (tools.options[static_cast<size_t>(i)].mod == kDownloadSchedule) apply(kModsTab + 1, i);
++        std::fprintf(stderr, "launcher: %s\n", scheduleNotice.c_str());
++    }
+     // =language-es / =language-en: switch the language once, as if chosen in INTERFAZ (the launcher is
+     // rebuilt on the same page; the rebuilt one finds the language already set and does nothing).
+     if (testAction != nullptr && std::strncmp(testAction, "language-", 9) == 0) {
+diff --git a/runtime/tests/season_schedule_mlb_tests.cpp b/runtime/tests/season_schedule_mlb_tests.cpp
+new file mode 100644
+index 0000000..36422a2
+--- /dev/null
++++ b/runtime/tests/season_schedule_mlb_tests.cpp
+@@ -0,0 +1,61 @@
++#include "season_schedule_mlb.h"
++#include "season_schedule.h"
++#include <cstdio>
++
++static int failures = 0;
++static void Check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++
++int main() {
++    using namespace season_schedule_mlb;
++    const auto years = OfferedYears();
++    Check(years.front() == 2026 && years.back() == 2002 && years.size() == 24, "2026 to 2002");
++    Check(std::find(years.begin(), years.end(), 2020) == years.end(), "not 2020");
++    Check(Weekday(2026, 3, 25) == 3 && Weekday(2008, 3, 25) == 2, "weekdays");
++    Check(EasternOffset(2026, 7, 2, 2) == -4 && EasternOffset(2026, 3, 1, 18) == -5 && EasternOffset(2026, 3, 8, 7) == -4,
++          "Eastern daylight time");
++
++    // A regular game (late West Coast: already the next day in UTC), its postponed make-up, an
++    // exhibition, a game with no time yet and an escaped string.
++    const char* json = R"({"copyright":"x \"y\" \u00e9","dates":[
++      {"date":"2026-04-01","games":[
++        {"gameType":"R","gameDate":"2026-04-02T02:10:00Z","status":{"startTimeTBD":false},
++         "teams":{"home":{"team":{"id":119}},"away":{"team":{"id":109}}}},
++        {"gameType":"R","gameDate":"2026-04-01T17:05:00Z","rescheduledFrom":"2026-03-30","status":{},
++         "teams":{"home":{"team":{"id":147}},"away":{"team":{"id":111}}}},
++        {"gameType":"S","gameDate":"2026-04-01T17:05:00Z","status":{},
++         "teams":{"home":{"team":{"id":147}},"away":{"team":{"id":111}}}},
++        {"gameType":"R","gameDate":"2026-04-01T07:33:00Z","status":{"startTimeTBD":true},
++         "teams":{"home":{"team":{"id":121}},"away":{"team":{"id":143}}}}]}]})";
++    const Converted c = ToCsv(json, 2026);
++    Check(c.error.empty() && c.games == 2, "two regular games kept");
++    Check(c.csv.find("2026-04-01,LAD,ARI,22:10") != std::string::npos, "home, away, Eastern time");
++    Check(c.csv.find("2026-04-01,NYM,PHI,\n") != std::string::npos, "no time when it is not set");
++    Check(!ToCsv("<html>", 2026).error.empty() && !ToCsv("{\"dates\":[]}", 2026).error.empty(), "errors");
++
++    // The CSV reads back, and Fit moves a season that ends after October 1.
++    const auto parsed = season_schedule::Parse(c.csv);
++    Check(parsed.games.size() == 2 && parsed.errors.empty(), "the CSV is the runtime's format");
++    std::vector<season_schedule::Game> late = {{season_schedule::DayIndex(10, 5), 0, 1, 1140},
++                                               {season_schedule::DayIndex(4, 7), 2, 3, 1140}};
++    const auto fitted = season_schedule::Fit(late);
++    Check(fitted.shift == -4 && fitted.games.back().day == season_schedule::DayIndex(10, 1), "moved 4 days earlier");
++    std::vector<season_schedule::Game> early = {{season_schedule::DayIndex(3, 18), 0, 1, 1140}};
++    Check(season_schedule::Fit(early).shift == 1, "a March 18 opener moves a day later");
++    // 17 games on a day: one goes to the day after, where neither team plays.
++    std::vector<season_schedule::Game> full;
++    for (int i = 0; i < 17; ++i) full.push_back({season_schedule::DayIndex(5, 1), i % 30, (i + 15) % 30, 1140});
++    const auto spread = season_schedule::Fit(full);
++    Check(spread.games.size() == 17 && spread.moved == 1 && spread.dropped == 0, "a 17th game moves to a nearby day");
++    int month = 0, day = 0;
++    season_schedule::MonthDay(season_schedule::DayIndex(9, 30), month, day);
++    Check(month == 9 && day == 30, "month and day back from a slot day");
++
++    if (failures) return 1;
++    std::printf("season_schedule_mlb_tests: ok\n");
++    return 0;
++}
