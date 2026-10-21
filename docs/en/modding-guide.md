@@ -122,8 +122,8 @@ More in [roster-2008.md](roster-2008.md).
 
 Players you make in Success are shared with a 156-character password. In the original game you had to copy it from a photo and type it with the controller; here it goes as text:
 
-- **Copy:** open My Data › View or Delete Custom Players › the player › Password Display and press **Ctrl+C**. The password is on the clipboard as text, in groups of 3 and rows of 18 as on the screen, to paste in a message, a forum or a file.
-- **Paste:** open My Data › Password Input, press **Ctrl+V** and then OK. The player is saved as if you had typed it.
+- **Copy:** open My Data › View or Delete Custom Players › the player › Password Display and press the orange **Copy password** button (bottom right) or **Ctrl+C**. The password is on the clipboard as text, in groups of 3 and rows of 18 as on the screen, to paste in a message, a forum or a file.
+- **Paste:** open My Data › Password Input, press the **Paste password** button or **Ctrl+V** and then OK. The player is saved as if you had typed it.
 
 When pasting, spaces and line breaks are skipped, and stand-ins are taken for the symbols that are not on the keyboard: `-` (−), `/` (÷), `!=` (≠), `@` (◎), `^` (△), `*` (☆), `->` (⇒), `<->` (⇔), `■` (□), `▼` (▽), `◆` (◇), `0` (O). A notice at the bottom shows the result. A Success player also has the right age in MLB Life with a season pack.
 
