@@ -84,7 +84,7 @@ Details in `docs/en/reverse-engineering.md` («DH in both leagues»).
 **TOOLS > SCHEDULE** downloads a major league season's real schedule from MLB's public site (statsapi.mlb.com) and saves it in a mod as `schedule/<year>.csv`:
 
 1. **SCHEDULE: YEAR**: 2002 to 2026. 2020 (60 games a team, from July) and the years before 2002 (their data on MLB's site does not add up to 162 a team) are not offered.
-2. **SCHEDULE: SAVE IN**: «New: MLB Schedules» creates the `MLBSchedules` mod with that year as its first season (`start_year`) and switches it on; or one of your mods (a season pack), which gets the file.
+2. **SCHEDULE: SAVE IN**: «New: MLB Schedules» creates the `MLBSchedules` mod with that year as its first season (`start_year`) and switches it on; or one of your mods (your roster, for example), which gets the file. The game uses a year's schedule in the season that carries that year: if the mod had no start year, `start_year = <year>` is added at the end of its `mod.toml` (the rest is left as it is) and a new season with it starts in that year. If it had another, the message says in which season it will be used.
 3. **DOWNLOAD SCHEDULE**: the result shows below, e.g. «2022: 2430 games (162 a team)… The game plays it 4 days earlier to end on October 1».
 
 The game plays the regular season from March 19 to October 1 and at most 16 games a day. A season that started earlier or ended later is played the days needed earlier or later (same order, other dates; it happens in 2004, 2005, 2009, 2010, 2012, 2015, 2016, 2021, 2022 and 2025). A game on a day with more than 16 moves to the nearest day off of both teams. No year loses games. For a roster of another year, `roster_year` in `mod.toml` (`docs/en/mods.md`). Internet is only needed to download.

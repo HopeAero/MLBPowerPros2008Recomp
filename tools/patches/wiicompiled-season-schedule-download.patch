@@ -368,7 +368,7 @@ index c5fafcd..249a2c4 100644
  
  }  // namespace
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index ad97aa2..0135020 100644
+index ad97aa2..3bdb836 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
 @@ -16,6 +16,8 @@
@@ -388,7 +388,7 @@ index ad97aa2..0135020 100644
  constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, MEJORAS; HERRAMIENTAS follows it
  
  // Shown with every option tagged experimental (MEJORAS).
-@@ -493,6 +496,86 @@ void OpenSavesFolder(const std::vector<mods::Mod>& all) {
+@@ -493,6 +496,124 @@ void OpenSavesFolder(const std::vector<mods::Mod>& all) {
  #endif
  }
  
@@ -397,8 +397,10 @@ index ad97aa2..0135020 100644
 +    "statsapi.mlb.com) y lo guarda en un mod como schedule/<año>.csv. El juego lo usa en la temporada "
 +    "que lleva ese año, en el modo Temporada y en MLB Life.\n\n"
 +    "Con «Nuevo: Calendarios MLB» se crea ese mod con el año elegido como primera temporada (start_year) "
-+    "y se activa: una temporada nueva empieza en ese año con su calendario. Con un mod tuyo (un paquete de "
-+    "temporada), el archivo se añade a los suyos.\n\n"
++    "y se activa: una temporada nueva empieza en ese año con su calendario. Con un mod tuyo (por ejemplo tu "
++    "roster), el archivo se añade a los suyos; si el mod no tenía año inicial, se le pone ese año (start_year "
++    "en su mod.toml, sin tocar lo demás), porque el juego usa el calendario de un año en la temporada que "
++    "lleva ese año.\n\n"
 +    "Años: de 2002 a 2026, sin 2020 (60 partidos). Si una temporada empezó antes del 19 de marzo o acabó "
 +    "después del 1 de octubre, el juego la juega unos días antes o después; los partidos de un día con "
 +    "más de 16 pasan a un día cercano.\n\n"
@@ -407,8 +409,10 @@ index ad97aa2..0135020 100644
 +    "it in a mod as schedule/<year>.csv. The game uses it in the season that carries that year, in Season "
 +    "mode and in MLB Life.\n\n"
 +    "With «New: MLB Schedules» that mod is created with the chosen year as its first season (start_year) "
-+    "and switched on: a new season starts in that year with its schedule. With a mod of yours (a season "
-+    "pack), the file is added to its own.\n\n"
++    "and switched on: a new season starts in that year with its schedule. With a mod of yours (your roster, "
++    "for example), the file is added to its own; if the mod had no start year, it gets that year (start_year "
++    "in its mod.toml, the rest left as it is), because the game uses a year's schedule in the season that "
++    "carries that year.\n\n"
 +    "Years: 2002 to 2026, not 2020 (60 games). If a season started before March 19 or ended after "
 +    "October 1, the game plays it a few days earlier or later; games on a day with more than 16 move to a "
 +    "nearby day.\n\n"
@@ -465,17 +469,51 @@ index ad97aa2..0135020 100644
 +                          RuntimeConfigFile::PathToUtf8(modDir.filename()) + "/schedule/" + std::to_string(year) + ".csv.";
 +    if (fitted.shift)
 +        message += std::string(Tr(" El juego lo juega ", " The game plays it ")) + std::to_string(std::abs(fitted.shift)) +
-+                   (fitted.shift < 0 ? Tr(" días antes para acabar el 1 de octubre.", " days earlier to end on October 1.")
-+                                     : Tr(" días después para empezar el 19 de marzo.", " days later to start on March 19."));
++                   (std::abs(fitted.shift) == 1 ? Tr(" día", " day") : Tr(" días", " days")) +
++                   (fitted.shift < 0 ? Tr(" antes para acabar el 1 de octubre.", " earlier to end on October 1.")
++                                     : Tr(" después para empezar el 19 de marzo.", " later to start on March 19."));
 +    if (fitted.moved) message += " " + std::to_string(fitted.moved) + Tr(" partidos pasan a un día cercano.", " games move to a nearby day.");
-+    if (newMod) message += Tr(" El mod está activado: empieza una temporada nueva.", " The mod is switched on: start a new season.");
++    if (newMod) {
++        message += Tr(" El mod está activado: empieza una temporada nueva.", " The mod is switched on: start a new season.");
++        return message;
++    }
++    // A mod of the user's: the game uses schedule/<year>.csv in the season it shows as <year>, so a mod
++    // with no first season of its own (it starts in 2008) gets this year as its start_year, appended to
++    // its mod.toml (the rest of the file is left as it is).
++    int startYear = 0;
++    for (const auto& m : mods::Discover())
++        if (m.root == modDir) startYear = m.startYear;
++    if (startYear == 0 && year != 2008) {
++        const fs::path manifest = modDir / "mod.toml";
++        std::string text;
++        if (std::ifstream in{manifest, std::ios::binary}) text.assign(std::istreambuf_iterator<char>(in), {});
++        // Before any [table], where a top-level key has to go.
++        const size_t table = text.find("\n[");
++        const std::string line = "start_year = " + std::to_string(year) + "\n";
++        if (text.empty()) text = "name = \"" + RuntimeConfigFile::PathToUtf8(modDir.filename()) + "\"\n" + line;
++        else if (table != std::string::npos) text.insert(table + 1, line);
++        else text += (text.back() == '\n' ? "" : "\n") + line;
++        std::ofstream(manifest, std::ios::binary) << text;
++        startYear = year;
++        message += std::string(Tr(" Se añadió start_year = ", " Added start_year = ")) + std::to_string(year) +
++                   Tr(" al mod.toml: una temporada nueva con este mod empieza en ese año (las partidas ya empezadas siguen "
++                      "como estaban).",
++                      " to its mod.toml: a new season with this mod starts in that year (games already started stay as "
++                      "they were).");
++    } else if (startYear != 0 && year < startYear) {
++        message += std::string(Tr(" Ojo: este mod empieza en ", " Note: this mod starts in ")) + std::to_string(startYear) +
++                   Tr(", así que este calendario no se usará.", ", so this schedule will not be used.");
++    } else if (startYear != 0 && year > startYear) {
++        message += std::string(Tr(" Se usará en la temporada ", " It will be used in the season ")) + std::to_string(year) +
++                   Tr(" de las partidas con este mod.", " of games with this mod.");
++    }
 +    return message;
 +}
 +
  void OpenModsFolder() {
      const std::filesystem::path dir = mods::Directory();
      std::error_code ec;
-@@ -774,6 +857,16 @@ Result Run(int argc, char** argv) {
+@@ -774,6 +895,16 @@ Result Run(int argc, char** argv) {
      toolsTab.options.push_back({Tr("ABRIR CARPETA DE MODS", "OPEN MODS FOLDER"), kModsHelp, {Tr("Abrir", "Open")}, 0, false, kOpenModsFolder});
      toolsTab.options.push_back({Tr("EDITAR ROSTER (PowerUp+)", "EDIT ROSTER (PowerUp+)"), kRosterEditorHelp, {Tr("Abrir", "Open")}, 0, false, kOpenRosterEditor});
      toolsTab.options.push_back({Tr("EDITOR DE TEXTURAS", "TEXTURE EDITOR"), kTextureStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenTextureStudio});
@@ -492,7 +530,7 @@ index ad97aa2..0135020 100644
      toolsTab.options.push_back({kRosterPlayersLabel, kRosterPlayersHelp, {Tr("Nativos", "Native"), Tr("Como en el editor", "As in the editor")},
                                  RuntimeConfigFile::NativeRoster(true) ? 0 : 1});
      for (size_t i = 0; i < installedMods.size(); ++i) {
-@@ -850,6 +943,21 @@ Result Run(int argc, char** argv) {
+@@ -850,6 +981,21 @@ Result Run(int argc, char** argv) {
              OpenTextureStudio();
              return;
          }
@@ -514,19 +552,26 @@ index ad97aa2..0135020 100644
          if (o.mod >= 0) {
              mods::Mod& m = currentMods[static_cast<size_t>(o.mod)];
              mods::SetEnabled(m.id, o.value != 0);
-@@ -951,6 +1059,20 @@ Result Run(int argc, char** argv) {
+@@ -951,6 +1097,27 @@ Result Run(int argc, char** argv) {
      const char* testAction = std::getenv("WIICOMPILED_LAUNCHER_ACTION");
      if (testAction != nullptr && std::strcmp(testAction, "roster-editor") == 0) OpenRosterEditor();
      if (testAction != nullptr && std::strcmp(testAction, "texture-studio") == 0) OpenTextureStudio();
-+    // schedule-<year>: TOOLS > SCHEDULE for that year into a new mod, as the button does.
++    // schedule-<year>[@<mod folder>]: TOOLS > SCHEDULE for that year into a new mod (or that mod), as the
++    // button does.
 +    if (testAction != nullptr && std::strncmp(testAction, "schedule-", 9) == 0) {
 +        Tab& tools = tabs[kModsTab + 1];
++        const std::string spec = testAction + 9;
++        const size_t at = spec.find('@');
++        const std::string yearText = spec.substr(0, at);
++        int target = 0;
++        for (size_t m = 0; m < installedMods.size() && at != std::string::npos; ++m)
++            if (installedMods[m].id == spec.substr(at + 1)) target = static_cast<int>(m) + 1;
 +        for (int i = 0; i < static_cast<int>(tools.options.size()); ++i) {
 +            Option& t = tools.options[static_cast<size_t>(i)];
 +            if (std::strcmp(t.label, Tr("CALENDARIO: AÑO", "SCHEDULE: YEAR")) == 0)
 +                for (size_t c = 0; c < t.choices.size(); ++c)
-+                    if (t.choices[c] == testAction + 9) t.value = static_cast<int>(c);
-+            if (std::strcmp(t.label, Tr("CALENDARIO: GUARDAR EN", "SCHEDULE: SAVE IN")) == 0) t.value = 0;
++                    if (t.choices[c] == yearText) t.value = static_cast<int>(c);
++            if (std::strcmp(t.label, Tr("CALENDARIO: GUARDAR EN", "SCHEDULE: SAVE IN")) == 0) t.value = target;
 +        }
 +        for (int i = 0; i < static_cast<int>(tools.options.size()); ++i)
 +            if (tools.options[static_cast<size_t>(i)].mod == kDownloadSchedule) apply(kModsTab + 1, i);
