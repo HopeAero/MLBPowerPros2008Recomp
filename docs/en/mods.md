@@ -144,6 +144,7 @@ mods\
 - **What does not change:** the game's economy (salaries, luxury tax) follows its seasons 1, 2, 3…, as from 2008. The postseason still has 8 teams.
 - The start year is set when the game is created and travels inside the save: a 2026 game stays in 2026 even if the pack is disabled later, and saves without a pack do not change.
 - With several packs enabled, the first one by name that has `start_year` wins.
+- **MLB Life too:** a new MLB Life career with the pack enabled starts in the previous off-season (November 2025 for `start_year = 2026`), with the roster's ages, the pack's divisions and `schedule/2026.csv` for its first season. The year travels inside its save (`pm3usmy*.dat`) as in Season mode.
 - Textures, uniforms and stadiums are better as separate mods: they combine with the pack when enabled together.
 
 ## Saves per roster

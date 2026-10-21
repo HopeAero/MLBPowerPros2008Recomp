@@ -144,6 +144,7 @@ mods\
 - **Lo que no cambia:** la economía del juego (salarios, impuesto de lujo) sigue la de sus temporadas 1, 2, 3…, como en 2008. La postemporada sigue siendo de 8 equipos.
 - El año inicial se fija al crear la partida y va dentro de ella: una partida de 2026 sigue en 2026 aunque luego se desactive el paquete, y las partidas sin paquete no cambian.
 - Con varios paquetes activos manda el primero, por nombre, que tenga `start_year`.
+- **MLB Life también:** una carrera nueva de MLB Life con el paquete activo empieza en la temporada baja anterior (noviembre de 2025 para `start_year = 2026`), con las edades del roster, las divisiones del paquete y `schedule/2026.csv` para su primera temporada. El año va dentro de su partida (`pm3usmy*.dat`) como en Temporada.
 - Texturas, uniformes y estadios mejor en mods aparte: se combinan con el paquete al activarlos a la vez.
 
 ## Partidas por roster

@@ -1,0 +1,261 @@
+diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
+index aaf0c42..adc4a30 100644
+--- a/runtime/include/season_cap.h
++++ b/runtime/include/season_cap.h
+@@ -276,6 +276,39 @@ inline std::vector<uint8_t> ShiftRows(uint8_t* rows, size_t rowBytes, size_t cou
+     return dropped;
+ }
+ 
++// MLB Life saves (pm3usmy<slot>.dat, 0xF8000 bytes) are the same kind of block copy: the year index is
++// at file 0x47EE8 and the game's data end before 0xF4000 (the last 16 KB chunk a load reads ends
++// there). A season pack's start year travels in a small tail of their own at kLifeTailOffset:
++// "PPLIFE01", u32 start shift (big-endian).
++constexpr uint32_t kLifeFileSize = 0xF8000, kLifeLoadEnd = 0xF4000, kLifeIndexOffset = 0x47EE8;
++constexpr uint32_t kLifeTailOffset = 0xF7FC0;
++constexpr size_t kLifeTailSize = 12;
++constexpr char kLifeTailMagic[8] = {'P', 'P', 'L', 'I', 'F', 'E', '0', '1'};
++inline void WriteLifeTail(uint32_t startShift, uint8_t* out) {
++    std::memcpy(out, kLifeTailMagic, 8);
++    PutBe32(out + 8, startShift);
++}
++inline bool ReadLifeTail(const uint8_t* in, uint32_t& startShift) {
++    startShift = 0;
++    if (std::memcmp(in, kLifeTailMagic, 8) != 0) return false;
++    startShift = GetBe32(in + 8);
++    return true;
++}
++// The part of a write chunk that covers the life tail gets it.
++inline void OverlayLifeTail(uint32_t startShift, uint32_t fileOffset, uint8_t* data, size_t length) {
++    const uint32_t from = fileOffset > kLifeTailOffset ? fileOffset : kLifeTailOffset;
++    const uint32_t end = kLifeTailOffset + static_cast<uint32_t>(kLifeTailSize);
++    const uint32_t to = fileOffset + length < end ? fileOffset + static_cast<uint32_t>(length) : end;
++    if (from >= to) return;
++    uint8_t bytes[kLifeTailSize];
++    WriteLifeTail(startShift, bytes);
++    std::memcpy(data + (from - fileOffset), bytes + (from - kLifeTailOffset), to - from);
++}
++inline bool IsLifeSaveName(const char* fileName) {
++    return fileName && std::strncmp(fileName, "pm3usmy", 7) == 0 && fileName[7] >= '0' && fileName[7] <= '2' &&
++           std::strcmp(fileName + 8, ".dat") == 0;
++}
++
+ // pm3usse0.dat .. pm3usse2.dat, the three Season mode slots.
+ inline bool IsSeasonSaveName(const char* fileName) {
+     return fileName && std::strncmp(fileName, "pm3usse", 7) == 0 && fileName[7] >= '0' && fileName[7] <= '2' &&
+@@ -296,5 +329,9 @@ void OnHostFrame();        // settings_overlay.cpp, once per presented frame
+ // data (a copy the hook may change).
+ void OnSeasonSaveRead(uint32_t fileOffset, const uint8_t* data, size_t length, const uint8_t* tail);
+ void OnSeasonSaveWrite(uint32_t fileOffset, uint8_t* data, size_t length);
++// The same for MLB Life saves (IsLifeSaveName); `tail` (kLifeTailSize bytes from kLifeTailOffset) comes
++// with the chunk that holds the year index.
++void OnLifeSaveRead(uint32_t fileOffset, const uint8_t* data, size_t length, const uint8_t* tail);
++void OnLifeSaveWrite(uint32_t fileOffset, uint8_t* data, size_t length);
+ 
+ }  // namespace season_cap
+diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
+index 10dd283..571b421 100644
+--- a/runtime/src/hle/mlb/season_cap.cpp
++++ b/runtime/src/hle/mlb/season_cap.cpp
+@@ -34,6 +34,7 @@ int g_pendingFrames = 0;
+ // (saving reads the slot's old file whole, then reads back what it wrote: those are not loads).
+ struct LoadCandidate {
+     bool set = false;
++    bool life = false;  // an MLB Life save (its own small tail: start shift only)
+     int index = -1;
+     bool ours = false;
+     SeasonTail tail;
+@@ -46,6 +47,7 @@ std::atomic<int> g_frame{0};
+ // Season mode and MLB Life both point [0x8104B5A8] and [0x8104B59C] at their own blocks; the first
+ // player id ([0x8104B608], u16) tells them apart: 7001 in Season mode (0x80C48344), 9001 in MLB Life.
+ bool SeasonModeActive() { return Memory::Read16(0x8104B608u) == 7001; }
++bool LifeModeActive() { return Memory::Read16(0x8104B608u) == 9001; }
+ 
+ // [0x8104B5A8], or 0 when there is no state.
+ uint32_t State() {
+@@ -187,21 +189,40 @@ int SeasonCount() {
+ 
+ int Count() { return SeasonModeActive() ? SeasonCount() : kOriginalSeasons; }
+ 
+-uint32_t YearOffset() { return SeasonModeActive() ? ShownOffset(g_tail) : 0; }
++uint32_t YearOffset() { return SeasonModeActive() ? ShownOffset(g_tail) : LifeModeActive() ? g_tail.startShift : 0; }
+ 
+-// The game's own players (ids 7001..8500, 1500 records of 0xB0 at [0x8104B59C] + 0x3564) carry the
++// The mode's own players (ids from [0x8104B608]: 7001.. in Season mode, 9001.. in MLB Life; 1500
++// records of 0xB0, PlayerTable) carry the
+ // roster's birth years, made for 2008; ages come from the year shown (0x80B861B0: 0x80B4A888 and the
+ // birth date, 11 bits from bit 1 of word +0x80, getter 0x8082B544). With a later start year they are
+ // born that much later, so the roster's ages stay; players the game makes later already use the year shown.
++// The mode's player table: Season mode's at [0x8104B59C] + 0x3564, MLB Life's at + 0x68E4; found by
++// its first ids (the first player id is [0x8104B608]: 7001 or 9001).
++uint32_t PlayerTable(uint16_t first) {
++    constexpr uint32_t kRecord = 0xB0;
++    const uint32_t block = Memory::Read32(0x8104B59Cu);
++    for (uint32_t at = block; at < block + 0x20000; at += 4) {
++        if (!Memory::Contains(at, 3 * kRecord)) return 0;
++        if (Memory::Read16(at) == first && Memory::Read16(at + kRecord) == first + 1 &&
++            Memory::Read16(at + 2 * kRecord) == first + 2)
++            return at;
++    }
++    return 0;
++}
++
+ void ShiftBirthYears(uint32_t shift) {
+-    constexpr uint32_t kPlayers = 0x3564, kSlots = 1500, kRecord = 0xB0;
+-    const uint32_t table = Memory::Read32(0x8104B59Cu) + kPlayers;
+-    if (!Memory::Contains(table, kSlots * kRecord)) return;
++    constexpr uint32_t kSlots = 1500, kRecord = 0xB0;
++    const uint16_t first = Memory::Read16(0x8104B608u);
++    const uint32_t table = PlayerTable(first);
++    if (!table || !Memory::Contains(table, kSlots * kRecord)) {
++        std::fprintf(stderr, "[season] player table not found: birth years unchanged\n");
++        return;
++    }
+     int moved = 0;
+     for (uint32_t i = 0; i < kSlots; ++i) {
+         const uint32_t record = table + i * kRecord;
+         const uint16_t id = Memory::Read16(record);
+-        if (id < 7001 || id > 8500) continue;
++        if (id < first || id >= first + kSlots) continue;
+         const uint32_t word = Memory::Read32(record + 0x80);
+         const uint32_t year = ((word >> 1) & 0x7FFu) + shift;
+         Memory::Write32(record + 0x80, (word & ~(0x7FFu << 1)) | ((year & 0x7FFu) << 1));
+@@ -222,7 +243,8 @@ bool UniversalDh() {
+ }
+ 
+ bool BeginNewGame(int startYear) {
+-    if (!SeasonModeActive() || CurrentIndex() != 0) return false;  // only a new game builds a schedule at index 0
++    // A new game of either mode (MLB Life's starts at index 0 too, then goes back to its off-season).
++    if ((!SeasonModeActive() && !LifeModeActive()) || CurrentIndex() != 0) return false;
+     g_tail = {};
+     g_tail.startShift = startYear > 2008 ? static_cast<uint32_t>(startYear - 2008) : 0;
+     if (g_tail.startShift) {
+@@ -295,7 +317,9 @@ static void TakeLoad() {
+     g_candidate.set = false;
+     g_loadedInMemory.store(false);
+     g_loadedIndex.store(g_candidate.index);
+-    g_needed.store(NeededCount(g_candidate.index, g_candidate.ours && g_candidate.tail.pastTen, g_candidate.tail.yearOffset));
++    g_needed.store(g_candidate.life ? kOriginalSeasons
++                                    : NeededCount(g_candidate.index, g_candidate.ours && g_candidate.tail.pastTen,
++                                                  g_candidate.tail.yearOffset));
+     g_tail = std::move(g_candidate.tail);  // empty for a save without our tail
+     std::fprintf(stderr, "[season] season %d loaded; %s, year offset %u, start shift %u, %zu archived seasons\n",
+                  g_candidate.index + 1,
+@@ -305,6 +329,26 @@ static void TakeLoad() {
+     g_pendingIndex.store(g_candidate.index);
+ }
+ 
++void OnLifeSaveRead(uint32_t fileOffset, const uint8_t* data, size_t length, const uint8_t* tail) {
++    std::lock_guard<std::mutex> lock(g_candidateLock);
++    if (fileOffset >= kLifeLoadEnd) {
++        g_candidate.set = false;  // past the data: a save's read, not a load
++        return;
++    }
++    if (!tail || fileOffset > kLifeIndexOffset || kLifeIndexOffset >= fileOffset + length) return;
++    g_candidate = {};
++    g_candidate.life = true;
++    g_candidate.ours = ReadLifeTail(tail, g_candidate.tail.startShift);
++    g_candidate.index = static_cast<int8_t>(data[kLifeIndexOffset - fileOffset]);
++    g_candidate.frame = g_frame.load();
++    g_candidate.set = true;
++}
++
++void OnLifeSaveWrite(uint32_t fileOffset, uint8_t* data, size_t length) {
++    if (!LifeModeActive() || g_tail.startShift == 0) return;  // anything else stays byte for byte
++    OverlayLifeTail(g_tail.startShift, fileOffset, data, length);
++}
++
+ void OnSeasonSaveWrite(uint32_t fileOffset, uint8_t* data, size_t length) {
+     // Only a game past season 10 (stored years) or from a season pack (its start year) needs the tail;
+     // anything else stays byte for byte.
+diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
+index cb9ffa1..9028b5e 100644
+--- a/runtime/src/hle/mlb/season_schedule.cpp
++++ b/runtime/src/hle/mlb/season_schedule.cpp
+@@ -181,7 +181,6 @@ void Apply(bool official) {
+ // 0x80B97DC4: builds the year's schedule. As the original, with the mod's schedule put in between.
+ extern "C" void MLB_BuildSchedule_80B97DC4(CpuContext* ctx) {
+     using season_schedule::Call;
+-    season_cap::BeginNewGame(season_schedule::StartYear());
+     Call(ctx, 0x80B97D68u, InvokeDirectCpu<0x80B97D68u>);  // empty every slot
+     // 2008 with the original divisions: the official schedule; otherwise one is generated, unless a
+     // mod brings this year's (the generator is the game's, made for leagues of even size).
+@@ -207,6 +206,8 @@ extern "C" void MLB_NewSeasonGame_80BB0B78(CpuContext* ctx) {
+     Call(ctx, 0x80B86AE0u, InvokeDirectCpu<0x80B86AE0u>);
+     Call(ctx, 0x80B7AF8Cu, InvokeDirectCpu<0x80B7AF8Cu>);
+     const uint32_t r3 = ctx->gpr[3];
++    // A new game of Season mode or MLB Life: the pack's start year (and ages), then its divisions.
++    season_cap::BeginNewGame(season_schedule::StartYear());
+     season_schedule::ApplyDivisions(ctx);
+     ctx->gpr[3] = r3;
+     Call(ctx, 0x80BAF2B4u, InvokeDirectCpu<0x80BAF2B4u>);
+diff --git a/runtime/src/hle/storage/nand_isfs.cpp b/runtime/src/hle/storage/nand_isfs.cpp
+index 942eac8..842eace 100644
+--- a/runtime/src/hle/storage/nand_isfs.cpp
++++ b/runtime/src/hle/storage/nand_isfs.cpp
+@@ -486,6 +486,10 @@ static bool IsSeasonSaveHandle(const FileHandle& handle) {
+     const std::filesystem::path& real = handle.safeCommitPath.empty() ? handle.path : handle.safeCommitPath;
+     return season_cap::IsSeasonSaveName(real.filename().string().c_str());
+ }
++static bool IsLifeSaveHandle(const FileHandle& handle) {
++    const std::filesystem::path& real = handle.safeCommitPath.empty() ? handle.path : handle.safeCommitPath;
++    return season_cap::IsLifeSaveName(real.filename().string().c_str());
++}
+ 
+ extern "C" int32_t NAND_IOS_Read_HLE(uint32_t fd, uint32_t bufferPtr, uint32_t length) {
+     auto* handle = GetHandle(fd);
+@@ -520,6 +524,18 @@ extern "C" int32_t NAND_IOS_Read_HLE(uint32_t fd, uint32_t bufferPtr, uint32_t l
+             std::fseek(handle->file, at, SEEK_SET);
+         }
+         season_cap::OnSeasonSaveRead(readAt, buffer, bytesRead, tailBytes);
++    } else if (IsLifeSaveHandle(*handle)) {
++        // MLB Life: the chunk with the year index brings the small tail, read here from the file.
++        static uint8_t tail[season_cap::kLifeTailSize];
++        const uint8_t* tailBytes = nullptr;
++        if (readAt <= season_cap::kLifeIndexOffset && season_cap::kLifeIndexOffset < readAt + bytesRead) {
++            const long at = std::ftell(handle->file);
++            if (std::fseek(handle->file, season_cap::kLifeTailOffset, SEEK_SET) == 0 &&
++                std::fread(tail, 1, sizeof(tail), handle->file) == sizeof(tail))
++                tailBytes = tail;
++            std::fseek(handle->file, at, SEEK_SET);
++        }
++        season_cap::OnLifeSaveRead(readAt, buffer, bytesRead, tailBytes);
+     }
+     
+     return static_cast<int32_t>(bytesRead);
+@@ -549,6 +565,10 @@ extern "C" int32_t NAND_IOS_Write_HLE(uint32_t fd, uint32_t bufferPtr, uint32_t
+         std::vector<uint8_t> copy(buffer, buffer + length);
+         season_cap::OnSeasonSaveWrite(handle->position, copy.data(), copy.size());
+         bytesWritten = std::fwrite(copy.data(), 1, copy.size(), handle->file);
++    } else if (IsLifeSaveHandle(*handle)) {
++        std::vector<uint8_t> copy(buffer, buffer + length);
++        season_cap::OnLifeSaveWrite(handle->position, copy.data(), copy.size());
++        bytesWritten = std::fwrite(copy.data(), 1, copy.size(), handle->file);
+     } else {
+         bytesWritten = std::fwrite(buffer, 1, length, handle->file);
+     }
+diff --git a/runtime/tests/season_cap_tests.cpp b/runtime/tests/season_cap_tests.cpp
+index 0842354..360bc81 100644
+--- a/runtime/tests/season_cap_tests.cpp
++++ b/runtime/tests/season_cap_tests.cpp
+@@ -101,6 +101,21 @@ int main() {
+     WriteTail(pack, packTail.data());
+     Check(ReadTail(packTail.data(), kTailSize, back) && back.pastTen && ShownOffset(back) == 20, "both offsets add up");
+ 
++    // MLB Life saves: a small tail with the start shift, written only where a chunk covers it.
++    Check(IsLifeSaveName("pm3usmy0.dat") && IsLifeSaveName("pm3usmy2.dat") && !IsLifeSaveName("pm3usse0.dat") &&
++              !IsLifeSaveName("pm3usmy3.dat"),
++          "MLB Life save names");
++    {
++        std::vector<uint8_t> life(kLifeFileSize, 0);
++        for (uint32_t at = 0; at < kLifeFileSize; at += 0x4000) OverlayLifeTail(18, at, life.data() + at, 0x4000);
++        uint32_t shift = 0;
++        Check(ReadLifeTail(life.data() + kLifeTailOffset, shift) && shift == 18, "MLB Life tail reads back");
++        Check(std::all_of(life.begin(), life.begin() + kLifeLoadEnd, [](uint8_t b) { return b == 0; }),
++              "the MLB Life tail stays past the game's data");
++        std::vector<uint8_t> none(kLifeTailSize, 0);
++        Check(!ReadLifeTail(none.data(), shift) && shift == 0, "a zero tail: no start year");
++    }
++
+     // A version 2 tail (before start years): written only past season 10, no start shift.
+     std::vector<uint8_t> v2(kTailSize, 0);
+     std::memcpy(v2.data(), kTailMagic, 8);
