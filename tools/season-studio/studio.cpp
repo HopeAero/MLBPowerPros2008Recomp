@@ -21,6 +21,7 @@
 #include <shellapi.h>
 #else
 #include <spawn.h>
+#include <sys/wait.h>
 extern char** environ;
 #endif
 
@@ -209,8 +210,12 @@ std::string FetchSchedule(int year, const fs::path& modDir, std::string& error) 
         CloseHandle(process.hProcess);
     }
 #else
-    const std::string command = "curl -sSfL --max-time 60 -o '" + temp.string() + "' '" + url + "'";
-    (void)std::system(command.c_str());
+    // No shell: the mod's folder name goes to curl as one argument, whatever it contains.
+    std::string out = temp.string(), link = url;
+    char* argv[] = {const_cast<char*>("curl"), const_cast<char*>("-sSfL"), const_cast<char*>("--max-time"), const_cast<char*>("60"),
+                    const_cast<char*>("-o"), out.data(), const_cast<char*>("--"), link.data(), nullptr};
+    pid_t pid = 0;
+    if (posix_spawnp(&pid, "curl", nullptr, nullptr, argv, environ) == 0) waitpid(pid, nullptr, 0);
 #endif
     const std::string json = ReadFile(temp);
     fs::remove(temp, ec);
