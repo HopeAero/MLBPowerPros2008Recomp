@@ -49,7 +49,7 @@ description = "Uniforms redrawn at 4x."
   - Format: one line per game, `date,home,away,time`. The date is `YYYY-MM-DD` (or `MM-DD`), teams go by code (`BOS`, `NYY`, `LAD`…; `MIA`/`FLA`, `ATH`/`OAK`, `TBR`, `CHW`, `WSN`… work too) and the time is the start time in Eastern time, `HH:MM` (19:05 when missing). Blank lines, lines starting with `#` and the `date,...` header are skipped.
   - The game's limits: March 1 to October 31 and 16 games a day; what does not fit is dropped and the log (`console.log`) says so. The game's regular season runs from March 19 to October 1. The game's All-Star Game stays on its day.
   - A year's real schedule comes from MLB's public API: `python tools/season_schedule.py mlb 2026 mymod/schedule/2026.csv`. To play the 2026 schedule in the first year, save it as `schedule/2008.csv`, or better make a season pack (below).
-  - Divisions, standings and the DH are still 2008's: Houston, for example, plays the 2026 schedule but counts in the National League Central. Details in `docs/en/reverse-engineering.md`, "Game schedule".
+  - Divisions and standings are still 2008's: Houston, for example, plays the 2026 schedule but counts in the National League Central. The DH in both leagues is separate (`dh = "both"` or the launcher option). Details in `docs/en/reverse-engineering.md`, "Game schedule".
 - **`riivolution/`**: Riivolution XMLs (`<wiidisc>`) valid for `RL8E54`. The mod folder acts as the SD root.
   - File patches work.
   - **Memory** patches only work for data: the game code is already translated to native, so changing PowerPC instructions in memory has no effect. The same goes for Gecko/Action Replay codes that modify code.
@@ -122,6 +122,7 @@ A mod that brings a roster and some years' schedules can be a **season pack**: w
 ```toml
 name = "Season 2026"
 start_year = 2026
+dh = "both"      # optional: the DH in both leagues, as since 2022
 ```
 
 ```
@@ -134,7 +135,8 @@ mods\
 
 - When a new season starts with the pack enabled, the first year is 2026: the date, the days of the week, the calendar (Y) and the save list say so, and `schedule/2026.csv` is the one used. The following years are 2027, 2028…
 - **Ages:** the roster keeps each player's age for its first season (PowerUp works out the birth year from the age). Starting in 2026, the roster's players are born 18 years later and keep that age; the birth date shown is the one that matches it. Players the game creates later (draft) already use the year shown.
-- **What does not change:** the game's economy (salaries, luxury tax) follows its seasons 1, 2, 3…, as from 2008. Divisions and the DH are still 2008's.
+- **DH:** with `dh = "both"` every Season mode game has the designated hitter, National League parks too (it is the launcher's DH IN BOTH LEAGUES option, turned on by the pack).
+- **What does not change:** the game's economy (salaries, luxury tax) follows its seasons 1, 2, 3…, as from 2008. Divisions are still 2008's.
 - The start year is set when the game is created and travels inside the save: a 2026 game stays in 2026 even if the pack is disabled later, and saves without a pack do not change.
 - With several packs enabled, the first one by name that has `start_year` wins.
 - Textures, uniforms and stadiums are better as separate mods: they combine with the pack when enabled together.

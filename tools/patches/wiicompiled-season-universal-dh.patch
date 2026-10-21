@@ -1,0 +1,192 @@
+diff --git a/runtime/include/mods.h b/runtime/include/mods.h
+index f599b80..3fd681b 100644
+--- a/runtime/include/mods.h
++++ b/runtime/include/mods.h
+@@ -18,7 +18,8 @@
+ //   roster/        a PowerUp / PowerUp+ roster (MLB Power Pros 2007 Wii save, *.dat), converted to
+ //                  2008's game_data.pack on the player's PC; it applies to every mode, MLB Life too.
+ //   schedule/      Season mode game schedules, <year>.csv (season_schedule.h).
+-// mod.toml may also set start_year (a season pack: a new Season mode game starts in that year).
++// mod.toml may also set start_year (a season pack: a new Season mode game starts in that year) and
++// dh = "both" (the DH in every Season mode game, as since 2022).
+ // Enabled folders are listed in Config.toml under [mods] enabled. Everything is read once at
+ // start-up, so toggling a mod needs a restart (the launcher relaunches).
+ //
+@@ -46,6 +47,7 @@ struct Mod {
+     std::string description;
+     std::string rosterIds;  // "2008" when roster/*.dat voice and face ids follow 2008's numbering
+     int startYear = 0;      // start_year: a new Season mode game's first season (0: 2008, the game's)
++    bool universalDh = false;  // dh = "both"
+     std::filesystem::path root;
+     bool textures = false;
+     bool disc = false;
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index a74152c..83ace1c 100644
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -43,6 +43,7 @@ struct RuntimeUserConfig {
+     std::optional<bool> autoMipmaps;
+     std::optional<uint32_t> msaa;
+     std::optional<uint32_t> maxSeasons;  // [season] max_seasons: 10 (original), 20 or 0 (no limit)
++    std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
+     std::optional<int32_t> windowPosX;
+     std::optional<int32_t> windowPosY;
+     std::optional<uint32_t> windowWidth;
+@@ -473,6 +474,7 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
+         value && (*value == 10 || *value == 20 || *value == 0)) {
+         config.maxSeasons = *value;
+     }
++    config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
+     config.windowPosX = FindConfigInt(document, "video", "window_x");
+     config.windowPosY = FindConfigInt(document, "video", "window_y");
+     if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
+@@ -954,6 +956,15 @@ inline uint32_t MaxSeasons(uint32_t fallback = 10) {
+     return Get().maxSeasons.value_or(fallback);
+ }
+ 
++inline bool UniversalDh(bool fallback = false) {
++    return Get().universalDh.value_or(fallback);
++}
++
++inline bool SetUniversalDh(bool value) {
++    Mutable().universalDh = value;
++    return WriteSetting("season", "universal_dh", value ? "true" : "false");
++}
++
+ inline bool SetMaxSeasons(uint32_t value) {
+     Mutable().maxSeasons = value;
+     return WriteSetting("season", "max_seasons", value == 20 ? "20" : value == 0 ? "0" : "10");
+diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
+index b81c6db..c03b17b 100644
+--- a/runtime/include/season_cap.h
++++ b/runtime/include/season_cap.h
+@@ -143,7 +143,16 @@ inline bool IsYearSite(uint32_t address) {
+     }
+ }
+ 
+-inline int32_t ImmediateFor(uint32_t address, int32_t original, int count, uint32_t yearOffset) {
++// A Season mode game's DH flag, in the game rules ([[0x8104E1D8] + 0x10], read by 0x805F0F1C and
++// directly): 0x80B6F00C stores (league of the home team == 0) with the stb at 0x80B6F210, and
++// 0x80B6EEAC then stores 1 or a li r0, 0 at 0x80B6EF88. With the universal DH both give 1 (the stb
++// ORs the runtime's value into what it stores; see the translator's immediate_overrides).
++constexpr uint32_t kSeasonDhStore = 0x80B6F210u, kSeasonNoDhSite = 0x80B6EF88u;
++inline bool IsDhSite(uint32_t address) { return address == kSeasonDhStore || address == kSeasonNoDhSite; }
++
++inline int32_t ImmediateFor(uint32_t address, int32_t original, int count, uint32_t yearOffset,
++                            bool universalDh = false) {
++    if (IsDhSite(address)) return universalDh ? 1 : original;
+     if (IsCapCompare(address)) return original - kOriginalSeasons + count;
+     if (IsYearSite(address)) return original + static_cast<int32_t>(yearOffset);
+     return original;
+@@ -279,6 +288,7 @@ int Count();               // the same, 10 outside Season mode (for code MLB Lif
+ uint32_t YearOffset();     // years shown past 2008 + index: seasons that left the window plus a season
+                            // pack's start year (0 outside Season mode)
+ void BeginNewGame(int startYear);  // a new Season mode game is building its first schedule (0: 2008)
++bool UniversalDh();                // [season] universal_dh, or an enabled mod with dh = "both"
+ void OnHostFrame();        // settings_overlay.cpp, once per presented frame
+ // nand_isfs.cpp hooks for the season saves (IsSeasonSaveName): a read of `length` bytes at
+ // fileOffset landed in data, and `tail` (kTailSize bytes, from the file) comes with the chunk that
+diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
+index 8c29db9..7808897 100644
+--- a/runtime/src/hle/mlb/season_cap.cpp
++++ b/runtime/src/hle/mlb/season_cap.cpp
+@@ -12,6 +12,7 @@
+ #include "gx_guest_write.h"
+ #include "memory.h"
+ #include "ppc_runtime.h"
++#include "mods.h"
+ #include "runtime_config.h"
+ 
+ namespace season_cap {
+@@ -209,6 +210,17 @@ void ShiftBirthYears(uint32_t shift) {
+     std::fprintf(stderr, "[season] %d players born %u years later\n", moved, shift);
+ }
+ 
++bool UniversalDh() {
++    // Mods are read once at start-up, as the rest of the runtime does.
++    static const bool fromMod = [] {
++        for (const auto& mod : mods::Discover()) {
++            if (mod.enabled && mod.universalDh) return true;
++        }
++        return false;
++    }();
++    return fromMod || RuntimeConfigFile::UniversalDh(false);
++}
++
+ void BeginNewGame(int startYear) {
+     if (!SeasonModeActive() || CurrentIndex() != 0) return;  // only a new game builds a schedule at index 0
+     g_tail = {};
+@@ -309,7 +321,7 @@ using namespace season_cap;
+ // The cap compares are in Season mode's own code, like 0x80C06534: no need to tell the modes apart
+ // (and 0x80C0C50C reads 0x80C06534 when the mode starts, before [0x8104B608] says Season mode).
+ extern "C" int32_t WiicompiledImmediate(uint32_t address, int32_t original) {
+-    return ImmediateFor(address, original, SeasonCount(), YearOffset());
++    return ImmediateFor(address, original, SeasonCount(), YearOffset(), IsDhSite(address) && UniversalDh());
+ }
+ 
+ // 0x80C06534: number of seasons (returns 10 in the original), a virtual of Season mode's scenario;
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 0297973..02f149c 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -716,6 +716,15 @@ Result Run(int argc, char** argv) {
+                    {Tr("10 (original)", "10 (original)"), "20", Tr("Sin límite", "No limit")},
+                    RuntimeConfigFile::MaxSeasons(10) == 20 ? 1 : RuntimeConfigFile::MaxSeasons(10) == 0 ? 2 : 0};
+     seasons.experimental = true;
++    Option universalDh{Tr("DH EN AMBAS LIGAS", "DH IN BOTH LEAGUES"),
++                       Tr("El bateador designado en todos los partidos del modo Temporada, como en las Grandes Ligas desde "
++                          "2022. El juego original solo lo usa en los estadios de la Liga Americana. Los paquetes de "
++                          "temporada con dh = \"both\" lo activan aunque aquí esté en No.",
++                          "The designated hitter in every Season mode game, as in the major leagues since 2022. The "
++                          "original game only uses it in American League parks. Season packs with dh = \"both\" "
++                          "turn it on even when this says No."),
++                       YesNo(), RuntimeConfigFile::UniversalDh(false) ? 1 : 0};
++    universalDh.experimental = true;
+ 
+     const std::string savedLanguage = RuntimeConfigFile::UiLanguage("auto");
+     Option language{"IDIOMA / LANGUAGE",
+@@ -785,7 +794,7 @@ Result Run(int argc, char** argv) {
+         {"AUDIO", {volume, mute}},
+         {Tr("CONTROLES", "CONTROLS"), {wiimote}},
+         {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
+-        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons}},
++        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh}},
+     };
+     tabs.push_back(std::move(modsTab));
+     tabs.push_back(std::move(toolsTab));
+@@ -877,6 +886,7 @@ Result Run(int argc, char** argv) {
+         if (label == wiimote.label) RuntimeConfigFile::SetWiiRemotesEnabled(o.value != 0);
+         if (label == launcherOption.label) RuntimeConfigFile::SetLauncherOnStartup(o.value != 0);
+         if (label == seasons.label) RuntimeConfigFile::SetMaxSeasons(o.value == 1 ? 20 : o.value == 2 ? 0 : 10);
++        if (label == universalDh.label) RuntimeConfigFile::SetUniversalDh(o.value != 0);
+         if (label == language.label) {
+             const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
+             RuntimeConfigFile::SetUiLanguage(code);
+diff --git a/runtime/src/mods.cpp b/runtime/src/mods.cpp
+index 2a9b480..964d651 100644
+--- a/runtime/src/mods.cpp
++++ b/runtime/src/mods.cpp
+@@ -233,6 +233,7 @@ std::vector<Mod> Discover() {
+                 text("roster_ids", mod.rosterIds);
+                 const int64_t startYear = toml::find_or<int64_t>(document, "start_year", 0);
+                 if (startYear >= 2008 && startYear <= 2099) mod.startYear = static_cast<int>(startYear);
++                mod.universalDh = Lower(toml::find_or<std::string>(document, "dh", "")) == "both";
+                 if (document.contains("stadium") && document.at("stadium").is_array()) {
+                     for (const toml::value& entry : document.at("stadium").as_array()) {
+                         if (!entry.is_table()) continue;
+diff --git a/runtime/tests/season_cap_tests.cpp b/runtime/tests/season_cap_tests.cpp
+index 17dc64f..0842354 100644
+--- a/runtime/tests/season_cap_tests.cpp
++++ b/runtime/tests/season_cap_tests.cpp
+@@ -52,6 +52,11 @@ int main() {
+     Check(ImmediateFor(0x80BAFBF0u, 8, kUnlimitedSeasons, 2) == 10 && ImmediateFor(0x80A3873Cu, 8, kUnlimitedSeasons, 2) == 10,
+           "the event dates' 2-digit year (season of the date + 8) moves with the year");
+     Check(ImmediateFor(0x80001000u, 9, 20, 5) == 9, "an address not in the lists keeps its immediate");
++    Check(ImmediateFor(kSeasonNoDhSite, 0, 10, 0) == 0, "Season mode: no DH in an NL park, as the original");
++    Check(ImmediateFor(kSeasonNoDhSite, 0, 10, 0, true) == 1 && ImmediateFor(kSeasonDhStore, 0, 10, 0, true) == 1,
++          "universal DH: that game has the DH too");
++    Check(ImmediateFor(kSeasonDhStore, 0, 10, 0) == 0, "the stored flag: nothing OR-ed in without it");
++    Check(ImmediateFor(0x80BB4A6Cu, 9, 20, 0, true) == 19, "the DH option leaves the other sites alone");
+ 
+     // Where a year's finances and records live: the game's 10 rows, our 10, or nowhere.
+     Check(YearSlot(9, 20) == YearWhere::Game, "year 9: the game's table");

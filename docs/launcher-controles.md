@@ -61,6 +61,16 @@ El launcher está en español o en inglés. Por defecto usa el idioma de Windows
 
 Detalles en `docs/ingenieria-inversa.md` («Año de la temporada») y `docs/superpowers/plans/2026-10-19-season-20-build.md`.
 
+## DH en ambas ligas (modo Temporada)
+
+**AJUSTES > MEJORAS > DH EN AMBAS LIGAS** (experimental): el bateador designado en todos los partidos del modo Temporada, como en las Grandes Ligas desde 2022. El juego original solo lo usa en los estadios de la Liga Americana; en los de la Nacional batea el pitcher. Se guarda en `Config.toml` (`[season] universal_dh = true`).
+
+- Solo cambia el modo Temporada. Exhibición tiene su propio ajuste de DH y lo respeta.
+- Un paquete de temporada con `dh = "both"` en su `mod.toml` lo activa aunque aquí esté en No (`docs/mods.md`).
+- Vale para la partida que se esté jugando: no se guarda en ella.
+
+Detalles en `docs/ingenieria-inversa.md` («DH en ambas ligas»).
+
 ## Guardado
 
 Se mantienen los archivos de mapeo existentes y la sección `[controller]` de `Config.toml`. Los ajustes adicionales se guardan bajo `UserData` en instalaciones portátiles:

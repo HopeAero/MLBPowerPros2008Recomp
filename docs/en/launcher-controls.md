@@ -61,6 +61,16 @@ The launcher is in Spanish or English. By default it follows Windows: Spanish wh
 
 Details in `docs/en/reverse-engineering.md` («Season year») and `docs/superpowers/plans/2026-10-19-season-20-build.md`.
 
+## DH in both leagues (Season mode)
+
+**SETTINGS > ENHANCEMENTS > DH IN BOTH LEAGUES** (experimental): the designated hitter in every Season mode game, as in the major leagues since 2022. The original game only uses it in American League parks; in National League parks the pitcher bats. It is saved in `Config.toml` (`[season] universal_dh = true`).
+
+- It only changes Season mode. Exhibition has its own DH setting and keeps it.
+- A season pack with `dh = "both"` in its `mod.toml` turns it on even when this says No (`docs/en/mods.md`).
+- It applies to whatever game is being played: it is not stored in the save.
+
+Details in `docs/en/reverse-engineering.md` («DH in both leagues»).
+
 ## Saving
 
 The existing mapping files and the `[controller]` section of `Config.toml` are kept. The additional settings are saved under `UserData` in portable installations:

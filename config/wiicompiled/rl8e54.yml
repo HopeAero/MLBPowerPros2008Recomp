@@ -46,6 +46,9 @@ translation:
     - {address: 0x80BF51BC, expect: 9}    # off-season events, index < 9
     - {address: 0x80BF52D0, expect: 9}    # off-season events, index < 9
     - {address: 0x80C0CC0C, expect: 10}   # index < 10
+    # Season mode games' DH flag (hle/mlb/season_cap.cpp, IsDhSite): 1 with the universal DH.
+    - {address: 0x80B6F210, expect: 0}    # stb of (home team's league == 0) in 0x80B6F00C: OR-ed with it
+    - {address: 0x80B6EF88, expect: 0}    # li r0, 0 (no DH) in 0x80B6EEAC
     # Year sites (tools/season_cap_sites.py --years): with no limit they move with the year offset.
     # 0x80B4A730, the season's year for a date: 2007 or 2008 + index, at least 2008.
     - {address: 0x80B4A7A0, expect: 2007}

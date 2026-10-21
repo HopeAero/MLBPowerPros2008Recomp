@@ -1,0 +1,45 @@
+diff --git a/translator/src/Translator.Core/Lifting/PpcLifter.cs b/translator/src/Translator.Core/Lifting/PpcLifter.cs
+index 9971015..c5ea55c 100644
+--- a/translator/src/Translator.Core/Lifting/PpcLifter.cs
++++ b/translator/src/Translator.Core/Lifting/PpcLifter.cs
+@@ -992,6 +992,18 @@ public sealed partial class PpcLifter
+             case "stb" when operands.Count == 2:
+                 {
+                     var (offset, reg) = ParseDisplacement(operands[1]);
++                    if (immediateOverrides is not null && immediateOverrides.ContainsKey(ins.Address))
++                    {
++                        // A listed store has no immediate: the runtime's value (expect 0) is OR-ed into
++                        // what it stores, so 0 keeps the original behaviour.
++                        var mixed = $"{operands[0]}_store_or";
++                        var stored = new List<IrInstruction>
++                        {
++                            new IrBinary(mixed, IrValue.Register(operands[0]), OverridableImmediate(ins, 0, immediateOverrides), "or"),
++                        };
++                        stored.AddRange(DFormStore(reg, offset, IrValue.Register(mixed), 1));
++                        return stored;
++                    }
+                     return DFormStore(reg, offset, IrValue.Register(operands[0]), 1);
+                 }
+ 
+diff --git a/translator/tests/Translator.Tests/ImmediateOverrideTests.cs b/translator/tests/Translator.Tests/ImmediateOverrideTests.cs
+index 99f2b4f..aa2130c 100644
+--- a/translator/tests/Translator.Tests/ImmediateOverrideTests.cs
++++ b/translator/tests/Translator.Tests/ImmediateOverrideTests.cs
+@@ -61,6 +61,17 @@ public sealed class ImmediateOverrideTests
+         Assert.Contains("WiicompiledImmediate(0x80001000u, 28)", code, StringComparison.Ordinal);
+     }
+ 
++    [Fact]
++    public void ListedStbOrsTheRuntimeValueIntoWhatItStores()
++    {
++        var code = Translate(new Dictionary<uint, long> { [Entry + 4] = 0 },
++            (Entry + 0x00, 0x38600000), // li r3, 0
++            (Entry + 0x04, 0x98640010), // stb r3, 16(r4)
++            (Entry + 0x08, 0x4E800020)); // blr
++        Assert.Contains("WiicompiledImmediate(0x80001004u, 0)", code, StringComparison.Ordinal);
++        Assert.Contains("|", code, StringComparison.Ordinal);
++    }
++
+     [Fact]
+     public void UnlistedCompareKeepsItsConstant()
+     {
