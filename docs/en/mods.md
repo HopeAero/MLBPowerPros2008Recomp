@@ -48,7 +48,7 @@ description = "Uniforms redrawn at 4x."
 - **`schedule/`**: Season mode game schedules, one per year: `schedule/2026.csv` replaces the games of the season the game calls 2026 when the game builds that year's schedule, that is, when the game starts (the first year) or on the year rollover. A season already under way does not change.
   - Format: one line per game, `date,home,away,time`. The date is `YYYY-MM-DD` (or `MM-DD`), teams go by code (`BOS`, `NYY`, `LAD`…; `MIA`/`FLA`, `ATH`/`OAK`, `TBR`, `CHW`, `WSN`… work too) and the time is the start time in Eastern time, `HH:MM` (19:05 when missing). Blank lines, lines starting with `#` and the `date,...` header are skipped.
   - The game's limits: March 1 to October 31 and 16 games a day; what does not fit is dropped and the log (`console.log`) says so. The game's regular season runs from March 19 to October 1. The game's All-Star Game stays on its day.
-  - A year's real schedule is downloaded from the launcher (TOOLS > SCHEDULE, 2002 to 2026) or with `python tools/season_schedule.py mlb 2026 mymod/schedule/2026.csv`. If it does not fit the game's season (3/19 to 10/1, 16 games a day), the game places it a few days earlier or later without losing games. To play the 2026 schedule in the first year, save it as `schedule/2008.csv`, or better make a season pack (below).
+  - A year's real schedule is downloaded from the launcher (MODS > SEASON, 2002 to 2026) or with `python tools/season_schedule.py mlb 2026 mymod/schedule/2026.csv`. If it does not fit the game's season (3/19 to 10/1, 16 games a day), the game places it a few days earlier or later without losing games. To play the 2026 schedule in the first year, save it as `schedule/2008.csv`, or better make a season pack (below).
   - The schedule does not change divisions: for Houston to count in the AL West a season pack needs `[divisions]` (below). The DH in both leagues is separate (`dh = "both"` or the launcher option). Details in `docs/en/reverse-engineering.md`, "Game schedule".
 - **`riivolution/`**: Riivolution XMLs (`<wiidisc>`) valid for `RL8E54`. The mod folder acts as the SD root.
   - File patches work.
@@ -117,7 +117,7 @@ base = "atl"             # stadium whose game data it uses (dimensions, menu, sa
 
 ## Season packs
 
-A mod that brings a roster and some years' schedules can be a **season pack**: with `start_year` in its `mod.toml`, a new season starts in that year.
+A mod that brings a roster and some years' schedules can be a **season pack**: with `start_year` in its `mod.toml`, a new season starts in that year. These keys (`start_year`, `roster_year`, `dh`, `[divisions]` 15/15) can also be changed in the launcher, in MODS > SEASON, which also shows what the next new game will use and warns when two mods clash.
 
 ```toml
 name = "Season 2026"

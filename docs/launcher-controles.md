@@ -80,15 +80,18 @@ Detalles en `docs/ingenieria-inversa.md` («DH en ambas ligas»).
 - Un paquete de temporada con `[divisions]` usa sus divisiones aunque aquí esté en No (`docs/mods.md`).
 - Con Start (en vez de Quick Start), la pantalla Custom League se abre ya en 15/15 y deja confirmar 15 y 15 (el juego original solo admite ligas pares). Si cambias ahí la distribución y la confirmas, se juega la tuya; la mejora solo cambia las ligas de 2008 tal cual.
 
-## Calendarios reales (HERRAMIENTAS)
+## Temporada (MODS > TEMPORADA)
 
-**HERRAMIENTAS > CALENDARIO** descarga el calendario real de una temporada de las Grandes Ligas desde la web pública de MLB (statsapi.mlb.com) y lo guarda en un mod como `schedule/<año>.csv`:
+**MODS > TEMPORADA** reúne en un sitio lo que usa una temporada nueva del modo Temporada o una carrera nueva de MLB Life:
 
-1. **CALENDARIO: AÑO**: de 2002 a 2026. No están 2020 (60 partidos por equipo, desde julio) ni los años antes de 2002 (sus datos en la web de MLB no cuadran a 162 por equipo).
-2. **CALENDARIO: GUARDAR EN**: «Nuevo: Calendarios MLB» crea el mod `MLBSchedules` con ese año como primera temporada (`start_year`) y lo activa; o uno de tus mods (por ejemplo tu roster), al que se añade el archivo. El juego usa el calendario de un año en la temporada que lleva ese año: si el mod no tenía año inicial, se le añade `start_year = <año>` al final de su `mod.toml` (lo demás no se toca) y una temporada nueva con él empieza en ese año. Si ya tenía otro, el mensaje dice en qué temporada se usará.
-3. **DESCARGAR CALENDARIO**: abajo se ve el resultado, por ejemplo «2022: 2430 partidos (162 por equipo)… El juego lo juega 4 días antes para acabar el 1 de octubre».
+1. **PRÓXIMA PARTIDA NUEVA**: el resumen. Dice el año en que empieza y de qué mod sale, de qué temporada son las edades, qué años tienen calendario real (y de qué mod) y cuáles uno generado por el juego, si hay DH en ambas ligas y cómo quedan las ligas, cada cosa con su origen (un mod o MEJORAS). Si dos mods activos piden cosas distintas (dos años de inicio, dos calendarios distintos del mismo año, dos tablas de divisiones), sale «¡aviso!» y la ayuda explica cuál se usa: el primero por nombre, como hace el juego. El mismo resumen, corto, sale al pie de **MEJORAS**, porque lo que trae un mod manda sobre esas opciones.
+2. **MOD DE TEMPORADA**: el mod cuyos ajustes se ven y se cambian debajo, y donde se guardan los calendarios. «Nuevo: Calendarios MLB» crea `mods/MLBSchedules` (y lo activa) en cuanto cambias algo o descargas. Si el mod elegido está desactivado en MODS, el pie lo dice.
+3. **AÑO DE INICIO** (`start_year`), **AÑO DEL ROSTER** (`roster_year`, «Igual que el inicio» por defecto), **DH EN AMBAS LIGAS** (`dh = "both"`) y **LIGAS 15 Y 15** (`[divisions]` con Houston en la AL West): se escriben en el `mod.toml` del mod, sin tocar lo demás. «Como en MEJORAS» deja que decida la opción de MEJORAS. Un mod con otras divisiones en su `mod.toml` sale como «Propias» y se cambia ahí.
+4. **CALENDARIOS: DESDE / HASTA** y **DESCARGAR CALENDARIOS**: descarga los calendarios reales de esos años (de 2002 a 2026, sin 2020: tenía 60 partidos por equipo, desde julio; antes de 2002 los datos de la web de MLB no cuadran a 162 por equipo) desde la web pública de MLB (statsapi.mlb.com) y los guarda en el mod como `schedule/<año>.csv`. Cada año tarda unos segundos. Si el mod no tenía año de inicio, se le pone el primero descargado. Abajo sale el resultado, por ejemplo «2025: 2430 partidos (162 por equipo), se juega 1 día después; 2026: …».
 
-El juego juega la temporada regular del 19 de marzo al 1 de octubre y como mucho 16 partidos por día. Si una temporada empezó antes o acabó después, se juega los días justos antes o después (mismo orden, otras fechas; pasa en 2004, 2005, 2009, 2010, 2012, 2015, 2016, 2021, 2022 y 2025). Un partido de un día con más de 16 pasa al día libre más cercano de los dos equipos. Ningún año pierde partidos. Para un roster de otro año, `roster_year` en el `mod.toml` (`docs/mods.md`). Solo hace falta internet al descargar.
+Los cambios valen para las partidas nuevas; las empezadas siguen como estaban.
+
+El juego juega la temporada regular del 19 de marzo al 1 de octubre y como mucho 16 partidos por día. Si una temporada empezó antes o acabó después, se juega los días justos antes o después (mismo orden, otras fechas; pasa en 2004, 2005, 2009, 2010, 2012, 2015, 2016, 2021, 2022 y 2025). Un partido de un día con más de 16 pasa al día libre más cercano de los dos equipos. Ningún año pierde partidos. Solo hace falta internet al descargar.
 
 ## Guardado
 
