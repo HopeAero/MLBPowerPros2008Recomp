@@ -97,6 +97,10 @@ translation:
     - {address: 0x809803B0, expect: 2008}
     - {address: 0x80980634, expect: 2008}
     - {address: 0x80A02F5C, expect: 107}  # MLB Life draft history entry: 2007 - 1900 (+ the pack's start shift)
+    # MLB Career's birth-date picker (0x80979E88): default and last year 1989, first 1968, as year - 1900.
+    - {address: 0x80979F44, expect: 89}
+    - {address: 0x80979F50, expect: 89}
+    - {address: 0x80979F54, expect: 68}
 
 runtime:
   # Rebound by tools/wiicompiled_rebind.py; unbound hooks are invisible here.
