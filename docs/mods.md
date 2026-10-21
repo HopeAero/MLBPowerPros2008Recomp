@@ -123,7 +123,7 @@ Un mod que trae un roster y los calendarios de unos años puede ser un **paquete
 name = "Temporada 2026"
 start_year = 2026
 roster_year = 2023 # opcional: el año para el que está hecho el roster (si no, start_year)
-dh = "both"      # opcional: DH en las dos ligas, como desde 2022
+dh = "both"      # opcional: DH en las dos ligas, como desde 2022 ("original": solo en la Americana, aunque el launcher diga Sí)
 
 [divisions]      # opcional: solo las divisiones que cambian
 al_west = ["HOU", "LAA", "OAK", "SEA", "TEX"]
@@ -140,7 +140,7 @@ mods\
 - Al empezar una temporada nueva con el paquete activo, el primer año es 2026: la fecha, los días de la semana, el calendario (Y) y la lista de partidas lo dicen, y `schedule/2026.csv` es el que se usa. Los años siguientes son 2027, 2028…
 - **Edades:** el roster guarda la edad de cada jugador para la temporada en que se hizo (PowerUp calcula el año de nacimiento a partir de la edad). Con `roster_year` se dice qué temporada es: un roster de 2023 usado con `start_year = 2026` lleva `roster_year = 2023`, y en 2026 cada jugador tiene 3 años más que en el roster, su edad real. Sin `roster_year` se toma `start_year` (las edades del roster tal cual). Los jugadores que crea el juego después (draft) ya usan el año que se ve.
 - **Familia en MLB Life:** la esposa y los hijos se crean con las fechas del juego original (2007); con el paquete se mueven al año que se ve y conservan la edad con que se crean.
-- **DH:** con `dh = "both"` todos los partidos del modo Temporada llevan bateador designado, también en los parques de la Nacional (es la opción DH EN AMBAS LIGAS del launcher, encendida por el paquete).
+- **DH:** con `dh = "both"` todos los partidos del modo Temporada llevan bateador designado, también en los parques de la Nacional (es la opción DH EN AMBAS LIGAS del launcher, encendida por el paquete). Con `dh = "original"` el DH queda como en el juego, solo en los parques de la Americana, aunque esa opción esté en Sí. Con `leagues = "original"` las ligas quedan las de 2008 aunque LIGAS 15 Y 15 esté en Sí. Si varios mods activos lo dicen, manda el primero por nombre.
 - **Divisiones:** `[divisions]` con `al_east`, `al_central`, `al_west`, `nl_east`, `nl_central` y `nl_west` (listas de códigos de equipo). Solo hace falta poner las que cambian: un equipo que aparece en una lista se mueve a esa división y los demás se quedan donde estaban. Con el ejemplo, Houston pasa a la AL West y las ligas quedan 15 y 15, como desde 2013. Se aplica al empezar una temporada nueva: clasificaciones, pantallas y liga de cada equipo (también para el DH) siguen las divisiones nuevas. Cada división admite de 1 a 7 equipos; si algo no cuadra (un código desconocido o repetido), el juego usa las de siempre y el registro lo dice.
   - Con divisiones cambiadas el juego no usa su calendario oficial de 2008 y genera uno. Su generador está pensado para ligas pares; con 15 y 15 el runtime usa uno propio (162 partidos por equipo, ver «Ligas 15 y 15» en `docs/launcher-controles.md`). Para el calendario real, el paquete trae `schedule/<año>.csv`.
   - Sin paquete, la opción **LIGAS 15 Y 15** de MEJORAS hace lo mismo con Houston.
