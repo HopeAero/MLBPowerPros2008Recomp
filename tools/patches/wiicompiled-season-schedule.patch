@@ -1,0 +1,371 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index a717b59..a460964 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -421,6 +421,10 @@ add_executable(mkw_season_cap_tests "${CMAKE_CURRENT_LIST_DIR}/tests/season_cap_
+ target_compile_features(mkw_season_cap_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_season_cap_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+ add_test(NAME mkw_season_cap_tests COMMAND mkw_season_cap_tests)
++add_executable(mkw_season_schedule_tests "${CMAKE_CURRENT_LIST_DIR}/tests/season_schedule_tests.cpp")
++target_compile_features(mkw_season_schedule_tests PRIVATE cxx_std_20)
++target_include_directories(mkw_season_schedule_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
++add_test(NAME mkw_season_schedule_tests COMMAND mkw_season_schedule_tests)
+ add_executable(mkw_game_camera_tests "${CMAKE_CURRENT_LIST_DIR}/tests/game_camera_tests.cpp")
+ target_compile_features(mkw_game_camera_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_game_camera_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+diff --git a/runtime/include/season_schedule.h b/runtime/include/season_schedule.h
+new file mode 100644
+index 0000000..6188177
+--- /dev/null
++++ b/runtime/include/season_schedule.h
+@@ -0,0 +1,154 @@
++#pragma once
++
++// Season mode game schedule from a mod: <mod>/schedule/<year>.csv replaces the game's schedule of
++// that year (docs/ingenieria-inversa.md, "Calendario de partidos").
++//
++// The game's table, at X + 10192 (X = [0x8104B5A0]): 245 days from March 1 (game day 60; the game's
++// year always has 366 days), 16 slots of 16 bytes per day: u32 home, u32 away, u32 start time
++// (hours * 400 + minutes * 4, Eastern time), u32 flags (0x8000: night game). An empty slot has teams
++// 44 and 44. 0x80B97DC4 builds it: empties it, fills it with the official 2008 schedule (0x80B97EA4)
++// or a generated one (0x80B98320), then derives its other data (0x80B98294, 0x80B73E2C, 0x80B9890C).
++//
++// CSV, one game per line: date,home,away[,time]. date is YYYY-MM-DD (the year is not checked) or
++// MM-DD; home and away are team codes (BOS, NYY... see kTeams); time is HH:MM, 24 h, Eastern
++// (19:05 when missing). Blank lines, lines starting with '#' and a "date,..." header are skipped.
++
++#include <algorithm>
++#include <array>
++#include <cctype>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace season_schedule {
++
++constexpr int kDays = 245, kSlots = 16, kFirstDay = 60, kEmptyTeam = 44, kTeams = 30;
++constexpr uint32_t kTableOffset = 10192, kSlotBytes = 16;
++constexpr uint32_t kGameFlags = 0x00A06700u, kNightFlag = 0x8000u;  // as in 2008's official games
++constexpr int kNightFrom = 18 * 60, kDefaultTime = 19 * 60 + 5;
++
++// Team numbers: by division, in 2007's final standings order. Several codes per team.
++struct TeamCode {
++    const char* code;
++    int number;
++};
++inline constexpr TeamCode kTeamCodes[] = {
++    {"BOS", 0},  {"NYY", 1},  {"TOR", 2},  {"BAL", 3},  {"TB", 4},   {"TBR", 4},  {"TBD", 4},
++    {"CLE", 5},  {"DET", 6},  {"MIN", 7},  {"CWS", 8},  {"CHW", 8},  {"KC", 9},   {"KCR", 9},
++    {"LAA", 10}, {"ANA", 10}, {"SEA", 11}, {"OAK", 12}, {"ATH", 12}, {"TEX", 13}, {"PHI", 14},
++    {"NYM", 15}, {"ATL", 16}, {"WSH", 17}, {"WSN", 17}, {"WAS", 17}, {"FLA", 18}, {"MIA", 18},
++    {"CHC", 19}, {"MIL", 20}, {"STL", 21}, {"HOU", 22}, {"CIN", 23}, {"PIT", 24}, {"ARI", 25},
++    {"AZ", 25},  {"COL", 26}, {"SD", 27},  {"SDP", 27}, {"LAD", 28}, {"SF", 29},  {"SFG", 29},
++};
++
++inline int TeamNumber(std::string_view code) {
++    std::string upper;
++    for (char c : code) upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++    for (const auto& team : kTeamCodes) {
++        if (upper == team.code) return team.number;
++    }
++    return -1;
++}
++
++// Slot day 0..244 for a month and day (the game's 366-day year), or -1 outside March 1 .. October 31.
++inline int DayIndex(int month, int day) {
++    static constexpr int kMonthFirst[12] = {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335};
++    static constexpr int kMonthDays[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
++    if (month < 1 || month > 12 || day < 1 || day > kMonthDays[month - 1]) return -1;
++    const int index = kMonthFirst[month - 1] + day - 1 - kFirstDay;
++    return index >= 0 && index < kDays ? index : -1;
++}
++
++inline uint32_t TimeWord(int minutes) { return static_cast<uint32_t>((minutes / 60) * 400 + (minutes % 60) * 4); }
++inline uint32_t FlagsWord(int minutes) { return kGameFlags | (minutes >= kNightFrom ? kNightFlag : 0u); }
++
++struct Game {
++    int day = 0;  // 0..244 from March 1
++    int home = 0, away = 0;
++    int minutes = kDefaultTime;  // start, minutes after midnight, Eastern
++};
++
++struct ParseResult {
++    std::vector<Game> games;
++    std::vector<std::string> errors;  // "line N: ..."
++};
++
++namespace detail {
++inline std::string_view Trim(std::string_view s) {
++    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
++    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
++    return s;
++}
++inline bool Number(std::string_view s, int& out) {
++    if (s.empty() || s.size() > 4) return false;
++    out = 0;
++    for (char c : s) {
++        if (c < '0' || c > '9') return false;
++        out = out * 10 + (c - '0');
++    }
++    return true;
++}
++inline std::vector<std::string_view> Split(std::string_view s, char separator) {
++    std::vector<std::string_view> parts;
++    size_t start = 0;
++    for (size_t i = 0; i <= s.size(); ++i) {
++        if (i == s.size() || s[i] == separator) {
++            parts.push_back(Trim(s.substr(start, i - start)));
++            start = i + 1;
++        }
++    }
++    return parts;
++}
++}  // namespace detail
++
++inline ParseResult Parse(std::string_view text) {
++    ParseResult result;
++    int lineNumber = 0;
++    auto fail = [&](const std::string& what) { result.errors.push_back("line " + std::to_string(lineNumber) + ": " + what); };
++    while (!text.empty()) {
++        const size_t end = text.find('\n');
++        std::string_view line = detail::Trim(text.substr(0, end));
++        text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
++        ++lineNumber;
++        if (lineNumber == 1 && line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF) line.remove_prefix(3);  // BOM
++        if (line.empty() || line.front() == '#') continue;
++        const auto fields = detail::Split(line, ',');
++        if (fields[0] == "date") continue;  // header
++        if (fields.size() < 3 || fields.size() > 4) { fail("expected date,home,away[,time]"); continue; }
++        const auto date = detail::Split(fields[0], '-');
++        int month = 0, day = 0;
++        const bool dateOk = date.size() == 3   ? detail::Number(date[1], month) && detail::Number(date[2], day)
++                            : date.size() == 2 ? detail::Number(date[0], month) && detail::Number(date[1], day)
++                                               : false;
++        Game game;
++        game.day = dateOk ? DayIndex(month, day) : -1;
++        if (game.day < 0) { fail("date '" + std::string(fields[0]) + "' is not between March 1 and October 31"); continue; }
++        game.home = TeamNumber(fields[1]);
++        game.away = TeamNumber(fields[2]);
++        if (game.home < 0 || game.away < 0) {
++            fail("unknown team '" + std::string(game.home < 0 ? fields[1] : fields[2]) + "'");
++            continue;
++        }
++        if (game.home == game.away) { fail("a team cannot play itself"); continue; }
++        if (fields.size() == 4 && !fields[3].empty()) {
++            const auto time = detail::Split(fields[3], ':');
++            int hours = 0, minutes = 0;
++            if (time.size() != 2 || !detail::Number(time[0], hours) || !detail::Number(time[1], minutes) || hours > 23 ||
++                minutes > 59) {
++                fail("time '" + std::string(fields[3]) + "' is not HH:MM");
++                continue;
++            }
++            game.minutes = hours * 60 + minutes;
++        }
++        result.games.push_back(game);
++    }
++    // Within a day, by start time (the game's own tables are in that order).
++    std::stable_sort(result.games.begin(), result.games.end(), [](const Game& a, const Game& b) {
++        return a.day != b.day ? a.day < b.day : a.minutes < b.minutes;
++    });
++    return result;
++}
++
++}  // namespace season_schedule
+diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
+new file mode 100644
+index 0000000..6b21f6b
+--- /dev/null
++++ b/runtime/src/hle/mlb/season_schedule.cpp
+@@ -0,0 +1,134 @@
++// Season mode game schedule from a mod (season_schedule.h): 0x80B97DC4 builds the year's schedule as
++// the game does, then a mod's schedule/<year>.csv replaces its games before the game derives the rest.
++#include "season_schedule.h"
++
++#include <array>
++#include <cstdio>
++#include <fstream>
++#include <iterator>
++#include <sstream>
++
++#include "abi_bridge.h"
++#include "hle_stubs.h"
++#include "memory.h"
++#include "mods.h"
++#include "ppc_runtime.h"
++#include "season_cap.h"
++
++namespace season_schedule {
++
++namespace {
++
++// Calls a game function from a native; the caller's lr is kept, as the original's prologue does.
++uint32_t Call(CpuContext* ctx, uint32_t target, void (*invoke)(CpuContext*)) {
++    const uint32_t lr = ctx->lr;
++    ctx->lr = target;
++    invoke(ctx);
++    ctx->lr = lr;
++    return ctx->gpr[3];
++}
++
++// The year being built: 2008 + [state + 8] (+ the seasons that left the window), 0 with no state.
++int Year() {
++    const uint32_t state = Memory::Read32(0x8104B5A8u);
++    if (!state || !Memory::Contains(state, 0x108)) return 0;
++    return 2008 + static_cast<int8_t>(Memory::Read8(state + 8)) + static_cast<int>(season_cap::YearOffset());
++}
++
++// The first enabled mod (by name) with schedule/<year>.csv.
++bool FindSchedule(int year, std::filesystem::path& path, std::string& modName) {
++    std::error_code ec;
++    for (const auto& mod : mods::Discover()) {
++        if (!mod.enabled) continue;
++        const auto candidate = mod.root / "schedule" / (std::to_string(year) + ".csv");
++        if (std::filesystem::is_regular_file(candidate, ec)) {
++            path = candidate;
++            modName = mod.name;
++            return true;
++        }
++    }
++    return false;
++}
++
++struct Slot {
++    std::array<uint32_t, 4> words{};
++};
++
++void Apply(bool official) {
++    const int year = Year();
++    std::filesystem::path path;
++    std::string modName;
++    if (!year || !FindSchedule(year, path, modName)) return;
++    std::ifstream input(path, std::ios::binary);
++    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
++    const ParseResult parsed = Parse(text);
++    for (size_t i = 0; i < parsed.errors.size() && i < 10; ++i) {
++        std::fprintf(stderr, "[season] schedule %d (%s): %s\n", year, modName.c_str(), parsed.errors[i].c_str());
++    }
++    if (parsed.games.empty()) {
++        std::fprintf(stderr, "[season] schedule %d (%s): no games, the game's schedule is kept\n", year, modName.c_str());
++        return;
++    }
++
++    const uint32_t table = Memory::Read32(0x8104B5A0u) + kTableOffset;
++    if (!Memory::Contains(table, kDays * kSlots * kSlotBytes)) return;
++    auto address = [&](int day, int slot) {
++        return table + static_cast<uint32_t>(day * kSlots + slot) * kSlotBytes;
++    };
++    // What the game put there: the empty slot's words, and the entries that are not team games
++    // (the All-Star Game, teams 30 and up), which stay on their day.
++    Slot empty{{kEmptyTeam, kEmptyTeam, 0, 0}};
++    bool haveEmpty = false;
++    std::vector<std::vector<Slot>> days(kDays);
++    for (int day = 0; day < kDays; ++day) {
++        for (int slot = 0; slot < kSlots; ++slot) {
++            Slot entry;
++            for (int w = 0; w < 4; ++w) entry.words[w] = Memory::Read32(address(day, slot) + 4 * w);
++            if (entry.words[0] == kEmptyTeam) {
++                if (!haveEmpty) empty = entry, haveEmpty = true;
++            } else if (entry.words[0] >= kTeams || entry.words[1] >= kTeams) {
++                days[day].push_back(entry);
++            }
++        }
++    }
++    int dropped = 0;
++    for (const Game& game : parsed.games) {
++        if (days[game.day].size() >= static_cast<size_t>(kSlots)) {
++            ++dropped;
++            continue;
++        }
++        days[game.day].push_back(Slot{{static_cast<uint32_t>(game.home), static_cast<uint32_t>(game.away),
++                                       TimeWord(game.minutes), FlagsWord(game.minutes)}});
++    }
++    for (int day = 0; day < kDays; ++day) {
++        for (int slot = 0; slot < kSlots; ++slot) {
++            const Slot& entry = slot < static_cast<int>(days[day].size()) ? days[day][slot] : empty;
++            for (int w = 0; w < 4; ++w) Memory::Write32(address(day, slot) + 4 * w, entry.words[w]);
++        }
++    }
++    std::fprintf(stderr, "[season] schedule %d: %zu games from mod \"%s\" replace the %s one%s\n", year,
++                 parsed.games.size() - dropped, modName.c_str(), official ? "official" : "generated",
++                 dropped ? (" (" + std::to_string(dropped) + " dropped: more than 16 on a day)").c_str() : "");
++}
++
++}  // namespace
++
++}  // namespace season_schedule
++
++// 0x80B97DC4: builds the year's schedule. As the original, with the mod's schedule put in between.
++extern "C" void MLB_BuildSchedule_80B97DC4(CpuContext* ctx) {
++    using season_schedule::Call;
++    Call(ctx, 0x80B97D68u, InvokeDirectCpu<0x80B97D68u>);  // empty every slot
++    // 2008 with the original divisions: the official schedule; otherwise one is generated.
++    const bool official = Call(ctx, 0x80B97E08u, InvokeDirectCpu<0x80B97E08u>) != 0;
++    if (official) {
++        Call(ctx, 0x80B97EA4u, InvokeDirectCpu<0x80B97EA4u>);
++    } else {
++        Call(ctx, 0x80B98320u, InvokeDirectCpu<0x80B98320u>);
++    }
++    season_schedule::Apply(official);
++    Call(ctx, 0x80B98294u, InvokeDirectCpu<0x80B98294u>);
++    Call(ctx, 0x80B73E2Cu, InvokeDirectCpu<0x80B73E2Cu>);
++    Call(ctx, 0x80B9890Cu, InvokeDirectCpu<0x80B9890Cu>);
++}
++PPC_NATIVE_OVERRIDE_VOID(80B97DC4, MLB_BuildSchedule_80B97DC4, (CpuContext* ctx), (ctx));
+diff --git a/runtime/tests/season_schedule_tests.cpp b/runtime/tests/season_schedule_tests.cpp
+new file mode 100644
+index 0000000..735567e
+--- /dev/null
++++ b/runtime/tests/season_schedule_tests.cpp
+@@ -0,0 +1,50 @@
++#include "season_schedule.h"
++#include <cstdio>
++
++static int failures = 0;
++static void Check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++
++int main() {
++    using namespace season_schedule;
++    // Team numbers: by division, 2007 standings order; today's codes too.
++    Check(TeamNumber("BOS") == 0 && TeamNumber("oak") == 12 && TeamNumber("ATH") == 12, "Boston, Oakland/Athletics");
++    Check(TeamNumber("MIA") == 18 && TeamNumber("FLA") == 18 && TeamNumber("SF") == 29, "Florida/Miami, San Francisco");
++    Check(TeamNumber("XXX") == -1 && TeamNumber("") == -1, "unknown code");
++    // Days: the game's 366-day year, slot day 0 = March 1.
++    Check(DayIndex(3, 1) == 0 && DayIndex(3, 25) == 24 && DayIndex(7, 15) == 136, "March 1, 2008's Tokyo game, All-Star");
++    Check(DayIndex(10, 31) == 244 && DayIndex(11, 1) == -1 && DayIndex(2, 29) == -1, "range ends");
++    Check(DayIndex(4, 31) == -1 && DayIndex(13, 1) == -1, "no such date");
++    // Words as in 2008's official games: 13:05 = 0x1464, 22:05 = 0x2274; night from 18:00.
++    Check(TimeWord(13 * 60 + 5) == 0x1464 && TimeWord(22 * 60 + 5) == 0x2274, "time word");
++    Check(FlagsWord(17 * 60 + 59) == 0x00A06700u && FlagsWord(18 * 60) == 0x00A0E700u, "night flag");
++
++    const auto parsed = Parse(
++        "\xEF\xBB\xBF" "date,home,away,time\n"
++        "# opening\n"
++        "2026-03-26,NYY,SF,19:05\r\n"
++        "2026-03-26,BOS,CIN,13:10\n"
++        "\n"
++        "03-27,LAD,ARI\n"
++        "2026-11-02,NYY,BOS,19:05\n"
++        "2026-04-01,NYY,XYZ,19:05\n"
++        "2026-04-01,NYY,NYY,19:05\n"
++        "2026-04-01,NYY,BOS,7pm\n"
++        "2026-04-01,NYY\n");
++    Check(parsed.games.size() == 3, "three games");
++    Check(parsed.errors.size() == 5, "five bad lines");
++    if (parsed.games.size() == 3) {
++        Check(parsed.games[0].home == 0 && parsed.games[0].minutes == 13 * 60 + 10, "a day's games by start time");
++        Check(parsed.games[1].home == 1 && parsed.games[1].away == 29 && parsed.games[1].day == 25, "home, away, day");
++        Check(parsed.games[2].minutes == kDefaultTime && parsed.games[2].day == 26, "MM-DD date, default time");
++    }
++    if (!parsed.errors.empty()) Check(parsed.errors[0].rfind("line 7:", 0) == 0, "errors name their line");
++
++    if (failures) return 1;
++    std::printf("season_schedule_tests: ok\n");
++    return 0;
++}

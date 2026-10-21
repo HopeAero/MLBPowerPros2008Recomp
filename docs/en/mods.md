@@ -19,6 +19,7 @@ mods\
     riivolution\   Riivolution patches (.xml)
     project\       project.bin packages (.pack/.dat/.arc) with their names
     roster\        a PowerUp / PowerUp+ roster (.dat)
+    schedule\      Season mode schedules (<year>.csv)
 ```
 
 `mod.toml` is optional; without it, the folder name is used:
@@ -44,6 +45,11 @@ description = "Uniforms redrawn at 4x."
   - If two mods bring the same file, the first in alphabetical order wins.
   - It is the right way to distribute `project.bin` changes: the mod only carries its `.pack` files, never the whole file.
 - **`roster/`**: a [PowerUp / PowerUp+](https://github.com/ogura-connection/PowerUpPlus) roster (the MLB Power Pros 2007 `.dat`). The game converts it to the 2008 format at startup and it works for all modes, **MLB Life included**. Details in `docs/en/roster-2008.md`.
+- **`schedule/`**: Season mode game schedules, one per year: `schedule/2026.csv` replaces the games of the season the game calls 2026 when the game builds that year's schedule, that is, when the game starts (the first year) or on the year rollover. A season already under way does not change.
+  - Format: one line per game, `date,home,away,time`. The date is `YYYY-MM-DD` (or `MM-DD`), teams go by code (`BOS`, `NYY`, `LAD`…; `MIA`/`FLA`, `ATH`/`OAK`, `TBR`, `CHW`, `WSN`… work too) and the time is the start time in Eastern time, `HH:MM` (19:05 when missing). Blank lines, lines starting with `#` and the `date,...` header are skipped.
+  - The game's limits: March 1 to October 31 and 16 games a day; what does not fit is dropped and the log (`console.log`) says so. The game's regular season runs from March 19 to October 1. The game's All-Star Game stays on its day.
+  - A year's real schedule comes from MLB's public API: `python tools/season_schedule.py mlb 2026 mymod/schedule/2026.csv`. To play the 2026 schedule in the first year, save it as `schedule/2008.csv`.
+  - Divisions, standings and the DH are still 2008's: Houston, for example, plays the 2026 schedule but counts in the National League Central. Details in `docs/en/reverse-engineering.md`, "Game schedule".
 - **`riivolution/`**: Riivolution XMLs (`<wiidisc>`) valid for `RL8E54`. The mod folder acts as the SD root.
   - File patches work.
   - **Memory** patches only work for data: the game code is already translated to native, so changing PowerPC instructions in memory has no effect. The same goes for Gecko/Action Replay codes that modify code.

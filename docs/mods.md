@@ -19,6 +19,7 @@ mods\
     riivolution\   parches Riivolution (.xml)
     project\       paquetes de project.bin (.pack/.dat/.arc) con su nombre
     roster\        un roster de PowerUp / PowerUp+ (.dat)
+    schedule\      calendarios del modo Temporada (<año>.csv)
 ```
 
 `mod.toml` es opcional; sin él se usa el nombre de la carpeta:
@@ -44,6 +45,11 @@ description = "Uniformes redibujados a 4x."
   - Si dos mods traen el mismo archivo, gana el primero en orden alfabético.
   - Es la forma correcta de repartir cambios de `project.bin`: el mod solo lleva sus `.pack`, nunca el archivo completo.
 - **`roster/`**: un roster de [PowerUp / PowerUp+](https://github.com/ogura-connection/PowerUpPlus) (el `.dat` de MLB Power Pros 2007). El juego lo convierte al formato de 2008 al arrancar y vale para todos los modos, **MLB Life incluido**. Detalles en `docs/roster-2008.md`.
+- **`schedule/`**: calendarios de partidos del modo Temporada, uno por año: `schedule/2026.csv` sustituye los partidos de la temporada que el juego llama 2026 cuando el juego monta el calendario de ese año, es decir, al empezar la partida (el primer año) o al pasar de año. Una temporada ya empezada no cambia.
+  - Formato: una línea por partido, `fecha,local,visitante,hora`. La fecha es `AAAA-MM-DD` (o `MM-DD`), los equipos van por código (`BOS`, `NYY`, `LAD`…; valen `MIA`/`FLA`, `ATH`/`OAK`, `TBR`, `CHW`, `WSN`…) y la hora es la de inicio en hora del Este, `HH:MM` (si falta, 19:05). Se ignoran las líneas vacías, las que empiezan por `#` y la cabecera `date,...`.
+  - Límites del juego: del 1 de marzo al 31 de octubre y 16 partidos por día; lo que no cabe se descarta y el registro (`console.log`) lo dice. La temporada regular del juego va del 19 de marzo al 1 de octubre. El All-Star del juego se queda en su día.
+  - El calendario real de un año sale de la API pública de MLB: `python tools/season_schedule.py mlb 2026 mimod/schedule/2026.csv`. Para jugar el calendario de 2026 en el primer año, guárdalo como `schedule/2008.csv`.
+  - Las divisiones, las clasificaciones y el DH siguen siendo los de 2008: Houston, por ejemplo, juega el calendario de 2026 pero cuenta en la División Central de la Nacional. Detalles en `docs/ingenieria-inversa.md`, «Calendario de partidos».
 - **`riivolution/`**: XML de Riivolution (`<wiidisc>`) válidos para `RL8E54`. La carpeta del mod hace de raíz de la SD.
   - Los parches de archivos funcionan.
   - Los parches de **memoria** solo sirven para datos: el código del juego ya está traducido a nativo, así que cambiar instrucciones PowerPC en memoria no tiene efecto. Lo mismo pasa con los códigos Gecko/Action Replay que modifican código.
