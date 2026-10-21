@@ -118,6 +118,15 @@ Consejos para que se vea bien en el juego, límites y problemas conocidos: [stad
 
 Más en [roster-2008.md](roster-2008.md).
 
+## Jugadores de Success: copiar y pegar contraseñas
+
+Los jugadores que creas en Success se comparten con una contraseña de 156 caracteres. En el juego original había que copiarla de una foto y escribirla con el mando; aquí va como texto:
+
+- **Copiar:** abre My Data › View or Delete Custom Players › el jugador › Password Display y pulsa **Ctrl+C**. La contraseña queda en el portapapeles como texto, en grupos de 3 y filas de 18 como en la pantalla, para pegarla en un mensaje, un foro o un archivo.
+- **Pegar:** abre My Data › Password Input, pulsa **Ctrl+V** y luego OK. El jugador queda guardado como si lo hubieras escrito.
+
+Al pegar se ignoran los espacios y saltos de línea, y se aceptan equivalentes para los símbolos que no están en el teclado: `-` (−), `/` (÷), `!=` (≠), `@` (◎), `^` (△), `*` (☆), `->` (⇒), `<->` (⇔), `■` (□), `▼` (▽), `◆` (◇), `0` (O). Abajo sale un aviso con el resultado. Un jugador de Success también tiene la edad correcta en MLB Life con un paquete de temporada.
+
 ## 5. Otros tipos
 
 - **`disc/`**: archivos con la misma ruta que en la carpeta `files` del disco, por ejemplo sonidos.
