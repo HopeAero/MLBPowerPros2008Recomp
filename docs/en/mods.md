@@ -122,6 +122,7 @@ A mod that brings a roster and some years' schedules can be a **season pack**: w
 ```toml
 name = "Season 2026"
 start_year = 2026
+roster_year = 2023 # optional: the season the roster was made for (default start_year)
 dh = "both"      # optional: the DH in both leagues, as since 2022
 
 [divisions]      # optional: only the divisions that change
@@ -137,7 +138,8 @@ mods\
 ```
 
 - When a new season starts with the pack enabled, the first year is 2026: the date, the days of the week, the calendar (Y) and the save list say so, and `schedule/2026.csv` is the one used. The following years are 2027, 2028…
-- **Ages:** the roster keeps each player's age for its first season (PowerUp works out the birth year from the age). Starting in 2026, the roster's players are born 18 years later and keep that age; the birth date shown is the one that matches it. Players the game creates later (draft) already use the year shown.
+- **Ages:** the roster keeps each player's age for the season it was made for (PowerUp works out the birth year from the age). `roster_year` says which season that is: a 2023 roster used with `start_year = 2026` takes `roster_year = 2023`, and in 2026 every player is 3 years older than in the roster, their real age. Without `roster_year`, `start_year` is used (the roster's ages as they are). Players the game creates later (draft) already use the year shown.
+- **Family in MLB Life:** the wife and children are created with the original game's dates (2007); with the pack they move to the year shown and keep the age they are created with.
 - **DH:** with `dh = "both"` every Season mode game has the designated hitter, National League parks too (it is the launcher's DH IN BOTH LEAGUES option, turned on by the pack).
 - **Divisions:** `[divisions]` with `al_east`, `al_central`, `al_west`, `nl_east`, `nl_central` and `nl_west` (lists of team codes). Only the ones that change are needed: a team in a list moves to that division and the others stay where they were. With the example, Houston moves to the AL West and the leagues are 15 and 15, as since 2013. It applies when a new season starts: standings, screens and each team's league (for the DH too) follow the new divisions. Each division takes 1 to 7 teams; if something does not fit (an unknown or repeated code), the game keeps the usual ones and the log says so.
   - With changed divisions the game does not use its official 2008 schedule and generates one. That generator is the game's, made for even leagues (its own Custom League screen does not allow odd ones): with 15 and 15 the pack should bring `schedule/<year>.csv` for each year, and then the generator is not used at all.

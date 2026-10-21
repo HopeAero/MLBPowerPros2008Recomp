@@ -1,0 +1,145 @@
+diff --git a/runtime/include/mods.h b/runtime/include/mods.h
+index c069b1a..20913af 100644
+--- a/runtime/include/mods.h
++++ b/runtime/include/mods.h
+@@ -48,6 +48,7 @@ struct Mod {
+     std::string description;
+     std::string rosterIds;  // "2008" when roster/*.dat voice and face ids follow 2008's numbering
+     int startYear = 0;      // start_year: a new Season mode game's first season (0: 2008, the game's)
++    int rosterYear = 0;     // roster_year: the season the roster's ages are for (0: start_year)
+     bool universalDh = false;  // dh = "both"
+     std::vector<std::string> divisions[6];  // [divisions] al_east ... nl_west: team codes (empty: unchanged)
+     bool hasDivisions = false;
+diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
+index adc4a30..02f6f01 100644
+--- a/runtime/include/season_cap.h
++++ b/runtime/include/season_cap.h
+@@ -304,6 +304,19 @@ inline void OverlayLifeTail(uint32_t startShift, uint32_t fileOffset, uint8_t* d
+     WriteLifeTail(startShift, bytes);
+     std::memcpy(data + (from - fileOffset), bytes + (from - kLifeTailOffset), to - from);
+ }
++// MLB Life's family (wife and up to 5 children): records of 0x20 bytes from [0x8104B59C] + 0x678C, the
++// birth date in each first word: bits 31..24 year - 1900, 23..20 month, 19..15 day. Made when the
++// career is created, against the game's own 2007/2008 dates.
++constexpr uint32_t kFamilyBirths = 0x678C, kFamilyStride = 0x20;
++constexpr int kFamilyMembers = 6;
++inline bool FamilyBirthValid(uint32_t word) {
++    const uint32_t year = word >> 24, month = (word >> 20) & 0xF, day = (word >> 15) & 0x1F;
++    return year >= 50 && year < 200 && month >= 1 && month <= 12 && day >= 1 && day <= 31;
++}
++inline uint32_t FamilyBirthShifted(uint32_t word, uint32_t years) {
++    return word + (years << 24);
++}
++
+ inline bool IsLifeSaveName(const char* fileName) {
+     return fileName && std::strncmp(fileName, "pm3usmy", 7) == 0 && fileName[7] >= '0' && fileName[7] <= '2' &&
+            std::strcmp(fileName + 8, ".dat") == 0;
+@@ -320,7 +333,9 @@ int SeasonCount();         // this game's number of seasons
+ int Count();               // the same, 10 outside Season mode (for code MLB Life shares)
+ uint32_t YearOffset();     // years shown past 2008 + index: seasons that left the window plus a season
+                            // pack's start year (0 outside Season mode)
+-bool BeginNewGame(int startYear);  // true for a new Season mode game building its first schedule (0: 2008)
++// A new Season mode game or MLB Life career is being set up: startYear is the pack's first season and
++// rosterYear the season its roster was made for (its ages); 0 for either means 2008 / startYear.
++bool BeginNewGame(int startYear, int rosterYear);
+ bool UniversalDh();                // [season] universal_dh, or an enabled mod with dh = "both"
+ void OnHostFrame();        // settings_overlay.cpp, once per presented frame
+ // nand_isfs.cpp hooks for the season saves (IsSeasonSaveName): a read of `length` bytes at
+diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
+index 571b421..56abe07 100644
+--- a/runtime/src/hle/mlb/season_cap.cpp
++++ b/runtime/src/hle/mlb/season_cap.cpp
+@@ -242,14 +242,33 @@ bool UniversalDh() {
+     return fromMod || RuntimeConfigFile::UniversalDh(false);
+ }
+ 
+-bool BeginNewGame(int startYear) {
++// MLB Life: the wife and children were born against the game's 2007 dates; same age in the year shown.
++void ShiftFamily(uint32_t shift) {
++    const uint32_t first = Memory::Read32(0x8104B59Cu) + kFamilyBirths;
++    if (!Memory::Contains(first, kFamilyMembers * kFamilyStride)) return;
++    int moved = 0;
++    for (int k = 0; k < kFamilyMembers; ++k) {
++        const uint32_t at = first + static_cast<uint32_t>(k) * kFamilyStride;
++        const uint32_t word = Memory::Read32(at);
++        if (!FamilyBirthValid(word)) continue;
++        Memory::Write32(at, FamilyBirthShifted(word, shift));
++        ++moved;
++    }
++    std::fprintf(stderr, "[season] MLB Life: %d family birth dates moved %u years\n", moved, shift);
++}
++
++bool BeginNewGame(int startYear, int rosterYear) {
+     // A new game of either mode (MLB Life's starts at index 0 too, then goes back to its off-season).
+     if ((!SeasonModeActive() && !LifeModeActive()) || CurrentIndex() != 0) return false;
+     g_tail = {};
+     g_tail.startShift = startYear > 2008 ? static_cast<uint32_t>(startYear - 2008) : 0;
+     if (g_tail.startShift) {
+-        std::fprintf(stderr, "[season] new game: the first season is %d\n", startYear);
+-        ShiftBirthYears(g_tail.startShift);
++        // The roster's ages are for its own season (rosterYear, by default the first one): its players
++        // are born rosterYear - 2008 years later, so they are startYear - rosterYear years older.
++        const int roster = rosterYear >= 2008 ? rosterYear : startYear;
++        std::fprintf(stderr, "[season] new game: the first season is %d, roster of %d\n", startYear, roster);
++        ShiftBirthYears(static_cast<uint32_t>(roster - 2008));
++        if (LifeModeActive()) ShiftFamily(g_tail.startShift);
+     }
+     return true;
+ }
+diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
+index 9028b5e..269d323 100644
+--- a/runtime/src/hle/mlb/season_schedule.cpp
++++ b/runtime/src/hle/mlb/season_schedule.cpp
+@@ -113,6 +113,14 @@ bool HasSchedule() {
+     return year && FindSchedule(year, path, name);
+ }
+ 
++// roster_year of the pack that gives the start year (0: its start year).
++int RosterYear() {
++    for (const auto& mod : mods::Discover()) {
++        if (mod.enabled && mod.startYear) return mod.rosterYear;
++    }
++    return 0;
++}
++
+ struct Slot {
+     std::array<uint32_t, 4> words{};
+ };
+@@ -207,7 +215,7 @@ extern "C" void MLB_NewSeasonGame_80BB0B78(CpuContext* ctx) {
+     Call(ctx, 0x80B7AF8Cu, InvokeDirectCpu<0x80B7AF8Cu>);
+     const uint32_t r3 = ctx->gpr[3];
+     // A new game of Season mode or MLB Life: the pack's start year (and ages), then its divisions.
+-    season_cap::BeginNewGame(season_schedule::StartYear());
++    season_cap::BeginNewGame(season_schedule::StartYear(), season_schedule::RosterYear());
+     season_schedule::ApplyDivisions(ctx);
+     ctx->gpr[3] = r3;
+     Call(ctx, 0x80BAF2B4u, InvokeDirectCpu<0x80BAF2B4u>);
+diff --git a/runtime/src/mods.cpp b/runtime/src/mods.cpp
+index 5e9c0ca..8a63325 100644
+--- a/runtime/src/mods.cpp
++++ b/runtime/src/mods.cpp
+@@ -233,6 +233,8 @@ std::vector<Mod> Discover() {
+                 text("roster_ids", mod.rosterIds);
+                 const int64_t startYear = toml::find_or<int64_t>(document, "start_year", 0);
+                 if (startYear >= 2008 && startYear <= 2099) mod.startYear = static_cast<int>(startYear);
++                const int64_t rosterYear = toml::find_or<int64_t>(document, "roster_year", 0);
++                if (rosterYear >= 2008 && rosterYear <= 2099) mod.rosterYear = static_cast<int>(rosterYear);
+                 mod.universalDh = Lower(toml::find_or<std::string>(document, "dh", "")) == "both";
+                 if (document.contains("divisions") && document.at("divisions").is_table()) {
+                     static constexpr const char* kKeys[6] = {"al_east", "al_central", "al_west",
+diff --git a/runtime/tests/season_cap_tests.cpp b/runtime/tests/season_cap_tests.cpp
+index 360bc81..3e5dd2c 100644
+--- a/runtime/tests/season_cap_tests.cpp
++++ b/runtime/tests/season_cap_tests.cpp
+@@ -101,6 +101,11 @@ int main() {
+     WriteTail(pack, packTail.data());
+     Check(ReadTail(packTail.data(), kTailSize, back) && back.pastTen && ShownOffset(back) == 20, "both offsets add up");
+ 
++    // MLB Life's family birth dates (year - 1900 in the top byte, then month and day).
++    Check(FamilyBirthValid(0x537E8000u) && !FamilyBirthValid(0x00000159u) && !FamilyBirthValid(0u),
++          "a wife born 7/29/1983; garbage and empty records are not dates");
++    Check(FamilyBirthShifted(0x537E8000u, 18) == 0x657E8000u, "1983 + 18 = 2001, month and day kept");
++
+     // MLB Life saves: a small tail with the start shift, written only where a chunk covers it.
+     Check(IsLifeSaveName("pm3usmy0.dat") && IsLifeSaveName("pm3usmy2.dat") && !IsLifeSaveName("pm3usse0.dat") &&
+               !IsLifeSaveName("pm3usmy3.dat"),
