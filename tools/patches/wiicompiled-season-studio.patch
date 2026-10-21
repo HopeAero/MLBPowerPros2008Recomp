@@ -263,6 +263,35 @@ index 0000000..0d18e04
 +}
 +
 +}  // namespace season_pack
+diff --git a/runtime/include/season_schedule.h b/runtime/include/season_schedule.h
+index 621dea3..f6e7121 100644
+--- a/runtime/include/season_schedule.h
++++ b/runtime/include/season_schedule.h
+@@ -465,4 +465,24 @@ inline void MonthDay(int index, int& month, int& day) {
+     day = d + 1;
+ }
+ 
++// The All-Star Game's day. The game puts it on the third Tuesday of July (`gameDay`); the real game has
++// been on the second or third Tuesday, the day after the Home Run Derby, with no games from Monday to
++// Wednesday. With a real schedule (`realSchedule`) it goes to the second day of the run of days without
++// games nearest the game's day (three weeks each way), so it lands on that year's break even when the
++// season was moved a few days (Fit). Otherwise the game's day stays unless it has games.
++// `teamGames[d]` = team games on slot day d.
++inline int AllStarBreakDay(const std::array<int, kDays>& teamGames, int gameDay, bool realSchedule) {
++    auto free = [&](int d) { return d >= kRegularFirst && d <= kRegularLast && teamGames[d] == 0; };
++    if (gameDay < 0 || gameDay >= kDays || (!realSchedule && free(gameDay))) return gameDay;
++    for (int k = 0; k <= 21; ++k) {
++        for (int d : {gameDay - k, gameDay + k}) {
++            if (!free(d)) continue;
++            int first = d;
++            while (free(first - 1)) --first;
++            return free(first + 1) ? first + 1 : first;
++        }
++    }
++    return gameDay;
++}
++
+ }  // namespace season_schedule
 diff --git a/runtime/include/season_text.h b/runtime/include/season_text.h
 new file mode 100644
 index 0000000..6485bf0
@@ -399,10 +428,20 @@ index 56abe07..23ac50e 100644
  
  // MLB Life: the wife and children were born against the game's 2007 dates; same age in the year shown.
 diff --git a/runtime/src/hle/mlb/season_schedule.cpp b/runtime/src/hle/mlb/season_schedule.cpp
-index 3218ecd..8a45933 100644
+index 3218ecd..d6046a3 100644
 --- a/runtime/src/hle/mlb/season_schedule.cpp
 +++ b/runtime/src/hle/mlb/season_schedule.cpp
-@@ -59,10 +59,10 @@ int StartYear() {
+@@ -29,6 +29,9 @@ uint32_t Call(CpuContext* ctx, uint32_t target, void (*invoke)(CpuContext*)) {
+     return ctx->gpr[3];
+ }
+ 
++// Whether this year's games came from a mod's schedule/<year>.csv (Apply; AllStarDay).
++bool g_realSchedule = false;
++
+ // The year being built: 2008 + [state + 8] (+ the seasons that left the window), 0 with no state.
+ int Year() {
+     const uint32_t state = Memory::Read32(0x8104B5A8u);
+@@ -59,10 +62,10 @@ int StartYear() {
      return 0;
  }
  
@@ -415,7 +454,7 @@ index 3218ecd..8a45933 100644
      }
      return nullptr;
  }
-@@ -72,6 +72,7 @@ const mods::Mod* DivisionsMod(const std::vector<mods::Mod>& all) {
+@@ -72,6 +75,7 @@ const mods::Mod* DivisionsMod(const std::vector<mods::Mod>& all) {
  bool WantedDivisions(std::vector<std::string> (&listed)[6], std::string& source) {
      const auto all = mods::Discover();
      if (const mods::Mod* mod = DivisionsMod(all)) {
@@ -423,7 +462,7 @@ index 3218ecd..8a45933 100644
          for (int d = 0; d < 6; ++d) listed[d] = mod->divisions[d];
          source = "mod \"" + mod->name + "\"";
          return true;
-@@ -188,7 +189,14 @@ std::array<int, kTeams> Divisions(const std::array<int, kTeams>& slot) {
+@@ -188,7 +192,15 @@ std::array<int, kTeams> Divisions(const std::array<int, kTeams>& slot) {
      return division;
  }
  
@@ -436,11 +475,15 @@ index 3218ecd..8a45933 100644
 +}
 +
 +void Apply(CpuContext* ctx, bool official) {
++    g_realSchedule = false;
      const int year = Year();
      if (!year) return;
      const uint32_t table = Memory::Read32(0x8104B5A0u) + kTableOffset;
-@@ -211,14 +219,7 @@ void Apply(bool official) {
+@@ -209,16 +221,10 @@ void Apply(bool official) {
+             return;
+         }
          games = std::move(parsed.games);
++        g_realSchedule = true;
      } else if (!official) {
          // Leagues of 15 and 15 (the option or a pack's divisions): the game's generator leaves them uneven.
 -        int asgDay = 136;  // 7/15; the game's All-Star Game, if it put one
@@ -455,32 +498,19 @@ index 3218ecd..8a45933 100644
          games = GenerateOddLeagues(Divisions(TeamSlots()), year, DayIndex(3, 25), asgDay);
          if (games.empty()) return;  // even leagues: the game's own generator is right
          source = "the 15/15 generator";
-@@ -266,10 +267,64 @@ void Apply(bool official) {
+@@ -266,10 +272,51 @@ void Apply(bool official) {
                   fitted.moved, fitted.dropped);
  }
  
-+// The day for the All-Star Game: the game's, unless it has team games (a real schedule, whose break is
-+// elsewhere); then the second day of the nearest run of days without games (Tuesday of a Monday-Thursday
-+// break), within ten days.
++// The day for the All-Star Game (AllStarBreakDay) from the table as it is now.
 +int AllStarDay(int day) {
 +    const uint32_t table = Memory::Read32(0x8104B5A0u) + kTableOffset;
-+    auto free = [&](int d) {
-+        if (d < kRegularFirst || d > kRegularLast) return false;
++    std::array<int, kDays> teamGames{};
++    for (int d = 0; d < kDays; ++d)
 +        for (int s = 0; s < kSlots; ++s)
 +            if (Memory::Read32(table + static_cast<uint32_t>(d * kSlots + s) * kSlotBytes) < static_cast<uint32_t>(kTeams))
-+                return false;
-+        return true;
-+    };
-+    if (day < 0 || day >= kDays || free(day)) return day;
-+    for (int k = 1; k <= 10; ++k) {
-+        for (int d : {day - k, day + k}) {
-+            if (!free(d)) continue;
-+            int first = d;
-+            while (free(first - 1)) --first;
-+            return free(first + 1) ? first + 1 : first;
-+        }
-+    }
-+    return day;
++                ++teamGames[d];
++    return AllStarBreakDay(teamGames, day, g_realSchedule);
 +}
 +
  }  // namespace
@@ -520,7 +550,7 @@ index 3218ecd..8a45933 100644
  // 0x80B97DC4: builds the year's schedule. As the original, with the mod's schedule put in between.
  extern "C" void MLB_BuildSchedule_80B97DC4(CpuContext* ctx) {
      using season_schedule::Call;
-@@ -282,7 +337,7 @@ extern "C" void MLB_BuildSchedule_80B97DC4(CpuContext* ctx) {
+@@ -282,7 +329,7 @@ extern "C" void MLB_BuildSchedule_80B97DC4(CpuContext* ctx) {
      } else if (!season_schedule::HasSchedule()) {
          Call(ctx, 0x80B98320u, InvokeDirectCpu<0x80B98320u>);
      }
@@ -1004,3 +1034,28 @@ index 0000000..c3ba2fb
 +    std::printf("season_pack_tests: ok\n");
 +    return 0;
 +}
+diff --git a/runtime/tests/season_schedule_tests.cpp b/runtime/tests/season_schedule_tests.cpp
+index 1cf2429..629b0d5 100644
+--- a/runtime/tests/season_schedule_tests.cpp
++++ b/runtime/tests/season_schedule_tests.cpp
+@@ -124,6 +124,20 @@ int main() {
+               "team codes: 1 BAL, 22 HOU, 23 MIL");
+     }
+ 
++    // The All-Star Game: the second day of the nearest break with a real schedule, the game's day otherwise.
++    {
++        std::array<int, kDays> games;
++        games.fill(15);
++        for (int d = 129; d <= 131; ++d) games[d] = 0;  // a Monday-Wednesday break, 12 days before the game's day
++        Check(AllStarBreakDay(games, 142, true) == 130, "All-Star Game: second day of the nearest break");
++        games[142] = 0;
++        Check(AllStarBreakDay(games, 142, false) == 142, "All-Star Game: the game's day when free (game's schedule)");
++        Check(AllStarBreakDay(games, 142, true) == 142, "All-Star Game: a one-day break is that day");
++        std::array<int, kDays> none;
++        none.fill(15);
++        Check(AllStarBreakDay(none, 136, true) == 136, "All-Star Game: no break, the game's day");
++    }
++
+     if (failures) return 1;
+     std::printf("season_schedule_tests: ok\n");
+     return 0;
