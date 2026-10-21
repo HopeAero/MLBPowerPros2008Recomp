@@ -79,6 +79,16 @@ Detalles en `docs/ingenieria-inversa.md` («DH en ambas ligas»).
 - Con 15 y 15 el generador de calendarios del juego deja calendarios desiguales (de 142 a 162 partidos por equipo), así que el runtime usa uno propio con el formato de las Grandes Ligas desde 2023: 162 partidos por equipo, 13 contra cada rival de división (52), 6 o 7 contra el resto de la liga (64) y 46 de interliga (3 contra cada equipo de la otra liga y 4 contra el rival natural: Yankees–Mets, Cubs–White Sox, Dodgers–Angels…), en series de 2 a 4 partidos, unos 81 en casa, del 25 de marzo a finales de septiembre. Las fechas y los cruces no son los del calendario real de un año: para eso, un paquete de temporada con `schedule/<año>.csv`.
 - Un paquete de temporada con `[divisions]` usa sus divisiones aunque aquí esté en No (`docs/mods.md`).
 
+## Calendarios reales (HERRAMIENTAS)
+
+**HERRAMIENTAS > CALENDARIO** descarga el calendario real de una temporada de las Grandes Ligas desde la web pública de MLB (statsapi.mlb.com) y lo guarda en un mod como `schedule/<año>.csv`:
+
+1. **CALENDARIO: AÑO**: de 2002 a 2026. No están 2020 (60 partidos por equipo, desde julio) ni los años antes de 2002 (sus datos en la web de MLB no cuadran a 162 por equipo).
+2. **CALENDARIO: GUARDAR EN**: «Nuevo: Calendarios MLB» crea el mod `MLBSchedules` con ese año como primera temporada (`start_year`) y lo activa; o uno de tus mods (un paquete de temporada), al que se añade el archivo.
+3. **DESCARGAR CALENDARIO**: abajo se ve el resultado, por ejemplo «2022: 2430 partidos (162 por equipo)… El juego lo juega 4 días antes para acabar el 1 de octubre».
+
+El juego juega la temporada regular del 19 de marzo al 1 de octubre y como mucho 16 partidos por día. Si una temporada empezó antes o acabó después, se juega los días justos antes o después (mismo orden, otras fechas; pasa en 2004, 2005, 2009, 2010, 2012, 2015, 2016, 2021, 2022 y 2025). Un partido de un día con más de 16 pasa al día libre más cercano de los dos equipos. Ningún año pierde partidos. Para un roster de otro año, `roster_year` en el `mod.toml` (`docs/mods.md`). Solo hace falta internet al descargar.
+
 ## Guardado
 
 Se mantienen los archivos de mapeo existentes y la sección `[controller]` de `Config.toml`. Los ajustes adicionales se guardan bajo `UserData` en instalaciones portátiles:
