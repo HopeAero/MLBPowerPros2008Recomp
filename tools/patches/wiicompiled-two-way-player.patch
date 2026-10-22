@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..2dd722e
+index 0000000..6310285
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,223 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -58,6 +58,7 @@ index 0000000..2dd722e
 +//   - when one player is both, a swap that would put him on the bench (a new P, or a new DH) drops
 +//     that bench entry instead, so he is never listed twice.
 +#include <algorithm>
++#include <array>
 +#include <cstdint>
 +
 +#include "abi_bridge.h"
@@ -178,16 +179,31 @@ index 0000000..2dd722e
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80886C08, MLB_LineupSwap_80886C08, (CpuContext* ctx), (ctx));
 +
-+// The PITCHER screen keeps a backup of the lineup to restore on B: 40 entries and the groups, in a
-+// 0x107-byte block at [screen + 0x2B30] (0x8066CC2C saves, 0x8066CE48 restores). With a two-way
-+// player 41 entries are in use, so the slots past 40 are kept here, next to it.
++// Lineup backups hold 40 entries and the groups (0xF0 + 0x17 bytes): the PITCHER screen's, at
++// [screen + 0x2B30], restored on B (0x8066CC2C saves, 0x8066CE48 restores), and Season mode's
++// temporary one at [[0x8104B7E0] + team * 0x1E24 + 8] (0x80B6BC64 saves, 0x80B6C4E4 restores).
++// With a two-way player 41 entries are in use, so the slots past 40 are kept here, by backup.
 +namespace two_way {
 +namespace {
 +struct Extra {
-+    uint32_t backup = 0;
++    uint32_t backup = 0, team = 0;
 +    uint8_t bytes[(kCapacity - 40) * kEntry] = {};
 +};
-+Extra g_extra[2];  // per team
++std::array<Extra, 4> g_extra;  // the latest backups
++size_t g_extraNext = 0;
++
++void KeepExtra(uint32_t team, uint32_t backup) {
++    if (team > 1 || backup == 0) return;
++    Extra* slot = nullptr;
++    for (Extra& e : g_extra)
++        if (e.backup == backup && e.team == team) slot = &e;
++    if (!slot) slot = &g_extra[g_extraNext++ % g_extra.size()];
++    slot->backup = backup, slot->team = team;
++    const uint32_t entries = Memory::Read32(kLineups + team * 12);
++    for (uint32_t b = 0; b < sizeof slot->bytes; ++b) slot->bytes[b] = Memory::Read8(entries + 40 * kEntry + b);
++}
++
++uint32_t GroupsOf(uint32_t team) { return Memory::Read32(0x8104E1D8u) + team * 0x17 + 0x103; }
 +}  // namespace
 +}  // namespace two_way
 +
@@ -196,26 +212,31 @@ index 0000000..2dd722e
 +    using namespace two_way;
 +    const uint32_t backup = ctx->gpr[3], groups = ctx->gpr[4];
 +    for (uint32_t b = 0; b < 0x17; ++b) Memory::Write8(backup + 0xF0 + b, Memory::Read8(groups + b));
-+    for (uint32_t team = 0; team < 2; ++team) {
-+        const uint32_t table = kLineups + team * 12;
-+        if (Memory::Read32(table + 8) != groups) continue;
-+        g_extra[team].backup = backup;
-+        for (uint32_t b = 0; b < sizeof g_extra[team].bytes; ++b)
-+            g_extra[team].bytes[b] = Memory::Read8(Memory::Read32(table) + 40 * kEntry + b);
-+    }
++    for (uint32_t team = 0; team < 2; ++team)
++        if (Memory::Read32(kLineups + team * 12 + 8) == groups) KeepExtra(team, backup);
 +}
 +PPC_NATIVE_OVERRIDE_VOID(8066CD74, MLB_LineupBackupGroups_8066CD74, (CpuContext* ctx), (ctx));
++
++// 0x805F1040 (team): the team's groups. Season mode's backup (0x80B6BC64, the call returning to
++// 0x80B6BCE4, its backup in r31 + 8) copies them next: the entries past 40 are kept then.
++extern "C" void MLB_LineupGroups_805F1040(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t team = ctx->gpr[3];
++    if (ctx->lr == 0x80B6BCE4u) KeepExtra(team, Memory::Read32(ctx->gpr[31] + 8));
++    ctx->gpr[3] = GroupsOf(team);
++}
++PPC_NATIVE_OVERRIDE_VOID(805F1040, MLB_LineupGroups_805F1040, (CpuContext* ctx), (ctx));
 +
 +// 0x805F10A4 (team, groups): sets a team's groups; from a backup, it also puts back the entries past 40.
 +extern "C" void MLB_LineupSetGroups_805F10A4(CpuContext* ctx) {
 +    using namespace two_way;
-+    const uint32_t team = ctx->gpr[3] & 0xFF, source = ctx->gpr[4];
-+    const uint32_t target = Memory::Read32(0x8104E1D8u) + team * 0x17 + 0x103;
++    const uint32_t team = ctx->gpr[3], source = ctx->gpr[4];
++    const uint32_t target = GroupsOf(team);
 +    for (uint32_t b = 0; b < 0x17; ++b) Memory::Write8(target + b, Memory::Read8(source + b));
-+    if (team < 2 && g_extra[team].backup != 0 && g_extra[team].backup + 0xF0 == source) {
++    for (const Extra& e : g_extra) {
++        if (e.backup == 0 || e.team != team || e.backup + 0xF0 != source) continue;
 +        const uint32_t entries = Memory::Read32(kLineups + team * 12);
-+        for (uint32_t b = 0; b < sizeof g_extra[team].bytes; ++b)
-+            Memory::Write8(entries + 40 * kEntry + b, g_extra[team].bytes[b]);
++        for (uint32_t b = 0; b < sizeof e.bytes; ++b) Memory::Write8(entries + 40 * kEntry + b, e.bytes[b]);
 +    }
 +}
 +PPC_NATIVE_OVERRIDE_VOID(805F10A4, MLB_LineupSetGroups_805F10A4, (CpuContext* ctx), (ctx));
