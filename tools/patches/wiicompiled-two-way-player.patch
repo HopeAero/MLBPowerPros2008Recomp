@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..d0d4100
+index 0000000..07d9ae5
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,511 @@
+@@ -0,0 +1,605 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -551,6 +551,100 @@ index 0000000..d0d4100
 +    if (ctx->lr == 0x80A210D4u && newPitcher && position == 1) SetAptitude(record, g_second, kSecondAptitude);
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80A5B1F4, MLB_SetAptitude_80A5B1F4, (CpuContext* ctx), (ctx));
++
++// 0x80887900 (entries, players, 44, rules): the automatic lineup, as the original: 0x808879D0
++// readies the entries, 0x80887C48 picks the starting pitcher, 0x80887F68 the fielders by position
++// (the DH only when rules[0] says so), 0x808880FC improves them, then the batting order from the
++// table at 0x80D10EA4 through 0x808881CC. Season mode, MLB Life and Exhibition build their lineups
++// with it (0x80973664, 0x80650B10), on 44 working entries, sorted and copied to the game afterwards.
++// With the rule on and the DH in use, before the batting order: a two-way pitcher (main position P
++// with an aptitude of 4 or more in the field: record +0x63.. P, C, 1B .. RF) is the DH on the days
++// he does not start, and the DH as well as the starter on the days he does (the Ohtani rule; the
++// displaced DH takes a free entry on the bench).
++namespace two_way {
++namespace {
++constexpr uint32_t kOrder = 5;
++
++bool TwoWay(uint32_t players, uint8_t index) {
++    const uint32_t record = Memory::Read32(players + index * 0x2Cu + 0xC);
++    if (!record || Memory::Read8(record + 0x62) != 1) return false;
++    for (uint32_t p = 1; p < 9; ++p)
++        if (Memory::Read8(record + 0x64 + p - 1) >= 4) return true;
++    return false;
++}
++
++void ApplyTwoWay(uint32_t entries, uint32_t players, uint32_t count) {
++    const auto at = [&](uint32_t i) { return entries + i * kEntry; };
++    int starter = -1, dh = -1, twoWay = -1;
++    for (uint32_t i = 0; i < count; ++i) {
++        if (!Memory::Read8(at(i) + kInLineup)) continue;
++        if (Memory::Read8(at(i) + kPosition) == kPitcher) starter = static_cast<int>(i);
++        if (Memory::Read8(at(i) + kPosition) == kDh) dh = static_cast<int>(i);
++    }
++    if (starter < 0 || dh < 0) return;
++    const uint8_t starterPlayer = Memory::Read8(at(static_cast<uint32_t>(starter)) + 1);
++    if (TwoWay(players, starterPlayer)) {
++        // He starts: he is the DH too; the DH goes to a free entry on the bench.
++        int free = -1;
++        for (uint32_t i = 0; i < count && free < 0; ++i) {
++            const uint8_t index = Memory::Read8(at(i) + 1);
++            if (!Memory::Read8(at(i) + kOnRoster) && !Memory::Read8(at(i) + kInLineup) &&
++                Memory::Read32(players + index * 0x2Cu + 0xC) == 0)
++                free = static_cast<int>(i);
++        }
++        if (free < 0) return;
++        const uint32_t d = at(static_cast<uint32_t>(dh)), f = at(static_cast<uint32_t>(free));
++        const uint8_t displaced = Memory::Read8(d + 1);
++        Memory::Write8(f + 1, displaced);  // the free entry's empty player index goes unused
++        Memory::Write8(f + kPosition, 0);
++        Memory::Write8(f + kOnRoster, 1);
++        Memory::Write8(f + kInLineup, 0);
++        Memory::Write8(f + kOrder, 0);
++        Memory::Write8(d + 1, starterPlayer);
++        return;
++    }
++    for (uint32_t i = 0; i < count; ++i) {
++        const uint8_t index = Memory::Read8(at(i) + 1);
++        if (Memory::Read8(at(i) + kOnRoster) && !Memory::Read8(at(i) + kInLineup) && TwoWay(players, index)) {
++            twoWay = static_cast<int>(i);
++            break;
++        }
++    }
++    if (twoWay < 0) return;
++    const uint32_t d = at(static_cast<uint32_t>(dh)), t = at(static_cast<uint32_t>(twoWay));
++    Memory::Write8(d + kPosition, 0);
++    Memory::Write8(d + kInLineup, 0);
++    Memory::Write8(t + kPosition, kDh);
++    Memory::Write8(t + kInLineup, 1);
++}
++}  // namespace
++}  // namespace two_way
++
++extern "C" void MLB_AutoLineup_80887900(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t entries = ctx->gpr[3], players = ctx->gpr[4], count = ctx->gpr[5], rules = ctx->gpr[6];
++    const auto args = [&] { ctx->gpr[3] = entries, ctx->gpr[4] = players, ctx->gpr[5] = count, ctx->gpr[6] = rules; };
++    args();
++    Call(ctx, 0x808879D0u, InvokeDirectCpu<0x808879D0u>);
++    args();
++    Call(ctx, 0x80887C48u, InvokeDirectCpu<0x80887C48u>);
++    const uint32_t starter = entries + ctx->gpr[3] * kEntry;
++    Memory::Write8(starter + kInLineup, 1);
++    Memory::Write8(starter + kPosition, kPitcher);
++    args();
++    Call(ctx, 0x80887F68u, InvokeDirectCpu<0x80887F68u>);
++    args();
++    Call(ctx, 0x808880FCu, InvokeDirectCpu<0x808880FCu>);
++    if (RuntimeConfigFile::TwoWayPlayer(false) && Memory::Read8(rules) != 0) ApplyTwoWay(entries, players, count);
++    for (uint32_t slot = 0; slot < 9; ++slot) {
++        const uint8_t order = Memory::Read8(0x80D10EA4u + slot);
++        args();
++        ctx->gpr[6] = order, ctx->gpr[7] = rules;
++        Call(ctx, 0x808881CCu, InvokeDirectCpu<0x808881CCu>);
++        Memory::Write8(entries + (ctx->gpr[3] & 0xFF) * kEntry + kOrder, order);
++    }
++}
++PPC_NATIVE_OVERRIDE_VOID(80887900, MLB_AutoLineup_80887900, (CpuContext* ctx), (ctx));
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
 index d9976c9..0238edd 100644
 --- a/runtime/src/launcher.cpp
