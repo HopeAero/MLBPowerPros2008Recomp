@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..6310285
+index 0000000..d0d4100
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,511 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -60,12 +60,16 @@ index 0000000..6310285
 +#include <algorithm>
 +#include <array>
 +#include <cstdint>
++#include <cstdlib>
++#include <vector>
 +
 +#include "abi_bridge.h"
++#include "gx_guest_write.h"
 +#include "hle_stubs.h"
 +#include "memory.h"
 +#include "ppc_runtime.h"
 +#include "runtime_config.h"
++#include "season_cap.h"
 +
 +namespace two_way {
 +namespace {
@@ -263,11 +267,295 @@ index 0000000..6310285
 +    ctx->gpr[3] = value;
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80579DF8, MLB_IsPitcher_80579DF8, (CpuContext* ctx), (ctx));
++
++// MLB Career's new player (with the rule on): choosing Pitcher in "Select Fielding Position" asks
++// again, on the same panel, for a second position, as Pawapuro's two-way players have one; the
++// Pitcher button there reads "None". The panel (vtable 0x80E77830) keeps its button grid at +0xB44,
++// the cursor at +0xB6C (0 Pitcher .. 8 Right Fielder). Its update 0x80A364E4 asks 0x805EF2F8 for A
++// (returning to 0x80A36630) and 0x805EF300 for B (0x80A36688); a cursor move calls +0x64,
++// 0x80A367A0, which sets the new player's main position (0x81048B00, setter 0x8082C8C4). The
++// aptitudes come later from a table by main position (0x80A233E8: the loop setting P..RF through
++// 0x80A5B1F4, returning to 0x80A23830), and the second position gets kSecondAptitude there.
++//
++// The panel's title and buttons are pictures of pack 4003 (0xFA3), all in one 512 x 256 C8 atlas with
++// its palette (256 RGB5A3 right after the texels): the title "Select Fielding Position" (0x400934E4, 384 x 28 at
++// 0, 0) and the nine buttons (0x40093550 + 0x48 each, 138 x 30, three a row from y 28). While the
++// question is up, the atlas itself is repainted from its own letters: the title reads "Select
++// Second Position" and the Pitcher button "None" (letters of "Second Baseman" over the button's own
++// background); the original texels come back when the question ends.
++namespace two_way {
++namespace {
++constexpr uint32_t kNewPlayer = 0x81048B00u, kPanelCursor = 0xB44 + 0x28;
++constexpr uint32_t kSecondAptitude = 5;  // the table: 7 the main position, 6 the closest ones
++constexpr uint32_t kPositionPack = 0xFA3, kTitlePicture = 0x400934E4u, kPitcherButton = 0x40093550u;
++constexpr int kAtlasWidth = 512, kTitleW = 384, kTitleH = 28, kButtonW = 138, kButtonH = 30;
++int g_stage = 0;        // 1 while the panel asks for the second position, 2 once answered
++uint32_t g_second = 0;  // 2..9 (C..RF) for the latest new pitcher, 0 none
++
++void Sound(CpuContext* ctx, uint32_t id) {
++    Call(ctx, 0x80010F8Cu, InvokeDirectCpu<0x80010F8Cu>);
++    ctx->gpr[4] = id;
++    Call(ctx, 0x80020254u, InvokeDirectCpu<0x80020254u>);
++}
++
++uint32_t Resolve(CpuContext* ctx, uint32_t handle) {  // 0x8000BBFC: a pointer into the pack
++    ctx->gpr[3] = kPositionPack;
++    ctx->gpr[4] = handle;
++    Call(ctx, 0x8000BBFCu, InvokeDirectCpu<0x8000BBFCu>);
++    return ctx->gpr[3];
++}
++
++// A picture's corner in the atlas and the atlas texels, after checking the layout above.
++bool Picture(CpuContext* ctx, uint32_t handle, int w, int h, uint32_t& texels, int& u0, int& v0) {
++    const uint32_t surf = Resolve(ctx, handle);
++    if (!Memory::Contains(surf, 0x20) || Memory::Read32(surf) != 0x53555246u) return false;  // "SURF"
++    const uint32_t rect = Resolve(ctx, Memory::Read32(surf + 0x18)), set = Resolve(ctx, Memory::Read32(surf + 0x1C));
++    if (!Memory::Contains(rect, 20) || !Memory::Contains(set, 8)) return false;
++    const uint32_t list = Resolve(ctx, Memory::Read32(set + 4));
++    if (!Memory::Contains(list, 4)) return false;
++    const uint32_t texture = Resolve(ctx, Memory::Read32(list));
++    if (!Memory::Contains(texture, 12) || Memory::Read32(texture) != 0x01000200u || Memory::Read32(texture + 4) != 9)
++        return false;  // 512 x 256 (height first), C8
++    u0 = Memory::Read16(rect + 12), v0 = Memory::Read16(rect + 14);
++    if (Memory::Read16(rect + 16) - u0 != w || Memory::Read16(rect + 18) - v0 != h) return false;
++    texels = Resolve(ctx, Memory::Read32(texture + 8));
++    return Memory::Contains(texels, kAtlasWidth * 256);
++}
++
++uint32_t g_texels = 0;
++std::vector<uint8_t> g_titleBackup, g_buttonBackup;
++int g_titleU = 0, g_titleV = 0, g_buttonU = 0, g_buttonV = 0;
++
++uint8_t Texel(int x, int y) { return Memory::Read8(g_texels + season_cap::C8Offset(x, y, kAtlasWidth)); }
++void SetTexel(int x, int y, uint8_t v) { Memory::Write8(g_texels + season_cap::C8Offset(x, y, kAtlasWidth), v); }
++
++void Restore() {
++    if (!g_texels) return;
++    for (int y = 0; y < kTitleH; ++y)
++        for (int x = 0; x < kTitleW; ++x) SetTexel(g_titleU + x, g_titleV + y, g_titleBackup[y * kTitleW + x]);
++    for (int y = 0; y < kButtonH; ++y)
++        for (int x = 0; x < kButtonW; ++x) SetTexel(g_buttonU + x, g_buttonV + y, g_buttonBackup[y * kButtonW + x]);
++    GxGuestWrite::NotifyWrite(g_texels, kAtlasWidth * 256);
++    g_texels = 0;
++}
++
++// Column runs of the title's own letters (x in the title picture): "Select ", then S E C O N D
++// from "Select Fielding Position", the end of "Fielding" (closing the word) and "Position".
++constexpr std::array<std::pair<int, int>, 9> kTitleRuns{
++    {{59, 136}, {59, 77}, {77, 89}, {111, 123}, {295, 309}, {202, 213}, {182, 193}, {225, 229}, {229, 324}}};
++// Letters of "Second Baseman" (the fourth button, x in the button): N O N E.
++constexpr std::array<std::pair<int, int>, 4> kNoneRuns{{{42, 51}, {32, 42}, {42, 51}, {17, 25}}};
++
++void Paint(CpuContext* ctx) {
++    uint32_t texels = 0, pitcherTexels = 0, sourceTexels = 0;
++    int su = 0, sv = 0;
++    if (!Picture(ctx, kTitlePicture, kTitleW, kTitleH, texels, g_titleU, g_titleV) ||
++        !Picture(ctx, kPitcherButton, kButtonW, kButtonH, pitcherTexels, g_buttonU, g_buttonV) ||
++        !Picture(ctx, kPitcherButton + 3 * 0x48, kButtonW, kButtonH, sourceTexels, su, sv) ||
++        pitcherTexels != texels || sourceTexels != texels || !Memory::Contains(texels, kAtlasWidth * 256 + 512))
++        return;
++    g_texels = texels;
++    g_titleBackup.resize(kTitleW * kTitleH);
++    g_buttonBackup.resize(kButtonW * kButtonH);
++    for (int y = 0; y < kTitleH; ++y)
++        for (int x = 0; x < kTitleW; ++x) g_titleBackup[y * kTitleW + x] = Texel(g_titleU + x, g_titleV + y);
++    for (int y = 0; y < kButtonH; ++y)
++        for (int x = 0; x < kButtonW; ++x) g_buttonBackup[y * kButtonW + x] = Texel(g_buttonU + x, g_buttonV + y);
++
++    // The title: the runs side by side, centred.
++    std::vector<int> columns;
++    for (const auto& [a, b] : kTitleRuns)
++        for (int x = a; x < b; ++x) columns.push_back(x);
++    const int start = (kTitleW - static_cast<int>(columns.size())) / 2;
++    for (int x = 0; x < kTitleW; ++x) {
++        const int from = x - start;
++        const bool inside = from >= 0 && from < static_cast<int>(columns.size());
++        for (int y = 0; y < kTitleH; ++y)
++            SetTexel(g_titleU + x, g_titleV + y,
++                     inside ? g_titleBackup[y * kTitleW + columns[static_cast<size_t>(from)]] : 0);
++    }
++
++    // The button, in the atlas palette's colours (a TLUT of 256 RGB5A3 right after the texels): its
++    // own background with the label wiped (each row blended across it, back to the nearest colour
++    // the button already uses), then N O N E with their rim, each colour moved to the Pitcher
++    // label's colour of the same relative brightness.
++    std::array<std::array<int, 4>, 256> palette{};
++    for (uint32_t i = 0; i < 256; ++i) {
++        const uint16_t v = Memory::Read16(g_texels + kAtlasWidth * 256 + i * 2);
++        palette[i] = v & 0x8000 ? std::array<int, 4>{((v >> 10) & 31) * 255 / 31, ((v >> 5) & 31) * 255 / 31,
++                                                      (v & 31) * 255 / 31, 255}
++                                : std::array<int, 4>{((v >> 8) & 15) * 17, ((v >> 4) & 15) * 17, (v & 15) * 17,
++                                                      ((v >> 12) & 7) * 255 / 7};
++    }
++    const auto lum = [&](uint8_t i) {
++        return 0.299f * palette[i][0] + 0.587f * palette[i][1] + 0.114f * palette[i][2];
++    };
++    const auto button = [&](int x, int y) { return g_buttonBackup[y * kButtonW + x]; };
++    std::vector<uint8_t> used;
++    for (uint8_t v : g_buttonBackup)
++        if (std::find(used.begin(), used.end(), v) == used.end()) used.push_back(v);
++    const auto nearest = [&](const std::array<int, 4>& c) {
++        uint8_t best = used[0];
++        long bestDistance = -1;
++        for (uint8_t i : used) {
++            long d = palette[i][3] == c[3] ? 0 : 1000000;
++            for (int k = 0; k < 3; ++k) d += (palette[i][k] - c[k]) * (palette[i][k] - c[k]);
++            if (bestDistance < 0 || d < bestDistance) best = i, bestDistance = d;
++        }
++        return best;
++    };
++    constexpr int kLabelLeft = 29, kLabelRight = 109;
++    std::vector<uint8_t> wiped(g_buttonBackup);
++    for (int y = 0; y < kButtonH; ++y) {
++        const auto& a = palette[button(kLabelLeft, y)];
++        const auto& b = palette[button(kLabelRight, y)];
++        for (int x = kLabelLeft + 1; x < kLabelRight; ++x) {
++            std::array<int, 4> c{};
++            for (int k = 0; k < 4; ++k) c[k] = a[k] + (b[k] - a[k]) * (x - kLabelLeft) / (kLabelRight - kLabelLeft);
++            wiped[y * kButtonW + x] = nearest(c);
++        }
++    }
++    const auto source = [&](int x, int y) { return Texel(su + x, sv + y); };
++    const auto core = [&](int x, int y) {
++        if (y < 9 || y > 21) return false;
++        bool inside = false;
++        for (const auto& [a, b] : kNoneRuns) inside = inside || (x >= a && x < b);
++        return inside && lum(source(x, y)) < 100;
++    };
++    const auto nearCore = [&](int x, int y, int r) {
++        for (int yy = std::max(0, y - r); yy <= std::min(kButtonH - 1, y + r); ++yy)
++            for (int xx = std::max(0, x - r); xx <= std::min(kButtonW - 1, x + r); ++xx)
++                if (core(xx, yy)) return true;
++        return false;
++    };
++    // The Pitcher label's colours (where it stands out from the wiped background), and the
++    // letters' own range, by brightness.
++    std::vector<uint8_t> labelColours, letterColours;
++    for (int y = 8; y < 24; ++y)
++        for (int x = kLabelLeft + 2; x < kLabelRight - 2; ++x) {
++            const uint8_t v = button(x, y);
++            if (std::abs(lum(v) - lum(wiped[y * kButtonW + x])) > 40 &&
++                std::find(labelColours.begin(), labelColours.end(), v) == labelColours.end())
++                labelColours.push_back(v);
++        }
++    for (int y = 8; y < 24; ++y)
++        for (int x = 0; x < kButtonW; ++x)
++            if (nearCore(x, y, 2)) letterColours.push_back(source(x, y));
++    if (labelColours.empty() || letterColours.empty()) return;
++    float lo = 255, hi = 0, plo = 255, phi = 0;
++    for (uint8_t v : letterColours) lo = std::min(lo, lum(v)), hi = std::max(hi, lum(v));
++    for (uint8_t v : labelColours) plo = std::min(plo, lum(v)), phi = std::max(phi, lum(v));
++    const auto recolour = [&](uint8_t v) {
++        const float target = plo + (lum(v) - lo) / std::max(1.0f, hi - lo) * (phi - plo);
++        uint8_t best = labelColours[0];
++        for (uint8_t c : labelColours)
++            if (std::abs(lum(c) - target) < std::abs(lum(best) - target)) best = c;
++        return best;
++    };
++    columns.clear();
++    for (const auto& [a, b] : kNoneRuns)
++        for (int x = a; x < b; ++x) columns.push_back(x);
++    const int left = kButtonW / 2 - static_cast<int>(columns.size()) / 2;
++    for (size_t i = 0; i < columns.size(); ++i)
++        for (int y = 8; y < 24; ++y) {
++            const int sx = columns[i];
++            const float l = lum(source(sx, y));
++            if (nearCore(sx, y, 1) || (nearCore(sx, y, 2) && (l > 250 || l < 100)))
++                wiped[y * kButtonW + left + static_cast<int>(i)] = recolour(source(sx, y));
++        }
++    for (int y = 0; y < kButtonH; ++y)
++        for (int x = 0; x < kButtonW; ++x) SetTexel(g_buttonU + x, g_buttonV + y, wiped[y * kButtonW + x]);
++    GxGuestWrite::NotifyWrite(g_texels, kAtlasWidth * 256);  // the renderer uploads the atlas again
++}
++}  // namespace
++}  // namespace two_way
++
++// 0x805EF2F8 (pad): A pressed, as the original (0x805EEB70, button 4). On the position panel, A on
++// Pitcher asks for the second position instead of going on; A there keeps the answer and goes on.
++extern "C" void MLB_PressedA_805EF2F8(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t lr = ctx->lr, panel = ctx->gpr[31];
++    ctx->gpr[4] = 4;
++    Call(ctx, 0x805EEB70u, InvokeDirectCpu<0x805EEB70u>);
++    if (lr != 0x80A36630u || ctx->gpr[3] == 0 || !RuntimeConfigFile::TwoWayPlayer(false)) return;
++    const uint32_t cursor = Memory::Read32(panel + kPanelCursor);
++    if (g_stage == 1) {
++        g_second = cursor == 0 ? 0 : cursor + 1;
++        g_stage = 2;  // the game confirms through 0x80A367A0, which keeps Pitcher
++        Restore();
++        return;  // the game goes on to the next step
++    }
++    g_second = 0;
++    if (cursor != 0) return;
++    g_stage = 1;
++    Paint(ctx);
++    Sound(ctx, 0x1001);
++    ctx->gpr[3] = 0;
++}
++PPC_NATIVE_OVERRIDE_VOID(805EF2F8, MLB_PressedA_805EF2F8, (CpuContext* ctx), (ctx));
++
++// 0x805EF300 (pad): B pressed (button 5). While asking for the second position, B goes back to the
++// main one, Pitcher selected.
++extern "C" void MLB_PressedB_805EF300(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t lr = ctx->lr, panel = ctx->gpr[31];
++    ctx->gpr[4] = 5;
++    Call(ctx, 0x805EEB70u, InvokeDirectCpu<0x805EEB70u>);
++    if (lr != 0x80A36688u || g_stage != 1 || ctx->gpr[3] == 0) return;
++    g_stage = 0;
++    Restore();
++    ctx->gpr[3] = panel + 0xB44, ctx->gpr[4] = 0;
++    Call(ctx, 0x805F77E8u, InvokeDirectCpu<0x805F77E8u>);
++    Sound(ctx, 0x1002);
++    ctx->gpr[3] = 0;
++}
++PPC_NATIVE_OVERRIDE_VOID(805EF300, MLB_PressedB_805EF300, (CpuContext* ctx), (ctx));
++
++// 0x80A367A0 (panel): the cursor moved, or A confirmed: marks the panel and sets the main position,
++// as the original; not while asking for the second position, and Pitcher when it was answered.
++extern "C" void MLB_PositionCursor_80A367A0(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t panel = ctx->gpr[3];
++    Memory::Write8(panel + 0x126, 1);
++    if (g_stage == 1) return;
++    ctx->gpr[3] = kNewPlayer;
++    ctx->gpr[4] = g_stage == 2 ? 1 : (Memory::Read32(panel + kPanelCursor) + 1) & 0xFF;
++    g_stage = 0;
++    Call(ctx, 0x8082C8C4u, InvokeDirectCpu<0x8082C8C4u>);
++}
++PPC_NATIVE_OVERRIDE_VOID(80A367A0, MLB_PositionCursor_80A367A0, (CpuContext* ctx), (ctx));
++
++// 0x80A5B1F4 (record, position 1..9, aptitude 0..7): sets a position's aptitude, 3 bits each from
++// bit 0x2FA of the record (P, C, then 1B..RF from bit 0x300), as the original. A new career sets the
++// main position's 7 at 0x80A210D0 (returning to 0x80A210D4), then either keeps the rest (a high
++// school player, 0x80A22554) or fills them from the table (0x80A233E8, returning to 0x80A23830):
++// a new two-way pitcher's second position gets kSecondAptitude in both.
++namespace two_way {
++namespace {
++void SetAptitude(uint32_t record, uint32_t position, uint32_t value) {
++    const uint32_t bit = position == 1 ? 0x2FA : position == 2 ? 0x2FD : 0x300 + 3 * (position - 3);
++    const uint32_t word = record + bit / 32 * 4, shift = 32 - bit % 32 - 3;
++    Memory::Write32(word, (Memory::Read32(word) & ~(7u << shift)) | value << shift);
++}
++}  // namespace
++}  // namespace two_way
++
++extern "C" void MLB_SetAptitude_80A5B1F4(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t record = ctx->gpr[3], position = ctx->gpr[4];
++    uint32_t value = std::min<uint32_t>(ctx->gpr[5], 7);
++    if (position == 0 || position > 9) return;
++    const bool newPitcher = g_second != 0 && ((Memory::Read32(record + 0x5C) >> 6) & 0xF) == 1;
++    if (ctx->lr == 0x80A23830u && newPitcher && position == g_second) value = std::max(value, kSecondAptitude);
++    SetAptitude(record, position, value);
++    if (ctx->lr == 0x80A210D4u && newPitcher && position == 1) SetAptitude(record, g_second, kSecondAptitude);
++}
++PPC_NATIVE_OVERRIDE_VOID(80A5B1F4, MLB_SetAptitude_80A5B1F4, (CpuContext* ctx), (ctx));
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index d9976c9..dc8e3cc 100644
+index d9976c9..0238edd 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
-@@ -825,12 +825,23 @@ Result Run(int argc, char** argv) {
+@@ -825,12 +825,25 @@ Result Run(int argc, char** argv) {
                                     static_cast<int>(i)});
      }
  
@@ -275,11 +563,13 @@ index d9976c9..dc8e3cc 100644
 +                  Tr("Con DH, un pitcher abridor también puede ser el bateador designado y seguir bateando cuando "
 +                     "deja el montículo, como en las Grandes Ligas desde 2022. En la alineación, pon de abridor (PITCHER) "
 +                     "al jugador que está de DH: queda en los dos puestos, y el abridor que tenía el equipo pasa al "
-+                     "bullpen. Sirve en todos los modos con DH.",
++                     "bullpen. Sirve en todos los modos con DH. Al crear un pitcher en MLB Career, el juego pregunta además "
++                     "una segunda posición (jugador de dos vías).",
 +                     "With the DH, a starting pitcher can also be the designated hitter and keep batting after he "
 +                     "leaves the mound, as in the major leagues since 2022. In the lineup, make the player who is the "
 +                     "DH the starter (PITCHER): he keeps both spots, and the team's former starter goes to the "
-+                     "bullpen. It works in every mode with the DH."),
++                     "bullpen. It works in every mode with the DH. When creating a pitcher in MLB Career, the game also asks "
++                     "for a second position (two-way player)."),
 +                  YesNo(), RuntimeConfigFile::TwoWayPlayer(false) ? 1 : 0};
 +    twoWay.experimental = true;
      std::vector<Tab> tabs{
@@ -292,7 +582,7 @@ index d9976c9..dc8e3cc 100644
      };
      tabs.push_back(std::move(modsTab));
      tabs.push_back(std::move(toolsTab));
-@@ -943,6 +954,7 @@ Result Run(int argc, char** argv) {
+@@ -943,6 +956,7 @@ Result Run(int argc, char** argv) {
          if (label == seasons.label) RuntimeConfigFile::SetMaxSeasons(o.value == 1 ? 20 : o.value == 2 ? 0 : 10);
          if (label == universalDh.label) RuntimeConfigFile::SetUniversalDh(o.value != 0);
          if (label == modernLeagues.label) RuntimeConfigFile::SetModernLeagues(o.value != 0);
