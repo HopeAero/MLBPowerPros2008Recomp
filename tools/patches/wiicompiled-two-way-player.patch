@@ -1,0 +1,214 @@
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index 549417e..3d43b99 100644
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -45,6 +45,7 @@ struct RuntimeUserConfig {
+     std::optional<uint32_t> maxSeasons;  // [season] max_seasons: 10 (original), 20 or 0 (no limit)
+     std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
+     std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
++    std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
+     std::optional<int32_t> windowPosX;
+     std::optional<int32_t> windowPosY;
+     std::optional<uint32_t> windowWidth;
+@@ -477,6 +478,7 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
+     }
+     config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
+     config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
++    config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
+     config.windowPosX = FindConfigInt(document, "video", "window_x");
+     config.windowPosY = FindConfigInt(document, "video", "window_y");
+     if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
+@@ -967,6 +969,15 @@ inline bool SetModernLeagues(bool value) {
+     return WriteSetting("season", "modern_leagues", value ? "true" : "false");
+ }
+ 
++inline bool TwoWayPlayer(bool fallback = false) {
++    return Get().twoWayPlayer.value_or(fallback);
++}
++
++inline bool SetTwoWayPlayer(bool value) {
++    Mutable().twoWayPlayer = value;
++    return WriteSetting("season", "two_way_player", value ? "true" : "false");
++}
++
+ inline bool UniversalDh(bool fallback = false) {
+     return Get().universalDh.value_or(fallback);
+ }
+diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
+new file mode 100644
+index 0000000..38e70f4
+--- /dev/null
++++ b/runtime/src/hle/mlb/two_way.cpp
+@@ -0,0 +1,135 @@
++// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
++// a starting pitcher can also be the DH and keep batting after he leaves the mound.
++//
++// A game's lineup is per team at 0x8103D090 + team * 12: {+0 entries, +4 players, +8 groups}. The
++// entries are 6 bytes each: [1] roster index, [2] position (1 P .. 9 RF, 10 DH), [3] on the MLB
++// roster, [4] in the lineup, [5] batting order (0 for the P). Each roster index appears once. The
++// players are 0x2C bytes per roster index (+0xC the player record; record +0x62 == 1: a pitcher).
++// The groups block (0x17 bytes) holds where each group of entries starts and ends and how many it
++// has; +0x16 is the number of entries in use (40 of 44). 0x808863E0 / 0x808866FC rebuild it from the
++// entries, 0x8088A090 sorts them.
++//
++// Every lineup change goes through 0x80886C08 (team, i, j, sort), which swaps the roster indices of
++// entries i and j. With the rule:
++//   - the DH (a pitcher) swapped with the starting P: he takes the P entry and keeps the DH one; the
++//     pitcher he replaces gets a new entry on the bench, so he can still pitch in relief;
++//   - when one player is both, a swap that would put him on the bench (a new P, or a new DH) drops
++//     that bench entry instead, so he is never listed twice.
++#include <algorithm>
++#include <cstdint>
++
++#include "abi_bridge.h"
++#include "hle_stubs.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++#include "runtime_config.h"
++
++namespace two_way {
++namespace {
++
++constexpr uint32_t kLineups = 0x8103D090u;
++constexpr uint32_t kEntry = 6, kCapacity = 44;
++constexpr uint32_t kPosition = 2, kOnRoster = 3, kInLineup = 4;
++constexpr uint8_t kPitcher = 1, kDh = 10;
++constexpr uint32_t kGroupsCount = 0x16, kBenchPitchersLast = 5, kBenchPitchersCount = 0x10;
++
++void Call(CpuContext* ctx, uint32_t target, void (*invoke)(CpuContext*)) {
++    const uint32_t lr = ctx->lr;
++    ctx->lr = target;
++    invoke(ctx);
++    ctx->lr = lr;
++}
++
++struct Lineup {
++    uint32_t entries, players, groups;
++    uint32_t Entry(uint32_t i) const { return entries + i * kEntry; }
++    uint8_t Count() const { return Memory::Read8(groups + kGroupsCount); }
++    uint8_t Player(uint32_t i) const { return Memory::Read8(Entry(i) + 1); }
++    bool Starter(uint32_t i, uint8_t position) const {
++        return Memory::Read8(Entry(i) + kInLineup) != 0 && Memory::Read8(Entry(i) + kPosition) == position;
++    }
++    bool IsPitcher(uint8_t player) const {
++        const uint32_t record = Memory::Read32(players + player * 0x2Cu + 0xC);
++        return record != 0 && Memory::Read8(record + 0x62) == 1;
++    }
++    int Find(uint8_t position) const {
++        for (uint32_t i = 0; i < Count(); ++i)
++            if (Starter(i, position)) return static_cast<int>(i);
++        return -1;
++    }
++};
++
++// A bench entry for `player`, right after the bench pitchers (the group rebuild needs each group to
++// stay in one run).
++void InsertBenchPitcher(const Lineup& l, uint8_t player) {
++    const uint8_t count = l.Count();
++    if (count >= kCapacity) return;
++    uint32_t at = count;
++    if (Memory::Read8(l.groups + kBenchPitchersCount) != 0) at = Memory::Read8(l.groups + kBenchPitchersLast) + 1u;
++    else
++        for (uint32_t i = 0; i < count; ++i)
++            if (Memory::Read8(l.Entry(i) + kOnRoster) == 0) { at = i; break; }  // before the minor leaguers
++    for (uint32_t i = count; i > at; --i)
++        for (uint32_t b = 0; b < kEntry; ++b) Memory::Write8(l.Entry(i) + b, Memory::Read8(l.Entry(i - 1) + b));
++    const uint8_t entry[kEntry] = {0, player, 0, 1, 0, 0};
++    for (uint32_t b = 0; b < kEntry; ++b) Memory::Write8(l.Entry(at) + b, entry[b]);
++    Memory::Write8(l.groups + kGroupsCount, static_cast<uint8_t>(count + 1));
++}
++
++void Remove(const Lineup& l, uint32_t at) {
++    const uint8_t count = l.Count();
++    for (uint32_t i = at; i + 1 < count; ++i)
++        for (uint32_t b = 0; b < kEntry; ++b) Memory::Write8(l.Entry(i) + b, Memory::Read8(l.Entry(i + 1) + b));
++    Memory::Write8(l.Entry(count - 1u) + 1, 0);
++    Memory::Write8(l.groups + kGroupsCount, static_cast<uint8_t>(count - 1));
++}
++
++// Applies the swap of entries i and j the rule's way; false when the rule has nothing to do with it.
++bool Swap(const Lineup& l, uint32_t i, uint32_t j) {
++    const int p = l.Find(kPitcher), d = l.Find(kDh);
++    if (p < 0 || d < 0 || i == j) return false;
++    const uint32_t up = static_cast<uint32_t>(p), ud = static_cast<uint32_t>(d);
++    const bool both = l.Player(up) == l.Player(ud);
++    if (!both && ((i == up && j == ud) || (i == ud && j == up)) && l.IsPitcher(l.Player(ud))) {
++        const uint8_t starter = l.Player(up);
++        Memory::Write8(l.Entry(up) + 1, l.Player(ud));
++        InsertBenchPitcher(l, starter);
++        return true;
++    }
++    if (both && (i == up || i == ud || j == up || j == ud) && !((i == up && j == ud) || (i == ud && j == up))) {
++        const uint32_t starter = (i == up || i == ud) ? i : j, other = starter == i ? j : i;
++        if (Memory::Read8(l.Entry(other) + kInLineup) != 0) return false;  // two starters: the game's swap
++        Memory::Write8(l.Entry(starter) + 1, l.Player(other));
++        Remove(l, other);
++        return true;
++    }
++    return false;
++}
++
++}  // namespace
++}  // namespace two_way
++
++// 0x80886C08 (team, i, j, sort): swaps two lineup entries, then sorts them (sort != 0) and rebuilds
++// the groups, as the original; with the two-way player rule the swap may keep one player in both
++// the P and the DH entries (see above).
++extern "C" void MLB_LineupSwap_80886C08(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t team = ctx->gpr[3], i = ctx->gpr[4], j = ctx->gpr[5], sort = ctx->gpr[6];
++    const uint32_t table = kLineups + team * 12;
++    const Lineup l{Memory::Read32(table), Memory::Read32(table + 4), Memory::Read32(table + 8)};
++    if (!(RuntimeConfigFile::TwoWayPlayer(false) && Swap(l, i, j))) {
++        const uint8_t a = l.Player(i), b = l.Player(j);
++        Memory::Write8(l.Entry(i) + 1, b);
++        Memory::Write8(l.Entry(j) + 1, a);
++    }
++    if (sort != 0) {
++        ctx->gpr[3] = l.entries, ctx->gpr[4] = l.players, ctx->gpr[5] = l.Count(), ctx->gpr[6] = 1;
++        Call(ctx, 0x8088A090u, InvokeDirectCpu<0x8088A090u>);
++        ctx->gpr[3] = l.groups, ctx->gpr[4] = l.entries, ctx->gpr[5] = l.players, ctx->gpr[6] = l.Count();
++        Call(ctx, 0x808863E0u, InvokeDirectCpu<0x808863E0u>);
++    } else {
++        ctx->gpr[3] = l.groups, ctx->gpr[4] = l.entries, ctx->gpr[5] = l.players, ctx->gpr[6] = l.Count();
++        Call(ctx, 0x808866FCu, InvokeDirectCpu<0x808866FCu>);
++    }
++}
++PPC_NATIVE_OVERRIDE_VOID(80886C08, MLB_LineupSwap_80886C08, (CpuContext* ctx), (ctx));
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index d9976c9..dc8e3cc 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -825,12 +825,23 @@ Result Run(int argc, char** argv) {
+                                    static_cast<int>(i)});
+     }
+ 
++    Option twoWay{Tr("REGLA OHTANI", "OHTANI RULE"),
++                  Tr("Con DH, un pitcher abridor también puede ser el bateador designado y seguir bateando cuando "
++                     "deja el montículo, como en las Grandes Ligas desde 2022. En la alineación, pon de abridor (PITCHER) "
++                     "al jugador que está de DH: queda en los dos puestos, y el abridor que tenía el equipo pasa al "
++                     "bullpen. Sirve en todos los modos con DH.",
++                     "With the DH, a starting pitcher can also be the designated hitter and keep batting after he "
++                     "leaves the mound, as in the major leagues since 2022. In the lineup, make the player who is the "
++                     "DH the starter (PITCHER): he keeps both spots, and the team's former starter goes to the "
++                     "bullpen. It works in every mode with the DH."),
++                  YesNo(), RuntimeConfigFile::TwoWayPlayer(false) ? 1 : 0};
++    twoWay.experimental = true;
+     std::vector<Tab> tabs{
+         {"VIDEO", {api, quality, display, resolution, fsr, filtering, mipmaps, msaa, aspect, fill, interpolation, fps}},
+         {"AUDIO", {volume, mute}},
+         {Tr("CONTROLES", "CONTROLS"), {wiimote}},
+         {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
+-        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh, modernLeagues}},
++        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh, modernLeagues, twoWay}},
+     };
+     tabs.push_back(std::move(modsTab));
+     tabs.push_back(std::move(toolsTab));
+@@ -943,6 +954,7 @@ Result Run(int argc, char** argv) {
+         if (label == seasons.label) RuntimeConfigFile::SetMaxSeasons(o.value == 1 ? 20 : o.value == 2 ? 0 : 10);
+         if (label == universalDh.label) RuntimeConfigFile::SetUniversalDh(o.value != 0);
+         if (label == modernLeagues.label) RuntimeConfigFile::SetModernLeagues(o.value != 0);
++        if (label == twoWay.label) RuntimeConfigFile::SetTwoWayPlayer(o.value != 0);
+         if (label == language.label) {
+             const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
+             RuntimeConfigFile::SetUiLanguage(code);

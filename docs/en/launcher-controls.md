@@ -75,6 +75,8 @@ Details in `docs/en/reverse-engineering.md` («DH in both leagues»).
 
 **SETTINGS > ENHANCEMENTS > 15 AND 15 LEAGUES** (experimental): Houston moves to the American League West, as since 2013, and both leagues have 15 teams. It is saved in `Config.toml` (`[season] modern_leagues = true`).
 
+**SETTINGS > ENHANCEMENTS > OHTANI RULE** (experimental): with the DH, a starting pitcher can also be the designated hitter and keep batting after he leaves the mound, as in the major leagues since 2022. In the lineup, on **PITCHER**, make the player who is the DH the starter (Ohtani, say): he keeps both spots and the team's former starter goes to the bullpen. When the pitcher is changed later, the player stays the DH. It works in every mode with the DH. It is saved in `Config.toml` (`[season] two_way_player = true`).
+
 - It applies to new Season mode games and new MLB Life careers; games already started stay as they were.
 - With 15 and 15 the game's schedule generator leaves uneven schedules (142 to 162 games a team), so the runtime uses its own with the major leagues' format since 2023: 162 games a team, 13 against each division rival (52), 6 or 7 against the rest of the league (64) and 46 interleague (3 against each team of the other league and 4 against the natural rival: Yankees–Mets, Cubs–White Sox, Dodgers–Angels…), in series of 2 to 4 games, about 81 at home, from March 25 to late September. Dates and matchups are not a real year's: for that, a season pack with `schedule/<year>.csv`.
 - A season pack with `[divisions]` uses its divisions even when this says No (`docs/en/mods.md`).

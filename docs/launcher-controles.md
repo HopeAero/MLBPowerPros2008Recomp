@@ -75,6 +75,8 @@ Detalles en `docs/ingenieria-inversa.md` («DH en ambas ligas»).
 
 **AJUSTES > MEJORAS > LIGAS 15 Y 15** (experimental): Houston pasa a la División Oeste de la Liga Americana, como desde 2013, y las dos ligas quedan con 15 equipos. Se guarda en `Config.toml` (`[season] modern_leagues = true`).
 
+**AJUSTES > MEJORAS > REGLA OHTANI** (experimental): con DH, un pitcher abridor también puede ser el bateador designado y seguir bateando cuando deja el montículo, como en las Grandes Ligas desde 2022. En la alineación, en **PITCHER**, pon de abridor al jugador que está de DH (por ejemplo Ohtani): queda en los dos puestos y el abridor que tenía el equipo pasa al bullpen. Al cambiar luego de pitcher, el jugador sigue de DH. Sirve en todos los modos con DH. Se guarda en `Config.toml` (`[season] two_way_player = true`).
+
 - Vale para las temporadas nuevas del modo Temporada y las carreras nuevas de MLB Life; las partidas ya empezadas siguen como estaban.
 - Con 15 y 15 el generador de calendarios del juego deja calendarios desiguales (de 142 a 162 partidos por equipo), así que el runtime usa uno propio con el formato de las Grandes Ligas desde 2023: 162 partidos por equipo, 13 contra cada rival de división (52), 6 o 7 contra el resto de la liga (64) y 46 de interliga (3 contra cada equipo de la otra liga y 4 contra el rival natural: Yankees–Mets, Cubs–White Sox, Dodgers–Angels…), en series de 2 a 4 partidos, unos 81 en casa, del 25 de marzo a finales de septiembre. Las fechas y los cruces no son los del calendario real de un año: para eso, un paquete de temporada con `schedule/<año>.csv`.
 - Un paquete de temporada con `[divisions]` usa sus divisiones aunque aquí esté en No (`docs/mods.md`).
