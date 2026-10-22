@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..38e70f4
+index 0000000..ca727d6
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,160 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -122,8 +122,10 @@ index 0000000..38e70f4
 +    const uint8_t count = l.Count();
 +    for (uint32_t i = at; i + 1 < count; ++i)
 +        for (uint32_t b = 0; b < kEntry; ++b) Memory::Write8(l.Entry(i) + b, Memory::Read8(l.Entry(i + 1) + b));
-+    Memory::Write8(l.Entry(count - 1u) + 1, 0);
-+    Memory::Write8(l.groups + kGroupsCount, static_cast<uint8_t>(count - 1));
++    // The freed slot as the game leaves its unused ones: an empty roster index (40..43 hold 40..43).
++    const uint32_t last = count - 1u;
++    for (uint32_t b = 0; b < kEntry; ++b) Memory::Write8(l.Entry(last) + b, b == 1 ? static_cast<uint8_t>(last) : 0);
++    Memory::Write8(l.groups + kGroupsCount, static_cast<uint8_t>(last));
 +}
 +
 +// Applies the swap of entries i and j the rule's way; false when the rule has nothing to do with it.
@@ -175,6 +177,29 @@ index 0000000..38e70f4
 +    }
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80886C08, MLB_LineupSwap_80886C08, (CpuContext* ctx), (ctx));
++
++// 0x80579DF8 (record): the record's +0x62, 1 for pitchers. The PITCHER screen's list (0x8066D754)
++// asks it of every starter but the P, to offer a pitcher who is the DH as the starter; when that
++// player already is the starter (two-way), he is not offered again.
++extern "C" void MLB_IsPitcher_80579DF8(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t record = ctx->gpr[3];
++    uint32_t value = Memory::Read8(record + 0x62);
++    if (ctx->lr == 0x8066D844u && value == 1 && RuntimeConfigFile::TwoWayPlayer(false)) {
++        for (uint32_t team = 0; team < 2; ++team) {
++            const uint32_t table = kLineups + team * 12;
++            const Lineup l{Memory::Read32(table), Memory::Read32(table + 4), Memory::Read32(table + 8)};
++            if (!l.entries) continue;
++            const int p = l.Find(kPitcher), d = l.Find(kDh);
++            if (p < 0 || d < 0) continue;
++            const uint8_t player = l.Player(static_cast<uint32_t>(p));
++            if (player == l.Player(static_cast<uint32_t>(d)) && Memory::Read32(l.players + player * 0x2Cu + 0xC) == record)
++                value = 0;
++        }
++    }
++    ctx->gpr[3] = value;
++}
++PPC_NATIVE_OVERRIDE_VOID(80579DF8, MLB_IsPitcher_80579DF8, (CpuContext* ctx), (ctx));
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
 index d9976c9..dc8e3cc 100644
 --- a/runtime/src/launcher.cpp
