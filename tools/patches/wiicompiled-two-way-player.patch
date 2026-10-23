@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..3d9d893
+index 0000000..367d34a
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,625 @@
+@@ -0,0 +1,627 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -558,7 +558,8 @@ index 0000000..3d9d893
 +// table at 0x80D10EA4 through 0x808881CC. Season mode, MLB Life and Exhibition build their lineups
 +// with it (0x80973664, 0x80650B10), on 44 working entries, sorted and copied to the game afterwards.
 +// With the rule on and the DH in use, before the batting order: a two-way pitcher (main position P
-+// with an aptitude of 4 or more in the field: record +0x63.. P, C, 1B .. RF) is the DH on the days
++// with an aptitude of 4 or more in the field: record +0x63.. P, C, 1B .. RF; or with a hitter's
++// batting: contact +0x72 and power +0x73, 1 and 16 for every other pitcher) is the DH on the days
 +// he does not start, and the DH as well as the starter on the days he does (the Ohtani rule; the
 +// displaced DH takes a free entry on the bench).
 +namespace two_way {
@@ -570,7 +571,8 @@ index 0000000..3d9d893
 +    if (!record || Memory::Read8(record + 0x62) != 1) return false;
 +    for (uint32_t p = 1; p < 9; ++p)
 +        if (Memory::Read8(record + 0x64 + p - 1) >= 4) return true;
-+    return false;
++    // ponytail: rosters' Ohtani (PowerUp+ 2025: P only, contact 9, power 238); hitters start at 3 / 124.
++    return Memory::Read8(record + 0x72) >= 5 && Memory::Read8(record + 0x73) >= 100;
 +}
 +
 +void ApplyTwoWay(uint32_t entries, uint32_t players, uint32_t count) {
