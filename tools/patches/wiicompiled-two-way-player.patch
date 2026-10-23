@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..367d34a
+index 0000000..c03f472
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,627 @@
+@@ -0,0 +1,757 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -60,6 +60,7 @@ index 0000000..367d34a
 +#include <algorithm>
 +#include <array>
 +#include <cstdint>
++#include <cstdio>
 +#include <cstdlib>
 +#include <vector>
 +
@@ -73,6 +74,11 @@ index 0000000..367d34a
 +
 +namespace two_way {
 +namespace {
++
++// MLB Life with a two-way player (end of the file).
++void NoteLifePitcher(uint32_t entries, uint32_t players, uint32_t count, bool start);
++void LifeDrillSwitch(CpuContext* ctx, uint32_t pad);
++void LifeDrillPicked();
 +
 +constexpr uint32_t kLineups = 0x8103D090u;
 +constexpr uint32_t kEntry = 6, kCapacity = 44;
@@ -171,6 +177,7 @@ index 0000000..367d34a
 +        Memory::Write8(l.Entry(i) + 1, b);
 +        Memory::Write8(l.Entry(j) + 1, a);
 +    }
++    NoteLifePitcher(l.entries, l.players, l.Count(), false);
 +    if (sort != 0) {
 +        ctx->gpr[3] = l.entries, ctx->gpr[4] = l.players, ctx->gpr[5] = l.Count(), ctx->gpr[6] = 1;
 +        Call(ctx, 0x8088A090u, InvokeDirectCpu<0x8088A090u>);
@@ -474,9 +481,11 @@ index 0000000..367d34a
 +// Pitcher asks for the second position instead of going on; A there keeps the answer and goes on.
 +extern "C" void MLB_PressedA_805EF2F8(CpuContext* ctx) {
 +    using namespace two_way;
-+    const uint32_t lr = ctx->lr, panel = ctx->gpr[31];
-+    ctx->gpr[4] = 4;
++    const uint32_t lr = ctx->lr, panel = ctx->gpr[31], pad = ctx->gpr[3];
++    LifeDrillSwitch(ctx, pad);
++    ctx->gpr[3] = pad, ctx->gpr[4] = 4;
 +    Call(ctx, 0x805EEB70u, InvokeDirectCpu<0x805EEB70u>);
++    if (ctx->gpr[3] != 0) LifeDrillPicked();
 +    if (lr != 0x80A36630u || ctx->gpr[3] == 0 || !RuntimeConfigFile::TwoWayPlayer(false)) return;
 +    const uint32_t cursor = Memory::Read32(panel + kPanelCursor);
 +    if (g_stage == 1) {
@@ -665,8 +674,129 @@ index 0000000..367d34a
 +            }
 +        }
 +    }
++    NoteLifePitcher(entries, players, count, true);
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80887900, MLB_AutoLineup_80887900, (CpuContext* ctx), (ctx));
++
++// MLB Life with a two-way player (the rule on): the mode asks whether its player is a pitcher
++// (0x80A2F88C, 135 places) and reads his main position (0x8057BD3C on his packed record, at the
++// places in kLifeRoleSites) to pick the practice drills, the look back after a game and the ability
++// growth. For a pitcher with a second position (aptitude 4 or more, read with 0x80A5B160) they follow
++// a role: in practice the one picked on the drill list (X switches pitcher / batter drills), else
++// pitcher on a day he pitched (the P of his game's lineup) and a hitter at his second position on the
++// others.
++namespace two_way {
++namespace {
++constexpr uint32_t kLifeModeId = 0x8104B608u;  // u16: 9001 in MLB Life
++// 0x80A372C0 (list) fills the drill list, asking 0x80A2F88C (returning to 0x80A37330).
++constexpr uint32_t kDrillListAsk = 0x80A37330u;
++constexpr uint32_t kLifeRoleSites[] = {
++    0x809E022Cu,                                                  // the look back after a day
++    0x809E328Cu,                                                  // a practice day
++    0x80A007F0u, 0x80A009E0u, 0x80A00ED4u, 0x80A00528u, 0x809FFF7Cu,  // the growth panel
++    0x809A8B38u,                                                  // the menu's stats panel
++};
++constexpr uint32_t kButtonX = 8;                  // 0x805EEB70's button index (A 4, B 5)
++
++bool g_practiceBatter = false, g_inPractice = false, g_pitched = false, g_drillOpen = false;
++uint32_t g_drillList = 0;
++
++bool LifeMode() { return RuntimeConfigFile::TwoWayPlayer(false) && Memory::Read16(kLifeModeId) == 9001; }
++
++// The MLB Life player's id (0x80A16F38: [[0x8104B5C0]], u16), as a game's players have it at +0.
++uint16_t LifeId() { return Memory::Read16(Memory::Read32(0x8104B5C0u)); }
++
++uint32_t LifeRecord(CpuContext* ctx) {  // 0x80A2F738: the MLB Life player's packed record
++    Call(ctx, 0x80A2F738u, InvokeDirectCpu<0x80A2F738u>);
++    return ctx->gpr[3];
++}
++
++// His best fielding position (2 C .. 9 RF) with an aptitude of 4 or more; 0 when he has none.
++uint32_t SecondPosition(CpuContext* ctx, uint32_t record) {
++    uint32_t best = 0, bestAptitude = 3;
++    for (uint32_t position = 2; position <= 9; ++position) {
++        ctx->gpr[3] = record, ctx->gpr[4] = position;
++        Call(ctx, 0x80A5B160u, InvokeDirectCpu<0x80A5B160u>);
++        if (ctx->gpr[3] > bestAptitude) best = position, bestAptitude = ctx->gpr[3];
++    }
++    return best;
++}
++
++bool Batter() { return g_inPractice ? g_practiceBatter : !g_pitched; }
++
++// A game's lineup: whether the MLB Life player is its P (a start, or a change).
++void NoteLifePitcher(uint32_t entries, uint32_t players, uint32_t count, bool start) {
++    if (!LifeMode()) return;
++    const uint16_t id = LifeId();
++    for (uint32_t i = 0; i < count; ++i) {
++        const uint32_t e = entries + i * kEntry;
++        if (Memory::Read16(players + Memory::Read8(e + 1) * 0x2Cu) != id) continue;
++        const bool pitching = Memory::Read8(e + kInLineup) && Memory::Read8(e + kPosition) == kPitcher;
++        if (start) g_inPractice = false, g_pitched = pitching;
++        else g_pitched = g_pitched || pitching;
++        std::fprintf(stderr, "[two-way] MLB Life player %s\n", g_pitched ? "pitches today" : "does not pitch today");
++        return;
++    }
++}
++
++// X on the drill list switches pitcher / batter drills: the list is filled again.
++void LifeDrillSwitch(CpuContext* ctx, uint32_t pad) {
++    if (!g_drillOpen || !g_drillList || !LifeMode()) return;
++    ctx->gpr[3] = pad, ctx->gpr[4] = kButtonX;
++    Call(ctx, 0x805EEB70u, InvokeDirectCpu<0x805EEB70u>);
++    if (ctx->gpr[3] == 0) return;
++    g_practiceBatter = !g_practiceBatter;
++    ctx->gpr[3] = g_drillList;
++    Call(ctx, 0x80A372C0u, InvokeDirectCpu<0x80A372C0u>);  // asks 0x80A2F88C again: the new drills
++    Sound(ctx, 0x1001);
++}
++
++void LifeDrillPicked() { g_drillOpen = false; }
++}  // namespace
++}  // namespace two_way
++
++extern "C" void MLB_LifeIsPitcher_80A2F88C(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t lr = ctx->lr, list = ctx->gpr[31];
++    // As the original: the player being made ([0x81048D84]) or the career's player.
++    if (Memory::Read8(0x81048D84u) != 0) {
++        Call(ctx, 0x80A2F738u, InvokeDirectCpu<0x80A2F738u>);
++        Call(ctx, 0x8057BD3Cu, InvokeDirectCpu<0x8057BD3Cu>);
++        ctx->gpr[3] = (ctx->gpr[3] & 0xFF) == 1 ? 1 : 0;
++    } else {
++        Call(ctx, 0x80A16F38u, InvokeDirectCpu<0x80A16F38u>);
++        ctx->gpr[3] &= 0xFFFF;
++        Call(ctx, 0x80B06888u, InvokeDirectCpu<0x80B06888u>);
++    }
++    const uint32_t pitcher = ctx->gpr[3];
++    if (pitcher == 0 || !LifeMode() || SecondPosition(ctx, LifeRecord(ctx)) == 0) {
++        ctx->gpr[3] = pitcher;
++        return;
++    }
++    if (lr == kDrillListAsk) {
++        g_inPractice = true, g_drillOpen = true, g_drillList = list;
++        std::fprintf(stderr, "[two-way] MLB Life practice: %s drills (X switches)%c", g_practiceBatter ? "batter" : "pitcher", 10);
++    }
++    ctx->gpr[3] = Batter() ? 0 : 1;
++}
++PPC_NATIVE_OVERRIDE_VOID(80A2F88C, MLB_LifeIsPitcher_80A2F88C, (CpuContext* ctx), (ctx));
++
++// 0x8057BD3C (packed record): the main position (word +0x5C, bits 6..9), as the original.
++extern "C" void MLB_MainPosition_8057BD3C(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t record = ctx->gpr[3], lr = ctx->lr;
++    const uint32_t value = (Memory::Read32(record + 0x5C) >> 6) & 0xF;
++    ctx->gpr[3] = value;
++    if (value != kPitcher || !LifeMode()) return;
++    const bool site = std::find(std::begin(kLifeRoleSites), std::end(kLifeRoleSites), lr) != std::end(kLifeRoleSites);
++    if (!site || LifeRecord(ctx) != record) {
++        ctx->gpr[3] = value;
++        return;
++    }
++    const uint32_t second = SecondPosition(ctx, record);
++    ctx->gpr[3] = second != 0 && Batter() ? second : value;
++}
++PPC_NATIVE_OVERRIDE_VOID(8057BD3C, MLB_MainPosition_8057BD3C, (CpuContext* ctx), (ctx));
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
 index d9976c9..0238edd 100644
 --- a/runtime/src/launcher.cpp
