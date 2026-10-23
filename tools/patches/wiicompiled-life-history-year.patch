@@ -1,0 +1,34 @@
+diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
+index 10e4f90..520b3ba 100644
+--- a/runtime/include/season_cap.h
++++ b/runtime/include/season_cap.h
+@@ -176,11 +176,16 @@ inline bool IsYearSite(uint32_t address) {
+ constexpr uint32_t kSeasonDhStore = 0x80B6F210u, kSeasonNoDhSite = 0x80B6EF88u;
+ inline bool IsDhSite(uint32_t address) { return address == kSeasonDhStore || address == kSeasonNoDhSite; }
+ 
++// MLB Life's History screen (0x809AD06C) picks a column by an entry's year - 2007 (addi -107): with a
++// pack the entries are in its years (the career starts 11/8 of start_year - 1), so the first year moves too.
++inline bool IsFirstYearSubtracted(uint32_t address) { return address == 0x809AD3ACu; }
++
+ inline int32_t ImmediateFor(uint32_t address, int32_t original, int count, uint32_t yearOffset,
+                             bool universalDh = false) {
+     if (IsDhSite(address)) return universalDh ? 1 : original;
+     if (IsCapCompare(address)) return original - kOriginalSeasons + count;
+     if (IsYearSite(address)) return original + static_cast<int32_t>(yearOffset);
++    if (IsFirstYearSubtracted(address)) return original - static_cast<int32_t>(yearOffset);
+     return original;
+ }
+ 
+diff --git a/runtime/tests/season_cap_tests.cpp b/runtime/tests/season_cap_tests.cpp
+index 6c1f658..d1ea8e7 100644
+--- a/runtime/tests/season_cap_tests.cpp
++++ b/runtime/tests/season_cap_tests.cpp
+@@ -53,6 +53,8 @@ int main() {
+           "the event dates' 2-digit year (season of the date + 8) moves with the year");
+     Check(ImmediateFor(0x809803B0u, 2008, 10, 18) == 2026 && ImmediateFor(0x80980634u, 2008, 10, 0) == 2008,
+           "MLB Life's first-season payday follows the start year");
++    Check(ImmediateFor(0x809AD3ACu, -107, 10, 17) == -124 && ImmediateFor(0x809AD3ACu, -107, 10, 0) == -107,
++          "MLB Life's History columns follow the start year");
+     Check(IsLifeCreationYearSite(0x80A02F5Cu) && IsLifeCreationYearSite(0x80979F44u) && !IsLifeCreationYearSite(0x80979F48u),
+           "MLB Life creation year sites");
+     Check(CenturyShown(89) == 19 && DigitsShown(89) == 89 && CenturyShown(107) == 20 && DigitsShown(107) == 7 &&
