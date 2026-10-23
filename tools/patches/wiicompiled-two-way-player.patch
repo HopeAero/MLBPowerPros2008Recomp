@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..c03f472
+index 0000000..264223c
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,757 @@
+@@ -0,0 +1,883 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -64,7 +64,12 @@ index 0000000..c03f472
 +#include <cstdlib>
 +#include <vector>
 +
++#include <aurora/imgui.h>
++#include <imgui.h>
++#include <xxhash.h>
++
 +#include "abi_bridge.h"
++#include "aurora_events.h"
 +#include "gx_guest_write.h"
 +#include "hle_stubs.h"
 +#include "memory.h"
@@ -797,6 +802,127 @@ index 0000000..c03f472
 +    ctx->gpr[3] = second != 0 && Batter() ? second : value;
 +}
 +PPC_NATIVE_OVERRIDE_VOID(8057BD3C, MLB_MainPosition_8057BD3C, (CpuContext* ctx), (ctx));
++
++// The drill list's help bar ("A Advance, + Move CRS", from the game's layout) gets "X Change" after it
++// while the list is open, drawn from the game's own pictures: the X button of the button atlas
++// (128 x 128 C8) and the "Change" label of the label atlas (128 x 512 C4). Both are in MEM2 behind
++// a texture header 0x40 bytes before the texels ({height << 16 | width, format, texels}), each
++// followed by its RGB5A3 palette, and found by the XXH64 of their texels (aurora's replacement hash
++// for them). Nothing of them leaves the running game.
++namespace two_way {
++namespace {
++struct Atlas {
++    uint64_t hash;
++    int width, height;
++    uint32_t format;  // 8 C4, 9 C8
++    uint32_t texels = 0;
++    ImTextureID texture = 0;
++};
++Atlas g_buttons{0xF3E663D037ED25ECull, 128, 128, 9};
++Atlas g_labels{0x69A94E8F79634306ull, 128, 512, 8};
++
++uint32_t TexelBytes(const Atlas& a) { return a.format == 8 ? a.width * a.height / 2 : a.width * a.height; }
++
++bool Valid(const Atlas& a) {
++    if (!a.texels || !Memory::Contains(a.texels - 0x40, TexelBytes(a) + 0x40) || Memory::Read32(a.texels - 0x38) != a.texels)
++        return false;
++    std::vector<uint8_t> bytes(TexelBytes(a));
++    for (uint32_t i = 0; i < bytes.size(); ++i) bytes[i] = Memory::Read8(a.texels + i);
++    return XXH64(bytes.data(), bytes.size(), 0) == a.hash;
++}
++
++uint32_t Be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
++
++void Find(Atlas& a) {
++    a.texels = 0;
++    const uint32_t size = uint32_t(a.height) << 16 | uint32_t(a.width);
++    constexpr uint32_t kBlock = 0x1000;  // Contains / GetPointer within one page
++    for (uint32_t block = 0x90000000u; block < 0x98000000u; block += kBlock) {  // MEM2, 128 MB here
++        if (!Memory::Contains(block, kBlock)) continue;
++        const uint8_t* p = Memory::GetPointer(block, kBlock);
++        for (uint32_t o = 0; o + 12 <= kBlock; o += 4) {
++            if (Be32(p + o) != size || Be32(p + o + 4) != a.format || Be32(p + o + 8) != block + o + 0x40) continue;
++            a.texels = block + o + 0x40;
++            if (Valid(a)) return;
++            a.texels = 0;
++        }
++    }
++}
++
++ImTextureID Decode(const Atlas& a) {
++    const uint32_t palette = a.texels + TexelBytes(a);
++    std::vector<uint8_t> rgba(size_t(a.width) * a.height * 4);
++    for (int y = 0; y < a.height; ++y)
++        for (int x = 0; x < a.width; ++x) {
++            uint32_t index;
++            if (a.format == 9) {
++                index = Memory::Read8(a.texels + season_cap::C8Offset(x, y, a.width));
++            } else {  // C4: 8 x 8 tiles of 32 bytes, high nibble first
++                const uint32_t tile = (uint32_t(y) / 8 * (a.width / 8) + uint32_t(x) / 8) * 32;
++                const uint8_t pair = Memory::Read8(a.texels + tile + (y % 8) * 4 + (x % 8) / 2);
++                index = x % 2 ? pair & 15 : pair >> 4;
++            }
++            const uint16_t v = Memory::Read16(palette + index * 2);
++            uint8_t* out = &rgba[(size_t(y) * a.width + x) * 4];
++            if (v & 0x8000) {
++                out[0] = ((v >> 10) & 31) * 255 / 31, out[1] = ((v >> 5) & 31) * 255 / 31, out[2] = (v & 31) * 255 / 31;
++                out[3] = 255;
++            } else {
++                out[0] = ((v >> 8) & 15) * 17, out[1] = ((v >> 4) & 15) * 17, out[2] = (v & 15) * 17;
++                out[3] = ((v >> 12) & 7) * 255 / 7;
++            }
++        }
++    return aurora_imgui_add_texture(uint32_t(a.width), uint32_t(a.height), rgba.data());
++}
++
++bool Ready(Atlas& a) {
++    if (!Valid(a)) {
++        Find(a);
++        if (!a.texels) return false;
++        a.texture = 0;
++    }
++    if (!a.texture) a.texture = Decode(a);
++    return a.texture != 0;
++}
++
++// Where the game's picture is in the window, as player_password.cpp has it.
++ImVec4 GameRect(const ImVec2& window) {
++    const float aspect = !RuntimeConfigFile::WidescreenEnabled(true) ? 4.0f / 3.0f
++                         : MkwForceAspect169Requested()              ? 16.0f / 9.0f
++                                                                     : window.x / window.y;
++    const float w = std::min(window.x, window.y * aspect), h = w / aspect;
++    return ImVec4((window.x - w) * 0.5f, (window.y - h) * 0.5f, w, h);
++}
++}  // namespace
++
++void OnHostFrame() {
++    // The pictures' headers are there once the game has drawn the list: look a few times, 30 frames apart.
++    static bool ready = false;
++    static int frames = 0, tries = 0;
++    const bool open = g_drillOpen && LifeMode();
++    if (!open) {
++        frames = tries = 0;
++        return;
++    }
++    if (frames++ % 30 == 0 && tries < 5 && (!ready || frames == 1)) {
++        ++tries;
++        const bool b = Ready(g_buttons), l = Ready(g_labels);
++        ready = b && l;
++    }
++    if (!ready) return;
++    // Measured on the bar at 1920 x 1080 (the game stretched to the window): a picture texel is
++    // 3.67 x 2.3 pixels; the X button goes where a third entry starts, at the A button's height.
++    const ImVec4 game = GameRect(ImGui::GetIO().DisplaySize);
++    const float sx = game.z / 1920.0f, sy = game.w / 1080.0f, tx = 3.67f * sx, ty = 2.3f * sy;
++    const auto at = [&](float x, float y) { return ImVec2(game.x + x * sx, game.y + y * sy); };
++    ImDrawList* dl = ImGui::GetForegroundDrawList();
++    const ImVec2 button = at(701.0f, 1006.7f), label = at(780.0f, 1008.8f);
++    dl->AddImage(g_buttons.texture, button, ImVec2(button.x + 21 * tx, button.y + 25 * ty), ImVec2(103 / 128.0f, 25 / 128.0f),
++                 ImVec2(124 / 128.0f, 50 / 128.0f));
++    dl->AddImage(g_labels.texture, label, ImVec2(label.x + 56 * tx, label.y + 22 * ty), ImVec2(0.0f, 110 / 512.0f),
++                 ImVec2(56 / 128.0f, 132 / 512.0f));
++}
++}  // namespace two_way
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
 index d9976c9..0238edd 100644
 --- a/runtime/src/launcher.cpp
@@ -836,3 +962,26 @@ index d9976c9..0238edd 100644
          if (label == language.label) {
              const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
              RuntimeConfigFile::SetUiLanguage(code);
+diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
+index bda3f34..7a2f7dd 100644
+--- a/runtime/src/settings_overlay.cpp
++++ b/runtime/src/settings_overlay.cpp
+@@ -72,6 +72,10 @@ namespace AxDspHle {
+ void SetMixWorkerEnabled(bool enabled);
+ }
+ 
++namespace two_way {
++void OnHostFrame();  // two_way.cpp: the MLB Life drill list's "X Change"
++}
++
+ namespace settings_overlay {
+ namespace {
+ 
+@@ -1712,6 +1716,7 @@ void Draw() noexcept {
+     season_probe::OnHostFrame();
+     season_cap::OnHostFrame();
+     player_password::OnHostFrame();
++    two_way::OnHostFrame();
+     // Also drive the Wii Remote rescan from here: PADRead runs it too, but this
+     // runs once per presented frame whatever the game is doing (e.g. sitting in
+     // its "communications interrupted" prompt without polling pads). Same guest
