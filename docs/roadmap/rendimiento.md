@@ -10,6 +10,7 @@ El juego debería ir a 60 FPS estables en las PCs que la gente tiene: portátile
 ## Dónde estamos
 - GPU a resolución nativa (x1) en un partido: unos 2,9 ms por cuadro en la RX 5500; x2 con filtrado 16x unos 7,5 ms. El launcher ya tiene calidades (Baja / Media / Alta), escalado AMD FSR 1, mipmaps y MSAA.
 - La lógica del juego está traducida de antemano a código nativo, así que no hay coste de emulación, pero el código traducido y el runtime aún no se han perfilado en CPUs lentas.
+- Memoria: el juego usa unos 630 MB en un partido (D3D12; unos 100 MB menos con Direct3D 11). El buffer de subida de uniforms bajó de 24 a 8 MB por cuadro (el pico medido es 1 MB, 2,9 MB con interpolación a 180 FPS): 44 MB menos de RAM y 22 MB menos de VRAM, sin cambio de FPS. El resto: la memoria de la Wii emulada (24 + 128 MB), el código traducido (94 MB), el driver de gráficas (~100 MB).
 - Vulkan mantiene 60 FPS donde Direct3D 12 caía en AMD en las vistas pesadas de fildeo; el launcher elige el backend.
 
 ## Plan

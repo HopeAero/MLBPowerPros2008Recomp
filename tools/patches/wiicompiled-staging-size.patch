@@ -1,0 +1,34 @@
+diff --git a/aurora-main/lib/gfx/common.cpp b/aurora-main/lib/gfx/common.cpp
+index 88b755f..b80a2be 100644
+--- a/aurora-main/lib/gfx/common.cpp
++++ b/aurora-main/lib/gfx/common.cpp
+@@ -1181,6 +1181,16 @@ static void end_batch_impl(const wgpu::CommandEncoder& cmd, bool advanceFrame) {
+   g_uniforms.append_zeroes(gx::MaxUniformSize); // Pad the end of the buffer
+   const auto used = staging_usage();
+   for (unsigned i = 0; i < used.size(); ++i) g_stagingHighWater[i] = std::max(g_stagingHighWater[i], used[i]);
++  {
++    static StagingSizes s_logged{};
++    bool grew = false;
++    for (unsigned i = 0; i < used.size(); ++i) grew |= g_stagingHighWater[i] > s_logged[i] + s_logged[i] / 8 + 4096;
++    if (grew) {
++      s_logged = g_stagingHighWater;
++      Log.info("Staging high water: vertex {} KiB, uniform {} KiB, index {} KiB, storage {} KiB; {} batch splits",
++               s_logged[0] >> 10, s_logged[1] >> 10, s_logged[2] >> 10, s_logged[3] >> 10, g_stagingSplitCount);
++    }
++  }
+   uint64_t bufferOffset = 0;
+   const auto writeBuffer = [&](ByteBuffer& buf, wgpu::Buffer& out, uint64_t size, std::string_view label) {
+     const auto writeSize = buf.size(); // Only need to copy this many bytes
+diff --git a/aurora-main/lib/gfx/common.hpp b/aurora-main/lib/gfx/common.hpp
+index d26e412..e89a430 100644
+--- a/aurora-main/lib/gfx/common.hpp
++++ b/aurora-main/lib/gfx/common.hpp
+@@ -228,7 +228,7 @@ private:
+ 
+ namespace aurora::gfx {
+ inline constexpr bool UseTextureBuffer = false;
+-inline constexpr uint64_t UniformBufferSize = 25165824;  // 24mb
++inline constexpr uint64_t UniformBufferSize = 8388608;   // 8mb (measured peak ~1mb, 2.9mb at 180 FPS interpolation)
+ inline constexpr uint64_t VertexBufferSize = 3145728;    // 3mb
+ inline constexpr uint64_t IndexBufferSize = 2097152;     // 2mb
+ inline constexpr uint64_t StorageBufferSize = 8388608;   // 8mb
