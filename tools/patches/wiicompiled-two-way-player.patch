@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..7ceb97f
+index 0000000..68ca2b1
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,924 @@
+@@ -0,0 +1,925 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -648,7 +648,8 @@ index 0000000..7ceb97f
 +    args();
 +    Call(ctx, 0x80887C48u, InvokeDirectCpu<0x80887C48u>);
 +    const bool twoWay = RuntimeConfigFile::TwoWayPlayer(false) && Memory::Read8(rules) != 0;
-+    const int life = twoWay ? LifeStarter(entries, players, count) : -1;
++    // Without the DH as well: then he starts and bats as the P.
++    const int life = RuntimeConfigFile::TwoWayPlayer(false) ? LifeStarter(entries, players, count) : -1;
 +    const uint16_t id = life >= 0 ? Memory::Read16(players + Memory::Read8(entries + life * kEntry + 1) * 0x2Cu) : 0;
 +    const uint32_t starter = entries + ctx->gpr[3] * kEntry;
 +    Memory::Write8(starter + kInLineup, 1);

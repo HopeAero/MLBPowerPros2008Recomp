@@ -45,12 +45,13 @@ def run(extra):
             text = re.sub(rb"(?m)^\[paths\]\s*$", b"[paths]\nnand_root = '" + os.environ["NAND"].replace("\\", "/").encode() + b"'", text, count=1)
         if os.environ.get("SEASONS"):  # SEASONS=20: [season] max_seasons for this run only
             text = re.sub(rb"(?ms)^\[season\].*?(?=^\[|\Z)", b"", text) + b"\n[season]\nmax_seasons = " + os.environ["SEASONS"].encode() + b"\n"
-        if os.environ.get("UDH"):  # UDH=1: [season] universal_dh = true for this run only
+        if os.environ.get("UDH"):  # UDH=1 / UDH=0: [season] universal_dh = true / false for this run only
+            value = b"false" if os.environ["UDH"] == "0" else b"true"
             text = re.sub(rb"(?m)^universal_dh = .*\r?\n", b"", text)
             if b"[season]" in text:
-                text = re.sub(rb"(?m)^\[season\][ \t]*\r?$", b"[season]\nuniversal_dh = true", text, count=1)
+                text = re.sub(rb"(?m)^\[season\][ \t]*\r?$", b"[season]\nuniversal_dh = " + value, text, count=1)
             else:
-                text += b"\n[season]\nuniversal_dh = true\n"
+                text += b"\n[season]\nuniversal_dh = " + value + b"\n"
         if os.environ.get("ML"):  # ML=1: [season] modern_leagues = true for this run only
             text = re.sub(rb"(?m)^modern_leagues = .*\r?\n", b"", text)
             text = re.sub(rb"(?m)^\[season\][ \t]*\r?$", b"[season]\nmodern_leagues = true", text, count=1)
