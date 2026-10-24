@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..ba31735
+index 0000000..83faaac
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,1048 @@
+@@ -0,0 +1,1251 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -59,6 +59,7 @@ index 0000000..ba31735
 +//     that bench entry instead, so he is never listed twice.
 +#include <algorithm>
 +#include <array>
++#include <cctype>
 +#include <cstdint>
 +#include <cstdio>
 +#include <cstdlib>
@@ -86,6 +87,7 @@ index 0000000..ba31735
 +void LifeDrillSwitch(CpuContext* ctx, uint32_t pad);
 +void LifeMenuSwitch(CpuContext* ctx, uint32_t pad, uint32_t lr, uint32_t self);
 +void LifeDrillPicked();
++bool LifePitcherOnly(uint32_t players, uint8_t index);
 +
 +constexpr uint32_t kLineups = 0x8103D090u;
 +constexpr uint32_t kEntry = 6, kCapacity = 44;
@@ -603,7 +605,7 @@ index 0000000..ba31735
 +    }
 +    if (starter < 0 || dh < 0) return;
 +    const uint8_t starterPlayer = Memory::Read8(at(static_cast<uint32_t>(starter)) + 1);
-+    if (TwoWay(players, starterPlayer)) {
++    if (TwoWay(players, starterPlayer) && !LifePitcherOnly(players, starterPlayer)) {
 +        // He starts: he is the DH too; the DH goes to a free entry (an empty player, record +0x51 == 0,
 +        // as the group rebuild 0x808863E0 tells them apart), which the caller's sort puts on the bench.
 +        int free = -1;
@@ -626,7 +628,8 @@ index 0000000..ba31735
 +    }
 +    for (uint32_t i = 0; i < count; ++i) {
 +        const uint8_t index = Memory::Read8(at(i) + 1);
-+        if (Memory::Read8(at(i) + kOnRoster) && !Memory::Read8(at(i) + kInLineup) && TwoWay(players, index)) {
++        if (Memory::Read8(at(i) + kOnRoster) && !Memory::Read8(at(i) + kInLineup) && TwoWay(players, index) &&
++            !LifePitcherOnly(players, index)) {
 +            twoWay = static_cast<int>(i);
 +            break;
 +        }
@@ -750,7 +753,35 @@ index 0000000..ba31735
 +    return best;
 +}
 +
-+bool Batter() { return g_inPractice ? g_practiceBatter : !g_pitched; }
++// The role the MLB Life player chose with the manager (see the talk below): two-way (the default), batter
++// only or pitcher only. Saved in the MLB Life block's padding, [0x8104B59C] + 13..15 (copied with the save,
++// 0x80A55970 / 0x80A5592C): a marker, the role, a version; anything else reads as two-way.
++enum class Role : uint8_t { TwoWay = 0, Batter = 1, Pitcher = 2 };
++constexpr uint8_t kRoleMarker = 0x7A, kRoleVersion = 1;
++
++Role LifeRole() {
++    const uint32_t q = Memory::Read32(0x8104B59Cu);
++    if (!Memory::Contains(q, 16) || Memory::Read8(q + 13) != kRoleMarker || Memory::Read8(q + 15) != kRoleVersion)
++        return Role::TwoWay;
++    const uint8_t role = Memory::Read8(q + 14);
++    return role <= 2 ? static_cast<Role>(role) : Role::TwoWay;
++}
++
++void SetLifeRole(Role role) {
++    const uint32_t q = Memory::Read32(0x8104B59Cu);
++    if (!Memory::Contains(q, 16)) return;
++    Memory::Write8(q + 13, kRoleMarker);
++    Memory::Write8(q + 14, static_cast<uint8_t>(role));
++    Memory::Write8(q + 15, kRoleVersion);
++    g_practiceBatter = role == Role::Batter;
++    std::fprintf(stderr, "[two-way] MLB Life role: %s\n",
++                 role == Role::Batter ? "batter only" : role == Role::Pitcher ? "pitcher only" : "two-way");
++}
++
++bool Batter() {
++    if (LifeRole() != Role::TwoWay) return LifeRole() == Role::Batter;  // practice too: no X then
++    return g_inPractice ? g_practiceBatter : !g_pitched;
++}
 +
 +// A game's lineup: whether the MLB Life player is its P (a start, or a change).
 +void NoteLifePitcher(uint32_t entries, uint32_t players, uint32_t count, bool start) {
@@ -803,7 +834,7 @@ index 0000000..ba31735
 +    const uint32_t state = Memory::Read32(0x8104B5A8u), life = Memory::Read32(0x8104B59Cu);
 +    if (!Memory::Contains(state, 8) || !Memory::Contains(life, 4)) return -1;
 +    const int game = TeamGame(Memory::Read16(state + 4), Memory::Read32(life));
-+    if (game < 0 || game % kRotation != 0) return -1;
++    if (game < 0 || game % kRotation != 0 || LifeRole() == Role::Batter) return -1;
 +    const uint16_t id = LifeId();
 +    for (uint32_t i = 0; i < count; ++i) {
 +        const uint32_t e = entries + i * kEntry;
@@ -816,7 +847,7 @@ index 0000000..ba31735
 +
 +// X on the drill list switches pitcher / batter drills: the list is filled again.
 +void LifeDrillSwitch(CpuContext* ctx, uint32_t pad) {
-+    if (!g_drillOpen || !g_drillList || !LifeMode()) return;
++    if (!g_drillOpen || !g_drillList || !LifeMode() || LifeRole() != Role::TwoWay) return;
 +    ctx->gpr[3] = pad, ctx->gpr[4] = kButtonX;
 +    Call(ctx, 0x805EEB70u, InvokeDirectCpu<0x805EEB70u>);
 +    if (ctx->gpr[3] == 0) return;
@@ -827,6 +858,115 @@ index 0000000..ba31735
 +}
 +
 +void LifeDrillPicked() { g_drillOpen = false; }
++
++bool LifePitcherOnly(uint32_t players, uint8_t index) {
++    return LifeMode() && LifeRole() == Role::Pitcher && Memory::Read16(players + index * 0x2Cu) == LifeId();
++}
++
++// The manager talk (FREE > CHAT > FRIENDS > the manager) is MLB Life event script 249 or 250 of bank 1
++// (mylife_event2.pack; 0x809EE598 / 0x809EE5A8 queue them): "What is it? You want to talk to me about
++// something?", then I need some advice / (I want to retire) / Nothing at all. The scripts run on an
++// interpreter (vtable 0x80E732D0; +0x40 code, +0x48 the current word, +0x4C PC in words, +0x50 script id,
++// +0x54 bank) whose opcodes are u32 words with a fixed operand count (table 0x80E8B1B8, 36 bytes each,
++// count at +24): 19 speaker, text: a line; 24 wait for A; 34 ... 35 25: a choice list, each row 36 text
++// followed by its branch; 33 pc: jump; 29 the end. For a two-way player the talk runs a copy with one
++// more row after the advice, "About my two-way role.", which asks for two-way / batter only / pitcher
++// only and answers; the answer is taken when the copy jumps to it (0x80B5C334). Copies and texts live in
++// the top of MEM2 the IOS keeps (unused here), in the game's font codes (ASCII + 0x9B; 0 space, 3 comma,
++// 4 period, 8 question mark, 0x1D hyphen, 0x26 apostrophe, 0xD000 new line, 0xFFFF end).
++constexpr uint32_t kTalkArea = 0x97FFF000u, kTalkTexts = kTalkArea + 0x400;
++constexpr uint32_t kTextBase = 30001;  // private text ids, only for the copies
++enum TalkText : uint32_t { kTxLabel, kTxQuestion, kTxTwoWay, kTxBatter, kTxPitcher, kTxAckTwoWay, kTxAckBatter, kTxAckPitcher, kTexts };
++const char* const kTalkStrings[kTexts] = {
++    "    About my two-way role.",
++    "Your two-way role, eh?|How do you want to play|for us now?",
++    "    Two-way player",
++    "    Batter only",
++    "    Pitcher only",
++    "Alright, two-way it is.|You pitch every fifth game|and hit in the others.",
++    "Ok, just hitting then.|No pitching for now.|Tell me if that changes.",
++    "Ok, just pitching then.|You won't bat for now.|Tell me if that changes.",
++};
++
++struct TalkCopy {
++    uint32_t script = 0;               // 249 or 250, 0 unused
++    uint32_t code = 0;                 // guest address of the copy
++    uint32_t answers[3] = {0, 0, 0};   // word PCs of the two-way / batter / pitcher answers
++};
++std::array<TalkCopy, 2> g_talks{};
++
++uint32_t Operands(uint32_t op) { return op < 45 ? Memory::Read32(0x80E8B1B8u + op * 36 + 24) : ~0u; }
++
++void WriteTalkTexts() {
++    uint32_t at = kTalkTexts;
++    for (uint32_t t = 0; t < kTexts; ++t) {
++        for (const char* c = kTalkStrings[t]; *c; ++c) {
++            const unsigned char ch = static_cast<unsigned char>(*c);
++            const uint16_t code = std::isalnum(ch) ? ch + 0x9B : ch == ' ' ? 0 : ch == ',' ? 3 : ch == '.' ? 4
++                                : ch == '?' ? 8 : ch == '-' ? 0x1D : ch == '\'' ? 0x26 : ch == '|' ? 0xD000 : 0;
++            Memory::Write16(at, code), at += 2;
++        }
++        Memory::Write16(at, 0xFFFF), at += 2;
++    }
++}
++
++uint32_t TalkText(uint32_t id) {  // the guest string of a private text id
++    uint32_t at = kTalkTexts;
++    for (uint32_t t = 0; t < id - kTextBase; ++t) {
++        while (Memory::Read16(at) != 0xFFFF) at += 2;
++        at += 2;
++    }
++    return at;
++}
++
++// The copy of the manager's script at `code` (the original, parsed until its end) into slot `slot`.
++uint32_t MakeTalk(uint32_t code, uint32_t script, size_t slot) {
++    std::vector<uint32_t> w;
++    for (uint32_t pc = 0; pc < 256;) {
++        const uint32_t op = Memory::Read32(code + pc * 4), n = Operands(op);
++        if (n > 4) return 0;
++        for (uint32_t k = 0; k <= n; ++k) w.push_back(Memory::Read32(code + (pc + k) * 4));
++        pc += n + 1;
++        if (op == 29) break;
++    }
++    if (w.empty() || w.back() != 29) return 0;
++    // The new row goes before the second row of the first choice list.
++    std::vector<uint32_t> rows;
++    for (uint32_t pc = 0; pc < w.size(); pc += Operands(w[pc]) + 1)
++        if (w[pc] == 36) rows.push_back(pc);
++    if (rows.size() < 2) return 0;
++    const uint32_t at = rows[1];
++    for (uint32_t pc = 0; pc < w.size(); pc += Operands(w[pc]) + 1)
++        if (w[pc] == 33 && w[pc + 1] >= at) w[pc + 1] += 4;
++    // A row's end is found by scanning its words for the next 36 or 35 (the 36 opcode), so no operand
++    // here may be 35 or 36: the question starts at word 40 or later, after unreachable ends (29).
++    const uint32_t r = std::max<uint32_t>(static_cast<uint32_t>(w.size()) + 4, 40);
++    const uint32_t row[] = {36, kTextBase + kTxLabel, 33, r};
++    w.insert(w.begin() + at, std::begin(row), std::end(row));
++    w.resize(r, 29);
++    // The question: rows whose branches jump to their answers, then the end as "Nothing at all" ends.
++    const uint32_t a1 = r + 25, a2 = a1 + 6, a3 = a2 + 6, end = a3 + 6;
++    const uint32_t question[] = {19, 1, kTextBase + kTxQuestion, 24, 3, 0, 1, 34, 8,
++                                 36, kTextBase + kTxTwoWay, 33, a1, 36, kTextBase + kTxBatter, 33, a2,
++                                 36, kTextBase + kTxPitcher, 33, a3, 35, 25, 33, end,
++                                 19, 1, kTextBase + kTxAckTwoWay, 24, 33, end,
++                                 19, 1, kTextBase + kTxAckBatter, 24, 33, end,
++                                 19, 1, kTextBase + kTxAckPitcher, 24, 33, end,
++                                 10, 41, 13, 29};
++    w.insert(w.end(), std::begin(question), std::end(question));
++    TalkCopy& t = g_talks[slot];
++    t.script = script, t.code = kTalkArea + static_cast<uint32_t>(slot) * 0x200;
++    t.answers[0] = a1, t.answers[1] = a2, t.answers[2] = a3;
++    if (w.size() * 4 > 0x200) return 0;
++    for (uint32_t i = 0; i < w.size(); ++i) Memory::Write32(t.code + i * 4, w[i]);
++    return t.code;
++}
++
++const TalkCopy* TalkOf(uint32_t code) {
++    for (const TalkCopy& t : g_talks)
++        if (t.script && t.code == code) return &t;
++    return nullptr;
++}
 +
 +// The MLB Life menu (built by 0x809A8974, `this` in r27) shows the player's stats in a panel held at
 +// +0x2BB0: made by 0x80A4D2BC from the layout at this + 11 * 224 + 3184 as variant 0 (a pitcher's
@@ -883,7 +1023,7 @@ index 0000000..ba31735
 +
 +void LifeMenuSwitch(CpuContext* ctx, uint32_t pad, uint32_t lr, uint32_t self) {
 +    if (lr != kMenuAsk || self != g_lifeMenu || !g_lifeMenu || !LifeMode()) return;
-+    if (SecondPosition(ctx, LifeRecord(ctx)) == 0) return;
++    if (SecondPosition(ctx, LifeRecord(ctx)) == 0 || LifeRole() != Role::TwoWay) return;
 +    ++g_menuTick;
 +    ctx->gpr[3] = pad, ctx->gpr[4] = kButtonX;
 +    Call(ctx, 0x805EEB70u, InvokeDirectCpu<0x805EEB70u>);
@@ -896,6 +1036,68 @@ index 0000000..ba31735
 +}
 +}  // namespace
 +}  // namespace two_way
++
++// 0x80B5C0E4 (interpreter): readies its script, as the original: the bank's descriptor (virtual +0x20)
++// gives the pack and its script table, and the script's code goes to +0x40. The manager's talk with a
++// two-way MLB Life player gets the copy with the role question instead.
++extern "C" void MLB_ScriptStart_80B5C0E4(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t vm = ctx->gpr[3], lr = ctx->lr, script = Memory::Read32(vm + 0x50);
++    const uint32_t describe = Memory::Read32(Memory::Read32(vm) + 0x20);
++    ctx->gpr[3] = vm, ctx->ctr = describe, ctx->lr = describe;
++    InvokeIndirectCpu(describe, ctx);
++    const uint32_t descriptor = ctx->gpr[3];
++    ctx->gpr[3] = Memory::Read32(descriptor), ctx->gpr[4] = Memory::Read32(descriptor + 4);
++    Call(ctx, 0x8000BBFCu, InvokeDirectCpu<0x8000BBFCu>);
++    const uint32_t table = ctx->gpr[3];
++    ctx->gpr[3] = Memory::Read32(descriptor), ctx->gpr[4] = Memory::Read32(table + script * 4);
++    Call(ctx, 0x8000BBFCu, InvokeDirectCpu<0x8000BBFCu>);
++    uint32_t code = ctx->gpr[3];
++    ctx->lr = lr;
++    if (Memory::Read32(vm) == 0x80E732D0u && Memory::Read32(vm + 0x54) == 1 && (script == 249 || script == 250) &&
++        LifeMode() && SecondPosition(ctx, LifeRecord(ctx)) != 0) {
++        WriteTalkTexts();
++        if (const uint32_t copy = MakeTalk(code, script, script == 249 ? 0 : 1)) {
++            code = copy;
++            std::fprintf(stderr, "[two-way] MLB Life manager talk %u with the role question\n", script);
++        }
++    }
++    Memory::Write32(vm + 0x40, code);
++    Memory::Write8(vm + 0x60, 0);
++    Memory::Write32(vm + 0x44, 4);
++}
++PPC_NATIVE_OVERRIDE_VOID(80B5C0E4, MLB_ScriptStart_80B5C0E4, (CpuContext* ctx), (ctx));
++
++// 0x80B599F0 (interpreter, text id): the text's string, as the original (0x80B5BEB8 with the bank's
++// descriptor); the role question's own texts in its copies.
++extern "C" void MLB_ScriptText_80B599F0(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t vm = ctx->gpr[3], id = ctx->gpr[4], lr = ctx->lr;
++    if (id >= kTextBase && id < kTextBase + kTexts && TalkOf(Memory::Read32(vm + 0x40))) {
++        ctx->gpr[3] = TalkText(id);
++        return;
++    }
++    const uint32_t describe = Memory::Read32(Memory::Read32(vm) + 0x20);
++    ctx->ctr = describe, ctx->lr = describe;
++    InvokeIndirectCpu(describe, ctx);
++    ctx->gpr[4] = id;
++    Call(ctx, 0x80B5BEB8u, InvokeDirectCpu<0x80B5BEB8u>);
++    ctx->lr = lr;
++}
++PPC_NATIVE_OVERRIDE_VOID(80B599F0, MLB_ScriptText_80B599F0, (CpuContext* ctx), (ctx));
++
++// 0x80B5C334 (interpreter, pc): jumps, as the original (+0x4C the PC, +0x48 its word); a copy jumping to
++// one of its answers is the player's choice.
++extern "C" void MLB_ScriptJump_80B5C334(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t vm = ctx->gpr[3], pc = ctx->gpr[4], code = Memory::Read32(vm + 0x40);
++    Memory::Write32(vm + 0x4C, pc);
++    Memory::Write32(vm + 0x48, Memory::Read32(code + pc * 4));
++    if (const TalkCopy* talk = TalkOf(code))
++        for (uint32_t i = 0; i < 3; ++i)
++            if (pc == talk->answers[i]) SetLifeRole(static_cast<Role>(i));
++}
++PPC_NATIVE_OVERRIDE_VOID(80B5C334, MLB_ScriptJump_80B5C334, (CpuContext* ctx), (ctx));
 +
 +extern "C" void MLB_LifeIsPitcher_80A2F88C(CpuContext* ctx) {
 +    using namespace two_way;
@@ -955,6 +1157,7 @@ index 0000000..ba31735
 +        g_lifeMenu = ctx->gpr[27];
 +        if (LifeDay() != g_menuDay) g_menuBatter = second != 0 && batter, g_menuDay = -1;
 +        batter = g_menuBatter;
++        std::fprintf(stderr, "[two-way] MLB Life menu, day %d\n", LifeDay());  // a mark for probes
 +    }
 +    ctx->gpr[3] = second != 0 && batter ? second : value;
 +}
@@ -1062,7 +1265,7 @@ index 0000000..ba31735
 +    menuIdle = g_menuTick != lastTick ? 0 : menuIdle + 1;
 +    lastTick = g_menuTick;
 +    const bool menu = menuIdle < 5;
-+    const bool open = (g_drillOpen || menu) && LifeMode();
++    const bool open = ((g_drillOpen && LifeRole() == Role::TwoWay) || menu) && LifeMode();
 +    if (!open) {
 +        frames = tries = 0;
 +        return;

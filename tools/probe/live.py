@@ -134,6 +134,25 @@ def do(steps):
                     found = next((l for l in f.read().decode("utf-8", "replace").splitlines() if rx.search(l)), None)
             print(found.strip())
             mark = log_size()
+        elif step.startswith("spamshot:"):
+            # spamshot:NAME:REF:x0,y0,x1,y1[:SECONDS]: press NAME every 1.5 s until that box (in 1920 x 1080
+            # coordinates) of the window matches REF.png (from shot:REF) again; checks before each press.
+            from PIL import Image, ImageChops
+            name, ref, box, *rest = step[9:].split(":")
+            box = tuple(int(v) for v in box.split(","))
+            want = Image.open(os.path.join(DIR, ref + ".png")).convert("RGB").resize((1920, 1080)).crop(box)
+            t, timeout, path = time.time(), float(rest[0]) if rest else 600, os.path.join(DIR, "spamshot.png")
+            while True:
+                winshot.shot(pid, path)
+                cur = Image.open(path).convert("RGB").resize((1920, 1080)).crop(box)
+                diff = ImageChops.difference(want, cur).convert("L")
+                if sum(diff.getdata()) / (want.width * want.height) < 12:
+                    print("matched", ref)
+                    break
+                if time.time() - t > timeout:
+                    sys.exit(f"{ref} not matched after {timeout:.0f} s")
+                send(f"pad {KEYS[name]:x} 150")
+                time.sleep(1.5)
         elif step.startswith("untilpeek:"):
             _, addr, size, want, *rest = step.split(":")
             t, timeout = time.time(), float(rest[0]) if rest else 60
