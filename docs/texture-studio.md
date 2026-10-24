@@ -5,7 +5,8 @@
 Programa para crear **mods de texturas** de MLB Power Pros 2008. Con él puedes:
 
 - ver todas las texturas del juego, ordenadas por lo que son;
-- exportarlas a PNG para editarlas en otro programa (Photoshop, GIMP, Krita) o escalarlas con IA (chaiNNer, Upscayl);
+- exportarlas a PNG para editarlas en otro programa (Photoshop, GIMP, Krita) o escalarlas con IA desde el propio Studio;
+- importar packs de texturas hechos para Dolphin;
 - volver a meterlas, del mismo tamaño o más grandes (HD).
 
 El juego nunca se modifica: todo va a un mod que activas o desactivas en el launcher.
@@ -58,32 +59,41 @@ Muchas texturas del juego usan paleta (16 o 256 colores). No tienes que preocupa
 - Unas 300 texturas tienen la paleta en otro pack. El Studio las muestra **en gris**, pero se pueden exportar y reemplazar igual.
 - Si el juego pinta una misma textura con varias paletas, cada variante es un reemplazo distinto. **Aplicar a todas las paletas** (en la ficha) hace que tu imagen sirva para todas.
 
-## Escalar con IA (opcional, fuera del Studio)
+## Escalar con IA
 
-El Studio no escala imágenes: se exporta, se escala con otro programa y se vuelve a importar la carpeta. Todo lo de abajo es gratuito, funciona sin conexión en tu tarjeta gráfica y no viene con el juego (cada uno lo descarga si quiere).
+**Escalar con IA** (abajo) exporta las texturas, las escala en tu tarjeta gráfica e importa el resultado en el mod activo, todo de una vez.
 
-**Programas** (código abierto):
+1. Elige una categoría (o selecciona una textura) y pulsa **Escalar con IA**.
+2. Elige el modelo, el tamaño (**x2** o **x4**) y si quieres **esta vista** o **solo la seleccionada**.
+3. Pulsa **Escalar**. Al terminar sale el informe de importación; activa el mod y míralo en el juego.
 
-| Herramienta | Para qué | Licencia | Descarga aprox. |
-|---|---|---|---|
-| Real-ESRGAN ncnn-vulkan | motor de escalado en línea de comandos; Vulkan, funciona en AMD, NVIDIA e Intel | MIT (Real-ESRGAN: BSD-3) | ~45 MB |
-| Upscayl | ventana sencilla sobre ese motor; admite modelos propios | AGPL-3.0 | ~150-200 MB |
-| chaiNNer | editor por nodos para lotes; en AMD usa el motor NCNN, no PyTorch (solo NVIDIA) | GPL-3.0 | ~150 MB + motor (~0,5 GB con NCNN) |
+**Modelos:**
 
-**Modelos** (gratuitos, en OpenModelDB; revisa la licencia de cada uno antes de redistribuirlo):
+- **AnimeSharp** (el recomendado): menús, logos, letras y personajes; conserva el sombreado y el estilo de dibujo.
+- **Real-ESRGAN anime**: más nítido, con contornos muy marcados (más «dibujo animado»).
+- **Real-ESRGAN x4plus**: para fotos, como los estadios y las cartas de jugador.
+- **Tus modelos**: cualquier modelo NCNN (`<nombre>.param` + `<nombre>.bin`) que pongas en `UserData\Tools\upscale\models` sale en la lista.
 
-- **4x-AnimeSharp**: menús, logos, letras, estadios y personajes; respeta el estilo de dibujo. CC BY-NC-SA 4.0 (sin uso comercial). ~65 MB (.pth) o ~35 MB (NCNN).
-- **4x-UltraSharp** (misma licencia) o **RealESRGAN x4plus** (BSD): fotos reales, como las cartas de jugador.
-
-**Pasos con chaiNNer:** Load Images (la carpeta exportada, incluidas subcarpetas) → Upscale Image con Load Model → Save Image en otra carpeta, **con el mismo nombre de archivo**. Luego **Importar carpeta...** en el Studio. Con Upscayl: carpeta de entrada, modelo y escala ×4, comprobando que conserve los nombres.
+**La primera vez** se descargan, gratis y de sus autores, el motor **Real-ESRGAN ncnn-vulkan** (unos 45 MB, licencia MIT, del GitHub de xinntao) y, si eliges AnimeSharp, **4x-AnimeSharp de Kim2091** (unos 33 MB, licencia CC BY-NC-SA 4.0: uso no comercial, de su página de Hugging Face). Van a `UserData\Tools\upscale` y no vienen con el juego. Funciona en tarjetas AMD, NVIDIA e Intel (Vulkan).
 
 **Consejos:**
 
-- A ×4 casi todo cabe en el máximo de 4096 px.
-- Si ves halos en los bordes transparentes, escala el canal alfa aparte.
-- Las texturas que se repiten (césped, gradas, muros) pueden mostrar costuras: revísalas en el juego y, si se notan, déjalas en el original o a ×2.
-- No escales las que salen en gris (su paleta está en otro pack): se verían grises en el juego.
-- Hazlo por partes: un ×4 multiplica por 16 los píxeles, así que el juego entero en ×4 son varios GB, y la memoria de vídeo crece con lo que haya en pantalla.
+- Las texturas en gris (su paleta está en otro pack) se saltan: se verían grises en el juego.
+- Con x4, una textura que pasaría de 4096 px se escala a x2.
+- Hazlo por categorías: un x4 multiplica por 16 los píxeles, y el juego entero en x4 son varios GB. Como referencia, en una RX 5500 son unos 4 segundos por textura de 512×512 con AnimeSharp.
+- Las texturas que se repiten (césped, gradas, muros) pueden mostrar costuras: revísalas en el juego y, si se notan, déjalas en el original o en x2.
+- También puedes escalar fuera del Studio (chaiNNer, Upscayl): exporta, escala **sin cambiar los nombres de archivo** y usa **Importar carpeta...**.
+
+## Packs de texturas de Dolphin
+
+Los nombres de las texturas son los mismos que en Dolphin (comprobado con Dolphin 2609: los 695 nombres de las texturas que se vieron en los dos son idénticos), así que **un pack hecho para Dolphin para MLB Power Pros 2008 (RL8E54) funciona tal cual**.
+
+1. Crea o elige un mod arriba.
+2. **Pack de Dolphin...** y elige la **carpeta** del pack (la que tiene los `tex1_…`, normalmente `Load\Textures\RL8E54`) o directamente el **.zip**.
+3. Los archivos se copian al mod sin cambiar nombres, con sus subcarpetas, mipmaps (`_mip1`…) y DDS (BC1, BC3, BC5, BC7). El informe dice cuáles son texturas del juego; las que no están en el índice se copian igual (pueden ser texturas que se crean al jugar).
+4. **Activar** y abre el juego.
+
+Al revés debería servir igual (sin probar): un mod hecho con el Studio, en Dolphin, copiando la carpeta `textures` del mod a `Load\Textures\RL8E54`.
 
 ## Capturar en juego
 
@@ -109,6 +119,8 @@ No compartas texturas originales sin modificar: son contenido del juego. Compart
 TextureStudio.exe --new-mod <carpeta mods> <nombre>
 TextureStudio.exe --export <project.bin> "<grupo>[/<subgrupo>]" <carpeta>
 TextureStudio.exe --import-folder <project.bin> <carpeta del mod> <carpeta con PNG>
+TextureStudio.exe --import-dolphin <project.bin> <carpeta del mod> <carpeta del pack>
+TextureStudio.exe --upscale <carpeta de herramientas> <modelo> <2|4> <carpeta con PNG>   (escribe <carpeta>-up)
 TextureStudio.exe --selftest
 ```
 

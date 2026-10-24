@@ -21,6 +21,14 @@ ImportResult ImportOne(Catalog& c, int texture, const std::filesystem::path& ima
 // A folder (recursive): files whose name is a known tex1_ name; others reported.
 std::vector<ImportResult> ImportFolder(Catalog& c, const std::filesystem::path& folder, const std::filesystem::path& modRoot,
                                        Progress* progress = nullptr);
+// A Dolphin texture pack (a folder, or a .zip already unpacked into one): every tex1_ PNG/DDS file, mipmaps
+// (_mipN), arbitrary mipmaps (_arb) and "_m_" names included, copied as it is into
+// <mod>/textures/<pack>/ keeping its subfolders, since the game reads Dolphin's names itself. The report
+// says which ones are textures of the game's packs (the rest may be drawn while playing, or not exist).
+std::vector<ImportResult> ImportDolphinPack(Catalog& c, const std::filesystem::path& folder, const std::filesystem::path& modRoot,
+                                            const std::string& packName, Progress* progress = nullptr);
+// The plain tex1_ name of a Dolphin file name: without _mipN, _arb and the "_m" part ("" if not a tex1_ name).
+std::string DolphinBaseName(std::string_view stem);
 // Original images as PNG under <out>/<group>/<subgroup>/<name>.png. Returns how many were written.
 // grey: how many came out grey because their palette lives in another pack.
 size_t Export(Catalog& c, const std::vector<int>& textures, const std::filesystem::path& out, std::vector<std::string>* problems,

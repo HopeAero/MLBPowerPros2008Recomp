@@ -542,6 +542,26 @@ void TestLanguage(const std::filesystem::path& temp) {
     CHECK(GroupLabel("Estadios") == "Estadios" && SubgroupLabel("Sesión 12") == "Sesión 12");
     CHECK(!ValidModName("", &error) && error == "Escribe un nombre para el mod.");
 }
+void TestDolphinPack(const std::filesystem::path& temp) {
+    const std::string base = "tex1_64x32_00000000000000aa_00000000000000bb_9";
+    CHECK(DolphinBaseName(base) == base);
+    CHECK(DolphinBaseName(base + "_mip2") == base);
+    CHECK(DolphinBaseName(base + "_arb") == base && DolphinBaseName(base + "_arb_mip1") == base);
+    CHECK(DolphinBaseName("tex1_64x32_m_00000000000000aa_00000000000000bb_9") == base);
+    CHECK(DolphinBaseName("tex1_64x32_00000000000000aa_$_9") == "tex1_64x32_00000000000000aa_$_9");
+    CHECK(DolphinBaseName("readme").empty() && DolphinBaseName("tex1_bad").empty());
+    // A pack copies tex1_ files as they are, subfolders kept; other files are reported, not copied.
+    const auto pack = temp / "dolphin-pack" / "RL8E54", mod = temp / "dolphin-mod";
+    std::filesystem::create_directories(pack / "menus");
+    for (const auto& name : {base + ".png", base + "_mip1.png", std::string("notes.png")}) std::ofstream(pack / "menus" / name) << "x";
+    Catalog empty;
+    const auto report = ImportDolphinPack(empty, pack.parent_path(), mod, "MyPack");
+    int copied = 0;
+    for (const auto& r : report) copied += r.ok;
+    CHECK(report.size() == 3 && copied == 2);
+    CHECK(std::filesystem::exists(mod / "textures" / "MyPack" / "RL8E54" / "menus" / (base + "_mip1.png")));
+    CHECK(!std::filesystem::exists(mod / "textures" / "MyPack" / "RL8E54" / "menus" / "notes.png"));
+}
 } // namespace
 
 int RunSelftest() {
@@ -562,6 +582,7 @@ int RunSelftest() {
     TestReviewFixes(temp);
     TestPolish(temp);
     TestLanguage(temp);
+    TestDolphinPack(temp);
     power_pros_ui::g_lang = lang;
     std::printf("selftest %s (%d checks)\n", g_failures ? "FAILED" : "ok", g_checks);
     return g_failures ? 1 : 0;

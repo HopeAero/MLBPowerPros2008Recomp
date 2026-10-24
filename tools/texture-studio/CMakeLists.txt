@@ -18,7 +18,7 @@ endforeach()
 add_subdirectory("${SDL_SOURCE_DIR}" sdl EXCLUDE_FROM_ALL)
 
 add_executable(TextureStudio
-    studio.cpp selftest.cpp gx.cpp pack.cpp projectbin.cpp names.cpp images.cpp categories.cpp catalog.cpp config.cpp modfolder.cpp transfer.cpp capture.cpp
+    studio.cpp selftest.cpp gx.cpp pack.cpp projectbin.cpp names.cpp images.cpp categories.cpp catalog.cpp config.cpp modfolder.cpp transfer.cpp capture.cpp upscale.cpp
     "${IMGUI_SOURCE_DIR}/imgui.cpp"
     "${IMGUI_SOURCE_DIR}/imgui_draw.cpp"
     "${IMGUI_SOURCE_DIR}/imgui_tables.cpp"

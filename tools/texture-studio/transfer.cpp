@@ -197,4 +197,54 @@ size_t Export(Catalog& c, const std::vector<int>& textures, const std::filesyste
     return written;
 }
 
+std::string DolphinBaseName(std::string_view stem) {
+    std::string s(stem);
+    if (s.rfind("tex1_", 0) != 0) return {};
+    if (const size_t m = s.rfind("_mip"); m != std::string::npos && m + 4 < s.size() &&
+                                          s.find_first_not_of("0123456789", m + 4) == std::string::npos)
+        s.erase(m);
+    if (s.size() > 4 && s.compare(s.size() - 4, 4, "_arb") == 0) s.erase(s.size() - 4);
+    if (const size_t m = s.find("_m_"); m != std::string::npos) s.erase(m, 2);
+    return ParseName(s) ? s : std::string();
+}
+
+std::vector<ImportResult> ImportDolphinPack(Catalog& c, const std::filesystem::path& folder, const std::filesystem::path& modRoot,
+                                            const std::string& packName, Progress* progress) {
+    namespace fs = std::filesystem;
+    std::vector<ImportResult> out;
+    std::vector<fs::path> files;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        const std::string ext = Lower(Utf8(it->path().extension()));
+        if (ext == ".png" || ext == ".dds") files.push_back(it->path());
+    }
+    if (progress) progress->total = files.size();
+    const fs::path target = modRoot / "textures" / PathFromUtf8(packName);
+    for (const auto& file : files) {
+        if (progress) ++progress->done;
+        const std::string relative = Utf8(file.lexically_relative(folder));
+        const std::string base = DolphinBaseName(Utf8(file.stem()));
+        if (base.empty()) {
+            out.push_back({relative, "", false,
+                           Tr("Nombre no reconocido (debe empezar por tex1_): no se copió.",
+                              "Name not recognized (it must start with tex1_): not copied.")});
+            continue;
+        }
+        const fs::path dest = target / file.lexically_relative(folder);
+        fs::create_directories(dest.parent_path(), ec);
+        fs::copy_file(file, dest, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            out.push_back({relative, base, false, Tr("No se pudo copiar: ", "Could not copy: ") + ec.message()});
+            continue;
+        }
+        const auto name = ParseName(base);
+        const bool known = c.Find(base) >= 0 || (name && c.FindTexture(*name) >= 0);
+        out.push_back({relative, base, true,
+                       known ? Tr("Copiada: textura del juego.", "Copied: a texture of the game.")
+                             : Tr("Copiada: no está en el índice (puede ser de una textura que se crea al jugar).",
+                                  "Copied: not in the index (it may be a texture made while playing).")});
+    }
+    return out;
+}
 } // namespace tstudio

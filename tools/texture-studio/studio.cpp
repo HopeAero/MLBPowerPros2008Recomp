@@ -14,6 +14,7 @@
 #include "projectbin.h"
 #include "transfer.h"
 #include "ui.h"
+#include "upscale.h"
 
 #include <SDL3/SDL.h>
 #include <backends/imgui_impl_sdl3.h>
@@ -99,6 +100,31 @@ int DevMode(const std::vector<std::string>& args) {
         std::printf("%d imported\n", ok);
         return 0;
     }
+    if (args.size() == 4 && args[0] == "--import-dolphin") {  // --import-dolphin <project.bin> <mod folder> <pack folder>
+        Catalog c;
+        std::string error;
+        if (!c.Build(PathFromUtf8(args[1]), nullptr, &error)) { std::fprintf(stderr, "%s\n", error.c_str()); return 1; }
+        int ok = 0, known = 0;
+        const auto report = ImportDolphinPack(c, PathFromUtf8(args[3]), PathFromUtf8(args[2]), Utf8(PathFromUtf8(args[3]).filename()));
+        for (const auto& r : report) {
+            ok += r.ok;
+            known += r.ok && c.Find(r.texture) >= 0;
+        }
+        std::printf("%zu files, %d copied, %d exact names of the game\n", report.size(), ok, known);
+        return 0;
+    }
+    if (args.size() == 5 && args[0] == "--upscale") {  // --upscale <tools dir> <model> <scale> <png folder>: into <folder>-up
+        std::string error;
+        const fs::path in = PathFromUtf8(args[4]);
+        Progress p;
+        if (!DownloadUpscaler(PathFromUtf8(args[1]), args[2], &error) ||
+            !Upscale(PathFromUtf8(args[1]), args[2], std::stoi(args[3]), in, fs::path(in).concat("-up"), &p, &error)) {
+            std::fprintf(stderr, "%s\n", error.c_str());
+            return 1;
+        }
+        std::printf("%zu images upscaled\n", static_cast<size_t>(p.total / 2));
+        return 0;
+    }
     if (args.size() == 2 && args[0] == "--list-entries") {
         std::string error;
         const auto index = ReadProjectIndex(PathFromUtf8(args[1]), &error);
@@ -156,7 +182,7 @@ void SDLCALL OnDialog(void* userdata, const char* const* files, int) {
     result->ready = true;
 }
 
-enum class Pending { None, ExportOne, ImportOne, ExportCategory, ImportFolder, Zip };
+enum class Pending { None, ExportOne, ImportOne, ExportCategory, ImportFolder, Zip, DolphinFolder, DolphinZip };
 
 // GPU copies of decoded textures, least recently used dropped first; a few created per frame so
 // scrolling a large category never stalls.
@@ -241,6 +267,10 @@ struct App {
     std::string newModError;
     bool openNewMod = false, openZoom = false;
     bool zoomReplacement = false;
+    // Upscale with AI: the popup's choices.
+    bool openUpscale = false, upscaleSelected = false, openDolphin = false;
+    std::vector<UpscaleModel> models;
+    int upscaleModel = 0, upscaleScale = 4;
     DialogResult dialog;
     Pending pending = Pending::None;
     bool dialogOpen = false;
@@ -279,6 +309,38 @@ void StartJob(App& a, std::string label, std::function<void(Progress&)> work, st
 }
 
 fs::path ModRoot(const App& a) { return a.activeMod >= 0 ? a.mods[a.activeMod].root : fs::path(); }
+fs::path UpscaleTools(const App& a) { return a.paths.userData / "Tools" / "upscale"; }
+void Refilter(App& a);
+
+// Exports the textures, upscales them and imports the results into the active mod, in the background.
+// Textures whose palette lives in another pack are left out: they would come out grey in the game.
+void StartUpscale(App& a, std::vector<int> textures, std::string model, int scale) {
+    std::erase_if(textures, [&](int i) { return a.catalog.Textures()[i].key.paletteWildcard; });
+    auto report = std::make_shared<std::vector<ImportResult>>();
+    StartJob(
+        a, Tr("Escalando con IA (exportar, escalar, importar)...", "Upscaling with AI (export, upscale, import)..."),
+        [&a, textures, model, scale, report, tools = UpscaleTools(a), mod = ModRoot(a)](Progress& p) {
+            std::error_code ec;
+            const fs::path work = a.paths.userData / "Cache" / "upscale";
+            fs::remove_all(work, ec);
+            std::string error;
+            std::vector<std::string> problems;
+            if (!DownloadUpscaler(tools, model, &error) || (Export(a.catalog, textures, work / "export", &problems, &p), false) ||
+                !Upscale(tools, model, scale, work / "export", work / "out", &p, &error)) {
+                report->push_back({"", "", false, error});
+                return;
+            }
+            *report = ImportFolder(a.catalog, work / "out", mod, &p);
+            fs::remove_all(work, ec);
+        },
+        [&a, report] {
+            a.report = std::move(*report);
+            a.thumbs.Clear();
+            a.replacements = FindReplacements(ModRoot(a));
+            a.openReport = true;
+            Refilter(a);
+        });
+}
 
 void RefreshMods(App& a, const std::string& keep = {}) {
     const std::string current = !keep.empty() ? keep : a.activeMod >= 0 ? a.mods[a.activeMod].id : std::string();
@@ -705,6 +767,21 @@ void DrawFooter(App& a, float w, float y) {
         else Toast(a, Tr("Crea o elige un mod arriba antes de importar.", "Create or choose a mod above before importing."), true);
     }
     ImGui::SameLine();
+    if (ui::Pill(Tr("Escalar con IA", "Upscale with AI"), ui::kOrangeTop, ui::kOrangeBottom)) {
+        if (hasMod) {
+            a.models = UpscaleModels(UpscaleTools(a));
+            a.upscaleSelected = false;
+            a.openUpscale = true;
+        } else {
+            Toast(a, Tr("Crea o elige un mod arriba antes de escalar.", "Create or choose a mod above before upscaling."), true);
+        }
+    }
+    ImGui::SameLine();
+    if (ui::Pill(Tr("Pack de Dolphin...", "Dolphin pack..."), ui::kGreenTop, ui::kGreenBottom)) {
+        if (hasMod) a.openDolphin = true;
+        else Toast(a, Tr("Crea o elige un mod arriba antes de importar.", "Create or choose a mod above before importing."), true);
+    }
+    ImGui::SameLine();
     if (ui::Pill(Tr("Capturar en juego", "Capture in game"), ui::kBlueTop, ui::kBlueBottom)) {
         std::string error;
         if (!fs::exists(a.paths.game)) {
@@ -745,7 +822,9 @@ void StartDialog(App& a, SDL_Window* window) {
     }
     case Pending::ImportOne: SDL_ShowOpenFileDialog(OnDialog, &a.dialog, window, png, 1, nullptr, false); break;
     case Pending::ExportCategory:
-    case Pending::ImportFolder: SDL_ShowOpenFolderDialog(OnDialog, &a.dialog, window, nullptr, false); break;
+    case Pending::ImportFolder:
+    case Pending::DolphinFolder: SDL_ShowOpenFolderDialog(OnDialog, &a.dialog, window, nullptr, false); break;
+    case Pending::DolphinZip: SDL_ShowOpenFileDialog(OnDialog, &a.dialog, window, zip, 1, nullptr, false); break;
     case Pending::Zip: {
         const std::string name = a.mods[a.activeMod].id + ".zip";
         SDL_ShowSaveFileDialog(OnDialog, &a.dialog, window, zip, 1, name.c_str());
@@ -809,6 +888,37 @@ void FinishDialog(App& a, Pending what, const std::string& chosen) {
             });
         break;
     }
+    case Pending::DolphinFolder:
+    case Pending::DolphinZip: {
+        auto result = std::make_shared<std::vector<ImportResult>>();
+        const bool zip = what == Pending::DolphinZip;
+        StartJob(
+            a, Tr("Importando el pack de Dolphin...", "Importing the Dolphin pack..."),
+            [&a, path, zip, result, mod = ModRoot(a)](Progress& p) {
+                std::error_code ec;
+                fs::path folder = path;
+                const fs::path unpacked = a.paths.userData / "Cache" / "dolphin-pack";
+                if (zip) {
+                    fs::remove_all(unpacked, ec);
+                    std::string error;
+                    if (!UnpackZip(path, unpacked, &error)) {
+                        result->push_back({Utf8(path.filename()), "", false, error});
+                        return;
+                    }
+                    folder = unpacked;
+                }
+                *result = ImportDolphinPack(a.catalog, folder, mod, Utf8(path.stem()), &p);
+                if (zip) fs::remove_all(unpacked, ec);
+            },
+            [&a, result] {
+                a.report = std::move(*result);
+                a.thumbs.Clear();
+                a.replacements = FindReplacements(ModRoot(a));
+                a.openReport = true;
+                Refilter(a);
+            });
+        break;
+    }
     case Pending::Zip: {
         auto result = std::make_shared<std::pair<bool, std::string>>();
         StartJob(
@@ -863,6 +973,77 @@ void DrawPopups(App& a, SDL_Renderer* r) {
             } else {
                 a.newModError = error;
             }
+        }
+        ImGui::SameLine();
+        if (ui::Pill(Tr("Cancelar", "Cancel"), ui::kGreyTop, ui::kGreyBottom, true)) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    if (a.openUpscale) { ImGui::OpenPopup("###upscale"); a.openUpscale = false; }
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(640, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal(Tr("Escalar con IA###upscale", "Upscale with AI###upscale"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("%s", Tr("Exporta las texturas, las escala con Real-ESRGAN en tu tarjeta gráfica y las importa en el mod "
+                                    "activo. Las que salen en gris (su paleta está en otro pack) se saltan.",
+                                    "Exports the textures, upscales them with Real-ESRGAN on your graphics card and imports them "
+                                    "into the active mod. Grey ones (their palette is in another pack) are skipped."));
+        ImGui::Spacing();
+        ImGui::TextUnformatted(Tr("Modelo", "Model"));
+        for (int i = 0; i < static_cast<int>(a.models.size()); ++i)
+            ImGui::RadioButton((a.models[i].label + "##m" + std::to_string(i)).c_str(), &a.upscaleModel, i);
+        ImGui::Spacing();
+        ImGui::TextUnformatted(Tr("Tamaño", "Size"));
+        ImGui::RadioButton("x2", &a.upscaleScale, 2);
+        ImGui::SameLine();
+        ImGui::RadioButton(Tr("x4 (máximo 4096 px)", "x4 (4096 px at most)"), &a.upscaleScale, 4);
+        ImGui::Spacing();
+        int target = a.upscaleSelected ? 1 : 0;
+        ImGui::RadioButton((Tr("Esta vista (", "This view (") + std::to_string(a.visible.size()) + Tr(" texturas)", " textures)")).c_str(),
+                           &target, 0);
+        if (a.selected >= 0) {
+            ImGui::SameLine();
+            ImGui::RadioButton(Tr("Solo la seleccionada", "Only the selected one"), &target, 1);
+        }
+        a.upscaleSelected = target == 1 && a.selected >= 0;
+        if (a.upscaleModel >= static_cast<int>(a.models.size())) a.upscaleModel = 0;
+        const std::string model = a.models.empty() ? std::string() : a.models[a.upscaleModel].id;
+        const std::string downloads = model.empty() ? std::string() : UpscaleDownloads(UpscaleTools(a), model);
+        if (!downloads.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(ui::kYellow), "%s",
+                               Tr("La primera vez se descarga (gratis, de sus autores):", "The first time it downloads (free, from their authors):"));
+            ImGui::TextUnformatted(downloads.c_str());
+        }
+        ImGui::TextWrapped("%s", Tr("Un x4 multiplica por 16 los píxeles: hazlo por categorías y revisa el resultado en el juego.",
+                                    "A x4 makes 16 times the pixels: do it by category and check the result in the game."));
+        ImGui::Spacing();
+        if (ui::Pill(downloads.empty() ? Tr("Escalar", "Upscale") : Tr("Descargar y escalar", "Download and upscale"), ui::kOrangeTop,
+                     ui::kOrangeBottom, true, !model.empty())) {
+            StartUpscale(a, a.upscaleSelected ? std::vector<int>{a.selected} : a.visible, model, a.upscaleScale);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ui::Pill(Tr("Cancelar", "Cancel"), ui::kGreyTop, ui::kGreyBottom, true)) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    if (a.openDolphin) { ImGui::OpenPopup("###dolphin"); a.openDolphin = false; }
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal(Tr("Pack de texturas de Dolphin###dolphin", "Dolphin texture pack###dolphin"), nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted(Tr("Los packs de Dolphin para MLB Power Pros 2008 (RL8E54) funcionan tal cual: sus archivos se\n"
+                                  "copian al mod activo sin cambiar nombres (mipmaps y DDS incluidos).",
+                                  "Dolphin packs for MLB Power Pros 2008 (RL8E54) work as they are: their files are copied\n"
+                                  "into the active mod without renaming (mipmaps and DDS included)."));
+        ImGui::Spacing();
+        if (ui::Pill(Tr("Carpeta...", "Folder..."), ui::kGreenTop, ui::kGreenBottom, true)) {
+            a.pending = Pending::DolphinFolder;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ui::Pill(Tr("Archivo .zip...", ".zip file..."), ui::kGreenTop, ui::kGreenBottom, true)) {
+            a.pending = Pending::DolphinZip;
+            ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
         if (ui::Pill(Tr("Cancelar", "Cancel"), ui::kGreyTop, ui::kGreyBottom, true)) ImGui::CloseCurrentPopup();
