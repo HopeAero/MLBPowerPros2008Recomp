@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..264223c
+index 0000000..7ceb97f
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,883 @@
+@@ -0,0 +1,924 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -82,6 +82,7 @@ index 0000000..264223c
 +
 +// MLB Life with a two-way player (end of the file).
 +void NoteLifePitcher(uint32_t entries, uint32_t players, uint32_t count, bool start);
++int LifeStarter(uint32_t entries, uint32_t players, uint32_t count);
 +void LifeDrillSwitch(CpuContext* ctx, uint32_t pad);
 +void LifeDrillPicked();
 +
@@ -575,7 +576,8 @@ index 0000000..264223c
 +// with an aptitude of 4 or more in the field: record +0x63.. P, C, 1B .. RF; or with a hitter's
 +// batting: contact +0x72 and power +0x73, 1 and 16 for every other pitcher) is the DH on the days
 +// he does not start, and the DH as well as the starter on the days he does (the Ohtani rule; the
-+// displaced DH takes a free entry on the bench).
++// displaced DH takes a free entry on the bench). The MLB Life player starts on his own turn (see
++// LifeStarter).
 +namespace two_way {
 +namespace {
 +constexpr uint32_t kOrder = 5;
@@ -645,6 +647,9 @@ index 0000000..264223c
 +    Call(ctx, 0x808879D0u, InvokeDirectCpu<0x808879D0u>);
 +    args();
 +    Call(ctx, 0x80887C48u, InvokeDirectCpu<0x80887C48u>);
++    const bool twoWay = RuntimeConfigFile::TwoWayPlayer(false) && Memory::Read8(rules) != 0;
++    const int life = twoWay ? LifeStarter(entries, players, count) : -1;
++    const uint16_t id = life >= 0 ? Memory::Read16(players + Memory::Read8(entries + life * kEntry + 1) * 0x2Cu) : 0;
 +    const uint32_t starter = entries + ctx->gpr[3] * kEntry;
 +    Memory::Write8(starter + kInLineup, 1);
 +    Memory::Write8(starter + kPosition, kPitcher);
@@ -652,7 +657,22 @@ index 0000000..264223c
 +    Call(ctx, 0x80887F68u, InvokeDirectCpu<0x80887F68u>);
 +    args();
 +    Call(ctx, 0x808880FCu, InvokeDirectCpu<0x808880FCu>);
-+    const bool twoWay = RuntimeConfigFile::TwoWayPlayer(false) && Memory::Read8(rules) != 0;
++    // His start: he takes the P's entry and the P takes his, once the game has made its lineup (MLB
++    // Life marks its day's P and nine batters beforehand and puts that P back in the field if he is
++    // left out earlier; two Ps break the game screen, 0x80669B38 calling an object it never made).
++    if (life >= 0) {
++        uint32_t p = starter, his = 0;
++        for (uint32_t i = 0; i < count; ++i) {
++            const uint32_t e = entries + i * kEntry;
++            if (Memory::Read8(e + kInLineup) && Memory::Read8(e + kPosition) == kPitcher) p = e;
++            if (Memory::Read16(players + Memory::Read8(e + 1) * 0x2Cu) == id) his = e;
++        }
++        if (his && his != p && !Memory::Read8(his + kInLineup)) {
++            const uint8_t pitcher = Memory::Read8(p + 1);
++            Memory::Write8(p + 1, Memory::Read8(his + 1));
++            Memory::Write8(his + 1, pitcher);
++        }
++    }
 +    if (twoWay) ApplyTwoWay(entries, players, count);
 +    for (uint32_t slot = 0; slot < 9; ++slot) {
 +        const uint8_t order = Memory::Read8(0x80D10EA4u + slot);
@@ -733,15 +753,36 @@ index 0000000..264223c
 +void NoteLifePitcher(uint32_t entries, uint32_t players, uint32_t count, bool start) {
 +    if (!LifeMode()) return;
 +    const uint16_t id = LifeId();
++    bool found = false, pitching = false;  // a two-way starter has two entries, P and DH
 +    for (uint32_t i = 0; i < count; ++i) {
 +        const uint32_t e = entries + i * kEntry;
 +        if (Memory::Read16(players + Memory::Read8(e + 1) * 0x2Cu) != id) continue;
-+        const bool pitching = Memory::Read8(e + kInLineup) && Memory::Read8(e + kPosition) == kPitcher;
-+        if (start) g_inPractice = false, g_pitched = pitching;
-+        else g_pitched = g_pitched || pitching;
-+        std::fprintf(stderr, "[two-way] MLB Life player %s\n", g_pitched ? "pitches today" : "does not pitch today");
-+        return;
++        found = true;
++        pitching = pitching || (Memory::Read8(e + kInLineup) && Memory::Read8(e + kPosition) == kPitcher);
 +    }
++    if (!found) return;
++    if (start) g_inPractice = false, g_pitched = pitching;
++    else g_pitched = g_pitched || pitching;
++    std::fprintf(stderr, "[two-way] MLB Life player %s\n", g_pitched ? "pitches today" : "does not pitch today");
++}
++
++// The game picks a team's starter as its best-rated rested pitcher (0x80887C48), which a new MLB Life
++// player almost never is, and a DH is never called in to relieve: so the two-way MLB Life player
++// starts his team's game on every kRotation-th day of the year ([0x8104B5A8] + 4, 0 = January 1),
++// and is the DH on the others. By the date, so nothing needs saving.
++constexpr uint32_t kRotation = 5;  // ponytail: fixed five-man turn; follow his fatigue if players ask
++int LifeStarter(uint32_t entries, uint32_t players, uint32_t count) {
++    if (!LifeMode()) return -1;
++    const uint32_t state = Memory::Read32(0x8104B5A8u);
++    if (!Memory::Contains(state, 8) || Memory::Read16(state + 4) % kRotation != 0) return -1;
++    const uint16_t id = LifeId();
++    for (uint32_t i = 0; i < count; ++i) {
++        const uint32_t e = entries + i * kEntry;
++        const uint8_t index = Memory::Read8(e + 1);
++        if (Memory::Read16(players + index * 0x2Cu) == id)
++            return Memory::Read8(e + kOnRoster) && TwoWay(players, index) ? static_cast<int>(i) : -1;
++    }
++    return -1;
 +}
 +
 +// X on the drill list switches pitcher / batter drills: the list is filled again.
