@@ -4,6 +4,8 @@
 
 **This file is the source of truth** for what is done, in progress and planned. Each line of work has a plan in [`docs/en/roadmap/`](docs/en/roadmap/) with its phases, how it is verified and a checklist. Bugs live in [Issues](https://github.com/HopeAero/MLBPowerPros2008Recomp/issues); ideas and questions in [Discussions](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions). When something is finished it moves to **Done** with the release that shipped it.
 
+Talk about it: [roadmap discussion](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/7).
+
 Updated: October 24, 2026 · latest release [v0.1.5](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.5).
 
 Two rules hold for everything below: the game stays **faithful to the Wii original by default** (anything that changes gameplay is opt-in from the launcher), and **no game files are ever distributed**: every player builds the game from their own disc.
