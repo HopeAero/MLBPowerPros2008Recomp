@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..68ca2b1
+index 0000000..3cccbd4
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,925 @@
+@@ -0,0 +1,1008 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -84,6 +84,7 @@ index 0000000..68ca2b1
 +void NoteLifePitcher(uint32_t entries, uint32_t players, uint32_t count, bool start);
 +int LifeStarter(uint32_t entries, uint32_t players, uint32_t count);
 +void LifeDrillSwitch(CpuContext* ctx, uint32_t pad);
++void LifeMenuSwitch(CpuContext* ctx, uint32_t pad, uint32_t lr, uint32_t self);
 +void LifeDrillPicked();
 +
 +constexpr uint32_t kLineups = 0x8103D090u;
@@ -489,6 +490,7 @@ index 0000000..68ca2b1
 +    using namespace two_way;
 +    const uint32_t lr = ctx->lr, panel = ctx->gpr[31], pad = ctx->gpr[3];
 +    LifeDrillSwitch(ctx, pad);
++    LifeMenuSwitch(ctx, pad, lr, panel);
 +    ctx->gpr[3] = pad, ctx->gpr[4] = 4;
 +    Call(ctx, 0x805EEB70u, InvokeDirectCpu<0x805EEB70u>);
 +    if (ctx->gpr[3] != 0) LifeDrillPicked();
@@ -799,6 +801,73 @@ index 0000000..68ca2b1
 +}
 +
 +void LifeDrillPicked() { g_drillOpen = false; }
++
++// The MLB Life menu (built by 0x809A8974, `this` in r27) shows the player's stats in a panel held at
++// +0x2BB0: made by 0x80A4D2BC from the layout at this + 11 * 224 + 3184 as variant 0 (a pitcher's
++// ERA, W-L, K, SV) or 1 (a batter's AVG, HR, RBI, SB), then filled by 0x80A4D850 from seven words.
++// Idle, the menu asks for A at 0x809A9B80 with itself in r31: for a two-way player, X there switches
++// the same panel's variant (its virtual +0x3C, as 0x80A4D2BC does) and fills it again. A new panel
++// would go last among its parent's children and cover the player's face.
++constexpr uint32_t kMenuStatsAsk = 0x809A8B38u, kMenuAsk = 0x809A9B84u, kMenuStats = 0x2BB0;
++uint32_t g_lifeMenu = 0, g_menuTick = 0;
++bool g_menuBatter = false;
++int g_menuDay = -1;  // the day X was pressed on
++
++int LifeDay() {
++    const uint32_t state = Memory::Read32(0x8104B5A8u);
++    return Memory::Contains(state, 8) ? Memory::Read16(state + 4) : -1;
++}
++
++uint32_t Get(CpuContext* ctx, void (*invoke)(CpuContext*), uint32_t target, uint32_t a = 0, uint32_t b = 0) {
++    ctx->gpr[3] = a, ctx->gpr[4] = b;
++    Call(ctx, target, invoke);
++    return ctx->gpr[3];
++}
++
++void MenuStats(CpuContext* ctx, uint32_t menu, bool batter) {
++    const uint32_t panel = Memory::Read32(menu + kMenuStats);
++    if (!Memory::Contains(panel, 0x200)) return;
++    const uint32_t layout = Memory::Read32(Memory::Read32(panel) + 0x3C), lr = ctx->lr;
++    ctx->gpr[3] = panel, ctx->gpr[4] = batter ? 1 : 0, ctx->ctr = layout, ctx->lr = layout;
++    InvokeIndirectCpu(layout, ctx);
++    ctx->lr = lr;
++    // The menu's numbers: this season's (0x80A4B590 with the year) when 0x80B06CD0 says so, else 0x80A4B618.
++    uint32_t words[7] = {Get(ctx, InvokeDirectCpu<0x80A178D4u>, 0x80A178D4u), Get(ctx, InvokeDirectCpu<0x80A17C34u>, 0x80A17C34u)};
++    const uint16_t id = Get(ctx, InvokeDirectCpu<0x80A16F38u>, 0x80A16F38u) & 0xFFFF;
++    const bool season = Get(ctx, InvokeDirectCpu<0x80B06CD0u>, 0x80B06CD0u, id) != 0;
++    const std::array<uint32_t, 5> pitcher{35, 33, 34, 40, 49}, hitter{15, 6, 7, 11, 0};
++    const auto& stats = batter ? hitter : pitcher;
++    for (size_t i = 0; i < stats.size() && stats[i]; ++i) {
++        if (season) {
++            const uint32_t year = Get(ctx, InvokeDirectCpu<0x80B74BCCu>, 0x80B74BCCu);
++            words[2 + i] = Get(ctx, InvokeDirectCpu<0x80A4B590u>, 0x80A4B590u, stats[i],
++                               static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(year))));
++        } else {
++            words[2 + i] = Get(ctx, InvokeDirectCpu<0x80A4B618u>, 0x80A4B618u, stats[i]);
++        }
++    }
++    const uint32_t sp = ctx->gpr[1];
++    ctx->gpr[1] = (sp - 0x40) & ~0xFu;
++    Memory::Write32(ctx->gpr[1], sp);
++    const uint32_t array = ctx->gpr[1] + 0x10;
++    for (uint32_t i = 0; i < 7; ++i) Memory::Write32(array + i * 4, words[i]);
++    Get(ctx, InvokeDirectCpu<0x80A4D850u>, 0x80A4D850u, panel, array);
++    ctx->gpr[1] = sp;
++}
++
++void LifeMenuSwitch(CpuContext* ctx, uint32_t pad, uint32_t lr, uint32_t self) {
++    if (lr != kMenuAsk || self != g_lifeMenu || !g_lifeMenu || !LifeMode()) return;
++    if (SecondPosition(ctx, LifeRecord(ctx)) == 0) return;
++    ++g_menuTick;
++    ctx->gpr[3] = pad, ctx->gpr[4] = kButtonX;
++    Call(ctx, 0x805EEB70u, InvokeDirectCpu<0x805EEB70u>);
++    if (ctx->gpr[3] == 0) return;
++    g_menuBatter = !g_menuBatter;
++    g_menuDay = LifeDay();
++    MenuStats(ctx, self, g_menuBatter);
++    Sound(ctx, 0x1001);
++    std::fprintf(stderr, "[two-way] MLB Life menu: %s stats\n", g_menuBatter ? "batter" : "pitcher");
++}
 +}  // namespace
 +}  // namespace two_way
 +
@@ -841,7 +910,13 @@ index 0000000..68ca2b1
 +        return;
 +    }
 +    const uint32_t second = SecondPosition(ctx, record);
-+    ctx->gpr[3] = second != 0 && Batter() ? second : value;
++    bool batter = Batter();
++    if (lr == kMenuStatsAsk) {  // the menu being built: the day's role, or what X picked that day
++        g_lifeMenu = ctx->gpr[27];
++        if (LifeDay() != g_menuDay) g_menuBatter = second != 0 && batter, g_menuDay = -1;
++        batter = g_menuBatter;
++    }
++    ctx->gpr[3] = second != 0 && batter ? second : value;
 +}
 +PPC_NATIVE_OVERRIDE_VOID(8057BD3C, MLB_MainPosition_8057BD3C, (CpuContext* ctx), (ctx));
 +
@@ -941,7 +1016,13 @@ index 0000000..68ca2b1
 +    // The pictures' headers are there once the game has drawn the list: look a few times, 30 frames apart.
 +    static bool ready = false;
 +    static int frames = 0, tries = 0;
-+    const bool open = g_drillOpen && LifeMode();
++    // The menu is idle while it keeps asking for A (LifeMenuSwitch counts it).
++    static uint32_t lastTick = 0;
++    static int menuIdle = 99;
++    menuIdle = g_menuTick != lastTick ? 0 : menuIdle + 1;
++    lastTick = g_menuTick;
++    const bool menu = menuIdle < 5;
++    const bool open = (g_drillOpen || menu) && LifeMode();
 +    if (!open) {
 +        frames = tries = 0;
 +        return;
@@ -953,12 +1034,14 @@ index 0000000..68ca2b1
 +    }
 +    if (!ready) return;
 +    // Measured on the bar at 1920 x 1080 (the game stretched to the window): a picture texel is
-+    // 3.67 x 2.3 pixels; the X button goes where a third entry starts, at the A button's height.
++    // 3.67 x 2.3 pixels; the X button goes where a third entry starts, at the A button's height (on
++    // the menu's bar, after "R History").
 +    const ImVec4 game = GameRect(ImGui::GetIO().DisplaySize);
 +    const float sx = game.z / 1920.0f, sy = game.w / 1080.0f, tx = 3.67f * sx, ty = 2.3f * sy;
 +    const auto at = [&](float x, float y) { return ImVec2(game.x + x * sx, game.y + y * sy); };
 +    ImDrawList* dl = ImGui::GetForegroundDrawList();
-+    const ImVec2 button = at(701.0f, 1006.7f), label = at(780.0f, 1008.8f);
++    const float left = g_drillOpen ? 701.0f : 1362.0f;
++    const ImVec2 button = at(left, 1006.7f), label = at(left + 79.0f, 1008.8f);
 +    dl->AddImage(g_buttons.texture, button, ImVec2(button.x + 21 * tx, button.y + 25 * ty), ImVec2(103 / 128.0f, 25 / 128.0f),
 +                 ImVec2(124 / 128.0f, 50 / 128.0f));
 +    dl->AddImage(g_labels.texture, label, ImVec2(label.x + 56 * tx, label.y + 22 * ty), ImVec2(0.0f, 110 / 512.0f),
