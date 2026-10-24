@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..3cccbd4
+index 0000000..864c46e
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,1008 @@
+@@ -0,0 +1,1022 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -896,6 +896,20 @@ index 0000000..3cccbd4
 +    ctx->gpr[3] = Batter() ? 0 : 1;
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80A2F88C, MLB_LifeIsPitcher_80A2F88C, (CpuContext* ctx), (ctx));
++
++// 0x80B06888 (id): whether that player is a pitcher (0x8085E988 == 1), as the original. The practice
++// screen's update (0x8098B860, returning to 0x8098B994) asks it each frame to show its pitcher or its
++// batter ability panel (0x8097DEFC): for the two-way MLB Life player, the drills picked with X.
++extern "C" void MLB_IsPitcherById_80B06888(CpuContext* ctx) {
++    using namespace two_way;
++    const uint32_t lr = ctx->lr, id = ctx->gpr[3] & 0xFFFF;
++    Call(ctx, 0x8085E988u, InvokeDirectCpu<0x8085E988u>);
++    const bool pitcher = (ctx->gpr[3] & 0xFF) == 1;
++    ctx->gpr[3] = pitcher;
++    if (lr != 0x8098B994u || !pitcher || !g_inPractice || !LifeMode() || id != LifeId()) return;
++    ctx->gpr[3] = SecondPosition(ctx, LifeRecord(ctx)) != 0 && g_practiceBatter ? 0 : 1;
++}
++PPC_NATIVE_OVERRIDE_VOID(80B06888, MLB_IsPitcherById_80B06888, (CpuContext* ctx), (ctx));
 +
 +// 0x8057BD3C (packed record): the main position (word +0x5C, bits 6..9), as the original.
 +extern "C" void MLB_MainPosition_8057BD3C(CpuContext* ctx) {
