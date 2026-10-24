@@ -144,7 +144,7 @@ $game = Join-Path $Install 'Game'
 New-Item -ItemType Directory -Force $game | Out-Null
 Copy-Item (Join-Path $build 'WiiCompiled.exe') (Join-Path $game 'MLBPowerPros2008.exe') -Force
 # Runtime files the build places next to the exe; same list as Wiicompiled's LocalBuild.ps1.
-foreach ($name in 'dxcompiler.dll', 'dxil.dll', 'libc++.dll', 'libpng16.dll', 'libunwind.dll', 'libz.dll', 'SDL3.dll',
+foreach ($name in 'dxcompiler.dll', 'dxil.dll', 'd3dcompiler_47.dll', 'libc++.dll', 'libpng16.dll', 'libunwind.dll', 'libz.dll', 'SDL3.dll',
                   'sqlite3.dll', 'webgpu_dawn.dll', 'z.dll', 'noshaders.zip', 'dsp_coef.bin', 'initial_pipeline_cache.db') {
     $file = Join-Path $build $name
     if (Test-Path $file) { Copy-Item $file $game -Force }

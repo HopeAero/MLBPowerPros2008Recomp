@@ -16,7 +16,7 @@ Two rules hold for everything below: the game stays **faithful to the Wii origin
 |---|---|---|
 | [Bug fixes](docs/en/roadmap/bugs.md) | Reports from players, triaged and fixed in hotfix releases | Ongoing |
 | [Performance on modest PCs](docs/en/roadmap/performance.md) | Measure and lower the CPU and GPU cost so the game holds 60 FPS on integrated graphics and older CPUs | Next up |
-| [OpenGL](docs/en/roadmap/opengl.md) | An OpenGL / OpenGL ES graphics backend for GPUs without Vulkan or Direct3D 12, and as the road to Switch | In progress: OpenGL ES plays a match on Linux |
+| [OpenGL](docs/en/roadmap/opengl.md) | An OpenGL / OpenGL ES graphics backend for GPUs without Vulkan or Direct3D 12, and as the road to Switch | In progress: OpenGL ES on Linux and Direct3D 11 on Windows play a match |
 
 ## Next
 

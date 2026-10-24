@@ -1,0 +1,115 @@
+diff --git a/aurora-main/cmake/AuroraCopyRuntimeDLLs.cmake b/aurora-main/cmake/AuroraCopyRuntimeDLLs.cmake
+index b4fa166..b5d7cd4 100644
+--- a/aurora-main/cmake/AuroraCopyRuntimeDLLs.cmake
++++ b/aurora-main/cmake/AuroraCopyRuntimeDLLs.cmake
+@@ -33,6 +33,12 @@ function(aurora_copy_runtime_dlls target)
+           )
+         endif ()
+       endforeach ()
++      file(TO_CMAKE_PATH "$ENV{SystemRoot}/System32/d3dcompiler_47.dll" _fxc)
++      if (DAWN_ENABLE_D3D11 AND EXISTS "${_fxc}")
++        add_custom_command(TARGET ${target} POST_BUILD
++            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_fxc}" $<TARGET_FILE_DIR:${target}>
++        )
++      endif ()
+     endif ()
+   endif ()
+ endfunction()
+diff --git a/aurora-main/cmake/AuroraDawnProvider.cmake b/aurora-main/cmake/AuroraDawnProvider.cmake
+index f23028c..5891f75 100644
+--- a/aurora-main/cmake/AuroraDawnProvider.cmake
++++ b/aurora-main/cmake/AuroraDawnProvider.cmake
+@@ -13,8 +13,8 @@ include_guard(GLOBAL)
+ function(_aurora_dawn_set_platform_backends)
+   if (WIN32)
+     set(DAWN_ENABLE_D3D12 ON CACHE INTERNAL "")
+-    # Disable D3D11 because this Aurora fork does not support it.
+-    set(DAWN_ENABLE_D3D11 OFF CACHE INTERNAL "")
++    # Direct3D 11: for GPUs without Direct3D 12 or Vulkan (tried after both in automatic selection).
++    set(DAWN_ENABLE_D3D11 ON CACHE INTERNAL "")
+     set(DAWN_ENABLE_VULKAN ON CACHE INTERNAL "")
+     set(DAWN_ENABLE_METAL OFF CACHE INTERNAL "")
+     set(DAWN_ENABLE_DESKTOP_GL OFF CACHE INTERNAL "")
+diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
+index aebb97a..e2e68c5 100644
+--- a/aurora-main/lib/aurora.cpp
++++ b/aurora-main/lib/aurora.cpp
+@@ -632,16 +632,13 @@ constexpr std::array PreferredBackendOrder{
+ #ifdef DAWN_ENABLE_BACKEND_D3D12
+     BACKEND_D3D12,
+ #endif
+-#if defined(_WIN32) && defined(DAWN_ENABLE_BACKEND_D3D11)
+-    BACKEND_D3D11,
+-#endif
+ #ifdef DAWN_ENABLE_BACKEND_METAL
+     BACKEND_METAL,
+ #endif
+ #ifdef DAWN_ENABLE_BACKEND_VULKAN
+     BACKEND_VULKAN,
+ #endif
+-#if !defined(_WIN32) && defined(DAWN_ENABLE_BACKEND_D3D11)
++#ifdef DAWN_ENABLE_BACKEND_D3D11
+     BACKEND_D3D11,
+ #endif
+ // #ifdef DAWN_ENABLE_BACKEND_DESKTOP_GL
+diff --git a/aurora-main/lib/webgpu/gpu.cpp b/aurora-main/lib/webgpu/gpu.cpp
+index cf2cf03..a2b8e90 100644
+--- a/aurora-main/lib/webgpu/gpu.cpp
++++ b/aurora-main/lib/webgpu/gpu.cpp
+@@ -561,9 +561,10 @@ bool initialize(AuroraBackend auroraBackend) {
+     }
+   }
+   {
+-    const bool gl = backend == wgpu::BackendType::OpenGL || backend == wgpu::BackendType::OpenGLES;
++    const bool compat = backend == wgpu::BackendType::OpenGL || backend == wgpu::BackendType::OpenGLES ||
++                        backend == wgpu::BackendType::D3D11;
+     const wgpu::RequestAdapterOptions options{
+-        .featureLevel = gl ? wgpu::FeatureLevel::Compatibility : wgpu::FeatureLevel::Core,
++        .featureLevel = compat ? wgpu::FeatureLevel::Compatibility : wgpu::FeatureLevel::Core,
+         .powerPreference = wgpu::PowerPreference::HighPerformance,
+         .backendType = backend,
+         .compatibleSurface = g_surface,
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index 5ec7684..dd06545 100644
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -194,7 +194,7 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
+ #elif defined(__linux__)
+     static constexpr std::array<std::string_view, 3> values{"auto", "vulkan", "opengles"};
+ #elif defined(_WIN32)
+-    static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};
++    static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
+ #endif
+     return std::find(values.begin(), values.end(), value) != values.end();
+ }
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 0238edd..64624a2 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -61,9 +61,10 @@ struct ApiOption {
+ };
+ 
+ // Config names match RuntimeConfigFile::IsSupportedGraphicsApi and the backend table in main.cpp.
+-constexpr std::array<ApiOption, 5> kApis{{
++constexpr std::array<ApiOption, 6> kApis{{
+     {BACKEND_AUTO, "auto", "Automática"},
+     {BACKEND_D3D12, "d3d12", "Direct3D 12"},
++    {BACKEND_D3D11, "d3d11", "Direct3D 11"},
+     {BACKEND_VULKAN, "vulkan", "Vulkan"},
+     {BACKEND_METAL, "metal", "Metal"},
+     {BACKEND_OPENGLES, "opengles", "OpenGL ES"},
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 3aba9ef..c0aabf6 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1441,8 +1441,8 @@ int RuntimeMain(int argc, char** argv) {
+             {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
+         }};
+ #elif defined(_WIN32)
+-        static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
+-            {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN},
++        static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
++            {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN}, {"d3d11", BACKEND_D3D11},
+         }};
+ 
+ #endif
