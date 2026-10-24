@@ -1,0 +1,81 @@
+diff --git a/aurora-main/lib/gfx/common.cpp b/aurora-main/lib/gfx/common.cpp
+index b80a2be..d22b37a 100644
+--- a/aurora-main/lib/gfx/common.cpp
++++ b/aurora-main/lib/gfx/common.cpp
+@@ -1393,6 +1393,13 @@ static void render_impl(std::vector<RenderPass>& renderPasses, wgpu::CommandEnco
+                 : passInfo.resolveNeedsConversion     ? pass_timing::Conv
+                 : passInfo.resolveNeedsShaderSampling ? pass_timing::Blit
+                                                       : pass_timing::Copy,
++        .clearColor = passInfo.clearColor,
++        .clearDepth = passInfo.clearDepth,
++        .copyX = passInfo.resolveTarget ? passInfo.resolveRect.x : 0,
++        .copyY = passInfo.resolveTarget ? passInfo.resolveRect.y : 0,
++        .copyW = passInfo.resolveTarget ? passInfo.resolveRect.width : 0,
++        .copyH = passInfo.resolveTarget ? passInfo.resolveRect.height : 0,
++        .copyFormat = passInfo.resolveTarget ? static_cast<uint32_t>(passInfo.resolveFormat) : 0,
+     };
+     const wgpu::RenderPassDescriptor renderPassDescriptor{
+         .label = render_pass_label(i),
+diff --git a/aurora-main/lib/gfx/pass_timing.hpp b/aurora-main/lib/gfx/pass_timing.hpp
+index e97bb8e..f294577 100644
+--- a/aurora-main/lib/gfx/pass_timing.hpp
++++ b/aurora-main/lib/gfx/pass_timing.hpp
+@@ -19,6 +19,9 @@ struct PassInfo {
+   uint32_t draws = 0, w = 0, h = 0;
+   uint64_t copyPixels = 0;
+   Kind kind = None;
++  bool clearColor = false, clearDepth = false;
++  int32_t copyX = 0, copyY = 0, copyW = 0, copyH = 0;
++  uint32_t copyFormat = 0;
+ };
+ struct Slot {
+   std::atomic<int> state{0}; // 0 free, 1 encoded, 2 mapping
+@@ -32,14 +35,23 @@ inline int current = -1;
+ struct Totals {
+   uint64_t frames = 0, drawNs = 0, gapNs[4] = {}, gapCount[4] = {}, passes = 0, copyPixels = 0;
+   std::array<uint64_t, kMaxPasses> passNs{};
++  std::array<uint64_t, kMaxPasses> passGapNs{};
+   std::array<PassInfo, kMaxPasses> lastInfo{};
+ };
+ inline Totals totals;
+ 
++inline bool list_passes() {
++  static const bool on = [] {
++    const char* v = std::getenv("WIICOMPILED_GPU_BREAKDOWN");
++    return v && *v == '2';
++  }();
++  return on;
++}
++
+ inline bool enabled() {
+   static const bool on = [] {
+     const char* v = std::getenv("WIICOMPILED_GPU_BREAKDOWN");
+-    return v && *v == '1';
++    return v && (*v == '1' || *v == '2');
+   }();
+   return on && webgpu::g_device.HasFeature(wgpu::FeatureName::TimestampQuery);
+ }
+@@ -61,6 +73,15 @@ inline void report() {
+     std::fprintf(stderr, "[gpu-breakdown]   pass %u: %.2fms target %ux%u draws %u then kind=%u copyPx=%llu\n", order[r],
+                  t.passNs[order[r]] / f / 1e6, p.w, p.h, p.draws, unsigned(p.kind), (unsigned long long)p.copyPixels);
+   }
++  if (list_passes()) {
++    for (uint32_t i = 0; i < kMaxPasses && t.passNs[i]; ++i) {
++      const auto& p = t.lastInfo[i];
++      std::fprintf(stderr,
++                   "[gpu-breakdown]   #%u %.3fms draws %u clear %c%c copy %d,%d %dx%d fmt %u kind %u gap %.3fms\n", i,
++                   t.passNs[i] / f / 1e6, p.draws, p.clearColor ? 'C' : '-', p.clearDepth ? 'D' : '-', p.copyX,
++                   p.copyY, p.copyW, p.copyH, p.copyFormat, unsigned(p.kind), t.passGapNs[i] / f / 1e6);
++    }
++  }
+   t = {};
+ }
+ 
+@@ -83,6 +104,7 @@ inline void harvest(Slot& s) {
+                             if (i + 1 < s.passes) {
+                               const uint64_t g = v[2 * i + 2] > v[2 * i + 1] ? v[2 * i + 2] - v[2 * i + 1] : 0;
+                               t.gapNs[s.info[i].kind] += g;
++                              t.passGapNs[i] += g;
+                               t.gapCount[s.info[i].kind] += s.info[i].kind != None;
+                             }
+                           }
