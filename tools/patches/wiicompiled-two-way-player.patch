@@ -36,10 +36,10 @@ index 549417e..3d43b99 100644
  }
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 new file mode 100644
-index 0000000..864c46e
+index 0000000..ba31735
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,1022 @@
+@@ -0,0 +1,1048 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -770,14 +770,40 @@ index 0000000..864c46e
 +}
 +
 +// The game picks a team's starter as its best-rated rested pitcher (0x80887C48), which a new MLB Life
-+// player almost never is, and a DH is never called in to relieve: so the two-way MLB Life player
-+// starts his team's game on every kRotation-th day of the year ([0x8104B5A8] + 4, 0 = January 1),
-+// and is the DH on the others. By the date, so nothing needs saving.
-+constexpr uint32_t kRotation = 5;  // ponytail: fixed five-man turn; follow his fatigue if players ask
++// player almost never is, and a DH is never called in to relieve: so the two-way MLB Life player has
++// his own turn in the rotation, every kRotation-th game of his team (the DH in the others), counted
++// on the season's schedule, which the save holds: X + 10192 (X = [0x8104B5A0]), 245 days from game
++// day 60 (March 1, spring training included), 16 slots of 16 bytes (u32 home, u32 away; 44 empty). His
++// team is [[0x8104B59C]] (u32, the schedule's numbering). Off days do not count, and a turn he is out
++// for (injured: off the roster) is skipped, as in a real rotation.
++constexpr uint32_t kRotation = 5;
++constexpr int kFirstDay = 60, kScheduleDays = 245;
++
++// His team's game number today (0 the first one), or -1 when it has none today. Past the schedule
++// (the postseason) every day counts as a game.
++int TeamGame(int day, uint32_t team) {
++    const uint32_t x = Memory::Read32(0x8104B5A0u);
++    if (day < kFirstDay || !Memory::Contains(x + 10192, kScheduleDays * 256)) return -1;
++    const auto plays = [&](int d) {
++        for (uint32_t s = 0; s < 16; ++s) {
++            const uint32_t slot = x + 10192 + static_cast<uint32_t>(d - kFirstDay) * 256 + s * 16;
++            if (Memory::Read32(slot) == team || Memory::Read32(slot + 4) == team) return true;
++        }
++        return false;
++    };
++    int games = 0, last = -1;
++    for (int d = kFirstDay; d < std::min(day, kFirstDay + kScheduleDays); ++d)
++        if (plays(d)) ++games, last = d;
++    if (day < kFirstDay + kScheduleDays) return plays(day) ? games : -1;
++    return games + day - std::max(last, kFirstDay + kScheduleDays - 1) - 1;  // ponytail: postseason, days as games
++}
++
 +int LifeStarter(uint32_t entries, uint32_t players, uint32_t count) {
 +    if (!LifeMode()) return -1;
-+    const uint32_t state = Memory::Read32(0x8104B5A8u);
-+    if (!Memory::Contains(state, 8) || Memory::Read16(state + 4) % kRotation != 0) return -1;
++    const uint32_t state = Memory::Read32(0x8104B5A8u), life = Memory::Read32(0x8104B59Cu);
++    if (!Memory::Contains(state, 8) || !Memory::Contains(life, 4)) return -1;
++    const int game = TeamGame(Memory::Read16(state + 4), Memory::Read32(life));
++    if (game < 0 || game % kRotation != 0) return -1;
 +    const uint16_t id = LifeId();
 +    for (uint32_t i = 0; i < count; ++i) {
 +        const uint32_t e = entries + i * kEntry;
