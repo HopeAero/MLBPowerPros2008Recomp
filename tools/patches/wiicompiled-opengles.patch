@@ -1,0 +1,226 @@
+diff --git a/aurora-main/cmake/AuroraDawnProvider.cmake b/aurora-main/cmake/AuroraDawnProvider.cmake
+index 9b28126..f23028c 100644
+--- a/aurora-main/cmake/AuroraDawnProvider.cmake
++++ b/aurora-main/cmake/AuroraDawnProvider.cmake
+@@ -34,7 +34,8 @@ function(_aurora_dawn_set_platform_backends)
+     set(DAWN_ENABLE_VULKAN ON CACHE INTERNAL "")
+     set(DAWN_ENABLE_METAL OFF CACHE INTERNAL "")
+     set(DAWN_ENABLE_DESKTOP_GL OFF CACHE INTERNAL "")
+-    set(DAWN_ENABLE_OPENGLES OFF CACHE INTERNAL "")
++    # OpenGL ES through EGL: for GPUs without Vulkan. Dawn's EGL swapchain needs an X11 window.
++    set(DAWN_ENABLE_OPENGLES ON CACHE INTERNAL "")
+     set(DAWN_ENABLE_NULL ON CACHE INTERNAL "")
+   endif ()
+ endfunction()
+diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
+index f528b47..aebb97a 100644
+--- a/aurora-main/lib/aurora.cpp
++++ b/aurora-main/lib/aurora.cpp
+@@ -37,6 +37,7 @@
+ #include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <deque>
+ #include <fstream>
+ #include <memory>
+@@ -260,8 +261,17 @@ struct FrameWorkerState {
+ 
+ FrameWorkerState g_frameWorker;
+ 
++#ifdef AURORA_ENABLE_GX
++bool gl_backend() noexcept {
++  return webgpu::g_backendType == wgpu::BackendType::OpenGL || webgpu::g_backendType == wgpu::BackendType::OpenGLES;
++}
++#endif
++
+ bool frame_worker_requested() noexcept {
+ #ifdef AURORA_ENABLE_GX
++  if (gl_backend()) {
++    return false;
++  }
+   static const bool enabled = [] {
+ #if defined(__APPLE__)
+     // ImGui's SDL backend may raise an SDL window from ImGui::NewFrame(). On
+@@ -637,9 +647,9 @@ constexpr std::array PreferredBackendOrder{
+ // #ifdef DAWN_ENABLE_BACKEND_DESKTOP_GL
+ //     BACKEND_OPENGL,
+ // #endif
+-// #ifdef DAWN_ENABLE_BACKEND_OPENGLES
+-//     BACKEND_OPENGLES,
+-// #endif
++#ifdef DAWN_ENABLE_BACKEND_OPENGLES
++    BACKEND_OPENGLES,
++#endif
+ #ifdef DAWN_ENABLE_BACKEND_NULL
+     BACKEND_NULL,
+ #endif
+@@ -900,8 +910,62 @@ std::shared_ptr<PresentationImage> acquire_presentation_image(size_t slot, uint3
+   return image;
+ }
+ 
++void dump_presentation_image(const PresentationJob& job) {
++  static const std::pair<uint32_t, std::string> request = [] {
++    const char* value = std::getenv("AURORA_DUMP_PRESENT");
++    const char* colon = value != nullptr ? std::strchr(value, ':') : nullptr;
++    if (colon == nullptr) return std::pair<uint32_t, std::string>{0, {}};
++    return std::pair<uint32_t, std::string>{static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), colon + 1};
++  }();
++  static uint32_t presents = 0;
++  if (request.second.empty() || ++presents != request.first || !job.image) return;
++  const auto& source = job.image->texture;
++  const uint32_t width = source.size.width, height = source.size.height;
++  const uint32_t rowBytes = (width * 4 + 255) & ~255u;
++  const wgpu::BufferDescriptor bufferDescriptor{
++      .label = "Present dump",
++      .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
++      .size = uint64_t{rowBytes} * height,
++  };
++  const auto buffer = g_device.CreateBuffer(&bufferDescriptor);
++  const auto encoder = g_device.CreateCommandEncoder();
++  const wgpu::TexelCopyTextureInfo from{.texture = source.texture};
++  const wgpu::TexelCopyBufferInfo to{.layout = {.bytesPerRow = rowBytes, .rowsPerImage = height}, .buffer = buffer};
++  const wgpu::Extent3D extent{width, height, 1};
++  encoder.CopyTextureToBuffer(&from, &to, &extent);
++  const auto commands = encoder.Finish();
++  {
++    std::lock_guard submitLock(g_queueSubmitMutex);
++    g_queue.Submit(1, &commands);
++  }
++  bool mapped = false;
++  g_instance.WaitAny(buffer.MapAsync(wgpu::MapMode::Read, 0, bufferDescriptor.size, wgpu::CallbackMode::WaitAnyOnly,
++                                     [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
++                                       mapped = status == wgpu::MapAsyncStatus::Success;
++                                     }),
++                     UINT64_MAX);
++  if (!mapped) {
++    Log.warn("Present dump: map failed");
++    return;
++  }
++  const bool bgra = source.format == wgpu::TextureFormat::BGRA8Unorm || source.format == wgpu::TextureFormat::BGRA8UnormSrgb;
++  const auto* pixels = static_cast<const uint8_t*>(buffer.GetConstMappedRange());
++  std::ofstream out(request.second, std::ios::binary);
++  out << "P6\n" << width << ' ' << height << "\n255\n";
++  for (uint32_t y = 0; y < height; ++y) {
++    for (uint32_t x = 0; x < width; ++x) {
++      const uint8_t* p = pixels + y * rowBytes + x * 4;
++      const char rgb[3]{static_cast<char>(p[bgra ? 2 : 0]), static_cast<char>(p[1]), static_cast<char>(p[bgra ? 0 : 2])};
++      out.write(rgb, 3);
++    }
++  }
++  buffer.Unmap();
++  Log.info("Present dump: frame {} ({}x{}) written to {}", presents, width, height, request.second);
++}
++
+ bool present_presentation_job(const PresentationJob& job) {
+   ZoneScoped;
++  dump_presentation_image(job);
+   const auto submissionStarted = PresentClock::now();
+   // Keep the threshold far above compositor and scheduling jitter. The timings below separate a
+   // real surface stall from a bad deadline, and only the former needs a rebuild.
+@@ -1717,8 +1781,8 @@ void publish_presentations(std::vector<PresentationJob>&& presentationJobs, bool
+ #else
+   // Keep presentation on the presenter whenever the async frame worker runs, even with
+   // interpolation off, so every mode shares one surface/resize path. RenderDoc keeps the sync path.
+-  if (frame_worker_requested() || interpolationActive ||
+-      g_presenterStarted.load(std::memory_order_acquire)) {
++  if (!gl_backend() && (frame_worker_requested() || interpolationActive ||
++                        g_presenterStarted.load(std::memory_order_acquire))) {
+     enqueue_presentations(std::move(presentationJobs));
+   } else {
+     for (const auto& job : presentationJobs) {
+diff --git a/aurora-main/lib/webgpu/gpu.cpp b/aurora-main/lib/webgpu/gpu.cpp
+index 6049e14..cf2cf03 100644
+--- a/aurora-main/lib/webgpu/gpu.cpp
++++ b/aurora-main/lib/webgpu/gpu.cpp
+@@ -561,7 +561,9 @@ bool initialize(AuroraBackend auroraBackend) {
+     }
+   }
+   {
++    const bool gl = backend == wgpu::BackendType::OpenGL || backend == wgpu::BackendType::OpenGLES;
+     const wgpu::RequestAdapterOptions options{
++        .featureLevel = gl ? wgpu::FeatureLevel::Compatibility : wgpu::FeatureLevel::Core,
+         .powerPreference = wgpu::PowerPreference::HighPerformance,
+         .backendType = backend,
+         .compatibleSurface = g_surface,
+diff --git a/aurora-main/lib/window.cpp b/aurora-main/lib/window.cpp
+index 2a24edb..c73ad5e 100644
+--- a/aurora-main/lib/window.cpp
++++ b/aurora-main/lib/window.cpp
+@@ -595,8 +595,10 @@ bool is_presentable() noexcept {
+          g_surfaceReady.load(std::memory_order_acquire);
+ }
+ 
++static std::atomic_bool g_syncWindowPending{true};
++
+ void pump_events() noexcept {
+-  if (g_window != nullptr) {
++  if (g_window != nullptr && g_syncWindowPending.exchange(false, std::memory_order_acq_rel)) {
+     SDL_SyncWindow(g_window);
+   }
+   SDL_PumpEvents();
+@@ -713,6 +715,7 @@ void set_display_mode(AuroraDisplayMode mode) {
+   }
+   g_displayMode.store(mode, std::memory_order_release);
+   g_nativeResizePending.store(true, std::memory_order_release);
++  g_syncWindowPending.store(true, std::memory_order_release);
+   TRY_WARN(push_custom_event(CustomEvent::FutureResize), "Failed to queue fullscreen resize event: {}",
+            SDL_GetError());
+ }
+@@ -722,15 +725,18 @@ AuroraDisplayMode get_display_mode() { return g_displayMode.load(std::memory_ord
+ void set_window_size(uint32_t width, uint32_t height) {
+   TRY_WARN(SDL_RestoreWindow(g_window), "Failed to un-maximize window: {}", SDL_GetError());
+   TRY_WARN(SDL_SetWindowSize(g_window, width, height), "Failed to set window size: {}", SDL_GetError());
++  g_syncWindowPending.store(true, std::memory_order_release);
+ }
+ 
+ void set_window_position(uint32_t x, uint32_t y) {
+   TRY_WARN(SDL_SetWindowPosition(g_window, x, y), "Failed to set window position: {}", SDL_GetError());
++  g_syncWindowPending.store(true, std::memory_order_release);
+ }
+ 
+ void center_window() {
+   TRY_WARN(SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED),
+            "Failed to center window: {}", SDL_GetError());
++  g_syncWindowPending.store(true, std::memory_order_release);
+ }
+ 
+ void sync_frame_buffer_size() noexcept {
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index 3d43b99..5ec7684 100644
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -192,7 +192,7 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
+     static constexpr std::array<std::string_view, 2> values{"auto", "metal"};
+ // only vulkan for linux
+ #elif defined(__linux__)
+-    static constexpr std::array<std::string_view, 2> values{"auto", "vulkan"};
++    static constexpr std::array<std::string_view, 3> values{"auto", "vulkan", "opengles"};
+ #elif defined(_WIN32)
+     static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};
+ #endif
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 656dd93..3aba9ef 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1437,8 +1437,8 @@ int RuntimeMain(int argc, char** argv) {
+         }};
+ // only vulkan for linux
+ #elif defined(__linux__)
+-            static constexpr std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{
+-            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN},
++        static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
++            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
+         }};
+ #elif defined(_WIN32)
+         static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
+@@ -1463,6 +1463,9 @@ int RuntimeMain(int argc, char** argv) {
+             }
+         }
+         const AuroraBackend requestedBackend = auroraConfig.desiredBackend;
++#if defined(__linux__)
++        if (requestedBackend == BACKEND_OPENGLES) setenv("SDL_VIDEO_DRIVER", "x11", 0);
++#endif
+ 
+         // SDL only reads its Wii driver hint when the joystick subsystem starts, which
+         // aurora_initialize does; a Bluetooth Wii Remote paired before launch must be

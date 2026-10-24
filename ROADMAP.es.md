@@ -16,13 +16,13 @@ Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto
 |---|---|---|
 | [Corrección de fallos](docs/roadmap/fallos.md) | Lo que reportan los jugadores, ordenado y arreglado en versiones de corrección | Continuo |
 | [Rendimiento en PCs modestas](docs/roadmap/rendimiento.md) | Medir y bajar el coste de CPU y GPU para mantener 60 FPS en gráficas integradas y CPUs antiguas | Lo siguiente |
+| [OpenGL](docs/roadmap/opengl.md) | Un backend gráfico OpenGL / OpenGL ES para gráficas sin Vulkan ni Direct3D 12, y camino hacia Switch | En curso: OpenGL ES juega un partido en Linux |
 
 ## Siguiente
 
 | Línea de trabajo | Qué | Estado |
 |---|---|---|
 | [Postemporada moderna](docs/roadmap/postemporada.md) | La postemporada de 12 equipos (Wild Card Series) en Temporada y MLB Life, opcional | Investigación |
-| [OpenGL](docs/roadmap/opengl.md) | Un backend gráfico OpenGL / OpenGL ES para gráficas sin Vulkan ni Direct3D 12, y camino hacia Switch | Investigación |
 | [Herramientas de modding](docs/roadmap/herramientas-modding.md) | Mejoras al Texture Studio, al Editor de temporada, a los rosters y estadios; estadios propios en Temporada y MLB Life | Continuo |
 
 ## Investigación
