@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ideas and questions / Ideas y preguntas
+    url: https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions
+    about: Feature ideas, help and roadmap talk go to Discussions. / Ideas, ayuda y el roadmap van en Discussions.
+  - name: Roadmap
+    url: https://github.com/HopeAero/MLBPowerPros2008Recomp/blob/main/ROADMAP.md
+    about: What is done, in progress and planned. / Qué está hecho, en curso y planificado.

@@ -16,6 +16,8 @@ A **static recompilation** of *MLB Power Pros 2008* (Wii, USA, `RL8E54`) into a 
 
 ## Status (October 2026)
 
+**What's next:** [ROADMAP.md](ROADMAP.md) (performance on modest PCs, OpenGL, modern postseason, modding tools, code mods, Nintendo Switch).
+
 **Beta, Windows; Linux and Steam Deck experimental.** What this table says was measured on the development PC; what was not checked, it says so.
 
 | Area | State |

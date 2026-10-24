@@ -1,0 +1,51 @@
+name: Bug report / Reporte de fallo
+description: Something doesn't work as it should / Algo no funciona como debería
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please don't attach game files (ISO, extracted assets). / ¡Gracias por reportar! No adjuntes archivos del juego (ISO, assets extraídos).
+  - type: input
+    id: version
+    attributes:
+      label: Version / Versión
+      placeholder: v0.1.5
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform / Plataforma
+      options: [Windows 10, Windows 11, Linux, Steam Deck, Other / Otra]
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: CPU and GPU / CPU y GPU
+      placeholder: Ryzen 5 5500, Radeon RX 5500
+    validations:
+      required: true
+  - type: input
+    id: controller
+    attributes:
+      label: Controller / Mando
+      placeholder: Keyboard, Xbox, DualSense, Wii Remote...
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where / Dónde
+      options: [Launcher, Exhibition, Season, MLB Life, Success, Other modes / Otros modos, Mods / Texture Studio / Season Editor, Setup / install]
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect? / ¿Qué pasó y qué esperabas?
+      description: Steps to reproduce if you can. / Pasos para reproducirlo si puedes.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: console.log
+      description: Attach `UserData\Logs\<latest>\console.log` from the game folder. For Season or MLB Life, your save (`UserData\NAND`, `UserData\ModSaves`) helps a lot. / Adjunta `UserData\Logs\<último>\console.log` de la carpeta del juego. Para Temporada o MLB Life, tu partida ayuda mucho.
