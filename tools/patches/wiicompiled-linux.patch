@@ -70,6 +70,38 @@ index f9f9d77..83a67e4 100644
  #endif
      if (!g_menu) g_menu = g_text;
      if (!g_menuBold) g_menuBold = g_bold;
+diff --git a/runtime/include/season_schedule_mlb.h b/runtime/include/season_schedule_mlb.h
+index bb2abe0..f94d5b8 100644
+--- a/runtime/include/season_schedule_mlb.h
++++ b/runtime/include/season_schedule_mlb.h
+@@ -40,11 +40,14 @@ struct Json {
+     double number = 0;
+     std::string text;
+     std::vector<Json> items;
+-    std::vector<std::pair<std::string, Json>> fields;
++    // Keys and values side by side: clang with libstdc++ 13 in C++20 rejects std::pair<std::string, Json>
++    // while Json is incomplete, where std::vector<Json> is fine.
++    std::vector<std::string> keys;
++    std::vector<Json> values;
+     const Json& operator[](std::string_view key) const {
+         static const Json none;
+-        for (const auto& [k, v] : fields)
+-            if (k == key) return v;
++        for (size_t i = 0; i < keys.size(); ++i)
++            if (keys[i] == key) return values[i];
+         return none;
+     }
+ };
+@@ -110,7 +113,8 @@ private:
+                 if (at_ >= s_.size() || s_[at_++] != ':') return false;
+                 Json value;
+                 if (!Value(value)) return false;
+-                out.fields.emplace_back(std::move(key), std::move(value));
++                out.keys.push_back(std::move(key));
++                out.values.push_back(std::move(value));
+                 Space();
+                 if (at_ < s_.size() && s_[at_] == ',') { ++at_; continue; }
+                 if (at_ < s_.size() && s_[at_] == '}') return ++at_, true;
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
 index 0238edd..2c2101a 100644
 --- a/runtime/src/launcher.cpp

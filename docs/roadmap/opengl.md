@@ -41,6 +41,6 @@ La misma prueba de rendimiento y las mismas comprobaciones visuales (menús, un 
 ## Casillas
 - [x] Dawn con OpenGL ES (Linux: viene en el paquete precompilado)
 - [x] El juego arranca y juega un partido en OpenGL ES (Linux, WSL)
-- [ ] OpenGL ES elegible en el launcher (en el código; falta verlo en pantalla)
+- [x] OpenGL ES elegible en el launcher (Linux)
 - [ ] Medido en Linux nativo
 - [ ] Direct3D 11 en Windows

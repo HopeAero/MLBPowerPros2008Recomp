@@ -41,6 +41,6 @@ The same benchmark and the same visual checks (menus, a match, every stadium) on
 ## Checklist
 - [x] Dawn with OpenGL ES (Linux: in the prebuilt package)
 - [x] The game boots and plays a match on OpenGL ES (Linux, WSL)
-- [ ] OpenGL ES selectable in the launcher (in the code; not yet seen on screen)
+- [x] OpenGL ES selectable in the launcher (Linux)
 - [ ] Measured on native Linux
 - [ ] Direct3D 11 on Windows
