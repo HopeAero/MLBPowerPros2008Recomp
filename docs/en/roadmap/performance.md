@@ -10,6 +10,7 @@ The game should run at a steady 60 FPS on the PCs people actually have: laptops 
 ## Where we are
 - GPU at native resolution (x1) in a match: about 2.9 ms per frame on the RX 5500; x2 with 16x filtering about 7.5 ms. Quality presets (Low / Medium / High), AMD FSR 1 upscaling, mipmaps and MSAA are already in the launcher.
 - The game logic is translated ahead of time to native code, so there is no emulation cost, but the translated code and the runtime have not been profiled on slow CPUs yet.
+- GPU per frame in a match (RX 5500, `WIICOMPILED_GPU_BREAKDOWN=1`): 3.0 ms at x1 (939x528), 7.5 ms at x2, 11.6 ms at x4. Each frame has about 28 render passes: the game makes ~27 EFB copies per frame (cheap on the Wii; on PC each one ends the pass and the next reloads color and depth). The main scene is 0.6 ms; the other 27 small passes add 1.3 ms plus 0.7 ms of copies. Anisotropic filtering and texture mods do not change the cost. On low-bandwidth integrated GPUs and on Switch, cutting those passes matters most.
 - Memory: the game uses about 630 MB in a match (D3D12; about 100 MB less with Direct3D 11). The uniform upload buffer went from 24 to 8 MB per frame (measured peak 1 MB, 2.9 MB with 180 FPS interpolation): 44 MB less RAM and 22 MB less VRAM, no FPS change. The rest: the emulated Wii memory (24 + 128 MB), the translated code (94 MB), the graphics driver (~100 MB).
 - Vulkan holds 60 FPS where Direct3D 12 dropped on AMD in heavy fielding views; the launcher picks the backend.
 
