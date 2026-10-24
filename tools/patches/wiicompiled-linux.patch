@@ -1,5 +1,5 @@
 diff --git a/runtime/include/power_pros_ui.h b/runtime/include/power_pros_ui.h
-index 242e2cc..9d6ceb2 100644
+index f9f9d77..83a67e4 100644
 --- a/runtime/include/power_pros_ui.h
 +++ b/runtime/include/power_pros_ui.h
 @@ -14,6 +14,10 @@
@@ -34,9 +34,9 @@ index 242e2cc..9d6ceb2 100644
 +#endif
 +
  inline void LoadFonts() {
+     if (g_text != nullptr) return;  // once: the launcher and the in-game overlay share the atlas
      ImFontAtlas* atlas = ImGui::GetIO().Fonts;
-     if (atlas->Fonts.empty()) atlas->AddFontDefault();  // the in-game overlay keeps ImGui's font
-@@ -91,9 +111,14 @@ inline void LoadFonts() {
+@@ -92,9 +112,14 @@ inline void LoadFonts() {
      g_title = LoadFirstFont({"C:/Windows/Fonts/ariblk.ttf", "C:/Windows/Fonts/segoeuib.ttf"}, 112.0f);
  #else
      g_text = LoadFirstFont({"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -53,7 +53,7 @@ index 242e2cc..9d6ceb2 100644
  #endif
      ImFont* fallback = atlas->Fonts[0];
      if (g_text == nullptr) g_text = fallback;
-@@ -103,8 +128,14 @@ inline void LoadFonts() {
+@@ -104,8 +129,14 @@ inline void LoadFonts() {
      g_menu = LoadFirstFont({"C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"}, 20.f);
      g_menuBold = LoadFirstFont({"C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf"}, 26.f);
  #else
@@ -71,10 +71,10 @@ index 242e2cc..9d6ceb2 100644
      if (!g_menu) g_menu = g_text;
      if (!g_menuBold) g_menuBold = g_bold;
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index d2dd7e9..51df1b2 100644
+index 0238edd..2c2101a 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
-@@ -30,6 +30,7 @@
+@@ -32,6 +32,7 @@
  #include <algorithm>
  #include <array>
  #include <chrono>
@@ -82,7 +82,7 @@ index d2dd7e9..51df1b2 100644
  #include <cmath>
  #include <cstdlib>
  #include <cstring>
-@@ -45,7 +46,12 @@
+@@ -47,7 +48,12 @@
  #include <windows.h>
  #include <shellapi.h>
  #else
@@ -95,7 +95,7 @@ index d2dd7e9..51df1b2 100644
  #endif
  
  namespace launcher {
-@@ -394,6 +400,30 @@ constexpr const char* kRosterEditorPage =
+@@ -422,6 +428,30 @@ constexpr const char* kRosterEditorPage =
  
  #if defined(_WIN32)
  std::wstring Quoted(const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; }
@@ -126,7 +126,7 @@ index d2dd7e9..51df1b2 100644
  #endif
  
  // PowerUp+ ships next to the game in powerupplus/ (tools/powerupplus.ps1 -Publish). It runs in its
-@@ -448,6 +478,71 @@ void OpenRosterEditor() {
+@@ -476,6 +506,71 @@ void OpenRosterEditor() {
      const fs::path page = data / "abrir.html";
      std::ofstream(page, std::ios::binary | std::ios::trunc) << kRosterEditorPage;
      ShellExecuteW(nullptr, L"open", page.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -198,18 +198,19 @@ index d2dd7e9..51df1b2 100644
  #endif
  }
  
-@@ -470,6 +565,20 @@ void OpenTextureStudio() {
-                               RuntimeConfigFile::ApplicationDataDirectory().wstring() + L"\" --mods \"" +
+@@ -499,7 +594,20 @@ void OpenStudio(const wchar_t* exe) {
                                mods::Directory().wstring() + L"\" --game \"" + std::wstring(self) + L"\"";
      ShellExecuteW(nullptr, L"open", studio.wstring().c_str(), args.c_str(), exeDir->wstring().c_str(), SW_SHOWNORMAL);
-+#else
+ #else
+-    (void)exe;
 +    const auto exeDir = RuntimeConfigFile::ExecutableDirectory();
 +    if (!exeDir) return;
-+    const std::filesystem::path studio = *exeDir / "TextureStudio";
++    std::filesystem::path name(exe);
++    name.replace_extension();  // TextureStudio.exe -> TextureStudio
++    const std::filesystem::path studio = *exeDir / name;
 +    std::error_code ec;
 +    if (!std::filesystem::exists(studio, ec)) {
-+        RT_LOG(RT_TAG_RUNTIME) << "launcher: Texture Studio is not installed (" << RuntimeConfigFile::PathToUtf8(studio) << ")"
-+                               << std::endl;
++        RT_LOG(RT_TAG_RUNTIME) << "launcher: " << RuntimeConfigFile::PathToUtf8(studio) << " is not installed" << std::endl;
 +        return;
 +    }
 +    const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ec);
@@ -218,8 +219,8 @@ index d2dd7e9..51df1b2 100644
 +                   "--game", self.string()});
  #endif
  }
- 
-@@ -482,6 +591,8 @@ void OpenSavesFolder(const std::vector<mods::Mod>& all) {
+ void OpenTextureStudio() { OpenStudio(L"TextureStudio.exe"); }
+@@ -514,6 +622,8 @@ void OpenSavesFolder(const std::vector<mods::Mod>& all) {
      std::filesystem::create_directories(dir, ec);
  #if defined(_WIN32)
      ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -228,7 +229,7 @@ index d2dd7e9..51df1b2 100644
  #endif
  }
  
-@@ -493,6 +604,8 @@ void OpenModsFolder() {
+@@ -525,6 +635,8 @@ void OpenModsFolder() {
      if (!std::filesystem::exists(readme, ec)) std::ofstream(readme, std::ios::binary) << kModsReadme;
  #if defined(_WIN32)
      ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -237,7 +238,7 @@ index d2dd7e9..51df1b2 100644
  #endif
  }
  
-@@ -708,10 +821,15 @@ Result Run(int argc, char** argv) {
+@@ -773,10 +885,15 @@ Result Run(int argc, char** argv) {
      std::vector<std::string> modHelp;
      modHelp.reserve(installedMods.size());
      Tab modsTab{"MODS", {}, installedMods.empty()
@@ -257,7 +258,7 @@ index d2dd7e9..51df1b2 100644
                                  : nullptr};
      // The first row says whose saves the game will use; it follows the roster mods switched on here.
      std::vector<mods::Mod> currentMods = installedMods;
-@@ -732,7 +850,9 @@ Result Run(int argc, char** argv) {
+@@ -797,7 +914,9 @@ Result Run(int argc, char** argv) {
                                 {saveSet()}, 0, false, kOpenSavesFolder});
      Tab toolsTab{Tr("HERRAMIENTAS", "TOOLS"), {}};
      toolsTab.options.push_back({Tr("ABRIR CARPETA DE MODS", "OPEN MODS FOLDER"), kModsHelp, {Tr("Abrir", "Open")}, 0, false, kOpenModsFolder});
@@ -266,5 +267,5 @@ index d2dd7e9..51df1b2 100644
 +        toolsTab.options.push_back({Tr("EDITAR ROSTER (PowerUp+)", "EDIT ROSTER (PowerUp+)"), kRosterEditorHelp, {Tr("Abrir", "Open")}, 0, false, kOpenRosterEditor});
 +    }
      toolsTab.options.push_back({Tr("EDITOR DE TEXTURAS", "TEXTURE EDITOR"), kTextureStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenTextureStudio});
+     toolsTab.options.push_back({Tr("EDITOR DE TEMPORADA", "SEASON EDITOR"), kSeasonStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenSeasonStudio});
      toolsTab.options.push_back({kRosterPlayersLabel, kRosterPlayersHelp, {Tr("Nativos", "Native"), Tr("Como en el editor", "As in the editor")},
-                                 RuntimeConfigFile::NativeRoster(true) ? 0 : 1});
