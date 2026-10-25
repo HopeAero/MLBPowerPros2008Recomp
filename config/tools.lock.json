@@ -15,5 +15,27 @@
     "commit": "6fa24737d3362b6cba8162671745262751f457b8",
     "license": "GPL-3.0",
     "clone_dir": "local/vendor/Wiicompiled"
+  },
+  "devkita64_image": {
+    "image": "devkitpro/devkita64",
+    "digest": "sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282",
+    "contents": "devkitA64 r30 (GCC 15.2.0), libnx 4.12.0, switch-tools 1.13.1",
+    "used_by": "tools/switch/Dockerfile"
+  },
+  "nxvk": {
+    "version": "26.2.2",
+    "release": "v26.2.2-nx-mod-v1",
+    "repository": "https://github.com/nx-mod/nxvk",
+    "portlib": "nxvk-switch-portlib-26.2.2.tar.xz",
+    "sha256": "9bbf12732d81891a2f03633b752d8f4f106b268861a8982fef956c1945a8e4e2",
+    "smoke_nros": "nxvk-switch-smoke-nros-26.2.2.tar.xz",
+    "smoke_sha256": "3321111253f2df1c2a8214c0987d400925dc00ba29d6c13b562163ade1844e57",
+    "license": "MIT (Mesa)"
+  },
+  "sdl3_switch": {
+    "repository": "https://github.com/devkitPro/SDL",
+    "branch": "switch-sdl-3.4",
+    "commit": "c329016c0e338ab4397ad930f83330c9fe058348",
+    "license": "Zlib"
   }
 }

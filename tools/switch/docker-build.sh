@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Runs a command inside the Switch build image with the repository mounted at /work, building the
+# image (tools/switch/Dockerfile) first when it is missing or older than the Dockerfile.
+#
+#   tools/switch/docker-build.sh <command...>      e.g. tools/switch/docker-build.sh cmake --version
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+image=mlb-switch-dev:1
+command -v docker >/dev/null || { echo "error: docker not found: install Docker Desktop" >&2; exit 1; }
+docker version --format '{{.Server.Version}}' >/dev/null 2>&1 ||
+    { echo "error: the Docker engine is not running: open Docker Desktop" >&2; exit 1; }
+
+dockerfile=$root/tools/switch/Dockerfile
+stamp=$(sha256sum "$dockerfile" | cut -c1-16)
+if [[ $(docker image inspect "$image" --format '{{index .Config.Labels "mlb.dockerfile"}}' 2>/dev/null) != "$stamp" ]]; then
+    echo "building $image (first time takes several minutes)..." >&2
+    docker build --label "mlb.dockerfile=$stamp" -t "$image" -f "$dockerfile" "$root/tools/switch" >&2
+fi
+# Git Bash on Windows rewrites /work-style paths; MSYS_NO_PATHCONV keeps them for the container.
+MSYS_NO_PATHCONV=1 docker run --rm -v "$root:/work" -w /work "$image" "$@"
