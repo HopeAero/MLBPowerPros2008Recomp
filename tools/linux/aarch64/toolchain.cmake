@@ -23,7 +23,9 @@ endforeach()
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+# BOTH: aurora's prebuilt Dawn package is found by an explicit path in the build tree, which ONLY
+# would re-root into the sysroot. The sysroot is still searched first.
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
 
 find_program(_mlb_qemu NAMES qemu-aarch64-static qemu-aarch64)
 if(_mlb_qemu)
