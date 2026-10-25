@@ -30,7 +30,7 @@ Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto
 | Línea de trabajo | Qué | Estado |
 |---|---|---|
 | [Mods de código](docs/roadmap/mods-de-codigo.md) | Mods que cambian la lógica del juego (torneos, reglas, pantallas nuevas) con una API de mods documentada, no solo datos | Investigación |
-| [Nintendo Switch](docs/roadmap/switch.md) | Una versión homebrew para Switch, desde la copia del propio jugador, como la de PC | Investigación |
+| [Nintendo Switch](docs/roadmap/switch.md) | Una versión homebrew para Switch, desde la copia del propio jugador, como la de PC | En curso: ARM64 en Linux llega al primer lanzamiento en un teléfono (aún sin gráficos) |
 
 ## Hecho
 

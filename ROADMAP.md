@@ -30,7 +30,7 @@ Two rules hold for everything below: the game stays **faithful to the Wii origin
 | Line of work | What | Status |
 |---|---|---|
 | [Code mods](docs/en/roadmap/code-mods.md) | Mods that change the game's logic (tournaments, gameplay rules, new screens) through a documented mod API, not only data | Research |
-| [Nintendo Switch](docs/en/roadmap/switch.md) | A homebrew Switch build, from the player's own copy, like the PC one | Research |
+| [Nintendo Switch](docs/en/roadmap/switch.md) | A homebrew Switch build, from the player's own copy, like the PC one | In progress: ARM64 on Linux reaches the first pitch on a phone (no graphics yet) |
 
 ## Done
 

@@ -61,6 +61,19 @@ The script checks that the disc is a clean `RL8E54` (ISO, RVZ, WIA, WBFS, CISO, 
 
 The installed folder is self-contained and can be moved: `Config.toml` points at `../Data`. `portable.txt` keeps the configuration, saves (NAND) and caches in `UserData/` next to the game.
 
+## ARM64 (experimental)
+
+On the way to the Switch, the game also builds for Linux ARM64 from an x86_64 PC running Ubuntu 24.04 (or WSL):
+
+```sh
+sudo apt install mmdebstrap qemu-user-static symlinks patchelf   # on top of the packages above
+tools/linux/aarch64/make-sysroot.sh            # arm64 sysroot in local/sysroot/noble-arm64 (~1.5 GB)
+tools/linux/build.sh --arch aarch64 --disc '/path/to/your copy.rvz'   # installs to local/install-aarch64
+tools/linux/aarch64/adb-match.sh               # test match without graphics on an ARM64 Android phone
+```
+
+It uses clang with `--target=aarch64-linux-gnu`, `-mcpu=cortex-a57` (the Switch's CPU: runs on any 64-bit ARM) and prebuilt Dawn for linux-aarch64; the runtime tests pass under QEMU. Texture Studio and the roster editor are not built. The game reached the first pitch on a phone with the null backend; graphics on ARM, real audio and controllers are **untested**. It needs 4 KiB memory pages. Details and results in [Nintendo Switch](roadmap/switch.md#arm64-build-october-2026).
+
 ## Steam Deck
 
 The normal build depends on the build machine's glibc (Fedora 44 here: 2.43), newer than SteamOS's, so it does not start on a Deck. `--container` builds inside `tools/linux/Containerfile` (Ubuntu 22.04: glibc 2.35, clang 20, with libstdc++ linked in statically, and the .NET 10 SDK). The result runs on SteamOS and on any current distribution, and the host needs only podman or docker, with no compilers or `-devel` packages.

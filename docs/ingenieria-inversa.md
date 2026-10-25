@@ -187,9 +187,11 @@ Fuentes: `docs/wiicompiled-feasibility.md`, `config/wiicompiled/rl8e54-data.csv`
 
 - **Espera de la biblioteca de Miis (RFL):** `RFLWaitAsync` (`0x800876A0`) gira sobre `RFLiIsWorking` (`0x80087B94`), que lee el indicador `+0x1B34` del gestor (puntero en `0x8031B168`). Hasta el 14 de octubre de 2026 el HLE de `RFLiIsWorking` leía el puntero en la dirección de Mario Kart Wii (`0x80386298`, memoria libre en MLB); ahora usa la de MLB (parche `wiicompiled-mlb-disc-identity`).
 - **IPC:** `IPCCltInit` (`0x800CC534`) solo inicializa una vez: comprueba y pone a 1 la bandera `r13-26876` (`0x8031B764`), llama a `IPCInit` (`0x800CC038`) y reserva `0x1000` bytes desde el búfer bajo (`r13-26908`; el alto está en `r13-26904`). Desensamblado, `RL8E54`.
+- **El bucle de fotograma solo espera si va adelantado:** `func_800472B4` compara `VIGetRetraceCount` (`0x800B442C`) con la cuenta guardada en `+0x1E94` de su objeto y solo llama a `VIWaitForRetrace` si no ha pasado ningún retrazo (`0x800472F8`-`0x80047308`). Si el fotograma llega tarde, no se bloquea. En consola sobra tiempo; en un equipo que no llega a 60 FPS, con hilos cooperativos, los hilos de menos prioridad no reciben turno. Así se quedaba sin ejecutar el cargador de arranque (prioridad 24, entrada `0x80051A7C`), que lee `project.bin`, y la intro no terminaba (visto en los núcleos lentos de un teléfono ARM, 25 de octubre de 2026). Arreglo: fase 10 de `wiicompiled-aarch64`, en la que `VIGetRetraceCount` espera un retrazo si un hilo de menos prioridad lleva 100 ms listo.
+- **Espera activa del DSP al iniciar el audio:** `__AXOutInitDSP` (`0x800BA458`) gira, tras `DSPAddTask`, en `while (*(r13-27264) == 0)` (`0x8031B5E0`, en `0x800BA520`), y nada dentro del bucle puede poner la bandera. En x86 la lectura del invitado es una carga simple y clang borra el bucle sin efectos (regla de progreso de C++). En ARM64, con la comprobación del tamaño de página en tiempo de ejecución, el bucle se queda y gira para siempre. Por eso Linux ARM64 fija páginas de 4 KiB como x86 (fase 9 de `wiicompiled-aarch64`); con páginas de 16 KiB haría falta un HLE de `__AXOutInitDSP`.
 - **Para portarlo:** el juego da por hecho que los temporizadores llegan a tiempo y que las interrupciones cortan cualquier cálculo. Con hilos cooperativos hay que ofrecer puntos de cambio (tras `GXCopyDisp` y al reactivar interrupciones) y recuperar los periodos perdidos.
 
-Fuentes: desensamblado de `0x80027A54`/`0x80027BF8`; `wiicompiled-preemption-point.patch`, `wiicompiled-periodic-sleep.patch`, `docs/wiicompiled-feasibility.md`.
+Fuentes: desensamblado de `0x80027A54`/`0x80027BF8`, `0x800472B4` y `0x800BA458`; volcados de hilos en un teléfono ARM; `wiicompiled-preemption-point.patch`, `wiicompiled-periodic-sleep.patch`, `wiicompiled-aarch64.patch`, `docs/wiicompiled-feasibility.md`.
 
 ## 4. Motor de sonido y comentarista
 
@@ -1099,6 +1101,8 @@ Fuentes de la sección: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_statu
 | Getters dentro de otras funciones, llamados por vtable (`0x80664C20`-`0x80664C38`) | Hay que añadirlos al mapa de funciones o el salto indirecto falla |
 | Stick de GC dividido entre 88/64 | Un mando moderno necesita escalar el recorrido |
 | `OSInit` espera al SYSCONF y `RFLWaitAsync` gira en bucle | Los callbacks de IOS deben llegar mientras el juego espera |
+| El bucle de fotograma solo espera a VI si va adelantado | Por debajo de 60 FPS el hilo principal no se bloquea y los hilos de menos prioridad, como el cargador, se quedan sin turno (sección 3) |
+| `__AXOutInitDSP` espera al DSP en un bucle vacío | Un traductor que conserve ese bucle se cuelga; en x86 lo borra el compilador (sección 3) |
 
 ## 15. Cómo seguir investigando
 

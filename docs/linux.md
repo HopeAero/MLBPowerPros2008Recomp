@@ -61,6 +61,19 @@ El script comprueba que el disco sea un `RL8E54` limpio (ISO, RVZ, WIA, WBFS, CI
 
 La carpeta instalada es autónoma y se puede mover: `Config.toml` apunta a `../Data`. `portable.txt` deja la configuración, las partidas (NAND) y las cachés en `UserData/`, junto al juego.
 
+## ARM64 (experimental)
+
+Para el camino hacia Switch, el juego también se compila para Linux ARM64 desde un PC x86_64 con Ubuntu 24.04 (o WSL):
+
+```sh
+sudo apt install mmdebstrap qemu-user-static symlinks patchelf   # además de lo de arriba
+tools/linux/aarch64/make-sysroot.sh            # sysroot arm64 en local/sysroot/noble-arm64 (~1,5 GB)
+tools/linux/build.sh --arch aarch64 --disc '/ruta/a/tu copia.rvz'   # instala en local/install-aarch64
+tools/linux/aarch64/adb-match.sh               # partido de prueba sin gráficos en un teléfono Android ARM64
+```
+
+Usa clang con `--target=aarch64-linux-gnu`, `-mcpu=cortex-a57` (la CPU de Switch: corre en cualquier ARM de 64 bits) y Dawn precompilado para linux-aarch64; las pruebas del runtime pasan bajo QEMU. No se compilan Texture Studio ni el editor de rosters. El juego llegó al primer lanzamiento en un teléfono con el backend nulo; los gráficos en ARM, el sonido real y los mandos están **sin probar**. Necesita páginas de memoria de 4 KiB. Detalles y resultados en [Nintendo Switch](roadmap/switch.md#versión-arm64-octubre-de-2026).
+
 ## Steam Deck
 
 La compilación normal depende de la glibc del equipo que compila (aquí Fedora 44: 2.43), más nueva que la de SteamOS, así que no arranca en una Deck. `--container` compila dentro de `tools/linux/Containerfile` (Ubuntu 22.04: glibc 2.35, clang 20, con libstdc++ enlazada de forma estática, y el SDK de .NET 10). El resultado funciona en SteamOS y en cualquier distribución actual, y el equipo solo necesita podman o docker, sin compiladores ni paquetes `-devel`.
