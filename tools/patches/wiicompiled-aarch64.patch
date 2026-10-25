@@ -37,6 +37,19 @@ index 3735e33..cd74a75 100644
  add_executable(mkw_platform_paths_tests "${CMAKE_CURRENT_LIST_DIR}/tests/platform_paths_tests.cpp")
  target_link_libraries(mkw_platform_paths_tests PRIVATE mkw_platform)
  target_compile_features(mkw_platform_paths_tests PRIVATE cxx_std_17)
+diff --git a/runtime/cmake/PublicProducts.cmake b/runtime/cmake/PublicProducts.cmake
+index 58e64d0..251c83a 100644
+--- a/runtime/cmake/PublicProducts.cmake
++++ b/runtime/cmake/PublicProducts.cmake
+@@ -339,6 +339,8 @@ endif()
+ # tuning rather than leaving target-specific performance on the table.
+ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+     set(MKW_BASELINE_ARCH_FLAG -march=x86-64-v3)
++elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND CMAKE_CROSSCOMPILING)
++    set(MKW_BASELINE_ARCH_FLAG -mcpu=cortex-a57)
+ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+     set(MKW_BASELINE_ARCH_FLAG -mcpu=native)
+ else()
 diff --git a/runtime/tests/aarch64_abi_tests.cpp b/runtime/tests/aarch64_abi_tests.cpp
 new file mode 100644
 index 0000000..f0b746f
