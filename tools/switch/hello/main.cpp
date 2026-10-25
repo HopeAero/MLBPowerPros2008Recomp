@@ -3,6 +3,7 @@
 // user's firmware and records what the game will have to work with (firmware, applet or full memory,
 // memory size) to sdmc:/switch/mlbpowerpros2008/logs/hello.log. Every line is flushed as written.
 #include <switch.h>
+#include <arpa/inet.h>  // struct in_addr, for __nxlink_host
 
 #include <cstdarg>
 #include <cstdio>
@@ -41,6 +42,10 @@ const char* AppletTypeName(AppletType type) {
 
 int main() {
     consoleInit(nullptr);
+    // Started by nxlink (tools/switch/nxlink.sh): stdout also goes back to the PC over Wi-Fi.
+    if (__nxlink_host.s_addr != 0 && R_SUCCEEDED(socketInitializeDefault())) {
+        nxlinkStdio();
+    }
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/mlbpowerpros2008", 0777);
     mkdir("sdmc:/switch/mlbpowerpros2008/logs", 0777);
@@ -80,6 +85,7 @@ int main() {
         consoleUpdate(nullptr);
     }
     if (g_log) std::fclose(g_log);
+    if (__nxlink_host.s_addr != 0) socketExit();
     consoleExit(nullptr);
     return 0;
 }

@@ -3,11 +3,14 @@
 # Runs a command inside the Switch build image with the repository mounted at /work, building the
 # image (tools/switch/Dockerfile) first when it is missing or older than the Dockerfile.
 #
-#   tools/switch/docker-build.sh <command...>      e.g. tools/switch/docker-build.sh cmake --version
+#   tools/switch/docker-build.sh [--publish HOST:CONTAINER] <command...>
+#   e.g. tools/switch/docker-build.sh cmake --version
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 image=mlb-switch-dev:1
+publish=()
+if [[ ${1:-} == --publish ]]; then publish=(-p "$2"); shift 2; fi   # nxlink's stdio server
 command -v docker >/dev/null || { echo "error: docker not found: install Docker Desktop" >&2; exit 1; }
 docker version --format '{{.Server.Version}}' >/dev/null 2>&1 ||
     { echo "error: the Docker engine is not running: open Docker Desktop" >&2; exit 1; }
@@ -22,4 +25,4 @@ fi
 # Big trees (Dawn's checkout, build directories) live in the mlb-switch-cache volume at /cache: a
 # Windows folder mounted into the container is slow for hundreds of thousands of files. Results
 # (NROs, patches, logs) are copied to /work/local/switch.
-MSYS_NO_PATHCONV=1 docker run --rm -v "$root:/work" -v mlb-switch-cache:/cache -w /work "$image" "$@"
+MSYS_NO_PATHCONV=1 docker run --rm "${publish[@]}" -v "$root:/work" -v mlb-switch-cache:/cache -w /work "$image" "$@"
