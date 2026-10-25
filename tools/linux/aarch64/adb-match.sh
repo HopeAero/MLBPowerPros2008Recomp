@@ -51,14 +51,20 @@ fi
 
 log=$root/local/analysis/adb-match.log
 mkdir -p "$(dirname "$log")"
-"$adb" shell "cd $remote && chmod 755 MLBPowerPros2008 lib/ld-linux-aarch64.so.1 && \
+# The game is backgrounded as a simple command so $! is its PID (taskset execs it): backgrounding a
+# `cd && ... &` list would leave $! on a subshell and the game running after the kill. Copies left
+# over from an interrupted run would compete for the same cores, so they go first.
+"$adb" shell "cd $remote || exit 1; chmod 755 MLBPowerPros2008 lib/ld-linux-aarch64.so.1; \
+    pkill -9 MLBPowerPros; \
     LD_LIBRARY_PATH=$remote/lib HOME=$remote TMPDIR=/data/local/tmp SDL_VIDEO_DRIVER=offscreen \
     SDL_AUDIO_DRIVER=dummy SDL_JOYSTICK_DISABLE_UDEV=1 WIICOMPILED_MATCH_BENCH=1 \
     WIICOMPILED_MATCH_SECONDS=0 WIICOMPILED_MATCH_API=null \
     taskset $cpus ./MLBPowerPros2008 > /data/local/tmp/mlb.log 2>&1 & p=\$!; s=0; \
     while [ \$s -lt $seconds ] && kill -0 \$p 2>/dev/null; do \
         grep -q 'gameplay phase=4' /data/local/tmp/mlb.log 2>/dev/null && break; sleep 1; s=\$((s+1)); done; \
-    kill -9 \$p 2>/dev/null; echo \"elapsed \${s}s\"; cat /data/local/tmp/mlb.log" | tr -d '\r' > "$log"
+    kill -9 \$p 2>/dev/null; wait \$p 2>/dev/null; echo \"elapsed \${s}s\"; cat /data/local/tmp/mlb.log; \
+    pgrep MLBPowerPros >/dev/null && echo 'error: a game process is still running'" | tr -d '\r' > "$log"
+grep -q '^error: a game process is still running' "$log" && fail "a game process outlived the run on the phone (see $log)"
 grep -m 1 '^elapsed' "$log"
 grep '\[match-bench\]' "$log"
 if grep -q 'gameplay phase=4' "$log"; then

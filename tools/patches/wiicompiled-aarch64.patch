@@ -14,14 +14,25 @@ index e2e68c5..bc80c3c 100644
    const uint32_t width = source.size.width, height = source.size.height;
    const uint32_t rowBytes = (width * 4 + 255) & ~255u;
 diff --git a/aurora-main/lib/dawn/BackendBinding.cpp b/aurora-main/lib/dawn/BackendBinding.cpp
-index bb8fba4..a0ca690 100644
+index bb8fba4..75b3c51 100644
 --- a/aurora-main/lib/dawn/BackendBinding.cpp
 +++ b/aurora-main/lib/dawn/BackendBinding.cpp
-@@ -38,6 +38,12 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
+@@ -9,8 +9,9 @@
+ namespace aurora::webgpu::utils {
+ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptorCocoa(SDL_Window* window);
+ 
+-std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Window* window) {
++std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Window* window, bool nullBackend) {
+ #if defined(SDL_PLATFORM_MACOS) || defined(SDL_PLATFORM_IOS) || defined(SDL_PLATFORM_TVOS)
++  (void)nullBackend;
+   return SetupWindowAndGetSurfaceDescriptorCocoa(window);
+ #else
+   const auto props = SDL_GetWindowProperties(window);
+@@ -38,6 +39,12 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
      desc->window = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
      return std::move(desc);
    }
-+  if (SDL_strcmp(driver, "offscreen") == 0) {
++  if (nullBackend && SDL_strcmp(driver, "offscreen") == 0) {
 +    std::shared_ptr<wgpu::SurfaceSourceWaylandSurface> desc = std::make_shared<wgpu::SurfaceSourceWaylandSurface>();
 +    desc->display = reinterpret_cast<void*>(1);
 +    desc->surface = reinterpret_cast<void*>(1);
@@ -30,6 +41,18 @@ index bb8fba4..a0ca690 100644
  #endif
    return nullptr;
  #endif
+diff --git a/aurora-main/lib/dawn/BackendBinding.hpp b/aurora-main/lib/dawn/BackendBinding.hpp
+index ac49d5c..caf4cbd 100644
+--- a/aurora-main/lib/dawn/BackendBinding.hpp
++++ b/aurora-main/lib/dawn/BackendBinding.hpp
+@@ -7,6 +7,6 @@ struct SDL_Window;
+ 
+ namespace aurora::webgpu::utils {
+ 
+-std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Window* window);
++std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Window* window, bool nullBackend);
+ 
+ } // namespace aurora::webgpu::utils
 diff --git a/aurora-main/lib/input.cpp b/aurora-main/lib/input.cpp
 index 96a9c1d..84d9632 100644
 --- a/aurora-main/lib/input.cpp
@@ -48,10 +71,36 @@ index 96a9c1d..84d9632 100644
  
  struct MouseScrollStatus {
 diff --git a/aurora-main/lib/webgpu/gpu.cpp b/aurora-main/lib/webgpu/gpu.cpp
-index a2b8e90..e1fbdff 100644
+index a2b8e90..e050749 100644
 --- a/aurora-main/lib/webgpu/gpu.cpp
 +++ b/aurora-main/lib/webgpu/gpu.cpp
-@@ -843,7 +843,8 @@ bool initialize(AuroraBackend auroraBackend) {
+@@ -497,13 +497,14 @@ static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
+   }
+ }
+ 
+-static bool create_surface() {
++static bool create_surface(wgpu::BackendType backend) {
+   SDL_Window* window = window::get_sdl_window();
+   if (window == nullptr) {
+     Log.error("Failed to create surface: no window");
+     return false;
+   }
+-  const auto chainedDescriptor = utils::SetupWindowAndGetSurfaceDescriptor(window);
++  const auto chainedDescriptor =
++      utils::SetupWindowAndGetSurfaceDescriptor(window, backend == wgpu::BackendType::Null);
+   if (!chainedDescriptor) {
+     Log.error("Failed to create surface descriptor for current window");
+     return false;
+@@ -556,7 +557,7 @@ bool initialize(AuroraBackend auroraBackend) {
+   g_backendType = wgpu::BackendType::Undefined;
+   {
+     window::SurfaceLock surfaceLock;
+-    if (!create_surface()) {
++    if (!create_surface(backend)) {
+       return false;
+     }
+   }
+@@ -843,7 +844,8 @@ bool initialize(AuroraBackend auroraBackend) {
        .surfaceConfiguration =
            wgpu::SurfaceConfiguration{
                .format = surfaceFormat,
@@ -61,6 +110,15 @@ index a2b8e90..e1fbdff 100644
                .width = size.native_fb_width,
                .height = size.native_fb_height,
                .presentMode = presentMode,
+@@ -941,7 +943,7 @@ bool refresh_surface(bool recreate) {
+     release_surface();
+     return false;
+   }
+-  if ((!g_surface || recreate) && !create_surface()) {
++  if ((!g_surface || recreate) && !create_surface(g_backendType)) {
+     return false;
+   }
+   uint32_t width = g_graphicsConfig.surfaceConfiguration.width;
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
 index 3735e33..0063653 100644
 --- a/runtime/CMakeLists.txt
@@ -144,7 +202,7 @@ index dd06545..3198082 100644
      static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
  #endif
 diff --git a/runtime/src/guest_flat_memory.cpp b/runtime/src/guest_flat_memory.cpp
-index 06d1898..98735aa 100644
+index 06d1898..9504488 100644
 --- a/runtime/src/guest_flat_memory.cpp
 +++ b/runtime/src/guest_flat_memory.cpp
 @@ -512,6 +512,12 @@ void Initialize(const std::vector<RegionRequest>& regions) {
@@ -155,19 +213,100 @@ index 06d1898..98735aa 100644
 +    if (const long page = sysconf(_SC_PAGESIZE); page != 4096) {
 +        throw std::runtime_error("This build assumes 4 KiB memory pages and this system uses " +
 +                                 std::to_string(page) +
-+                                 "-byte pages; rebuild with -DMKW_AARCH64_4K_PAGES=OFF");
++                                 "-byte pages; rebuild with tools/linux/build.sh --arch aarch64 --16k-pages");
 +    }
  #endif
  
      if (g_initialized) {
+diff --git a/runtime/src/hle/audio/ax_mix.cpp b/runtime/src/hle/audio/ax_mix.cpp
+index c6a9e90..0bb8fa0 100644
+--- a/runtime/src/hle/audio/ax_mix.cpp
++++ b/runtime/src/hle/audio/ax_mix.cpp
+@@ -5,6 +5,7 @@
+ #include "abi_bridge.h"
+ #include "audio_backend.h"
+ #include "ax_mix_kernels.h"
++#include "guest_interrupt_context.h"
+ #include "isa/big_endian.h"
+ #include "memory.h"
+ #include "ppc_runtime.h"
+@@ -1526,6 +1527,19 @@ uint32_t CheckInit() {
+     return ReadGuestU32OrZero(kDspInitializedAddr);
+ }
+ 
++// task->init_cb(task), from the DSP interrupt on hardware: a private register file like the
++// other interrupt-time guest callbacks.
++void InvokeTaskInitCallback(uint32_t taskPtr) {
++    const uint32_t initCallback = ReadGuestU32OrZero(taskPtr + 0x28u);
++    if (initCallback == 0 || !TranslatedFunctionRegistry::FindByAddressPtr(initCallback)) {
++        return;
++    }
++    GuestInterruptCallbackContext interrupt;
++    CpuContext* cpu = interrupt.get();
++    cpu->gpr[3] = taskPtr;
++    InvokeIndirectCpu(initCallback, cpu);
++}
++
+ uint32_t AddTask(uint32_t taskPtr) {
+     if (taskPtr == 0) {
+         return 0;
+@@ -1547,6 +1561,7 @@ uint32_t AddTask(uint32_t taskPtr) {
+     Memory::TryWrite32(taskPtr + 0x08u, 1);
+     if (taskPtr == ReadGuestU32OrZero(kDspFirstTaskAddr)) {
+         AssertTask(taskPtr);
++        InvokeTaskInitCallback(taskPtr);
+     }
+     return taskPtr;
+ }
+diff --git a/runtime/src/hle/os/os_scheduler.cpp b/runtime/src/hle/os/os_scheduler.cpp
+index 2c46300..3997cc3 100644
+--- a/runtime/src/hle/os/os_scheduler.cpp
++++ b/runtime/src/hle/os/os_scheduler.cpp
+@@ -11,6 +11,25 @@
+ #include "runtime_log.h"
+ #include "os_internal.h"
+ 
++#include <algorithm>
++#include <array>
++#include <chrono>
++
++namespace {
++// When SelectThread last switched to a thread of each priority (VI's starvation guard reads it).
++std::array<std::chrono::steady_clock::time_point, 32> g_lastScheduledAt{};
++} // namespace
++
++// Latest time a thread with a numerically higher (lower) priority than `priority` was scheduled.
++std::chrono::steady_clock::time_point OS_HLE_LastScheduledBelowPriority(uint32_t priority)
++{
++    std::chrono::steady_clock::time_point latest{};
++    for (uint32_t p = priority + 1; p < g_lastScheduledAt.size(); ++p) {
++        latest = std::max(latest, g_lastScheduledAt[p]);
++    }
++    return latest;
++}
++
+ namespace {
+ void LinkMutexToThread(uint32_t threadPtr, uint32_t mutexPtr)
+ {
+@@ -329,6 +348,8 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
+         break;
+     }
+ 
++    g_lastScheduledAt[priorityLevel] = std::chrono::steady_clock::now();
++
+     // Remove thread from queue head
+     const uint32_t threadNext = PopThreadQueueHead(queueEntry, nextThread);
+ 
 diff --git a/runtime/src/hle/vi.cpp b/runtime/src/hle/vi.cpp
-index 23f85fc..8e70c3c 100644
+index 23f85fc..a8609c3 100644
 --- a/runtime/src/hle/vi.cpp
 +++ b/runtime/src/hle/vi.cpp
-@@ -847,8 +847,72 @@ extern "C" void VISetBlack_HLE_801bab2c(CpuContext* ctx)
+@@ -847,8 +847,85 @@ extern "C" void VISetBlack_HLE_801bab2c(CpuContext* ctx)
  }
  PPC_NATIVE_OVERRIDE_VOID(801BAB2C, VISetBlack_HLE_801bab2c, (CpuContext* ctx), (ctx));
  
++std::chrono::steady_clock::time_point OS_HLE_LastScheduledBelowPriority(uint32_t priority);
++
 +namespace {
 +
 +// Blocks the calling guest thread on the retrace queue until the next retrace (VIWaitForRetrace).
@@ -193,37 +332,45 @@ index 23f85fc..8e70c3c 100644
 +}
 +
 +// MLB's frame loop (func_800472B4) waits only when it is early: `if (VIGetRetraceCount() == last)
-+// VIWaitForRetrace();`. On a host that cannot hold 60 fps it never blocks, and the cooperative
-+// scheduler never runs a READY lower-priority thread: on a phone's little cores the boot loader
-+// (priority 24) starved and the intro never ended. Hardware has idle time in that loop, so once
-+// such a thread has waited kLowerPriorityStarvation the caller sleeps to the next retrace, that
-+// late frame quantized to vblank as on hardware. Addresses as in hle/os/os_internal.h.
++// VIWaitForRetrace();`. The console holds 60 fps there, so the wait always comes and lower-priority
++// threads run in it. A host that cannot hold 60 fps never reaches the wait, and the cooperative
++// scheduler then never runs a READY lower-priority thread: on a phone's little cores the boot
++// loader (priority 24) starved and the intro never ended. Host-side scheduling fix, not hardware
++// behavior: once such a thread has gone kLowerPriorityStarvation without running, the caller
++// sleeps to the next retrace. Addresses as in hle/os/os_internal.h.
 +constexpr auto kLowerPriorityStarvation = 100ms;
++constexpr uint32_t kOSCurrentContextAddr = 0x800000d4u;
 +constexpr uint32_t kOSRunningContextAddr = 0x800000e4u;
-+constexpr uint32_t kSchedulerPendingFlagAddr = 0x8031b270u;   // READY mask, bit 31 - priority
-+constexpr uint32_t kSchedulerDisableCountAddr = 0x8031b268u;
++constexpr uint32_t kSchedulerPendingFlagAddr = 0x8031b270u;  // READY mask, bit 31 - priority
++constexpr uint32_t kSchedulerIdleFlagAddr = 0x8031b268u;     // OSDisableScheduler nesting count
 +constexpr uint32_t kThreadStateOffset = 0x2C8u;
 +constexpr uint32_t kThreadPriorityOffset = 0x2D0u;
-+Clock::time_point s_lowerPriorityReadySince{};  // guest threads only, one host thread
++Clock::time_point s_lowerPriorityReadySince{};  // first seen READY; guest threads, one host thread
++uint32_t s_starvationYields = 0;
 +
 +bool LowerPriorityThreadStarved()
 +{
 +    if (!Fiber::GuestFiberManager::IsInitialized() || !OS_HLE_InterruptsEnabled() ||
-+        ::Memory::Read32(kSchedulerDisableCountAddr) != 0 || VI_HLE_IsAdvancingRetrace()) {
++        ::Memory::Read32(kSchedulerIdleFlagAddr) != 0 || VI_HLE_IsAdvancingRetrace()) {
 +        return false;
 +    }
 +    const uint32_t running = ::Memory::Read32(kOSRunningContextAddr);
-+    if (running == 0 || ::Memory::Read16(running + kThreadStateOffset) != 2) {
++    if (running == 0 || ::Memory::Read32(kOSCurrentContextAddr) != running ||
++        ::Memory::Read16(running + kThreadStateOffset) != 2) {
 +        return false;
 +    }
 +    const uint32_t priority = ::Memory::Read32(running + kThreadPriorityOffset);
 +    const uint32_t lowerMask = priority >= 31 ? 0u : (1u << (31 - priority)) - 1u;
-+    const auto now = Clock::now();
 +    if ((::Memory::Read32(kSchedulerPendingFlagAddr) & lowerMask) == 0) {
-+        s_lowerPriorityReadySince = now;
++        s_lowerPriorityReadySince = {};
 +        return false;
 +    }
-+    return now - s_lowerPriorityReadySince >= kLowerPriorityStarvation;
++    const auto now = Clock::now();
++    if (s_lowerPriorityReadySince == Clock::time_point{}) {
++        s_lowerPriorityReadySince = now;
++    }
++    const auto since = std::max(s_lowerPriorityReadySince, OS_HLE_LastScheduledBelowPriority(priority));
++    return now - since >= kLowerPriorityStarvation;
 +}
 +
 +} // namespace
@@ -231,13 +378,16 @@ index 23f85fc..8e70c3c 100644
  extern "C" void VIGetRetraceCount_HLE_801baba4(CpuContext* ctx)
  {
 +    if (ctx != nullptr && LowerPriorityThreadStarved()) {
++        if (++s_starvationYields == 1 || s_starvationYields % 100 == 0) {
++            RT_LOG(RT_TAG_VI) << "lower-priority thread starved: waiting one retrace (" << s_starvationYields
++                              << " so far)" << std::endl;
++        }
 +        SleepUntilNextRetrace(ctx);
-+        s_lowerPriorityReadySince = Clock::now();
 +    }
      uint32_t count = 0;
      {
          std::lock_guard<std::mutex> lock(g_viMutex);
-@@ -902,28 +966,8 @@ extern "C" void VIWaitForRetrace_HLE_801b99ec(CpuContext* ctx)
+@@ -902,28 +979,7 @@ extern "C" void VIWaitForRetrace_HLE_801b99ec(CpuContext* ctx)
      match_benchmark::OnGuestFrame(cpu);
      
      if (Fiber::GuestFiberManager::IsInitialized()) {
@@ -264,7 +414,6 @@ index 23f85fc..8e70c3c 100644
 -
 -        OS__RestoreInterrupts_801a65d4(irqState);
 +        SleepUntilNextRetrace(cpu);
-+        s_lowerPriorityReadySince = Clock::now();  // lower-priority threads had this wait
      } else {
          std::chrono::microseconds interval{16666us};
          Clock::time_point target;

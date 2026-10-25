@@ -27,6 +27,14 @@ if [[ -f $stamp && $(cat "$stamp") == "$want" ]]; then
     exit 0
 fi
 
+# DIR gets deleted and rebuilt: only an empty directory or an earlier sysroot (finished, or a
+# failed mmdebstrap run) may be replaced, never someone's files.
+if [[ -d $sysroot && -n $(ls -A "$sysroot") && ! -f $stamp &&
+      ! ( -f $sysroot/etc/debian_version && -d $sysroot/usr/lib/aarch64-linux-gnu ) ]]; then
+    echo "error: $sysroot is not empty and is not a sysroot from this script; choose another directory" >&2
+    exit 1
+fi
+
 sudo=()
 (( EUID == 0 )) || sudo=(sudo)
 host_tools=()
@@ -39,7 +47,7 @@ if (( ${#host_tools[@]} )); then
     "${sudo[@]}" apt-get install -y "${host_tools[@]}"
 fi
 
-rm -rf "$sysroot"
+"${sudo[@]}" rm -rf "$sysroot"   # a failed run leaves root-owned files
 mkdir -p "$(dirname "$sysroot")"
 # Root mode keeps file ownership simple; the maintainer scripts run through qemu-user-static.
 "${sudo[@]}" mmdebstrap --arch=arm64 --variant=minbase --components=main,universe \

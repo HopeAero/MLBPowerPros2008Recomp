@@ -28,6 +28,7 @@ desktop_entry=0
 container=0
 in_container=0
 arch=x86_64
+pages16k=0
 
 usage() {
     sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -45,6 +46,8 @@ Options:
   --arch aarch64     experimental: cross-compile for Linux ARM64 against the sysroot from
                      tools/linux/aarch64/make-sysroot.sh (installs into local/install-aarch64; no
                      Texture/Season Studio or PowerUp+)
+  --16k-pages        with --arch aarch64: also run on 16 KiB-page systems (Raspberry Pi 5's default
+                     kernel); slower, every guest memory access checks the page size
 EOF
 }
 
@@ -59,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --desktop-entry) desktop_entry=1; shift ;;
         --container) container=1; shift ;;
         --arch) arch=$2; shift 2 ;;
+        --16k-pages) pages16k=1; shift ;;
         --in-container) in_container=1; shift ;;   # internal: the half of --container that runs inside
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -70,6 +74,7 @@ fail() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 cd "$root"
 [[ $arch == x86_64 || $arch == aarch64 ]] || fail "--arch must be x86_64 or aarch64"
 [[ $arch == aarch64 ]] && (( container )) && fail "--arch aarch64 is not supported with --container"
+(( pages16k )) && [[ $arch != aarch64 ]] && fail "--16k-pages needs --arch aarch64"
 [[ -n $install_dir ]] || install_dir=$HOME/Games/MLBPowerPros2008
 [[ $arch == aarch64 && $install_dir == "$HOME/Games/MLBPowerPros2008" ]] && install_dir=$root/local/install-aarch64
 
@@ -284,6 +289,7 @@ if [[ $arch == aarch64 ]]; then
     # aurora vendors (builds from source) every dependency when cross-compiling; Dawn has a pinned
     # prebuilt linux-aarch64 package, like the x86_64 build uses.
     configure+=(-DCMAKE_TOOLCHAIN_FILE="$root/tools/linux/aarch64/toolchain.cmake" -DAURORA_DAWN_PROVIDER=package)
+    configure+=(-DMKW_AARCH64_4K_PAGES=$( (( pages16k )) && echo OFF || echo ON ))
 else
     configure+=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++)
 fi

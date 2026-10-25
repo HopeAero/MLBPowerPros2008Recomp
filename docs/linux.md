@@ -68,11 +68,11 @@ Para el camino hacia Switch, el juego también se compila para Linux ARM64 desde
 ```sh
 sudo apt install mmdebstrap qemu-user-static symlinks patchelf   # además de lo de arriba
 tools/linux/aarch64/make-sysroot.sh            # sysroot arm64 en local/sysroot/noble-arm64 (~1,5 GB)
-tools/linux/build.sh --arch aarch64 --disc '/ruta/a/tu copia.rvz'   # instala en local/install-aarch64
+tools/linux/build.sh --arch aarch64 --disc '/ruta/a/tu copia.rvz'   # instala en local/install-aarch64 (--fresh si el árbol es anterior)
 tools/linux/aarch64/adb-match.sh               # partido de prueba sin gráficos en un teléfono Android ARM64
 ```
 
-Usa clang con `--target=aarch64-linux-gnu`, `-mcpu=cortex-a57` (la CPU de Switch: corre en cualquier ARM de 64 bits) y Dawn precompilado para linux-aarch64; las pruebas del runtime pasan bajo QEMU. No se compilan Texture Studio ni el editor de rosters. El juego llegó al primer lanzamiento en un teléfono con el backend nulo; los gráficos en ARM, el sonido real y los mandos están **sin probar**. Necesita páginas de memoria de 4 KiB. Detalles y resultados en [Nintendo Switch](roadmap/switch.md#versión-arm64-octubre-de-2026).
+Usa clang con `--target=aarch64-linux-gnu`, `-mcpu=cortex-a57` (la CPU de Switch: corre en cualquier ARM de 64 bits) y Dawn precompilado para linux-aarch64; las pruebas del runtime pasan bajo QEMU salvo tres que también fallan en Linux x86_64. No se compilan Texture Studio ni el editor de rosters. El juego llegó al primer lanzamiento en un teléfono con el backend nulo; los gráficos en ARM, el sonido real y los mandos están **sin probar**. Necesita páginas de memoria de 4 KiB; con `--16k-pages` funciona también con páginas de 16 KiB (Raspberry Pi 5), más lento. Detalles y resultados en [Nintendo Switch](roadmap/switch.md#versión-arm64-octubre-de-2026).
 
 ## Steam Deck
 
