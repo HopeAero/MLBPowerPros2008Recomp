@@ -1,0 +1,1571 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 015f968c4..f9df85433 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -41,6 +41,32 @@ project(
+ )
+ enable_testing()
+ 
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" OR CMAKE_SYSTEM_NAME STREQUAL "Horizon")
++  # newlib/libnx gates _timezone/_tzname/fdopen/etc behind these feature-test
++  # macros; several third-party deps (Abseil's cctz) assume they're already
++  # visible. Set here, after project(), rather than via CMAKE_CXX_FLAGS on
++  # the toolchain file or command line: devkitPro's Switch.cmake sets
++  # CMAKE_CXX_FLAGS via CMAKE_CXX_FLAGS_INIT through its own NintendoSwitch
++  # platform module, which CMake only processes internally after the
++  # toolchain file's own include() returns, so anything set there either
++  # races it or clobbers its -D__SWITCH__/-march/... flags outright.
++  add_compile_definitions(_GNU_SOURCE _DEFAULT_SOURCE)
++
++  # CMake's FindThreads probes for a separate -lpthread or glibc/musl-style
++  # pthread_create-in-libc; devkitA64's newlib+libnx has real pthreads, but
++  # baked directly into libnx.a/libc.a with no separate library to detect,
++  # so FindThreads comes up empty and any dependency that treats "no threads
++  # found" as fatal (SDL3's CMakeLists does) aborts configure outright.
++  # Pre-declaring the imported target short-circuits find_package(Threads):
++  # it returns early once the target already exists.
++  if (NOT TARGET Threads::Threads)
++    add_library(Threads::Threads INTERFACE IMPORTED)
++    set(THREADS_FOUND TRUE CACHE INTERNAL "")
++    set(CMAKE_THREAD_LIBS_INIT "" CACHE INTERNAL "")
++    set(CMAKE_USE_PTHREADS_INIT TRUE CACHE INTERNAL "")
++  endif()
++endif()
++
+ list(INSERT CMAKE_MODULE_PATH 0 "${Dawn_SOURCE_DIR}/src/cmake")
+ 
+ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+@@ -374,6 +400,12 @@ if (${DAWN_ENABLE_DESKTOP_GL} OR ${DAWN_ENABLE_OPENGLES})
+     set(DAWN_ENABLE_OPENGL ON)
+ endif()
+ 
++# Khronos' eglplatform.h has no Horizon branch ("Platform not recognized"); the
++# EGL here is nxvk's, whose native window/display types are plain pointers.
++if (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    add_compile_definitions(EGL_NO_PLATFORM_SPECIFIC_TYPES)
++endif ()
++
+ if(DAWN_ENABLE_PIC)
+     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+ endif()
+@@ -497,6 +529,67 @@ if (DAWN_ENABLE_D3D11 OR DAWN_ENABLE_D3D12 OR DAWN_ENABLE_METAL OR DAWN_ENABLE_N
+     add_subdirectory(src/emdawnwebgpu)
+     add_subdirectory(src/dawn)
+     add_subdirectory(src/dawn/fuzzers)
++    if (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++        include(switch_smoke_test/NvkLink.cmake)
++        add_subdirectory(switch_smoke_test)
++
++        # Build aurora-main (WiiCompiled's GX->modern-API renderer) as part of
++        # this same CMake project so it reuses the webgpu_dawn target that's
++        # already defined above, instead of aurora's own CMake FetchContent'ing
++        # a fresh, UNPATCHED vanilla Dawn tarball from upstream (which would
++        # silently lose every Horizon fix made in this fork tonight). Aurora's
++        # AuroraDawnProvider.cmake vendor path checks `if (NOT TARGET
++        # webgpu_dawn)` before fetching - since that target already exists by
++        # this point in the same configure pass, it just reuses it.
++        set(AURORA_ENABLE_GX ON CACHE BOOL "" FORCE)
++        set(AURORA_ENABLE_DVD OFF CACHE BOOL "" FORCE)
++        set(AURORA_ENABLE_CARD OFF CACHE BOOL "" FORCE)
++        set(AURORA_DAWN_PROVIDER "vendor" CACHE STRING "" FORCE)
++        set(AURORA_SDL3_PROVIDER "vendor" CACHE STRING "" FORCE)
++        # Standalone dev layout only: a game checkout next to this one
++        # (../mkwii-nx or ../wiicompiled), or -DMKWII_NX_DIR=<path>. Inside wii-nx
++        # Dawn is a subproject and wii-nx builds the game itself.
++        if (NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
++            set(MKWII_NX_DIR "")
++        elseif (NOT MKWII_NX_DIR)
++            foreach(_candidate mkwii-nx wiicompiled)
++                if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../${_candidate}/runtime/CMakeLists.txt")
++                    get_filename_component(MKWII_NX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../${_candidate}" ABSOLUTE)
++                    break()
++                endif ()
++            endforeach ()
++        endif ()
++        # No game checkout: build Dawn (and the smoke test) alone. That is what CI
++        # does, since a game's translated code can never live in a public runner.
++        if (NOT EXISTS "${MKWII_NX_DIR}/runtime/CMakeLists.txt")
++            message(STATUS "wii-nx: no game checkout found; building Dawn without it "
++                           "(set -DMKWII_NX_DIR=<path> to build a game)")
++            set(MKWII_NX_DIR "" CACHE PATH "wii-nx game checkout" FORCE)
++        endif ()
++        if (MKWII_NX_DIR)
++        set(MKWII_NX_DIR "${MKWII_NX_DIR}" CACHE PATH "mkwii-nx checkout" FORCE)
++        add_subdirectory(${MKWII_NX_DIR}/aurora-main aurora-main-build)
++
++        # The actual translated-MKW build: runtime/CMakeLists.txt's own aurora
++        # add_subdirectory() is guarded with `if (NOT TARGET aurora_core)`, so
++        # it reuses the aurora-main-build target added just above instead of
++        # re-adding the same source directory under a second binary dir.
++        set(MKW_BUILD_PRODUCTS ON CACHE BOOL "" FORCE)
++        add_subdirectory(${MKWII_NX_DIR}/runtime wiicompiled-runtime-build)
++
++        # The game's Vulkan path ends at NVK. Same recipe the smoke test
++        # proved on hardware: libnvk MUST be whole-archive (its Mesa dispatch
++        # tables are only reached by runtime string lookup, so the linker
++        # drops them otherwise) and needs the newlib gap-fill stubs.
++        if (TARGET WiiCompiled)
++            dawn_switch_link_nvk(WiiCompiled)
++            # Every thread gets a 4 MiB stack instead of libnx's 128 KiB
++            # default; Tint overflowed the default compiling MKW shaders.
++            # See runtime/platform_switch/switch_thread_stack.cpp.
++            target_link_libraries(WiiCompiled PRIVATE -Wl,--wrap=pthread_create)
++        endif()
++        endif ()  # MKWII_NX_DIR
++    endif()
+ endif()
+ 
+ ################################################################################
+diff --git a/build-switch-toolchain.cmake b/build-switch-toolchain.cmake
+new file mode 100644
+index 000000000..b653d3bb1
+--- /dev/null
++++ b/build-switch-toolchain.cmake
+@@ -0,0 +1,3 @@
++# Thin wrapper so this build's toolchain choice is self-documenting; the
++# actual devkitPro Switch platform toolchain does all the work.
++include(/opt/devkitpro/cmake/Switch.cmake)
+diff --git a/src/dawn/common/DynamicLib.cpp b/src/dawn/common/DynamicLib.cpp
+index d155e490d..f480e1406 100644
+--- a/src/dawn/common/DynamicLib.cpp
++++ b/src/dawn/common/DynamicLib.cpp
+@@ -39,6 +39,19 @@
+ #endif
+ #elif DAWN_PLATFORM_IS(POSIX)
+ #include <dlfcn.h>
++#elif DAWN_PLATFORM_IS(HORIZON)
++// No dynamic library loading exists on Horizon (no dlopen, no shared
++// objects at all - everything is statically linked into the NRO). Every
++// method below is a stub that reports "not available" rather than
++// "not found": Dawn's own callers (Vulkan ICD discovery, SwiftShader
++// fallback, ANGLE) already treat a failed DynamicLib::Open as a normal,
++// recoverable "library absent" outcome, since that's also how it behaves on
++// any desktop platform that simply doesn't have that library installed. The
++// Vulkan backend's Switch path bypasses this file entirely (static-linked
++// against libnvk.a, driven through vk_icdGetInstanceProcAddr directly), so
++// by the time that patch lands this file's stub bodies are dead code for
++// Vulkan specifically; leaving it as a working stub here still avoids
++// silently swallowing an actual DynamicLib call from elsewhere in Dawn.
+ #else
+ #error "Unsupported platform for DynamicLib"
+ #endif
+@@ -106,6 +119,10 @@ bool DynamicLib::Open(const std::string& filename, std::string* error) {
+     if (mHandle == nullptr && error != nullptr) {
+         *error = dlerror();
+     }
++#elif DAWN_PLATFORM_IS(HORIZON)
++    if (error != nullptr) {
++        *error = "DynamicLib.Open: " + filename + ": no dynamic library loading on Horizon";
++    }
+ #else
+ #error "Unsupported platform for DynamicLib"
+ #endif
+@@ -130,6 +147,10 @@ bool DynamicLib::OpenLoaded(const std::string& filename, std::string* error) {
+     if (mHandle == nullptr && error != nullptr) {
+         *error = dlerror();
+     }
++#elif DAWN_PLATFORM_IS(HORIZON)
++    if (error != nullptr) {
++        *error = "DynamicLib.OpenLoaded: " + filename + ": no dynamic library loading on Horizon";
++    }
+ #else
+ #error "Unsupported platform for DynamicLib"
+ #endif
+@@ -167,6 +188,9 @@ void DynamicLib::Close() {
+ #endif
+ #elif DAWN_PLATFORM_IS(POSIX)
+         dlclose(mHandle);
++#elif DAWN_PLATFORM_IS(HORIZON)
++        // Unreachable: mHandle is never non-null on Horizon (Open/OpenLoaded
++        // above never set it), so mNeedsClose is never true here either.
+ #else
+ #error "Unsupported platform for DynamicLib"
+ #endif
+@@ -191,6 +215,10 @@ void* DynamicLib::GetProc(const std::string& procName, std::string* error) const
+     if (proc == nullptr && error != nullptr) {
+         *error = dlerror();
+     }
++#elif DAWN_PLATFORM_IS(HORIZON)
++    if (error != nullptr) {
++        *error = "DynamicLib.GetProc: " + procName + ": no dynamic library loading on Horizon";
++    }
+ #else
+ #error "Unsupported platform for DynamicLib"
+ #endif
+diff --git a/src/dawn/common/DynamicLib.h b/src/dawn/common/DynamicLib.h
+index e678438b9..4c1463453 100644
+--- a/src/dawn/common/DynamicLib.h
++++ b/src/dawn/common/DynamicLib.h
+@@ -37,7 +37,7 @@
+ 
+ #if DAWN_PLATFORM_IS(WINDOWS)
+ #include "partition_alloc/pointers/raw_ptr.h"
+-#elif DAWN_PLATFORM_IS(POSIX)
++#elif DAWN_PLATFORM_IS(POSIX) || DAWN_PLATFORM_IS(HORIZON)
+ #include "partition_alloc/pointers/raw_ptr_exclusion.h"
+ #else
+ #error "Unsupported platform for DynamicLib"
+@@ -88,6 +88,9 @@ class DynamicLib {
+     // On POSIX we use `dlopen`, which returns a "handle" which may not be a real pointer:
+     // > The value of this symbol table handle should not be interpreted in any way by the caller.
+     RAW_PTR_EXCLUSION void* mHandle = nullptr;
++#elif DAWN_PLATFORM_IS(HORIZON)
++    // Never set to anything but nullptr - see DynamicLib.cpp's Horizon branch.
++    RAW_PTR_EXCLUSION void* mHandle = nullptr;
+ #else
+ #error "Unsupported platform for DynamicLib"
+ #endif
+diff --git a/src/dawn/common/SystemUtils.cpp b/src/dawn/common/SystemUtils.cpp
+index 65728cd5e..67c1d76d0 100644
+--- a/src/dawn/common/SystemUtils.cpp
++++ b/src/dawn/common/SystemUtils.cpp
+@@ -46,6 +46,8 @@
+ #include <mach-o/dyld.h>
+ 
+ #include <vector>
++#elif DAWN_PLATFORM_IS(HORIZON)
++#include <cstdlib>
+ #endif
+ 
+ #include <array>
+@@ -85,11 +87,13 @@ std::pair<std::string, bool> GetEnvironmentVar(const char* variableName) {
+ bool SetEnvironmentVar(const char* variableName, const char* value) {
+     return SetEnvironmentVariableA(variableName, value) == TRUE;
+ }
+-#elif DAWN_PLATFORM_IS(POSIX)
++#elif DAWN_PLATFORM_IS(POSIX) || DAWN_PLATFORM_IS(HORIZON)
+ const char* GetPathSeparator() {
+     return "/";
+ }
+ 
++// getenv/setenv/unsetenv are plain newlib in-process environ emulation, not
++// backed by any real OS environment - they work identically on Horizon.
+ std::pair<std::string, bool> GetEnvironmentVar(const char* variableName) {
+     char* value = getenv(variableName);
+     return value == nullptr ? std::make_pair(std::string(), false)
+@@ -152,6 +156,12 @@ std::optional<std::string> GetExecutablePath() {
+ std::optional<std::string> GetExecutablePath() {
+     return {};
+ }
++#elif DAWN_PLATFORM_IS(HORIZON)
++std::optional<std::string> GetExecutablePath() {
++    // No /proc, and libnx does not expose the loaded .nro's own path - same
++    // "unimplemented, treat as absent" answer as Fuchsia/Emscripten above.
++    return {};
++}
+ #else
+ #error "Implement GetExecutablePath for your platform."
+ #endif
+@@ -206,6 +216,12 @@ std::optional<std::string> GetModulePath() {
+ std::optional<std::string> GetModulePath() {
+     return {};
+ }
++#elif DAWN_PLATFORM_IS(HORIZON)
++std::optional<std::string> GetModulePath() {
++    // Everything is statically linked into the one NRO on Horizon - no
++    // separate loadable modules, no dladdr - same "absent" answer as above.
++    return {};
++}
+ #else
+ #error "Implement GetModulePath for your platform."
+ #endif
+diff --git a/src/dawn/common/vulkan_platform.h b/src/dawn/common/vulkan_platform.h
+index 0005f6845..ca9777afa 100644
+--- a/src/dawn/common/vulkan_platform.h
++++ b/src/dawn/common/vulkan_platform.h
+@@ -186,6 +186,12 @@ const HandleType* AsVkArray(const detail::VkHandle<Tag, HandleType>* handle) {
+ #endif
+ #endif  // DAWN_PLATFORM_IS(FUCHSIA)
+ 
++#if DAWN_PLATFORM_IS(HORIZON)
++#ifndef VK_USE_PLATFORM_VI_NN
++#define VK_USE_PLATFORM_VI_NN
++#endif
++#endif  // DAWN_PLATFORM_IS(HORIZON)
++
+ // The actual inclusion of vulkan.h!
+ #define VK_NO_PROTOTYPES
+ #include <vulkan/vulkan.h>
+diff --git a/src/dawn/dawn.json b/src/dawn/dawn.json
+index b5ec9a257..0e74daf29 100644
+--- a/src/dawn/dawn.json
++++ b/src/dawn/dawn.json
+@@ -3945,6 +3945,15 @@
+             {"name": "window", "type": "void *"}
+         ]
+     },
++    "surface source vi NN": {
++        "category": "structure",
++        "chained": "in",
++        "chain roots": ["surface descriptor"],
++        "tags": ["dawn", "native"],
++        "members": [
++            {"name": "window", "type": "void *"}
++        ]
++    },
+     "emscripten surface source canvas HTML selector": {
+         "category": "structure",
+         "chained": "in",
+@@ -4165,7 +4174,8 @@
+             {"value": 78, "name": "shared texture memory D3D12 resource descriptor", "tags": ["dawn", "native"]},
+             {"value": 79, "name": "request adapter options angle virtualization group", "tags": ["dawn", "native"]},
+             {"value": 80, "name": "pipeline layout resource table", "tags": ["dawn"]},
+-            {"value": 81, "name": "adapter properties drm", "tags": ["dawn", "native"]}
++            {"value": 81, "name": "adapter properties drm", "tags": ["dawn", "native"]},
++            {"value": 82, "name": "surface source vi NN", "tags": ["dawn", "native"]}
+         ]
+     },
+     "texture": {
+diff --git a/src/dawn/native/CMakeLists.txt b/src/dawn/native/CMakeLists.txt
+index dbdc1d35d..9031d66b7 100644
+--- a/src/dawn/native/CMakeLists.txt
++++ b/src/dawn/native/CMakeLists.txt
+@@ -879,7 +879,7 @@ if (DAWN_ENABLE_VULKAN)
+     endif()
+ endif()
+ 
+-if (DAWN_ENABLE_D3D12 OR DAWN_ENABLE_VULKAN)
++if ((DAWN_ENABLE_D3D12 OR DAWN_ENABLE_VULKAN) AND NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+     list(APPEND conditional_private_depends RenderDocApi)
+     list(APPEND private_headers "utils/RenderDoc.h")
+     list(APPEND sources "utils/RenderDoc.cpp")
+diff --git a/src/dawn/native/Surface.cpp b/src/dawn/native/Surface.cpp
+index bdcbf45bd..f8eba4811 100644
+--- a/src/dawn/native/Surface.cpp
++++ b/src/dawn/native/Surface.cpp
+@@ -85,6 +85,9 @@ absl::FormatConvertResult<absl::FormatConversionCharSet::kString> AbslFormatConv
+         case Surface::Type::XlibWindow:
+             s->Append("XlibWindow");
+             break;
++        case Surface::Type::ViWindow:
++            s->Append("ViWindow");
++            break;
+         case Surface::Type::Undefined:
+             DAWN_UNREACHABLE();
+             break;
+@@ -116,7 +119,8 @@ ResultOrError<UnpackedPtr<SurfaceDescriptor>> ValidateSurfaceDescriptor(
+                   Branch<SurfaceSourceWindowsHWND>, Branch<SurfaceDescriptorFromWindowsCoreWindow>,
+                   Branch<SurfaceDescriptorFromWindowsUWPSwapChainPanel>,
+                   Branch<SurfaceDescriptorFromWindowsWinUISwapChainPanel>,
+-                  Branch<SurfaceSourceXlibWindow>, Branch<SurfaceSourceWaylandSurface>>()));
++                  Branch<SurfaceSourceXlibWindow>, Branch<SurfaceSourceWaylandSurface>,
++                  Branch<SurfaceSourceViNN>>()));
+     switch (type) {
+ #if DAWN_PLATFORM_IS(ANDROID)
+         case wgpu::SType::SurfaceSourceAndroidNativeWindow: {
+@@ -126,6 +130,14 @@ ResultOrError<UnpackedPtr<SurfaceDescriptor>> ValidateSurfaceDescriptor(
+             return descriptor;
+         }
+ #endif  // DAWN_PLATFORM_IS(ANDROID)
++#if DAWN_PLATFORM_IS(HORIZON)
++        case wgpu::SType::SurfaceSourceViNN: {
++            auto* subDesc = descriptor.Get<SurfaceSourceViNN>();
++            DAWN_ASSERT(subDesc != nullptr);
++            DAWN_INVALID_IF(subDesc->window == nullptr, "NWindow is not set.");
++            return descriptor;
++        }
++#endif  // DAWN_PLATFORM_IS(HORIZON)
+ #if defined(DAWN_ENABLE_BACKEND_METAL)
+         case wgpu::SType::SurfaceSourceMetalLayer: {
+             auto* subDesc = descriptor.Get<SurfaceSourceMetalLayer>();
+@@ -305,7 +317,8 @@ Surface::Surface(InstanceBase* instance, const UnpackedPtr<SurfaceDescriptor>& d
+                 Branch<SurfaceSourceWindowsHWND>, Branch<SurfaceDescriptorFromWindowsCoreWindow>,
+                 Branch<SurfaceDescriptorFromWindowsUWPSwapChainPanel>,
+                 Branch<SurfaceDescriptorFromWindowsWinUISwapChainPanel>,
+-                Branch<SurfaceSourceXlibWindow>, Branch<SurfaceSourceWaylandSurface>>()
++                Branch<SurfaceSourceXlibWindow>, Branch<SurfaceSourceWaylandSurface>,
++                Branch<SurfaceSourceViNN>>()
+             .AcquireSuccess();
+     switch (type) {
+         case wgpu::SType::SurfaceSourceAndroidNativeWindow: {
+@@ -314,6 +327,12 @@ Surface::Surface(InstanceBase* instance, const UnpackedPtr<SurfaceDescriptor>& d
+             mAndroidNativeWindow = subDesc->window;
+             break;
+         }
++        case wgpu::SType::SurfaceSourceViNN: {
++            auto* subDesc = descriptor.Get<SurfaceSourceViNN>();
++            mType = Type::ViWindow;
++            mNWindow = subDesc->window;
++            break;
++        }
+         case wgpu::SType::SurfaceSourceMetalLayer: {
+             auto* subDesc = descriptor.Get<SurfaceSourceMetalLayer>();
+             mType = Type::MetalLayer;
+@@ -396,6 +415,12 @@ void* Surface::GetAndroidNativeWindow() const {
+     return mAndroidNativeWindow;
+ }
+ 
++void* Surface::GetNWindow() const {
++    DAWN_CHECK(!IsError());
++    DAWN_CHECK(mType == Type::ViWindow);
++    return mNWindow;
++}
++
+ void* Surface::GetMetalLayer() const {
+     DAWN_CHECK(!IsError());
+     DAWN_CHECK(mType == Type::MetalLayer);
+diff --git a/src/dawn/native/Surface.h b/src/dawn/native/Surface.h
+index 4e0ba99e0..1201a020e 100644
+--- a/src/dawn/native/Surface.h
++++ b/src/dawn/native/Surface.h
+@@ -85,6 +85,7 @@ class Surface final : public ErrorMonad {
+         WindowsUWPSwapChainPanel,
+         WindowsWinUISwapChainPanel,
+         XlibWindow,
++        ViWindow,
+     };
+     Type GetType() const;
+     InstanceBase* GetInstance() const;
+@@ -96,6 +97,9 @@ class Surface final : public ErrorMonad {
+     // Valid to call if the type is Android
+     void* GetAndroidNativeWindow() const;
+ 
++    // Valid to call if the type is ViWindow (Horizon/Switch's NWindow)
++    void* GetNWindow() const;
++
+     // Valid to call if the type is WaylandSurface
+     void* GetWaylandDisplay() const;
+     void* GetWaylandSurface() const;
+@@ -160,6 +164,9 @@ class Surface final : public ErrorMonad {
+     // ANativeWindow
+     raw_ptr<void> mAndroidNativeWindow = nullptr;
+ 
++    // Horizon/Switch NWindow
++    raw_ptr<void> mNWindow = nullptr;
++
+     // Wayland
+     raw_ptr<void> mWaylandDisplay = nullptr;
+     raw_ptr<void> mWaylandSurface = nullptr;
+diff --git a/src/dawn/native/vulkan/BackendVk.cpp b/src/dawn/native/vulkan/BackendVk.cpp
+index 86e89f947..0b737bbda 100644
+--- a/src/dawn/native/vulkan/BackendVk.cpp
++++ b/src/dawn/native/vulkan/BackendVk.cpp
+@@ -69,10 +69,25 @@ constexpr char kVulkanLibName[] = "vulkan-1.dll";
+ constexpr char kVulkanLibName[] = "libvulkan.dylib";
+ #elif DAWN_PLATFORM_IS(FUCHSIA)
+ constexpr char kVulkanLibName[] = "libvulkan.so";
++#elif DAWN_PLATFORM_IS(HORIZON)
++// Unused: NVK is statically linked (libnvk.a, no dlopen on Horizon - see DynamicLib.cpp), so
++// VulkanInstance::Initialize's ICD::None case skips LoadVulkan()/kVulkanLibName entirely and
++// calls vk_icdGetInstanceProcAddr (NVK's statically-linked ICD entry point) directly instead.
++constexpr char kVulkanLibName[] = "";
+ #else
+ #error "Unimplemented Vulkan backend platform"
+ #endif
+ 
++#if DAWN_PLATFORM_IS(HORIZON)
++extern "C" {
++// NVK's statically-linked ICD entry point (standard Vulkan Loader-ICD interface symbol,
++// see Mesa's src/nouveau/vulkan/). No Vulkan Loader is used on Switch - libnvk.a is linked
++// directly, so this is called in place of the dynamically-loaded vkGetInstanceProcAddr other
++// platforms get via DynamicLib (see DynamicLib.cpp's Horizon stub and its comment).
++PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char* pName);
++}
++#endif
++
+ struct SkippedMessage {
+     const char* messageId;
+     const char* messageContents;
+@@ -366,7 +381,12 @@ MaybeError VulkanInstance::Initialize(const InstanceBase* instance, ICD icd) {
+ 
+     switch (icd) {
+         case ICD::None: {
++#if DAWN_PLATFORM_IS(HORIZON)
++            // NVK is statically linked; there's no loader/ICD file to open (see
++            // vk_icdGetInstanceProcAddr below).
++#else
+             DAWN_TRY(LoadVulkan(kVulkanLibName));
++#endif
+             // Succesfully loaded driver; break.
+             break;
+         }
+@@ -393,7 +413,11 @@ MaybeError VulkanInstance::Initialize(const InstanceBase* instance, ICD icd) {
+ #endif
+     }
+ 
++#if DAWN_PLATFORM_IS(HORIZON)
++    DAWN_TRY(mFunctions.LoadGlobalProcs(vk_icdGetInstanceProcAddr));
++#else
+     DAWN_TRY(mFunctions.LoadGlobalProcs(mVulkanLib));
++#endif
+ 
+     DAWN_TRY_ASSIGN(mGlobalInfo, GatherGlobalInfo(mFunctions));
+ 
+diff --git a/src/dawn/native/vulkan/ExternalHandle.h b/src/dawn/native/vulkan/ExternalHandle.h
+index 904e2d3c0..3d49b51d2 100644
+--- a/src/dawn/native/vulkan/ExternalHandle.h
++++ b/src/dawn/native/vulkan/ExternalHandle.h
+@@ -28,6 +28,8 @@
+ #ifndef SRC_DAWN_NATIVE_VULKAN_EXTERNALHANDLE_H_
+ #define SRC_DAWN_NATIVE_VULKAN_EXTERNALHANDLE_H_
+ 
++#include <cstdint>
++
+ #include "src/dawn/common/vulkan_platform.h"
+ 
+ namespace dawn::native::vulkan {
+@@ -42,6 +44,13 @@ const ExternalSemaphoreHandle kNullExternalSemaphoreHandle = ZX_HANDLE_INVALID;
+ #elif DAWN_PLATFORM_IS(POSIX)
+ using ExternalSemaphoreHandle = int;
+ const ExternalSemaphoreHandle kNullExternalSemaphoreHandle = -1;
++#elif DAWN_PLATFORM_IS(HORIZON)
++// No VK_KHR_external_semaphore_{fd,win32} equivalent on Switch, and this single-process,
++// single-device game never shares a semaphore across processes/APIs. Must still match
++// dawn::SystemHandle::Handle's type (uint32_t on Horizon, see SystemHandle.h) since
++// SharedFenceVk hands a SystemHandle::Get() result straight to this type (TextureVk.cpp).
++using ExternalSemaphoreHandle = uint32_t;
++const ExternalSemaphoreHandle kNullExternalSemaphoreHandle = 0;
+ #else
+ #error "Platform not supported."
+ #endif
+diff --git a/src/dawn/native/vulkan/SwapChainVk.cpp b/src/dawn/native/vulkan/SwapChainVk.cpp
+index 7d88e5fcb..8c042c878 100644
+--- a/src/dawn/native/vulkan/SwapChainVk.cpp
++++ b/src/dawn/native/vulkan/SwapChainVk.cpp
+@@ -665,6 +665,27 @@ ResultOrError<VkSurfaceKHR> CreateVulkanSurface(InstanceBase* instance,
+ 
+ #endif  // DAWN_PLATFORM_IS(ANDROID)
+ 
++#if DAWN_PLATFORM_IS(HORIZON)
++        case Surface::Type::ViWindow: {
++            if (info.HasExt(InstanceExt::ViSurface)) {
++                DAWN_ASSERT(surface->GetNWindow() != nullptr);
++
++                VkViSurfaceCreateInfoNN createInfo;
++                createInfo.sType = VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN;
++                createInfo.pNext = nullptr;
++                createInfo.flags = 0;
++                createInfo.window = surface->GetNWindow();
++
++                VkSurfaceKHR vkSurface = VK_NULL_HANDLE;
++                DAWN_TRY(CheckVkSuccess(
++                    fn.CreateViSurfaceNN(vkInstance, &createInfo, nullptr, &*vkSurface),
++                    "CreateViSurfaceNN"));
++                return vkSurface;
++            }
++            break;
++        }
++#endif  // DAWN_PLATFORM_IS(HORIZON)
++
+ #if defined(DAWN_USE_WAYLAND)
+         case Surface::Type::WaylandSurface: {
+             if (info.HasExt(InstanceExt::WaylandSurface)) {
+diff --git a/src/dawn/native/vulkan/VulkanExtensions.cpp b/src/dawn/native/vulkan/VulkanExtensions.cpp
+index 548726690..51bed2b92 100644
+--- a/src/dawn/native/vulkan/VulkanExtensions.cpp
++++ b/src/dawn/native/vulkan/VulkanExtensions.cpp
+@@ -49,6 +49,7 @@ static constexpr std::array<InstanceExtInfo, kInstanceExtCount> sInstanceExtInfo
+     {InstanceExt::XcbSurface, "VK_KHR_xcb_surface"},
+     {InstanceExt::XlibSurface, "VK_KHR_xlib_surface"},
+     {InstanceExt::AndroidSurface, "VK_KHR_android_surface"},
++    {InstanceExt::ViSurface, "VK_NN_vi_surface"},
+ 
+     {InstanceExt::DebugUtils, "VK_EXT_debug_utils"},
+     {InstanceExt::ValidationFeatures, "VK_EXT_validation_features"},
+@@ -102,6 +103,7 @@ InstanceExtSet EnsureDependencies(const InstanceExtSet& advertisedExts) {
+             case InstanceExt::Win32Surface:
+             case InstanceExt::XcbSurface:
+             case InstanceExt::XlibSurface:
++            case InstanceExt::ViSurface:
+                 hasDependencies = HasDep(InstanceExt::Surface);
+                 break;
+ 
+diff --git a/src/dawn/native/vulkan/VulkanExtensions.h b/src/dawn/native/vulkan/VulkanExtensions.h
+index e0ea4da59..733957597 100644
+--- a/src/dawn/native/vulkan/VulkanExtensions.h
++++ b/src/dawn/native/vulkan/VulkanExtensions.h
+@@ -47,6 +47,7 @@ enum class InstanceExt : uint32_t {
+     XcbSurface,
+     XlibSurface,
+     AndroidSurface,
++    ViSurface,
+ 
+     // Others
+     DebugUtils,
+diff --git a/src/dawn/native/vulkan/VulkanFunctions.cpp b/src/dawn/native/vulkan/VulkanFunctions.cpp
+index 7dc1c51c9..c6277f414 100644
+--- a/src/dawn/native/vulkan/VulkanFunctions.cpp
++++ b/src/dawn/native/vulkan/VulkanFunctions.cpp
+@@ -92,10 +92,25 @@ MaybeError VulkanFunctions::LoadGlobalProcs(const DynamicLib& vulkanLib) {
+     if (!vulkanLib.GetProc(&GetInstanceProcAddr, "vkGetInstanceProcAddr")) {
+         return DAWN_INTERNAL_ERROR("Couldn't get vkGetInstanceProcAddr");
+     }
++    return LoadGlobalProcs(GetInstanceProcAddr);
++}
++
++MaybeError VulkanFunctions::LoadGlobalProcs(PFN_vkGetInstanceProcAddr getInstanceProcAddr) {
++    if (getInstanceProcAddr == nullptr) {
++        return DAWN_INTERNAL_ERROR("Couldn't get vkGetInstanceProcAddr");
++    }
++    GetInstanceProcAddr = getInstanceProcAddr;
+ 
+     GET_GLOBAL_PROC(CreateInstance);
+     GET_GLOBAL_PROC(EnumerateInstanceExtensionProperties);
+-    GET_GLOBAL_PROC(EnumerateInstanceLayerProperties);
++
++    // NVK's global (instance=NULL) vkGetInstanceProcAddr doesn't resolve this
++    // one on Switch, even though the spec lists it as always-available - so,
++    // like EnumerateInstanceVersion below, allow nullptr here too.
++    // GatherGlobalInfo() treats a null proc as "no layers" (correct: Switch
++    // has no Vulkan layers installed at all).
++    EnumerateInstanceLayerProperties = AsVkFn<PFN_vkEnumerateInstanceLayerProperties>(
++        GetInstanceProcAddr(nullptr, "vkEnumerateInstanceLayerProperties"));
+ 
+     // Is not available in Vulkan 1.0, so allow nullptr
+     EnumerateInstanceVersion = AsVkFn<PFN_vkEnumerateInstanceVersion>(
+@@ -207,6 +222,12 @@ MaybeError VulkanFunctions::LoadInstanceProcs(VkInstance instance,
+     }
+ #endif  // DAWN_PLATFORM_IS(ANDROID)
+ 
++#if DAWN_PLATFORM_IS(HORIZON)
++    if (globalInfo.HasExt(InstanceExt::ViSurface)) {
++        GET_INSTANCE_PROC(CreateViSurfaceNN);
++    }
++#endif  // DAWN_PLATFORM_IS(HORIZON)
++
+ #if defined(DAWN_USE_X11)
+     if (globalInfo.HasExt(InstanceExt::XlibSurface)) {
+         GET_INSTANCE_PROC(CreateXlibSurfaceKHR);
+diff --git a/src/dawn/native/vulkan/VulkanFunctions.h b/src/dawn/native/vulkan/VulkanFunctions.h
+index 847a14dab..3ff30d9f3 100644
+--- a/src/dawn/native/vulkan/VulkanFunctions.h
++++ b/src/dawn/native/vulkan/VulkanFunctions.h
+@@ -69,6 +69,9 @@ using VkFn = typename VkFnImpl<F>::type;
+ // and the vkGet*ProcAddress entry points.
+ struct VulkanFunctions {
+     MaybeError LoadGlobalProcs(const DynamicLib& vulkanLib);
++    // Horizon has no dlopen (see DynamicLib.cpp); NVK's static ICD entry point
++    // (vk_icdGetInstanceProcAddr) is loaded directly, skipping DynamicLib entirely.
++    MaybeError LoadGlobalProcs(PFN_vkGetInstanceProcAddr getInstanceProcAddr);
+     MaybeError LoadInstanceProcs(VkInstance instance, const VulkanGlobalInfo& globalInfo);
+     MaybeError LoadDeviceProcs(VkInstance instance,
+                                VkDevice device,
+@@ -176,6 +179,11 @@ struct VulkanFunctions {
+         GetPhysicalDeviceWin32PresentationSupportKHR = nullptr;
+ #endif  // DAWN_PLATFORM_IS(WINDOWS)
+ 
++#if DAWN_PLATFORM_IS(HORIZON)
++    // NN_vi_surface
++    VkFn<PFN_vkCreateViSurfaceNN> CreateViSurfaceNN = nullptr;
++#endif  // DAWN_PLATFORM_IS(HORIZON)
++
+ #if DAWN_PLATFORM_IS(ANDROID)
+     // KHR_android_surface
+     VkFn<PFN_vkCreateAndroidSurfaceKHR> CreateAndroidSurfaceKHR = nullptr;
+diff --git a/src/dawn/native/vulkan/VulkanInfo.cpp b/src/dawn/native/vulkan/VulkanInfo.cpp
+index 5ee21ed27..3e5393813 100644
+--- a/src/dawn/native/vulkan/VulkanInfo.cpp
++++ b/src/dawn/native/vulkan/VulkanInfo.cpp
+@@ -93,8 +93,11 @@ ResultOrError<VulkanGlobalInfo> GatherGlobalInfo(const VulkanFunctions& vkFuncti
+                     "Vulkan API version (%s) was not at least %s.",
+                     FormatAPIVersion(info.apiVersion), FormatAPIVersion(kRequiredVulkanVersion));
+ 
+-    // Gather the info about the instance layers
+-    {
++    // Gather the info about the instance layers. A null proc (see
++    // VulkanFunctions::LoadGlobalProcs) leaves info.layers empty/default,
++    // which is the correct answer on Switch anyway - no layers are ever
++    // installed there.
++    if (vkFunctions.EnumerateInstanceLayerProperties != nullptr) {
+         uint32_t count = 0;
+         VkResult result =
+             VkResult::WrapUnsafe(vkFunctions.EnumerateInstanceLayerProperties(&count, nullptr));
+diff --git a/src/dawn/utils/SystemHandle.cpp b/src/dawn/utils/SystemHandle.cpp
+index 4127e9125..28b41ef9d 100644
+--- a/src/dawn/utils/SystemHandle.cpp
++++ b/src/dawn/utils/SystemHandle.cpp
+@@ -36,6 +36,8 @@
+ #include "src/utils/windows_with_undefs.h"
+ #elif DAWN_PLATFORM_IS(FUCHSIA)
+ #include <zircon/syscalls.h>
++#elif DAWN_PLATFORM_IS(HORIZON)
++#include <switch.h>
+ #elif DAWN_PLATFORM_IS(POSIX)
+ #include <unistd.h>
+ #endif
+@@ -86,6 +88,27 @@ inline void CloseHandle(zx_handle_t handle) {
+     DAWN_CHECK(status == ZX_OK);
+ }
+ 
++#elif DAWN_PLATFORM_IS(HORIZON)
++
++// Horizon has no blanket handle duplication; Duplicate() is only reached by cross-API or
++// cross-process sharing, which a single-backend in-process game never does, so it fails fast.
++constexpr inline ::Handle kInvalidHandle = INVALID_HANDLE;
++
++inline bool IsHandleValid(::Handle handle) {
++    return handle != INVALID_HANDLE;
++}
++
++inline ::Handle DuplicateHandle(::Handle handle) {
++    (void)handle;
++    DAWN_UNREACHABLE();
++    return kInvalidHandle;
++}
++
++inline void CloseHandle(::Handle handle) {
++    Result rc = svcCloseHandle(handle);
++    DAWN_CHECK(R_SUCCEEDED(rc));
++}
++
+ #elif DAWN_PLATFORM_IS(POSIX)
+ 
+ constexpr inline int kInvalidHandle = -1;
+diff --git a/src/dawn/utils/SystemHandle.h b/src/dawn/utils/SystemHandle.h
+index 98d04fd55..1c1b5303e 100644
+--- a/src/dawn/utils/SystemHandle.h
++++ b/src/dawn/utils/SystemHandle.h
+@@ -42,7 +42,8 @@ class SystemHandle : public NonCopyable {
+     // Create an alias for the actual primitive handle type on a platform.
+ #if DAWN_PLATFORM_IS(WINDOWS)
+     using Handle = void*;
+-#elif DAWN_PLATFORM_IS(FUCHSIA)
++#elif DAWN_PLATFORM_IS(FUCHSIA) || DAWN_PLATFORM_IS(HORIZON)
++    // libnx kernel object Handle is a u32, same shape as Fuchsia's zx_handle_t.
+     using Handle = uint32_t;
+ #elif DAWN_PLATFORM_IS(POSIX)
+     using Handle = int;
+diff --git a/src/dawn/utils/SystemUtils.cpp b/src/dawn/utils/SystemUtils.cpp
+index 33a7bab5b..0338730be 100644
+--- a/src/dawn/utils/SystemUtils.cpp
++++ b/src/dawn/utils/SystemUtils.cpp
+@@ -31,6 +31,8 @@
+ 
+ #if DAWN_PLATFORM_IS(WINDOWS)
+ #include "src/utils/windows_with_undefs.h"
++#elif DAWN_PLATFORM_IS(HORIZON)
++#include <switch.h>
+ #elif DAWN_PLATFORM_IS(POSIX)
+ #include <unistd.h>
+ #else
+@@ -43,6 +45,10 @@ namespace dawn::utils {
+ void USleep(unsigned int usecs) {
+     Sleep(static_cast<DWORD>(usecs / 1000));
+ }
++#elif DAWN_PLATFORM_IS(HORIZON)
++void USleep(unsigned int usecs) {
++    svcSleepThread(static_cast<int64_t>(usecs) * 1000);
++}
+ #elif DAWN_PLATFORM_IS(POSIX)
+ void USleep(unsigned int usecs) {
+     usleep(usecs);
+diff --git a/src/utils/platform.h b/src/utils/platform.h
+index 4dd58a487..6143a0f3c 100644
+--- a/src/utils/platform.h
++++ b/src/utils/platform.h
+@@ -95,6 +95,14 @@
+ #define DAWN_PLATFORM_IS_POSIX 1
+ #include <emscripten/emscripten.h>
+ 
++#elif defined(__SWITCH__)
++// Nintendo Switch (Horizon OS / libnx). Not treated as POSIX: newlib/libnx
++// provides pthreads and a POSIX-ish libc subset, but no dlopen and no real
++// mmap (see wiicompiled/runtime/src/guest_flat_memory.cpp in this same
++// workspace for the mmap gap hit porting the game runtime itself) - letting
++// DAWN_PLATFORM_IS(POSIX) code paths run here would pull those in silently.
++#define DAWN_PLATFORM_IS_HORIZON 1
++
+ #else
+ #error "Unsupported platform."
+ #endif
+@@ -241,6 +249,9 @@ static_assert(sizeof(sizeof(char)) == 4, "Expect sizeof(size_t) == 4");
+ #if !defined(DAWN_PLATFORM_IS_EMSCRIPTEN)
+ #define DAWN_PLATFORM_IS_EMSCRIPTEN 0
+ #endif
++#if !defined(DAWN_PLATFORM_IS_HORIZON)
++#define DAWN_PLATFORM_IS_HORIZON 0
++#endif
+ 
+ #if !defined(DAWN_PLATFORM_IS_X86)
+ #define DAWN_PLATFORM_IS_X86 0
+diff --git a/switch_smoke_test/CMakeLists.txt b/switch_smoke_test/CMakeLists.txt
+new file mode 100644
+index 000000000..a7b5f51c1
+--- /dev/null
++++ b/switch_smoke_test/CMakeLists.txt
+@@ -0,0 +1,12 @@
++# dawn-nx demo: WebGPU on Nintendo Switch through Dawn's C++ API - device,
++# buffers, compute, render-to-texture with readback checks, and presenting to
++# the screen. Builds dawn-nx-demo.nro; the report goes to
++# sdmc:/switch/dawn-nx-demo.log.
++
++add_executable(dawn_nx_demo demo.cpp)
++target_compile_features(dawn_nx_demo PRIVATE cxx_std_20)
++target_link_libraries(dawn_nx_demo PRIVATE webgpu_dawn)
++dawn_switch_link_nvk(dawn_nx_demo)
++
++nx_generate_nacp(dawn-nx-demo.nacp NAME "dawn-nx demo" AUTHOR "nx-mod" VERSION "1.0.0")
++nx_create_nro(dawn_nx_demo OUTPUT dawn-nx-demo.nro NACP dawn-nx-demo.nacp)
+diff --git a/switch_smoke_test/NvkLink.cmake b/switch_smoke_test/NvkLink.cmake
+new file mode 100644
+index 000000000..91e97021a
+--- /dev/null
++++ b/switch_smoke_test/NvkLink.cmake
+@@ -0,0 +1,36 @@
++# dawn_switch_link_nvk(<target> [GL]): link a Switch executable against NVK, the
++# Vulkan driver Dawn runs on (built and installed into portlibs by nxvk). With
++# GL, also link nxvk's OpenGL package (EGL + Zink over NVK), which Dawn's
++# OpenGL ES and OpenGL backends use; install it with nxvk's `make install-gl`.
++#
++# libnvk.a (and libnvk_gl.a) must be whole-archived: Mesa's generated dispatch
++# and trampoline tables are only reached through runtime string lookup, so a
++# selective link silently drops them (the same recipe as nxvk.pc / nxvk-gl.pc).
++# nvk_switch_stubs.cpp fills the newlib gaps NVK needs.
++function(dawn_switch_link_nvk target)
++    cmake_parse_arguments(PARSE_ARGV 1 NVK "GL" "" "")
++    set(_lib "${DEVKITPRO}/portlibs/switch/lib")
++    if (NOT EXISTS "${_lib}/libnvk.a")
++        message(FATAL_ERROR "libnvk.a not found in ${_lib}: build and install nxvk first "
++                            "(see nxvk/switch/README.md)")
++    endif ()
++    set(_whole -lnvk)
++    if (NVK_GL)
++        if (NOT EXISTS "${_lib}/libnvk_gl.a")
++            message(FATAL_ERROR "libnvk_gl.a not found in ${_lib}: build and install nxvk's "
++                                "OpenGL package first (make gl && make install-gl)")
++        endif ()
++        set(_whole -lnvk_gl -lnvk)
++    endif ()
++    target_sources(${target} PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/nvk_switch_stubs.cpp")
++    if (NVK_GL)
++        # EGL/GLES headers live in portlibs, which is on the link path but not
++        # the include path.
++        target_include_directories(${target} PRIVATE "${DEVKITPRO}/portlibs/switch/include")
++    endif ()
++    target_link_libraries(${target} PRIVATE
++        -L${_lib}
++        -Wl,-u,vk_icdGetInstanceProcAddr
++        -Wl,--whole-archive ${_whole} -Wl,--no-whole-archive
++        -Wl,--start-group -lnvk_support -lz -Wl,--end-group)
++endfunction()
+diff --git a/switch_smoke_test/demo.cpp b/switch_smoke_test/demo.cpp
+new file mode 100644
+index 000000000..5f3cbce11
+--- /dev/null
++++ b/switch_smoke_test/demo.cpp
+@@ -0,0 +1,536 @@
++// dawn-nx demo: WebGPU on Nintendo Switch through Dawn's C++ API, end to end.
++//
++//   1. instance, a Vulkan adapter (NVK) and a device
++//   2. buffers: WriteBuffer, CopyBufferToBuffer, MapAsync readback
++//   3. compute: a WGSL shader over a storage buffer
++//   4. render to a texture: vertex and uniform buffers, a sampled texture and a
++//      sampler; the pixels are read back and checked
++//   5. present: a surface on the Switch's default window, 180 frames
++//
++// Every check is written to sdmc:/switch/dawn-nx-demo.log (and to nxlink when
++// one is listening). The screen flashes green (all passed) or red, Dawn is torn
++// down in order, and the report is shown on a text console until + is pressed.
++#include <switch.h>
++
++#include <webgpu/webgpu_cpp.h>
++
++#include <array>
++#include <cmath>
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++// Run as an application (full memory), with the whole heap available to NVK.
++extern "C" {
++u32 __nx_applet_type = AppletType_Application;
++size_t __nx_heap_size = 0;
++}
++
++namespace {
++
++FILE* g_log = nullptr;
++std::string g_report;   // Everything reported, shown on the console at the end
++int g_passed = 0;
++int g_failed = 0;
++int g_deviceErrors = 0;
++wgpu::Instance g_instance;
++
++void Report(const char* fmt, ...) {
++    char line[512];
++    va_list args;
++    va_start(args, fmt);
++    vsnprintf(line, sizeof(line), fmt, args);
++    va_end(args);
++    g_report += line;
++    if (g_log) {
++        fputs(line, g_log);
++        fflush(g_log);
++    }
++    fputs(line, stdout);
++    fflush(stdout);
++}
++
++void Check(const char* what, bool ok) {
++    (ok ? g_passed : g_failed)++;
++    Report("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
++}
++
++std::string Str(wgpu::StringView view) {
++    if (view.data == nullptr) {
++        return {};
++    }
++    return view.length == WGPU_STRLEN ? std::string(view.data) : std::string(view.data, view.length);
++}
++
++bool Wait(const wgpu::Future& future) {
++    return g_instance.WaitAny(future, 5'000'000'000ull) == wgpu::WaitStatus::Success;
++}
++
++bool ReadBack(const wgpu::Buffer& buffer, size_t size, void* out) {
++    wgpu::MapAsyncStatus status = wgpu::MapAsyncStatus::CallbackCancelled;
++    const wgpu::Future future = buffer.MapAsync(wgpu::MapMode::Read, 0, size, wgpu::CallbackMode::WaitAnyOnly,
++                                                [&status](wgpu::MapAsyncStatus s, wgpu::StringView) { status = s; });
++    if (!Wait(future) || status != wgpu::MapAsyncStatus::Success) {
++        return false;
++    }
++    std::memcpy(out, buffer.GetConstMappedRange(0, size), size);
++    buffer.Unmap();
++    return true;
++}
++
++wgpu::Buffer MakeBuffer(const wgpu::Device& device, uint64_t size, wgpu::BufferUsage usage) {
++    wgpu::BufferDescriptor desc;
++    desc.size = size;
++    desc.usage = usage;
++    return device.CreateBuffer(&desc);
++}
++
++wgpu::ShaderModule MakeShader(const wgpu::Device& device, const char* wgsl) {
++    wgpu::ShaderSourceWGSL source;
++    source.code = wgsl;
++    wgpu::ShaderModuleDescriptor desc;
++    desc.nextInChain = &source;
++    return device.CreateShaderModule(&desc);
++}
++
++void Submit(const wgpu::Device& device, const wgpu::CommandEncoder& encoder) {
++    const wgpu::CommandBuffer commands = encoder.Finish();
++    device.GetQueue().Submit(1, &commands);
++}
++
++// --- 1. instance, adapter, device ---------------------------------------------
++
++wgpu::Adapter RequestAdapter() {
++    wgpu::RequestAdapterOptions options;
++    options.backendType = wgpu::BackendType::Vulkan;
++    wgpu::Adapter result;
++    const wgpu::Future future = g_instance.RequestAdapter(
++        &options, wgpu::CallbackMode::WaitAnyOnly,
++        [&result](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter, wgpu::StringView message) {
++            if (status == wgpu::RequestAdapterStatus::Success) {
++                result = std::move(adapter);
++            } else {
++                Report("  adapter request failed: %s\n", Str(message).c_str());
++            }
++        });
++    return Wait(future) ? result : nullptr;
++}
++
++wgpu::Device RequestDevice(const wgpu::Adapter& adapter) {
++    wgpu::DeviceDescriptor desc;
++    desc.SetUncapturedErrorCallback([](const wgpu::Device&, wgpu::ErrorType type, wgpu::StringView message) {
++        g_deviceErrors++;
++        Report("  device error %d: %s\n", static_cast<int>(type), Str(message).c_str());
++    });
++    desc.SetDeviceLostCallback(wgpu::CallbackMode::AllowSpontaneous,
++                               [](const wgpu::Device&, wgpu::DeviceLostReason reason, wgpu::StringView message) {
++                                   if (reason != wgpu::DeviceLostReason::Destroyed) {
++                                       Report("  device lost: %s\n", Str(message).c_str());
++                                   }
++                               });
++    wgpu::Device result;
++    const wgpu::Future future = adapter.RequestDevice(
++        &desc, wgpu::CallbackMode::WaitAnyOnly,
++        [&result](wgpu::RequestDeviceStatus status, wgpu::Device device, wgpu::StringView message) {
++            if (status == wgpu::RequestDeviceStatus::Success) {
++                result = std::move(device);
++            } else {
++                Report("  device request failed: %s\n", Str(message).c_str());
++            }
++        });
++    return Wait(future) ? result : nullptr;
++}
++
++// --- 2. buffers ---------------------------------------------------------------
++
++void TestBuffers(const wgpu::Device& device) {
++    std::array<uint32_t, 256> data;
++    for (uint32_t i = 0; i < data.size(); i++) {
++        data[i] = i * 2654435761u;
++    }
++    const uint64_t bytes = sizeof(data);
++    const wgpu::Buffer source = MakeBuffer(device, bytes, wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst);
++    const wgpu::Buffer readback = MakeBuffer(device, bytes, wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst);
++    device.GetQueue().WriteBuffer(source, 0, data.data(), bytes);
++
++    const wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
++    encoder.CopyBufferToBuffer(source, 0, readback, 0, bytes);
++    Submit(device, encoder);
++
++    std::array<uint32_t, 256> out{};
++    Check("buffer upload, GPU copy and readback", ReadBack(readback, bytes, out.data()) && out == data);
++}
++
++// --- 3. compute ---------------------------------------------------------------
++
++constexpr const char* kComputeShader = R"(
++@group(0) @binding(0) var<storage, read_write> values: array<u32>;
++
++@compute @workgroup_size(64)
++fn main(@builtin(global_invocation_id) id: vec3u) {
++    if (id.x < arrayLength(&values)) {
++        values[id.x] = values[id.x] * values[id.x] + 7u;
++    }
++}
++)";
++
++void TestCompute(const wgpu::Device& device) {
++    constexpr uint32_t kCount = 4096;
++    std::array<uint32_t, kCount> data;
++    for (uint32_t i = 0; i < kCount; i++) {
++        data[i] = i;
++    }
++    const uint64_t bytes = sizeof(data);
++    const wgpu::Buffer values = MakeBuffer(
++        device, bytes, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst);
++    const wgpu::Buffer readback = MakeBuffer(device, bytes, wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst);
++    device.GetQueue().WriteBuffer(values, 0, data.data(), bytes);
++
++    wgpu::ComputePipelineDescriptor pipelineDesc;
++    pipelineDesc.compute.module = MakeShader(device, kComputeShader);
++    pipelineDesc.compute.entryPoint = "main";
++    const wgpu::ComputePipeline pipeline = device.CreateComputePipeline(&pipelineDesc);
++
++    wgpu::BindGroupEntry entry;
++    entry.binding = 0;
++    entry.buffer = values;
++    entry.size = bytes;
++    wgpu::BindGroupDescriptor groupDesc;
++    groupDesc.layout = pipeline.GetBindGroupLayout(0);
++    groupDesc.entryCount = 1;
++    groupDesc.entries = &entry;
++    const wgpu::BindGroup group = device.CreateBindGroup(&groupDesc);
++
++    const wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
++    const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
++    pass.SetPipeline(pipeline);
++    pass.SetBindGroup(0, group);
++    pass.DispatchWorkgroups((kCount + 63) / 64);
++    pass.End();
++    encoder.CopyBufferToBuffer(values, 0, readback, 0, bytes);
++    Submit(device, encoder);
++
++    std::array<uint32_t, kCount> out{};
++    bool ok = ReadBack(readback, bytes, out.data());
++    for (uint32_t i = 0; ok && i < kCount; i++) {
++        ok = out[i] == i * i + 7u;
++    }
++    Check("compute shader over 4096 values", ok);
++}
++
++// --- 4. render to a texture -----------------------------------------------------
++
++constexpr const char* kRenderShader = R"(
++struct Uniforms { tint: vec4f }
++@group(0) @binding(0) var<uniform> u: Uniforms;
++@group(0) @binding(1) var tex: texture_2d<f32>;
++@group(0) @binding(2) var samp: sampler;
++
++struct VertexOut {
++    @builtin(position) position: vec4f,
++    @location(0) uv: vec2f,
++}
++
++@vertex
++fn vs(@location(0) position: vec2f, @location(1) uv: vec2f) -> VertexOut {
++    var out: VertexOut;
++    out.position = vec4f(position, 0.0, 1.0);
++    out.uv = uv;
++    return out;
++}
++
++@fragment
++fn fs(in: VertexOut) -> @location(0) vec4f {
++    return textureSample(tex, samp, in.uv) * u.tint;
++}
++)";
++
++bool Near(uint8_t actual, int expected) {
++    return std::abs(static_cast<int>(actual) - expected) <= 2;
++}
++
++void TestRender(const wgpu::Device& device) {
++    constexpr uint32_t kSize = 64;  // 64 px * 4 bytes = 256, the required row alignment
++    const wgpu::Queue queue = device.GetQueue();
++
++    // A triangle covering the centre but not the top-left corner.
++    const float vertices[] = {
++        // x, y, u, v
++        -0.9f, -0.9f, 0.0f, 1.0f,
++        0.9f, -0.9f, 1.0f, 1.0f,
++        0.0f, 0.9f, 0.5f, 0.0f,
++    };
++    const wgpu::Buffer vertexBuffer =
++        MakeBuffer(device, sizeof(vertices), wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst);
++    queue.WriteBuffer(vertexBuffer, 0, vertices, sizeof(vertices));
++
++    const float tint[4] = {1.0f, 0.5f, 1.0f, 1.0f};
++    const wgpu::Buffer uniformBuffer =
++        MakeBuffer(device, sizeof(tint), wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst);
++    queue.WriteBuffer(uniformBuffer, 0, tint, sizeof(tint));
++
++    // A 2x2 texture, every texel (200, 100, 50).
++    wgpu::TextureDescriptor texDesc;
++    texDesc.size = {2, 2, 1};
++    texDesc.format = wgpu::TextureFormat::RGBA8Unorm;
++    texDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
++    const wgpu::Texture texture = device.CreateTexture(&texDesc);
++    const uint8_t texels[16] = {200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255};
++    wgpu::TexelCopyTextureInfo texDst;
++    texDst.texture = texture;
++    wgpu::TexelCopyBufferLayout texLayout;
++    texLayout.bytesPerRow = 8;
++    texLayout.rowsPerImage = 2;
++    const wgpu::Extent3D texExtent = {2, 2, 1};
++    queue.WriteTexture(&texDst, texels, sizeof(texels), &texLayout, &texExtent);
++    const wgpu::Sampler sampler = device.CreateSampler();
++
++    wgpu::TextureDescriptor targetDesc;
++    targetDesc.size = {kSize, kSize, 1};
++    targetDesc.format = wgpu::TextureFormat::RGBA8Unorm;
++    targetDesc.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
++    const wgpu::Texture target = device.CreateTexture(&targetDesc);
++
++    const wgpu::ShaderModule shader = MakeShader(device, kRenderShader);
++    std::array<wgpu::VertexAttribute, 2> attributes;
++    attributes[0].format = wgpu::VertexFormat::Float32x2;
++    attributes[0].offset = 0;
++    attributes[0].shaderLocation = 0;
++    attributes[1].format = wgpu::VertexFormat::Float32x2;
++    attributes[1].offset = 8;
++    attributes[1].shaderLocation = 1;
++    wgpu::VertexBufferLayout vertexLayout;
++    vertexLayout.arrayStride = 16;
++    vertexLayout.attributeCount = attributes.size();
++    vertexLayout.attributes = attributes.data();
++    wgpu::ColorTargetState colorTarget;
++    colorTarget.format = wgpu::TextureFormat::RGBA8Unorm;
++    wgpu::FragmentState fragment;
++    fragment.module = shader;
++    fragment.entryPoint = "fs";
++    fragment.targetCount = 1;
++    fragment.targets = &colorTarget;
++    wgpu::RenderPipelineDescriptor pipelineDesc;
++    pipelineDesc.vertex.module = shader;
++    pipelineDesc.vertex.entryPoint = "vs";
++    pipelineDesc.vertex.bufferCount = 1;
++    pipelineDesc.vertex.buffers = &vertexLayout;
++    pipelineDesc.fragment = &fragment;
++    const wgpu::RenderPipeline pipeline = device.CreateRenderPipeline(&pipelineDesc);
++
++    std::array<wgpu::BindGroupEntry, 3> entries;
++    entries[0].binding = 0;
++    entries[0].buffer = uniformBuffer;
++    entries[0].size = sizeof(tint);
++    entries[1].binding = 1;
++    entries[1].textureView = texture.CreateView();
++    entries[2].binding = 2;
++    entries[2].sampler = sampler;
++    wgpu::BindGroupDescriptor groupDesc;
++    groupDesc.layout = pipeline.GetBindGroupLayout(0);
++    groupDesc.entryCount = entries.size();
++    groupDesc.entries = entries.data();
++    const wgpu::BindGroup group = device.CreateBindGroup(&groupDesc);
++
++    wgpu::RenderPassColorAttachment attachment;
++    attachment.view = target.CreateView();
++    attachment.loadOp = wgpu::LoadOp::Clear;
++    attachment.storeOp = wgpu::StoreOp::Store;
++    attachment.clearValue = {0.0, 0.0, 1.0, 1.0};
++    wgpu::RenderPassDescriptor passDesc;
++    passDesc.colorAttachmentCount = 1;
++    passDesc.colorAttachments = &attachment;
++
++    const uint64_t bytes = kSize * kSize * 4;
++    const wgpu::Buffer readback = MakeBuffer(device, bytes, wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst);
++
++    const wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
++    const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDesc);
++    pass.SetPipeline(pipeline);
++    pass.SetBindGroup(0, group);
++    pass.SetVertexBuffer(0, vertexBuffer);
++    pass.Draw(3);
++    pass.End();
++    wgpu::TexelCopyTextureInfo copySrc;
++    copySrc.texture = target;
++    wgpu::TexelCopyBufferInfo copyDst;
++    copyDst.buffer = readback;
++    copyDst.layout.bytesPerRow = kSize * 4;
++    copyDst.layout.rowsPerImage = kSize;
++    const wgpu::Extent3D copyExtent = {kSize, kSize, 1};
++    encoder.CopyTextureToBuffer(&copySrc, &copyDst, &copyExtent);
++    Submit(device, encoder);
++
++    std::array<uint8_t, kSize * kSize * 4> pixels{};
++    const bool read = ReadBack(readback, bytes, pixels.data());
++    const uint8_t* centre = &pixels[((kSize / 2) * kSize + kSize / 2) * 4];
++    const uint8_t* corner = &pixels[0];
++    Report("         centre (%u, %u, %u, %u), corner (%u, %u, %u, %u)\n", centre[0], centre[1], centre[2], centre[3],
++           corner[0], corner[1], corner[2], corner[3]);
++    // texel * tint: (200, 100 * 0.5, 50)
++    Check("render: vertex + uniform buffers, sampled texture",
++          read && Near(centre[0], 200) && Near(centre[1], 50) && Near(centre[2], 50) && centre[3] == 255);
++    Check("render: clear colour outside the triangle",
++          read && corner[0] == 0 && corner[1] == 0 && corner[2] == 255 && corner[3] == 255);
++}
++
++// --- 5. present -------------------------------------------------------------------
++
++void ClearFrame(const wgpu::Device& device, const wgpu::Texture& texture, const wgpu::Color& color) {
++    wgpu::RenderPassColorAttachment attachment;
++    attachment.view = texture.CreateView();
++    attachment.loadOp = wgpu::LoadOp::Clear;
++    attachment.storeOp = wgpu::StoreOp::Store;
++    attachment.clearValue = color;
++    wgpu::RenderPassDescriptor passDesc;
++    passDesc.colorAttachmentCount = 1;
++    passDesc.colorAttachments = &attachment;
++    const wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
++    encoder.BeginRenderPass(&passDesc).End();
++    Submit(device, encoder);
++}
++
++bool PresentFrame(const wgpu::Device& device, const wgpu::Surface& surface, const wgpu::Color& color) {
++    wgpu::SurfaceTexture frame;
++    surface.GetCurrentTexture(&frame);
++    if (frame.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal &&
++        frame.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
++        return false;
++    }
++    ClearFrame(device, frame.texture, color);
++    return surface.Present() == wgpu::Status::Success;
++}
++
++wgpu::Surface MakeSurface(const wgpu::Adapter& adapter, const wgpu::Device& device) {
++    wgpu::SurfaceSourceViNN source;
++    source.window = nwindowGetDefault();
++    wgpu::SurfaceDescriptor desc;
++    desc.nextInChain = &source;
++    const wgpu::Surface surface = g_instance.CreateSurface(&desc);
++    if (!surface) {
++        return nullptr;
++    }
++    wgpu::SurfaceCapabilities caps;
++    if (surface.GetCapabilities(adapter, &caps) != wgpu::Status::Success || caps.formatCount == 0) {
++        return nullptr;
++    }
++    wgpu::SurfaceConfiguration config;
++    config.device = device;
++    config.format = caps.formats[0];
++    config.usage = wgpu::TextureUsage::RenderAttachment;
++    config.width = 1280;
++    config.height = 720;
++    config.presentMode = wgpu::PresentMode::Fifo;
++    surface.Configure(&config);
++    Report("         surface format %d, 1280x720, FIFO\n", static_cast<int>(config.format));
++    return surface;
++}
++
++void TestPresent(const wgpu::Surface& surface, const wgpu::Device& device) {
++    constexpr int kFrames = 180;
++    int presented = 0;
++    const u64 start = armGetSystemTick();
++    for (int frame = 0; frame < kFrames && appletMainLoop(); frame++) {
++        const double t = frame / 60.0;
++        const wgpu::Color color = {0.5 + 0.5 * std::sin(t * 2.0), 0.5 + 0.5 * std::sin(t * 2.0 + 2.1),
++                                   0.5 + 0.5 * std::sin(t * 2.0 + 4.2), 1.0};
++        presented += PresentFrame(device, surface, color) ? 1 : 0;
++    }
++    const double seconds = armTicksToNs(armGetSystemTick() - start) / 1e9;
++    Report("         %d/%d frames in %.2f s (%.1f fps)\n", presented, kFrames, seconds, presented / seconds);
++    Check("present 180 frames to the screen", presented == kFrames);
++}
++
++}  // namespace
++
++int main(int, char**) {
++    // NVK is experimental on Switch and reports no devices unless asked to.
++    setenv("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 1);
++    socketInitializeDefault();
++    nxlinkStdio();
++    g_log = fopen("sdmc:/switch/dawn-nx-demo.log", "w");
++    Report("dawn-nx demo\n\n");
++
++    const wgpu::InstanceFeatureName features[] = {wgpu::InstanceFeatureName::TimedWaitAny};
++    wgpu::InstanceDescriptor instanceDesc;
++    instanceDesc.requiredFeatureCount = 1;
++    instanceDesc.requiredFeatures = features;
++    g_instance = wgpu::CreateInstance(&instanceDesc);
++    Check("create instance", g_instance != nullptr);
++
++    wgpu::Adapter adapter = g_instance ? RequestAdapter() : nullptr;
++    Check("Vulkan adapter (NVK)", adapter != nullptr);
++    if (adapter) {
++        wgpu::AdapterInfo info;
++        adapter.GetInfo(&info);
++        Report("         %s, %s\n", Str(info.device).c_str(), Str(info.description).c_str());
++    }
++    wgpu::Device device = adapter ? RequestDevice(adapter) : nullptr;
++    Check("device", device != nullptr);
++
++    wgpu::Surface surface;
++    if (device) {
++        TestBuffers(device);
++        TestCompute(device);
++        TestRender(device);
++        surface = MakeSurface(adapter, device);
++        Check("surface on the default window", surface != nullptr);
++        if (surface) {
++            TestPresent(surface, device);
++        }
++        Check("no device errors", g_deviceErrors == 0);
++    }
++
++    Report("\n%d passed, %d failed.\n", g_passed, g_failed);
++
++    // Two seconds of green (all passed) or red on the GPU surface.
++    const wgpu::Color result = g_failed == 0 ? wgpu::Color{0.0, 0.6, 0.0, 1.0} : wgpu::Color{0.7, 0.0, 0.0, 1.0};
++    for (int frame = 0; surface && frame < 120 && appletMainLoop(); frame++) {
++        PresentFrame(device, surface, result);
++    }
++
++    // Tear down in dependency order, logging each step, so a hang names itself.
++    Report("\nshutting down: surface");
++    if (surface) {
++        surface.Unconfigure();
++        surface = nullptr;
++    }
++    Report(", device");
++    if (device) {
++        device.Destroy();
++        g_instance.ProcessEvents();
++        device = nullptr;
++    }
++    Report(", adapter");
++    adapter = nullptr;
++    Report(", instance");
++    g_instance = nullptr;
++    Report(" - done.\n");
++
++    // The window is free again (the swapchain released it): show the report
++    // on a text console.
++    if (g_log) {
++        fclose(g_log);
++        g_log = nullptr;
++    }
++    consoleInit(nullptr);
++    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
++    PadState pad;
++    padInitializeDefault(&pad);
++    std::fputs(g_report.c_str(), stdout);
++    std::printf("\nFinished. Report saved to sdmc:/switch/dawn-nx-demo.log\nPress + to exit.\n");
++    while (appletMainLoop()) {
++        padUpdate(&pad);
++        if (padGetButtonsDown(&pad) & HidNpadButton_Plus) {
++            break;
++        }
++        consoleUpdate(nullptr);
++    }
++    consoleExit(nullptr);
++
++    socketExit();
++    return 0;
++}
+diff --git a/switch_smoke_test/nvk_switch_stubs.cpp b/switch_smoke_test/nvk_switch_stubs.cpp
+new file mode 100644
+index 000000000..729991cc9
+--- /dev/null
++++ b/switch_smoke_test/nvk_switch_stubs.cpp
+@@ -0,0 +1,166 @@
++// libnvk.a / libnvk_support.a (Mesa util code) reference a handful of POSIX
++// APIs devkitA64's newlib doesn't implement, plus expat (XML) for Mesa's
++// driconf per-app workaround config, which we don't ship on Switch. Most of
++// this is unreachable from the actual Vulkan instance/device path this smoke
++// test exercises - it lives in optional disk-cache/driconf machinery - so a
++// safe "not available" stub is fine. sysconf() is the one exception:
++// nvk_physical_device.c calls sysconf(_SC_PHYS_PAGES)/_SC_PAGESIZE to size
++// its memory heaps and hard-fails VK_ERROR_INITIALIZATION_FAILED if that
++// comes back negative (see switch-port-notes.md), so it needs a real answer.
++
++#include <cerrno>
++#include <cstdlib>
++#include <cstring>
++
++#include <csignal>
++#include <dirent.h>
++#include <malloc.h>
++#include <pwd.h>
++#include <regex.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <switch.h>
++
++extern "C" {
++
++// NAK's Rust code backs its RNG with this; svc-backed CSRNG makes it real
++// rather than a stub (matches nxvk's own nvk_compat.c).
++ssize_t getrandom(void* buf, size_t buflen, unsigned int flags) {
++    (void)flags;
++    randomGet(buf, buflen);
++    return static_cast<ssize_t>(buflen);
++}
++
++int posix_memalign(void** memptr, size_t alignment, size_t size) {
++    if (alignment % sizeof(void*) != 0 || (alignment & (alignment - 1)) != 0) {
++        return EINVAL;
++    }
++    void* p = memalign(alignment, size);
++    if (!p) {
++        return ENOMEM;
++    }
++    *memptr = p;
++    return 0;
++}
++
++long sysconf(int name) {
++    switch (name) {
++    case _SC_PAGESIZE: // == _SC_PAGE_SIZE
++        return 0x1000;
++    case _SC_PHYS_PAGES: {
++        u64 totalMemory = 0;
++        if (R_FAILED(svcGetInfo(&totalMemory, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0))) {
++            return -1;
++        }
++        return static_cast<long>(totalMemory / 0x1000);
++    }
++    case _SC_NPROCESSORS_ONLN:
++    case _SC_NPROCESSORS_CONF:
++        // Horizon gives an application three cores (the fourth is reserved for
++        // the system). Returning -1 here made std::thread::hardware_concurrency()
++        // report 0, and every worker pool sized from it collapsed to a single
++        // thread - including the shader compiler's.
++        return 3;
++    default:
++        return -1;
++    }
++}
++
++uid_t geteuid() { return 0; }
++uid_t getuid() { return 0; }
++gid_t getegid() { return 0; }
++gid_t getgid() { return 0; }
++
++int getpwuid_r(uid_t uid, struct passwd* pwd, char* buf, size_t buflen, struct passwd** result) {
++    (void)uid; (void)pwd; (void)buf; (void)buflen;
++    *result = nullptr;
++    return 0;
++}
++
++int flock(int fd, int operation) {
++    // Single-process on Switch: no real contention, so pretend every lock succeeds.
++    (void)fd; (void)operation;
++    return 0;
++}
++
++int dirfd(DIR* dirp) {
++    (void)dirp;
++    errno = ENOSYS;
++    return -1;
++}
++
++int fstatat(int fd, const char* path, struct stat* buf, int flag) {
++    (void)fd; (void)path; (void)buf; (void)flag;
++    errno = ENOSYS;
++    return -1;
++}
++
++int regcomp(regex_t* preg, const char* pattern, int cflags) {
++    // Reports "compiled fine, matches nothing" rather than "invalid pattern" -
++    // matches nxvk's own nvk_compat.c, which callers (driconf app-name
++    // matching, unreachable here anyway) are written to tolerate.
++    (void)pattern; (void)cflags;
++    if (preg) preg->re_nsub = 0;
++    return 0;
++}
++
++int regexec(const regex_t* preg, const char* string, size_t nmatch, regmatch_t* pmatch, int eflags) {
++    (void)preg; (void)string; (void)nmatch; (void)pmatch; (void)eflags;
++    return REG_NOMATCH;
++}
++
++void regfree(regex_t* preg) { (void)preg; }
++
++int pthread_sigmask(int how, const sigset_t* set, sigset_t* oldset) {
++    (void)how; (void)set;
++    if (oldset) {
++        sigemptyset(oldset);
++    }
++    return 0;
++}
++
++// --- expat (driconf XML parsing) ---
++//
++// nvk_CreateInstance unconditionally calls into Mesa's driconf loader
++// (nvk_parse_dri_options -> driParseConfigFiles -> parseOneConfigFile),
++// which does NOT null-check the parser handle - a null XML_ParserCreate
++// return crashed inside Mesa itself (see the "raw vk probe" investigation
++// in switch-port-notes.md). Since we don't ship a driconf.xml on Switch and
++// don't need real XML parsing, hand back a real (trivial) allocation so
++// every other call has a valid, dereferenceable-but-content-irrelevant
++// pointer, and report success so Mesa's happy path completes.
++
++void* XML_ParserCreate(const void* encoding) {
++    (void)encoding;
++    return std::malloc(1);
++}
++void XML_SetElementHandler(void* parser, void* start, void* end) { (void)parser; (void)start; (void)end; }
++void XML_SetUserData(void* parser, void* userData) { (void)parser; (void)userData; }
++int XML_ParseBuffer(void* parser, int len, int isFinal) {
++    (void)parser; (void)len; (void)isFinal;
++    return 1; // XML_STATUS_OK
++}
++void* XML_GetBuffer(void* parser, int len) {
++    (void)parser;
++    return len > 0 ? std::malloc(static_cast<size_t>(len)) : nullptr;
++}
++void XML_ParserFree(void* parser) { std::free(parser); }
++int XML_GetErrorCode(void* parser) { (void)parser; return 0; }
++const char* XML_ErrorString(int code) { (void)code; return "no error"; }
++
++// newlib has no pipes or ownership changes on Horizon; callers only need the
++// symbols to exist and to see a normal "unsupported" failure.
++int pipe(int fds[2]) { (void)fds; errno = ENOSYS; return -1; }
++int fchown(int fd, uid_t owner, gid_t group) { (void)fd; (void)owner; (void)group; errno = ENOSYS; return -1; }
++
++} // extern "C"
++
++// NVK refuses to enumerate any device unless this is set before the first
++// Vulkan call (see the smoke test's README-derived note). Setting it in a
++// constructor makes every binary that links NVK safe without each `main`
++// having to remember.
++__attribute__((constructor)) static void NvkAllowExperimentalDriver() {
++    setenv("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 1);
++}
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index 8ff1eb05f..d52ded678 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -173,7 +173,11 @@ if (DAWN_BUILD_PROTOBUF AND NOT TARGET libprotobuf-mutator)
+     include("libprotobuf-mutator/BUILD.cmake")
+ endif()
+ 
+-if (NOT TARGET renderdoc-api)
++# RenderDoc is a desktop-only GPU frame-capture/debugging tool - its vendored
++# renderdoc_app.h has no Switch support at all (#error "Unknown platform" for
++# anything it doesn't recognize) and never will, so this is unconditional
++# everywhere except here rather than trying to patch vendored third-party code.
++if (NOT TARGET renderdoc-api AND NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+     add_library(RenderDocApi INTERFACE)
+     target_include_directories(RenderDocApi INTERFACE "renderdoc")
+     target_compile_definitions(RenderDocApi INTERFACE "DAWN_ENABLE_RENDERDOC")

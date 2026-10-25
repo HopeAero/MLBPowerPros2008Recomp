@@ -31,4 +31,8 @@ RUN curl -sSL -o /tmp/sdl.tar.gz "https://github.com/devkitPro/SDL/archive/${SDL
     && cmake --build /tmp/sdl/build && cmake --install /tmp/sdl/build \
     && rm -rf /tmp/sdl /tmp/sdl.tar.gz
 
+# Horizon has no dynamic loader; Dawn's CMake still links -ldl for its (unused here) dlopen path, as
+# nxvk's own build environment does, so an empty libdl.a satisfies it.
+RUN /opt/devkitpro/devkitA64/bin/aarch64-none-elf-ar rcs /opt/devkitpro/portlibs/switch/lib/libdl.a
+
 WORKDIR /work

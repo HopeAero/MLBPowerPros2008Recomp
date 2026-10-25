@@ -19,4 +19,7 @@ if [[ $(docker image inspect "$image" --format '{{index .Config.Labels "mlb.dock
     docker build --label "mlb.dockerfile=$stamp" -t "$image" -f "$dockerfile" "$root/tools/switch" >&2
 fi
 # Git Bash on Windows rewrites /work-style paths; MSYS_NO_PATHCONV keeps them for the container.
-MSYS_NO_PATHCONV=1 docker run --rm -v "$root:/work" -w /work "$image" "$@"
+# Big trees (Dawn's checkout, build directories) live in the mlb-switch-cache volume at /cache: a
+# Windows folder mounted into the container is slow for hundreds of thousands of files. Results
+# (NROs, patches, logs) are copied to /work/local/switch.
+MSYS_NO_PATHCONV=1 docker run --rm -v "$root:/work" -v mlb-switch-cache:/cache -w /work "$image" "$@"

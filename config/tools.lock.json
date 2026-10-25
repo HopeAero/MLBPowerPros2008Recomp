@@ -37,5 +37,14 @@
     "branch": "switch-sdl-3.4",
     "commit": "c329016c0e338ab4397ad930f83330c9fe058348",
     "license": "Zlib"
+  },
+  "dawn_switch": {
+    "dawn": "13abc3bc8ea2d3c2050f9e77a12d012108ceee24",
+    "dawn_note": "aurora's AURORA_DAWN_VERSION v20260603.191052 (encounter/dawn-build)",
+    "port_repository": "https://github.com/nx-mod/dawn-nx",
+    "port_base": "aa02747dfae033881f4334ad7e2b04a5e06bc492",
+    "port_head": "173c6191adb50ce081d370ab8be252f4af67758d",
+    "patch": "tools/switch/dawn/dawn-horizon.patch",
+    "license": "BSD-3-Clause"
   }
 }
