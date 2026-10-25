@@ -1,5 +1,68 @@
+diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
+index e2e68c5..bc80c3c 100644
+--- a/aurora-main/lib/aurora.cpp
++++ b/aurora-main/lib/aurora.cpp
+@@ -915,7 +915,9 @@ void dump_presentation_image(const PresentationJob& job) {
+     return std::pair<uint32_t, std::string>{static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), colon + 1};
+   }();
+   static uint32_t presents = 0;
+-  if (request.second.empty() || ++presents != request.first || !job.image) return;
++  if (request.second.empty()) return;
++  if (++presents % 30 == 0) Log.info("Present tick {}", presents);
++  if (presents != request.first || !job.image) return;
+   const auto& source = job.image->texture;
+   const uint32_t width = source.size.width, height = source.size.height;
+   const uint32_t rowBytes = (width * 4 + 255) & ~255u;
+diff --git a/aurora-main/lib/dawn/BackendBinding.cpp b/aurora-main/lib/dawn/BackendBinding.cpp
+index bb8fba4..a0ca690 100644
+--- a/aurora-main/lib/dawn/BackendBinding.cpp
++++ b/aurora-main/lib/dawn/BackendBinding.cpp
+@@ -38,6 +38,12 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
+     desc->window = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+     return std::move(desc);
+   }
++  if (SDL_strcmp(driver, "offscreen") == 0) {
++    std::shared_ptr<wgpu::SurfaceSourceWaylandSurface> desc = std::make_shared<wgpu::SurfaceSourceWaylandSurface>();
++    desc->display = reinterpret_cast<void*>(1);
++    desc->surface = reinterpret_cast<void*>(1);
++    return std::move(desc);
++  }
+ #endif
+   return nullptr;
+ #endif
+diff --git a/aurora-main/lib/input.cpp b/aurora-main/lib/input.cpp
+index 96a9c1d..84d9632 100644
+--- a/aurora-main/lib/input.cpp
++++ b/aurora-main/lib/input.cpp
+@@ -538,8 +538,10 @@ void persist_controller_for_player(uint32_t player, const GameController* contro
+ void initialize() noexcept {
+   /* Make sure we initialize everything input related now, this will automatically add all of the connected controllers
+    * as expected */
+-  ASSERT(SDL_Init(SDL_INIT_HAPTIC | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD), "Failed to initialize SDL subsystems: {}",
+-         SDL_GetError());
++  if (!SDL_Init(SDL_INIT_HAPTIC | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
++    Log.warn("Haptics unavailable ({}); controllers without rumble", SDL_GetError());
++    ASSERT(SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD), "Failed to initialize SDL subsystems: {}", SDL_GetError());
++  }
+ }
+ 
+ struct MouseScrollStatus {
+diff --git a/aurora-main/lib/webgpu/gpu.cpp b/aurora-main/lib/webgpu/gpu.cpp
+index a2b8e90..e1fbdff 100644
+--- a/aurora-main/lib/webgpu/gpu.cpp
++++ b/aurora-main/lib/webgpu/gpu.cpp
+@@ -843,7 +843,8 @@ bool initialize(AuroraBackend auroraBackend) {
+       .surfaceConfiguration =
+           wgpu::SurfaceConfiguration{
+               .format = surfaceFormat,
+-              .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
++              .usage = (wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc) &
++                       g_surfaceCapabilities.usages,
+               .width = size.native_fb_width,
+               .height = size.native_fb_height,
+               .presentMode = presentMode,
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index 3735e33..cd74a75 100644
+index 3735e33..0063653 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
 @@ -37,6 +37,9 @@ elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|arm
@@ -12,7 +75,7 @@ index 3735e33..cd74a75 100644
  else()
      message(FATAL_ERROR
          "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS x86_64/arm64")
-@@ -46,6 +49,12 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+@@ -46,6 +49,16 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
      message(FATAL_ERROR "WiiCompiled only supports Release builds")
  endif()
  
@@ -20,12 +83,16 @@ index 3735e33..cd74a75 100644
 +    # Plain char is unsigned on Linux aarch64; the translated code and the runtime were written for
 +    # (and tested on) targets where it is signed. Directory-wide, so aurora and the shards get it.
 +    add_compile_options(-fsigned-char)
++    option(MKW_AARCH64_4K_PAGES "Assume 4 KiB host pages (the Switch, phones, most distributions)" ON)
++    if(MKW_AARCH64_4K_PAGES)
++        add_compile_definitions(MKW_AARCH64_4K_PAGES)
++    endif()
 +endif()
 +
  option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
  option(MKW_BUILD_PSQ_TESTS "Build focused PSQ ISA tests" OFF)
  
-@@ -379,6 +388,11 @@ if(MKW_BUILD_PSQ_TESTS)
+@@ -379,6 +392,11 @@ if(MKW_BUILD_PSQ_TESTS)
          -P "${CMAKE_CURRENT_LIST_DIR}/tests/psq_reserved_tests.cmake")
  endif()
  
@@ -50,6 +117,172 @@ index 58e64d0..251c83a 100644
  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
      set(MKW_BASELINE_ARCH_FLAG -mcpu=native)
  else()
+diff --git a/runtime/include/guest_flat_memory.h b/runtime/include/guest_flat_memory.h
+index 6c0bdd3..2514913 100644
+--- a/runtime/include/guest_flat_memory.h
++++ b/runtime/include/guest_flat_memory.h
+@@ -73,7 +73,7 @@ bool IsActive();
+ // fold this to a compile-time false: it appears in every flat access and must
+ // not become a hot-path load. Only AArch64, where the page size is a kernel
+ // configuration (4/16/64 KiB), has to probe it at runtime.
+-#if defined(_WIN32) || defined(__x86_64__)
++#if defined(_WIN32) || defined(__x86_64__) || defined(MKW_AARCH64_4K_PAGES)
+ #define MKW_GUEST_FLAT_FIXED_PAGE_SIZE 1
+ #endif
+ 
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index dd06545..3198082 100644
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -192,7 +192,7 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
+     static constexpr std::array<std::string_view, 2> values{"auto", "metal"};
+ // only vulkan for linux
+ #elif defined(__linux__)
+-    static constexpr std::array<std::string_view, 3> values{"auto", "vulkan", "opengles"};
++    static constexpr std::array<std::string_view, 4> values{"auto", "vulkan", "opengles", "null"};
+ #elif defined(_WIN32)
+     static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
+ #endif
+diff --git a/runtime/src/guest_flat_memory.cpp b/runtime/src/guest_flat_memory.cpp
+index 06d1898..98735aa 100644
+--- a/runtime/src/guest_flat_memory.cpp
++++ b/runtime/src/guest_flat_memory.cpp
+@@ -512,6 +512,12 @@ void Initialize(const std::vector<RegionRequest>& regions) {
+ 
+ #if !defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
+     g_requiresCheckedAccess = HostPageSize() > kGuestPageSize;
++#elif defined(MKW_AARCH64_4K_PAGES)
++    if (const long page = sysconf(_SC_PAGESIZE); page != 4096) {
++        throw std::runtime_error("This build assumes 4 KiB memory pages and this system uses " +
++                                 std::to_string(page) +
++                                 "-byte pages; rebuild with -DMKW_AARCH64_4K_PAGES=OFF");
++    }
+ #endif
+ 
+     if (g_initialized) {
+diff --git a/runtime/src/hle/vi.cpp b/runtime/src/hle/vi.cpp
+index 23f85fc..8e70c3c 100644
+--- a/runtime/src/hle/vi.cpp
++++ b/runtime/src/hle/vi.cpp
+@@ -847,8 +847,72 @@ extern "C" void VISetBlack_HLE_801bab2c(CpuContext* ctx)
+ }
+ PPC_NATIVE_OVERRIDE_VOID(801BAB2C, VISetBlack_HLE_801bab2c, (CpuContext* ctx), (ctx));
+ 
++namespace {
++
++// Blocks the calling guest thread on the retrace queue until the next retrace (VIWaitForRetrace).
++void SleepUntilNextRetrace(CpuContext* cpu)
++{
++    const int32_t irqState = OS__DisableInterrupts_801a65ac();
++    uint32_t retraceCount = 0;
++    {
++        std::lock_guard<std::mutex> lock(g_viMutex);
++        EnsureInitializedLocked();
++        retraceCount = g_vi.retraceCount;
++    }
++    for (;;) {
++        cpu->gpr[3] = kViRetraceQueueAddr;
++        OSSleepThread_HLE_801aa9b8(cpu);
++        std::lock_guard<std::mutex> lock(g_viMutex);
++        EnsureInitializedLocked();
++        if (g_vi.retraceCount != retraceCount) {
++            break;
++        }
++    }
++    OS__RestoreInterrupts_801a65d4(irqState);
++}
++
++// MLB's frame loop (func_800472B4) waits only when it is early: `if (VIGetRetraceCount() == last)
++// VIWaitForRetrace();`. On a host that cannot hold 60 fps it never blocks, and the cooperative
++// scheduler never runs a READY lower-priority thread: on a phone's little cores the boot loader
++// (priority 24) starved and the intro never ended. Hardware has idle time in that loop, so once
++// such a thread has waited kLowerPriorityStarvation the caller sleeps to the next retrace, that
++// late frame quantized to vblank as on hardware. Addresses as in hle/os/os_internal.h.
++constexpr auto kLowerPriorityStarvation = 100ms;
++constexpr uint32_t kOSRunningContextAddr = 0x800000e4u;
++constexpr uint32_t kSchedulerPendingFlagAddr = 0x8031b270u;   // READY mask, bit 31 - priority
++constexpr uint32_t kSchedulerDisableCountAddr = 0x8031b268u;
++constexpr uint32_t kThreadStateOffset = 0x2C8u;
++constexpr uint32_t kThreadPriorityOffset = 0x2D0u;
++Clock::time_point s_lowerPriorityReadySince{};  // guest threads only, one host thread
++
++bool LowerPriorityThreadStarved()
++{
++    if (!Fiber::GuestFiberManager::IsInitialized() || !OS_HLE_InterruptsEnabled() ||
++        ::Memory::Read32(kSchedulerDisableCountAddr) != 0 || VI_HLE_IsAdvancingRetrace()) {
++        return false;
++    }
++    const uint32_t running = ::Memory::Read32(kOSRunningContextAddr);
++    if (running == 0 || ::Memory::Read16(running + kThreadStateOffset) != 2) {
++        return false;
++    }
++    const uint32_t priority = ::Memory::Read32(running + kThreadPriorityOffset);
++    const uint32_t lowerMask = priority >= 31 ? 0u : (1u << (31 - priority)) - 1u;
++    const auto now = Clock::now();
++    if ((::Memory::Read32(kSchedulerPendingFlagAddr) & lowerMask) == 0) {
++        s_lowerPriorityReadySince = now;
++        return false;
++    }
++    return now - s_lowerPriorityReadySince >= kLowerPriorityStarvation;
++}
++
++} // namespace
++
+ extern "C" void VIGetRetraceCount_HLE_801baba4(CpuContext* ctx)
+ {
++    if (ctx != nullptr && LowerPriorityThreadStarved()) {
++        SleepUntilNextRetrace(ctx);
++        s_lowerPriorityReadySince = Clock::now();
++    }
+     uint32_t count = 0;
+     {
+         std::lock_guard<std::mutex> lock(g_viMutex);
+@@ -902,28 +966,8 @@ extern "C" void VIWaitForRetrace_HLE_801b99ec(CpuContext* ctx)
+     match_benchmark::OnGuestFrame(cpu);
+     
+     if (Fiber::GuestFiberManager::IsInitialized()) {
+-        const int32_t irqState = OS__DisableInterrupts_801a65ac();
+-        uint32_t retraceCount = 0;
+-        {
+-            std::lock_guard<std::mutex> lock(g_viMutex);
+-            EnsureInitializedLocked();
+-            retraceCount = g_vi.retraceCount;
+-        }
+-
+-        do {
+-            cpu->gpr[3] = kViRetraceQueueAddr;
+-            OSSleepThread_HLE_801aa9b8(cpu);
+-
+-            {
+-                std::lock_guard<std::mutex> lock(g_viMutex);
+-                EnsureInitializedLocked();
+-                if (g_vi.retraceCount != retraceCount) {
+-                    break;
+-                }
+-            }
+-        } while (true);
+-
+-        OS__RestoreInterrupts_801a65d4(irqState);
++        SleepUntilNextRetrace(cpu);
++        s_lowerPriorityReadySince = Clock::now();  // lower-priority threads had this wait
+     } else {
+         std::chrono::microseconds interval{16666us};
+         Clock::time_point target;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index c0aabf6..7269747 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1437,8 +1437,9 @@ int RuntimeMain(int argc, char** argv) {
+         }};
+ // only vulkan for linux
+ #elif defined(__linux__)
+-        static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
++        static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
+             {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
++            {"null", BACKEND_NULL},
+         }};
+ #elif defined(_WIN32)
+         static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
 diff --git a/runtime/tests/aarch64_abi_tests.cpp b/runtime/tests/aarch64_abi_tests.cpp
 new file mode 100644
 index 0000000..f0b746f
