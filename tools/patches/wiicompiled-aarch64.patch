@@ -259,10 +259,10 @@ index c6a9e90..0bb8fa0 100644
      return taskPtr;
  }
 diff --git a/runtime/src/hle/os/os_scheduler.cpp b/runtime/src/hle/os/os_scheduler.cpp
-index 2c46300..3997cc3 100644
+index 2c46300..d1384fc 100644
 --- a/runtime/src/hle/os/os_scheduler.cpp
 +++ b/runtime/src/hle/os/os_scheduler.cpp
-@@ -11,6 +11,25 @@
+@@ -11,6 +11,53 @@
  #include "runtime_log.h"
  #include "os_internal.h"
  
@@ -271,24 +271,52 @@ index 2c46300..3997cc3 100644
 +#include <chrono>
 +
 +namespace {
-+// When SelectThread last switched to a thread of each priority (VI's starvation guard reads it).
++// When SelectThread last switched to a thread of each priority (the starvation guard reads it).
 +std::array<std::chrono::steady_clock::time_point, 32> g_lastScheduledAt{};
++// When a READY lower-priority thread was first seen by the guard; guest threads, one host thread.
++std::chrono::steady_clock::time_point g_lowerPriorityReadySince{};
 +} // namespace
 +
-+// Latest time a thread with a numerically higher (lower) priority than `priority` was scheduled.
-+std::chrono::steady_clock::time_point OS_HLE_LastScheduledBelowPriority(uint32_t priority)
++// MLB's frame loop (func_800472B4) waits only when it is early: `if (VIGetRetraceCount() == last)
++// VIWaitForRetrace();`. The console holds 60 fps there, so the wait always comes and lower-priority
++// threads run in it. A host that cannot hold 60 fps never reaches the wait, and the cooperative
++// scheduler then never runs a READY lower-priority thread: on a phone's little cores the boot loader
++// (priority 24) starved and the intro never ended. VIGetRetraceCount asks this, and sleeps to the
++// next retrace when it says so: a host-side scheduling fix, not hardware behavior. True when the
++// running thread may sleep here and a READY thread of lower priority has gone `starvation` without
++// being scheduled.
++bool OS_HLE_LowerPriorityThreadStarved(std::chrono::steady_clock::duration starvation)
 +{
-+    std::chrono::steady_clock::time_point latest{};
-+    for (uint32_t p = priority + 1; p < g_lastScheduledAt.size(); ++p) {
-+        latest = std::max(latest, g_lastScheduledAt[p]);
++    if (!Fiber::GuestFiberManager::IsInitialized() || !OS_HLE_InterruptsEnabled() ||
++        ::Memory::Read32(kSchedulerIdleFlagAddr) != 0 || VI_HLE_IsAdvancingRetrace()) {
++        return false;
 +    }
-+    return latest;
++    const uint32_t running = ::Memory::Read32(kOSRunningContextAddr);
++    if (running == 0 || ::Memory::Read32(kOSCurrentContextAddr) != running ||
++        ::Memory::Read16(running + kThreadStateOffset) != 2) {
++        return false;
++    }
++    const uint32_t priority = ::Memory::Read32(running + kThreadPriorityOffset);
++    const uint32_t lowerMask = priority >= 31 ? 0u : (1u << (31 - priority)) - 1u;
++    if ((::Memory::Read32(kSchedulerPendingFlagAddr) & lowerMask) == 0) {
++        g_lowerPriorityReadySince = {};
++        return false;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (g_lowerPriorityReadySince == std::chrono::steady_clock::time_point{}) {
++        g_lowerPriorityReadySince = now;
++    }
++    auto since = g_lowerPriorityReadySince;
++    for (uint32_t p = priority + 1; p < g_lastScheduledAt.size(); ++p) {
++        since = std::max(since, g_lastScheduledAt[p]);
++    }
++    return now - since >= starvation;
 +}
 +
  namespace {
  void LinkMutexToThread(uint32_t threadPtr, uint32_t mutexPtr)
  {
-@@ -329,6 +348,8 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
+@@ -329,6 +376,8 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
          break;
      }
  
@@ -298,14 +326,15 @@ index 2c46300..3997cc3 100644
      const uint32_t threadNext = PopThreadQueueHead(queueEntry, nextThread);
  
 diff --git a/runtime/src/hle/vi.cpp b/runtime/src/hle/vi.cpp
-index 23f85fc..a8609c3 100644
+index 23f85fc..b1feb54 100644
 --- a/runtime/src/hle/vi.cpp
 +++ b/runtime/src/hle/vi.cpp
-@@ -847,8 +847,85 @@ extern "C" void VISetBlack_HLE_801bab2c(CpuContext* ctx)
+@@ -847,8 +847,49 @@ extern "C" void VISetBlack_HLE_801bab2c(CpuContext* ctx)
  }
  PPC_NATIVE_OVERRIDE_VOID(801BAB2C, VISetBlack_HLE_801bab2c, (CpuContext* ctx), (ctx));
  
-+std::chrono::steady_clock::time_point OS_HLE_LastScheduledBelowPriority(uint32_t priority);
++// hle/os/os_scheduler.cpp: whether a READY lower-priority thread has starved (the guard below).
++bool OS_HLE_LowerPriorityThreadStarved(std::chrono::steady_clock::duration starvation);
 +
 +namespace {
 +
@@ -331,53 +360,16 @@ index 23f85fc..a8609c3 100644
 +    OS__RestoreInterrupts_801a65d4(irqState);
 +}
 +
-+// MLB's frame loop (func_800472B4) waits only when it is early: `if (VIGetRetraceCount() == last)
-+// VIWaitForRetrace();`. The console holds 60 fps there, so the wait always comes and lower-priority
-+// threads run in it. A host that cannot hold 60 fps never reaches the wait, and the cooperative
-+// scheduler then never runs a READY lower-priority thread: on a phone's little cores the boot
-+// loader (priority 24) starved and the intro never ended. Host-side scheduling fix, not hardware
-+// behavior: once such a thread has gone kLowerPriorityStarvation without running, the caller
-+// sleeps to the next retrace. Addresses as in hle/os/os_internal.h.
++// How long a READY lower-priority thread may go unscheduled before the caller yields one retrace
++// (OS_HLE_LowerPriorityThreadStarved explains why MLB needs it).
 +constexpr auto kLowerPriorityStarvation = 100ms;
-+constexpr uint32_t kOSCurrentContextAddr = 0x800000d4u;
-+constexpr uint32_t kOSRunningContextAddr = 0x800000e4u;
-+constexpr uint32_t kSchedulerPendingFlagAddr = 0x8031b270u;  // READY mask, bit 31 - priority
-+constexpr uint32_t kSchedulerIdleFlagAddr = 0x8031b268u;     // OSDisableScheduler nesting count
-+constexpr uint32_t kThreadStateOffset = 0x2C8u;
-+constexpr uint32_t kThreadPriorityOffset = 0x2D0u;
-+Clock::time_point s_lowerPriorityReadySince{};  // first seen READY; guest threads, one host thread
 +uint32_t s_starvationYields = 0;
-+
-+bool LowerPriorityThreadStarved()
-+{
-+    if (!Fiber::GuestFiberManager::IsInitialized() || !OS_HLE_InterruptsEnabled() ||
-+        ::Memory::Read32(kSchedulerIdleFlagAddr) != 0 || VI_HLE_IsAdvancingRetrace()) {
-+        return false;
-+    }
-+    const uint32_t running = ::Memory::Read32(kOSRunningContextAddr);
-+    if (running == 0 || ::Memory::Read32(kOSCurrentContextAddr) != running ||
-+        ::Memory::Read16(running + kThreadStateOffset) != 2) {
-+        return false;
-+    }
-+    const uint32_t priority = ::Memory::Read32(running + kThreadPriorityOffset);
-+    const uint32_t lowerMask = priority >= 31 ? 0u : (1u << (31 - priority)) - 1u;
-+    if ((::Memory::Read32(kSchedulerPendingFlagAddr) & lowerMask) == 0) {
-+        s_lowerPriorityReadySince = {};
-+        return false;
-+    }
-+    const auto now = Clock::now();
-+    if (s_lowerPriorityReadySince == Clock::time_point{}) {
-+        s_lowerPriorityReadySince = now;
-+    }
-+    const auto since = std::max(s_lowerPriorityReadySince, OS_HLE_LastScheduledBelowPriority(priority));
-+    return now - since >= kLowerPriorityStarvation;
-+}
 +
 +} // namespace
 +
  extern "C" void VIGetRetraceCount_HLE_801baba4(CpuContext* ctx)
  {
-+    if (ctx != nullptr && LowerPriorityThreadStarved()) {
++    if (ctx != nullptr && OS_HLE_LowerPriorityThreadStarved(kLowerPriorityStarvation)) {
 +        if (++s_starvationYields == 1 || s_starvationYields % 100 == 0) {
 +            RT_LOG(RT_TAG_VI) << "lower-priority thread starved: waiting one retrace (" << s_starvationYields
 +                              << " so far)" << std::endl;
@@ -387,7 +379,7 @@ index 23f85fc..a8609c3 100644
      uint32_t count = 0;
      {
          std::lock_guard<std::mutex> lock(g_viMutex);
-@@ -902,28 +979,7 @@ extern "C" void VIWaitForRetrace_HLE_801b99ec(CpuContext* ctx)
+@@ -902,28 +943,7 @@ extern "C" void VIWaitForRetrace_HLE_801b99ec(CpuContext* ctx)
      match_benchmark::OnGuestFrame(cpu);
      
      if (Fiber::GuestFiberManager::IsInitialized()) {

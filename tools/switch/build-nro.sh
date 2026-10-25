@@ -73,7 +73,8 @@ EOF
     (( ${#patches[@]} > 0 )) || fail "could not read the patch list from tools/wiicompiled-translate.ps1"
     patches+=(wiicompiled-linux)
     for patch in "${patches[@]}"; do
-        git -C "$src" apply "$root/tools/patches/$patch.patch" || fail "patch $patch does not apply"
+        # Some Windows working copies of the patches are CRLF; git apply needs the LF they are committed as.
+        sed 's/$//' "$root/tools/patches/$patch.patch" | git -C "$src" apply || fail "patch $patch does not apply"
     done
     echo "applied ${#patches[@]} patches"
     mkdir -p "$gen"
