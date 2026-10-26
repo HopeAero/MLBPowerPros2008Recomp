@@ -310,10 +310,10 @@ index bf22212..9d69468 100644
  }
  }
 diff --git a/aurora-main/lib/dolphin/gx/GXFrameBuffer.cpp b/aurora-main/lib/dolphin/gx/GXFrameBuffer.cpp
-index dfa305b..532fdea 100644
+index dfa305b..f77455d 100644
 --- a/aurora-main/lib/dolphin/gx/GXFrameBuffer.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXFrameBuffer.cpp
-@@ -251,6 +251,61 @@ void prune_copy_texture_pool(const void* dest) noexcept {
+@@ -251,6 +251,81 @@ void prune_copy_texture_pool(const void* dest) noexcept {
  }
  } // namespace aurora::gx
  
@@ -370,12 +370,32 @@ index dfa305b..532fdea 100644
 +  g_gxState.copyFilterVFilter = a.vfilter;
 +}
 +void ClearBoundingBoxOnDecoder(const CopyU32Arg&) { g_gxState.boundingBox = {1023, 0, 1023, 0}; }
++
++// EFB copies with a deferred/thread GX FIFO: queued behind the draws they copy and run by the
++// decoder with the sync body (GXCopyTex/GXCopyDisp below skip their drain there).
++struct CopyArgs {
++  void* dest;
++  u32 clear;
++};
++void CopyTexOnDecoder(const CopyArgs& a) { GXCopyTex(a.dest, static_cast<GXBool>(a.clear)); }
++void CopyDispOnDecoder(const CopyArgs& a) { GXCopyDisp(a.dest, static_cast<GXBool>(a.clear)); }
++// The copy size the decoder will hold at the next GXCopyTex: only GXSetTexCopyDst writes it.
++u16 sProducerTexCopyDstWidth = 0;
++u16 sProducerTexCopyDstHeight = 0;
++// efb_ram::schedule writes guest RAM at the call when a probe-sized copy opens a readback slot (the
++// 0xFF fill the guest may read right away), so such a copy runs on the producer, as in sync. Above
++// 512 pixels a copy cannot fit the 256-byte readback limit (every format is >= 4 bits per pixel).
++bool copy_tex_writes_guest_ram(void* dest) {
++  const u64 pixels = static_cast<u64>(std::max<u32>(sProducerTexCopyDstWidth, 1)) *
++                     std::max<u32>(sProducerTexCopyDstHeight, 1);
++  return pixels <= 512 && aurora::gfx::efb_ram::may_open_async_slot(dest);
++}
 +} // namespace
 +
  extern "C" {
  GXRenderModeObj GXNtsc480IntDf = {
      VI_TVMODE_NTSC_INT,
-@@ -315,6 +370,7 @@ GXRenderModeObj GXMpal480IntDf = {
+@@ -315,6 +390,7 @@ GXRenderModeObj GXMpal480IntDf = {
  
  void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor, u16 ver) {
    *rmout = *rmin;
@@ -383,7 +403,7 @@ index dfa305b..532fdea 100644
    const auto renderSize = aurora::gfx::get_render_target_size();
    rmout->fbWidth = static_cast<u16>(std::min<uint32_t>(renderSize.x, UINT16_MAX));
    rmout->efbHeight = static_cast<u16>(std::min<uint32_t>(renderSize.y, UINT16_MAX));
-@@ -322,43 +378,40 @@ void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor,
+@@ -322,43 +398,42 @@ void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor,
  }
  
  void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {
@@ -412,6 +432,8 @@ index dfa305b..532fdea 100644
 -  g_gxState.texCopyDstWidth = wd;
 -  g_gxState.texCopyDstHeight = ht;
 -  g_gxState.texCopyHalfScale = mipmap != GX_FALSE;
++  sProducerTexCopyDstWidth = wd;
++  sProducerTexCopyDstHeight = ht;
 +  aurora::gx::fifo::run_on_decoder<SetTexCopyDstOnDecoder>(
 +      CopyDstArgs{wd, ht, static_cast<u32>(fmt), static_cast<u32>(mipmap)});
  }
@@ -436,7 +458,7 @@ index dfa305b..532fdea 100644
    return get_num_xfb_lines_internal(static_cast<u16>(g_gxState.dispCopySrc.height), iScale);
  }
  
-@@ -386,6 +439,30 @@ void GXSetCopyClear(GXColor color, u32 depth) {
+@@ -386,6 +461,30 @@ void GXSetCopyClear(GXColor color, u32 depth) {
  }
  
  void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {
@@ -467,7 +489,7 @@ index dfa305b..532fdea 100644
    g_gxState.copyFilterAa = aa;
    g_gxState.copyFilterVf = vf;
    if (sample_pattern) {
-@@ -419,16 +496,14 @@ void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[
+@@ -419,16 +518,23 @@ void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[
  }
  
  void GXSetDispCopyGamma(GXGamma gamma) {
@@ -482,23 +504,41 @@ index dfa305b..532fdea 100644
    // Finish queued commands before this copy reads live EFB state.
 -  if (aurora::gx::fifo::get_buffer_size() != 0) {
 -    aurora::gx::fifo::drain();
-+  if (aurora::gx::fifo::has_unprocessed()) {
-+    aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::Copy);
++  if (!aurora::gx::fifo::decoding_stream_call()) {
++    if (aurora::gx::fifo::async_mode()) {
++      // Deferred/thread FIFO: the decoder runs this copy behind the draws it copies; no wait here.
++      aurora::gx::fifo::note_copy(true);
++      aurora::gx::fifo::run_in_stream<CopyDispOnDecoder>(CopyArgs{dest, static_cast<u32>(clear)});
++      return;
++    }
++    aurora::gx::fifo::note_copy(false);
++    if (aurora::gx::fifo::has_unprocessed()) {
++      aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::Copy);
++    }
    }
    auto rect = aurora::gx::map_logical_scissor(g_gxState.dispCopySrc);
    const float renderYScale = static_cast<float>(rect.height) / std::max<float>(g_gxState.dispCopySrc.height, 1.0f);
-@@ -474,8 +549,8 @@ uint32_t aurora_get_display_crop_lines() { return g_displayCropLines.load(std::m
+@@ -474,8 +580,17 @@ uint32_t aurora_get_display_crop_lines() { return g_displayCropLines.load(std::m
  
  void GXCopyTex(void* dest, GXBool clear) {
    // Texture copies must see all earlier draws and state changes.
 -  if (aurora::gx::fifo::get_buffer_size() != 0) {
 -    aurora::gx::fifo::drain();
-+  if (aurora::gx::fifo::has_unprocessed()) {
-+    aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::Copy);
++  if (!aurora::gx::fifo::decoding_stream_call()) {
++    if (aurora::gx::fifo::async_mode() && !copy_tex_writes_guest_ram(dest)) {
++      // Deferred/thread FIFO: the decoder runs this copy behind the draws it copies; no wait here.
++      aurora::gx::fifo::note_copy(true);
++      aurora::gx::fifo::run_in_stream<CopyTexOnDecoder>(CopyArgs{dest, static_cast<u32>(clear)});
++      return;
++    }
++    aurora::gx::fifo::note_copy(false);
++    if (aurora::gx::fifo::has_unprocessed()) {
++      aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::Copy);
++    }
    }
    const auto sourceRect = map_texture_copy_source(g_gxState.texCopySrc, g_gxState.texCopySrcRenderSpace);
    const auto rect = sourceRect.clearRect;
-@@ -565,13 +640,14 @@ void GXCopyTex(void* dest, GXBool clear) {
+@@ -565,13 +680,14 @@ void GXCopyTex(void* dest, GXBool clear) {
  }
  
  void GXClearBoundingBox() {
@@ -731,6 +771,36 @@ index 6f71945..0ca5c7d 100644
    }
  }
  
+diff --git a/aurora-main/lib/gfx/efb_ram_copy.cpp b/aurora-main/lib/gfx/efb_ram_copy.cpp
+index aabd5ca..8fa4ae3 100644
+--- a/aurora-main/lib/gfx/efb_ram_copy.cpp
++++ b/aurora-main/lib/gfx/efb_ram_copy.cpp
+@@ -227,6 +227,11 @@ void schedule(void* dest, uint32_t width, uint32_t height, GXTexFmt format, Text
+   }
+ }
+ 
++bool may_open_async_slot(void* dest) noexcept {
++  std::lock_guard lock{g_asyncMutex};
++  return g_asyncSlots.size() < kMaxAsyncSlots && g_asyncSlots.find(dest) == g_asyncSlots.end();
++}
++
+ bool has_pending(void* dest) noexcept {
+   if (dest == nullptr) return !g_pending.empty() || !g_downloads.empty();
+   return std::any_of(g_pending.begin(), g_pending.end(),
+diff --git a/aurora-main/lib/gfx/efb_ram_copy.hpp b/aurora-main/lib/gfx/efb_ram_copy.hpp
+index 3828d3c..9c595d7 100644
+--- a/aurora-main/lib/gfx/efb_ram_copy.hpp
++++ b/aurora-main/lib/gfx/efb_ram_copy.hpp
+@@ -10,6 +10,9 @@ namespace aurora::gfx::efb_ram {
+ inline constexpr size_t MaxAsyncReadbackSlots = 32;
+ 
+ void schedule(void* dest, uint32_t width, uint32_t height, GXTexFmt format, TextureHandle texture) noexcept;
++// Whether a schedule() for `dest` could open a new readback slot now (and so fill guest RAM with
++// 0xFF at the call). Slots are only ever added, by schedule().
++bool may_open_async_slot(void* dest) noexcept;
+ bool has_pending(void* dest = nullptr) noexcept;
+ bool prepare_downloads(void* dest = nullptr);
+ void encode_downloads(const wgpu::CommandEncoder& encoder, void* dest = nullptr) noexcept;
 diff --git a/aurora-main/lib/gfx/texture_replacement.cpp b/aurora-main/lib/gfx/texture_replacement.cpp
 index 8b55612..1afac0a 100644
 --- a/aurora-main/lib/gfx/texture_replacement.cpp
@@ -1084,7 +1154,7 @@ index 9818084..319df6f 100644
 +
 +#include "fifo_async.inc"
 diff --git a/aurora-main/lib/gx/fifo.hpp b/aurora-main/lib/gx/fifo.hpp
-index b01ea45..22fa6c1 100644
+index b01ea45..5cd0a23 100644
 --- a/aurora-main/lib/gx/fifo.hpp
 +++ b/aurora-main/lib/gx/fifo.hpp
 @@ -16,6 +16,18 @@ extern uint32_t sDlSize;
@@ -1106,7 +1176,7 @@ index b01ea45..22fa6c1 100644
  void init();
  
  // Out-of-line slow path: grows internal buffer then appends data
-@@ -81,6 +93,73 @@ bool in_display_list();
+@@ -81,6 +93,92 @@ bool in_display_list();
  // Drain the internal FIFO buffer through the command processor
  void drain();
  
@@ -1177,15 +1247,34 @@ index b01ea45..22fa6c1 100644
 +      &args, sizeof(Args));
 +}
 +
++// Work sync did right after a drain (EFB copies): deferred/thread queue it behind everything
++// written so far, decoded in stream order. Only for the asynchronous modes.
++void queue_decoder_call_in_stream(DecoderCall call, const void* args, uint32_t size);
++template <auto Fn, typename Args>
++inline void run_in_stream(const Args& args) {
++  static_assert(std::is_trivially_copyable_v<Args>);
++  queue_decoder_call_in_stream(
++      [](const void* data) {
++        Args copy;
++        std::memcpy(static_cast<void*>(&copy), data, sizeof(Args));
++        Fn(static_cast<const Args&>(copy));
++      },
++      &args, sizeof(Args));
++}
++// True on the decoder while it runs a run_in_stream call.
++bool decoding_stream_call() noexcept;
++// EFB copies: decoded in stream order (queued) or run by the producer after a drain (inline).
++void note_copy(bool queued) noexcept;
++
  // Internal buffer inspection
  const uint8_t* get_buffer_data();
  uint32_t get_buffer_size();
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 new file mode 100644
-index 0000000..077fa48
+index 0000000..8532dd9
 --- /dev/null
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -0,0 +1,983 @@
+@@ -0,0 +1,1003 @@
 +// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
 +// at the end of fifo.cpp.
 +//
@@ -1607,10 +1696,11 @@ index 0000000..077fa48
 +      DecoderCall call;
 +      std::memcpy(&call, payload, sizeof(call));
 +      // A stream-ordered call (queue_decoder_call_in_stream) runs the work sync did after its drain.
-+      const bool streamCall = (header.flags & kRecSealed) != 0;
-+      tStreamCall = streamCall;
++      struct StreamCallScope {
++        explicit StreamCallScope(bool on) { tStreamCall = on; }
++        ~StreamCallScope() { tStreamCall = false; }
++      } scope{(header.flags & kRecSealed) != 0};
 +      call(payload + 8);
-+      tStreamCall = false;
 +      break;
 +    }
 +    case kRecProbeVcd: {
@@ -2020,6 +2110,23 @@ index 0000000..077fa48
 +  std::memcpy(out + 8, args, size);
 +}
 +
++// Work sync did right after a drain (an EFB copy): behind everything written so far, decoded once
++// the frame worker has sealed, as that drain waited (kRecSealed).
++void queue_decoder_call_in_stream(DecoderCall call, const void* args, uint32_t size) {
++  ensure_started();
++  publish_main(); // what sync's drain decoded before the call
++  uint8_t* out = open_record(kRecCall, kRecSealed, 8 + size, false);
++  std::memcpy(out, &call, sizeof(call));
++  std::memcpy(out + 8, args, size);
++  flush_records();
++  ++sKickDraws;
++  kick(false);
++}
++
++bool decoding_stream_call() noexcept { return tStreamCall; }
++
++void note_copy(bool queued) noexcept { ++(queued ? sStats.copiesQueued : sStats.copiesInline); }
++
 +void queue_raw_draw(uint8_t prim, uint8_t fmt, const uint8_t* vertices, uint16_t vtxCount, uint32_t vertexBytes,
 +                    bool accepted) {
 +  ensure_started();
@@ -2152,7 +2259,8 @@ index 0000000..077fa48
 +      "gx_fifo_segments_per_frame=%.1f gx_fifo_bytes_per_frame_kib=%.1f\n"
 +      "gx_fifo_decode_ms_per_frame=%.3f gx_fifo_producer_wait_ms_per_frame=%.3f%s\n"
 +      "gx_fifo_raw_draw_mismatches=%.0f gx_fifo_staging_splits drain=%.0f display_list=%.0f "
-+      "gx_fifo_array_hazards=%.0f gx_fifo_decode_errors=%.0f\n",
++      "gx_fifo_array_hazards=%.0f gx_fifo_decode_errors=%.0f\n"
++      "gx_fifo_copies_per_frame queued=%.2f inline=%.2f\n",
 +      modeName, frames, sExactRawDraws ? 1 : 0, sCheckArrays ? 1 : 0, drains(DrainReason::Draw) / frames,
 +      drains(DrainReason::DisplayList) / frames, drains(DrainReason::RawDraw) / frames,
 +      drains(DrainReason::DrawDone) / frames, drains(DrainReason::Copy) / frames,
@@ -2166,7 +2274,8 @@ index 0000000..077fa48
 +      delta(now.waitNs, base.waitNs) / frames / 1e6, mode() == Mode::Sync ? " (sync: decode time not measured)" : "",
 +      delta(now.rawMismatches, base.rawMismatches), delta(now.drainSplits, base.drainSplits),
 +      delta(now.listSplits, base.listSplits), delta(now.arrayHazards, base.arrayHazards),
-+      delta(now.decodeErrors, base.decodeErrors));
++      delta(now.decodeErrors, base.decodeErrors), delta(now.copiesQueued, base.copiesQueued) / frames,
++      delta(now.copiesInline, base.copiesInline) / frames);
 +  return n < 0 ? 0 : std::min(n, size - 1);
 +}
 diff --git a/aurora-main/lib/window.cpp b/aurora-main/lib/window.cpp
@@ -3152,6 +3261,43 @@ index 0bb8fa0..697d98c 100644
          t_onMixWorker = true;
          for (;;) {
              {
+diff --git a/runtime/src/hle/gx/gx_copy.cpp b/runtime/src/hle/gx/gx_copy.cpp
+index eaf6809..f9821a8 100644
+--- a/runtime/src/hle/gx/gx_copy.cpp
++++ b/runtime/src/hle/gx/gx_copy.cpp
+@@ -10,6 +10,10 @@
+ #include <mutex>
+ #include <vector>
+ 
++// aurora gx/fifo_async.inc: nonzero with WIICOMPILED_GX_FIFO=deferred|thread, where GXCopyTex and
++// GXCopyDisp are decoded behind the draws they copy, so the DrawDone before them has nothing to do.
++extern "C" int aurora_gx_fifo_async(void);
++
+ namespace {
+ // Copy destinations stay GPU-only until an explicit/lazy readback. Track the
+ // guest ranges that own those results so a later data-cache flush over a reused
+@@ -118,7 +122,9 @@ extern "C" void GX__CopyDisp_8016fc38(uint32_t da, uint32_t c) {
+     EnsureAuroraFrameActive();
+     // GX copies are FIFO-ordered on hardware. Drain submitted draws before
+     // resolving the EFB so high-level copies see the same contents.
+-    GXDrawDone();
++    if (aurora_gx_fifo_async() == 0) {
++        GXDrawDone();
++    }
+     GXCopyDisp(GuestToHostPtr(da), (GXBool)c);
+     // No second GXDrawDone here: the frame-worker wait below is for the DONE
+     // phase, which strictly subsumes the drain this call would perform.
+@@ -142,7 +148,9 @@ PPC_NATIVE_OVERRIDE_VOID(8016fc38, GX__CopyDisp_8016fc38, (uint32_t da, uint32_t
+ extern "C" void GX__CopyTex_8016fd74(uint32_t da, uint32_t c) {
+     EnsureAuroraFrameActive();
+     // Match GX FIFO ordering: texture copies observe all prior draws.
+-    GXDrawDone();
++    if (aurora_gx_fifo_async() == 0) {
++        GXDrawDone();
++    }
+     const uint16_t rawSrcLeft = g_texCopyState.srcLeft;
+     const uint16_t rawSrcTop = g_texCopyState.srcTop;
+     const uint16_t rawSrcWidth = g_texCopyState.srcWidth;
 diff --git a/runtime/src/hle/gx/gx_dl.cpp b/runtime/src/hle/gx/gx_dl.cpp
 index 818478d..e31183b 100644
 --- a/runtime/src/hle/gx/gx_dl.cpp
@@ -3704,7 +3850,7 @@ index 7269747..49093ee 100644
  }
  extern "C" bool g_dynamicAspectRatioEnabled = false;
 diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
-index 280cfd6..25faec6 100644
+index 280cfd6..b936f49 100644
 --- a/runtime/src/match_benchmark_overlay.inc
 +++ b/runtime/src/match_benchmark_overlay.inc
 @@ -156,6 +156,10 @@ void DrawMatchBenchmark() {
@@ -3741,7 +3887,7 @@ index 280cfd6..25faec6 100644
              else summary << loadNames[i] << "=unavailable\n";
          }
 +        {
-+            char fifo[1024];
++            char fifo[2048];
 +            if (aurora_gx_fifo_stats_report(fifo, sizeof fifo) > 0) summary << fifo;
 +        }
          summary << "process_cpu_pct is over all logical cores, like Task Manager. GPU/VRAM from Windows GPU counters.\n"
