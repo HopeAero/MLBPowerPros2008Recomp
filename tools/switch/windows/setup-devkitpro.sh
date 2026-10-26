@@ -50,17 +50,22 @@ fi
 # SDL3 for Switch: devkitPro/SDL branch switch-sdl-3.4, pinned (there is no package). Its Switch sources
 # test SDL_VIDEO_DRIVER_SWITCH before SDL_internal.h, which the precompiled header supplies:
 # with PCH off they include it themselves (an SDL without it has no Switch video driver).
-nm=/opt/devkitpro/devkitA64/bin/aarch64-none-elf-nm
-if [[ ! -f $portlibs/lib/libSDL3.a ]] || ! $nm "$portlibs/lib/libSDL3.a" 2>/dev/null | grep -q ' D SWITCH_bootstrap$'; then
-    sdl=c329016c0e338ab4397ad930f83330c9fe058348
+# sdl-switch-vulkan.patch: its window makes an EGL surface for OpenGL windows only (Dawn's Vulkan
+# presents to the same NWindow). The stamp rebuilds SDL when the pin or the patch changes.
+sdl=c329016c0e338ab4397ad930f83330c9fe058348
+sdl_patch=$(dirname "${BASH_SOURCE[0]}")/sdl-switch-vulkan.patch
+stamp="$sdl $(sha256sum "$sdl_patch" | cut -d' ' -f1)"
+if [[ ! -f $portlibs/lib/libSDL3.a || $(cat "$portlibs/share/mlb-sdl3.stamp" 2>/dev/null) != "$stamp" ]]; then
     rm -rf /tmp/sdl && mkdir /tmp/sdl
     curl -fsSL "https://github.com/devkitPro/SDL/archive/$sdl.tar.gz" | tar -xz -C /tmp/sdl --strip-components=1
+    tr -d '\r' < "$sdl_patch" | git -C /tmp/sdl apply
     sed -i '1i #include "../../SDL_internal.h"' /tmp/sdl/src/video/switch/*.c
     cmake -S /tmp/sdl -B /tmp/sdl/build -G Ninja -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake -DCMAKE_INSTALL_PREFIX=$portlibs \
         -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
     cmake --build /tmp/sdl/build
     cmake --install /tmp/sdl/build
+    mkdir -p "$portlibs/share" && echo "$stamp" > "$portlibs/share/mlb-sdl3.stamp"
     rm -rf /tmp/sdl
 fi
 # Horizon has no dynamic loader; Dawn's CMake still links -ldl, so an empty libdl.a satisfies it.

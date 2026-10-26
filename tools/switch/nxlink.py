@@ -67,8 +67,10 @@ def send_nro(address: str, path: pathlib.Path, remote_name: str, args: list[str]
             piece = tail[start:start + CHUNK]
             sock.sendall(struct.pack("<i", len(piece)) + piece)
             sent += len(piece)
-        print(f"{sent} sent ({sent * 100 / len(payload):.2f}%)", flush=True)
-        recv_int(sock)  # the Switch acknowledges the whole file
+        print(f"{sent} bytes compressed sent ({sent * 100 / len(payload):.0f}% of the file)", flush=True)
+        # The Switch acknowledges once the whole file is on the SD card: the game's 170 MB take a while.
+        sock.settimeout(300)
+        recv_int(sock)
         command = b"".join(arg.encode() + b"\0" for arg in args)
         sock.sendall(struct.pack("<i", len(command)) + command)
         sock.shutdown(socket.SHUT_WR)
