@@ -211,7 +211,7 @@ index 0063653..d18efce 100644
          target_compile_options(mkw_psq_helpers_tests PRIVATE -march=x86-64-v3)
      endif()
 diff --git a/runtime/cmake/PublicProducts.cmake b/runtime/cmake/PublicProducts.cmake
-index 251c83a..9e4f5a1 100644
+index 251c83a..08be853 100644
 --- a/runtime/cmake/PublicProducts.cmake
 +++ b/runtime/cmake/PublicProducts.cmake
 @@ -18,6 +18,9 @@ if(EXISTS "${GUEST_SYMBOL_TABLE_FILE}")
@@ -251,7 +251,7 @@ index 251c83a..9e4f5a1 100644
      elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
          # mkw_runtime_common is an OBJECT library: WiiCompiled/RetroRewind only pull in its .o
          # files via $<TARGET_OBJECTS:>, which does not propagate mkw_runtime_common's own
-@@ -310,6 +317,23 @@ endfunction()
+@@ -310,6 +317,25 @@ endfunction()
  
  add_executable(WiiCompiled "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})
  mkw_configure_product(WiiCompiled)
@@ -266,6 +266,8 @@ index 251c83a..9e4f5a1 100644
 +        # libnvk_support carries: the first copy (NVK's) wins. The game draws through Vulkan and
 +        # never creates a GL context, so EGL's code never runs.
 +        -Wl,--allow-multiple-definition
++        # chmod, fchmod, link, rename, pthread_create: platform/switch/switch_posix.cpp.
++        -Wl,--wrap=chmod -Wl,--wrap=fchmod -Wl,--wrap=link -Wl,--wrap=rename -Wl,--wrap=pthread_create
 +        # devkitA64's prebuilt libstdc++ carries text relocations (nx-mod's port notes).
 +        -Wl,-z,notext)
 +    nx_generate_nacp(MLBPowerPros2008.nacp NAME "MLB Power Pros 2008" AUTHOR "HopeAero" VERSION "0.1.0")
@@ -796,6 +798,61 @@ index 0000000..d37b613
 +    timespec now{};
 +    clock_gettime(CLOCK_MONOTONIC, &now);
 +    return int64_t{now.tv_sec} * 1000 + now.tv_nsec / 1000000;
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_posix.cpp b/runtime/src/platform/switch/switch_posix.cpp
+new file mode 100644
+index 0000000..e01a61b
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_posix.cpp
+@@ -0,0 +1,49 @@
++// POSIX calls Horizon's SD card cannot honour, linked in with -Wl,--wrap (PublicProducts.cmake).
++// FAT32/exFAT keep no Unix permissions, so changing them succeeds with nothing to do; libnx's fsdev
++// answers ENOSYS instead, which made every std::filesystem::copy_file fail.
++//
++// FAT has no hard links either. The runtime links a finished temporary file to its final name to
++// publish it without replacing one already there; Horizon's rename refuses an existing destination,
++// so it gives the same result. POSIX rename does replace (atomic saves rely on it): when Horizon
++// refuses, the old file goes first. ponytail: not atomic, which FAT cannot be anyway.
++#if defined(__SWITCH__)
++#include <cerrno>
++#include <pthread.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++extern "C" {
++int __real_rename(const char* from, const char* to);
++
++int __wrap_chmod(const char*, mode_t) { return 0; }
++int __wrap_fchmod(int, mode_t) { return 0; }
++int __wrap_link(const char* from, const char* to) { return __real_rename(from, to); }
++
++int __wrap_rename(const char* from, const char* to) {
++    if (__real_rename(from, to) == 0) return 0;
++    if (errno != EEXIST || ::unlink(to) != 0) return -1;
++    return __real_rename(from, to);
++}
++
++// A thread that asks for no particular stack (std::thread never does) gets 128 KiB from libnx;
++// Dawn's shader compiler alone needs more (GCC gives tint's AnalyzeUniformity a ~110 KB frame).
++// Desktop systems give 1 MiB (Windows) to 8 MiB (Linux). ponytail: one size for every such thread.
++constexpr size_t kDefaultThreadStack = 2 * 1024 * 1024;
++
++int __real_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg);
++
++int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
++    size_t size = 0;
++    if (attr != nullptr) pthread_attr_getstacksize(attr, &size);
++    if (size != 0) return __real_pthread_create(thread, attr, start, arg);
++    pthread_attr_t sized;
++    if (attr != nullptr) {
++        sized = *attr;
++    } else {
++        pthread_attr_init(&sized);
++    }
++    pthread_attr_setstacksize(&sized, kDefaultThreadStack);
++    return __real_pthread_create(thread, &sized, start, arg);
++}
 +}
 +#endif
 diff --git a/runtime/src/platform/switch/switch_stdio.cpp b/runtime/src/platform/switch/switch_stdio.cpp
