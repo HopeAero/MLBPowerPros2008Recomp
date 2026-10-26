@@ -152,4 +152,7 @@ cmake --build "$build" --target WiiCompiled_nro --parallel "$jobs" -- -k 0 > "$l
     grep -m 25 "error" "$logs/build-$graphics.log" || tail -n 30 "$logs/build-$graphics.log"
     fail "build failed (local/switch/logs/build-$graphics.log)"; }
 cp -f "$build/MLBPowerPros2008.nro" "$out/MLBPowerPros2008.nro"
+# The runtime's own files go beside the NRO on the SD card, as beside the desktop executable.
+rm -rf "$out/wii_bootstrap"
+cp -rf "$build"/{dsp_coef.bin,cacert.pem,initial_pipeline_cache.db,wii_bootstrap} "$out/"
 echo "built: local/switch/build/MLBPowerPros2008.nro ($(du -h "$out/MLBPowerPros2008.nro" | cut -f1))"

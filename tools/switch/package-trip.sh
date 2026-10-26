@@ -50,7 +50,7 @@ EOF
     ;;
 trip2)
     # The game itself: the NRO, your extracted disc and a configuration that skips the PC launcher.
-    cp "$root/local/switch/build/MLBPowerPros2008.nro" "$dest/"
+    cp -r "$root/local/switch/build"/{MLBPowerPros2008.nro,dsp_coef.bin,cacert.pem,initial_pipeline_cache.db,wii_bootstrap} "$dest/"
     cp -r "$root/local/disc/DATA" "$dest/Data"
     mkdir -p "$dest/UserData"
     cat > "$dest/UserData/Config.toml" <<'EOF'
@@ -67,7 +67,8 @@ EOF
 Prueba 2 en la consola: ¿arranca el juego?
 
 1. Copia la carpeta "switch" de aquí a la raíz de la tarjeta SD (se junta con la que ya tienes).
-   Queda sdmc:/switch/mlbpowerpros2008/ con MLBPowerPros2008.nro, Data/ (tu disco) y UserData/.
+   Queda sdmc:/switch/mlbpowerpros2008/ con MLBPowerPros2008.nro, los archivos del runtime
+   (dsp_coef.bin, cacert.pem, initial_pipeline_cache.db, wii_bootstrap/), Data/ (tu disco) y UserData/.
    Data pesa 1,2 GB: por cable o lector de tarjetas va más rápido que por Wi-Fi.
 
 2. Abre el menú homebrew "sobre un juego" (mantén R al abrir un juego instalado): el juego necesita
