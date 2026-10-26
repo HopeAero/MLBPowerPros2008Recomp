@@ -52,6 +52,37 @@ index a71eb74..c6538d9 100644
  #define GXSETARRAY(attr, data, size, stride, le) GXSetArray((attr), (data), (size), (stride), (le))
  #else
  void GXSetArray(GXAttr attr, const void* data, u8 stride);
+diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
+index bc80c3c..649c657 100644
+--- a/aurora-main/lib/aurora.cpp
++++ b/aurora-main/lib/aurora.cpp
+@@ -311,7 +311,13 @@ bool frame_worker_requested() noexcept {
+ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept;
+ #endif
+ 
++#if defined(__SWITCH__)
++extern "C" void SwitchPinCurrentThread(int core, int priority);  // runtime platform/switch
++#endif
+ void frame_worker_main() noexcept {
++#if defined(__SWITCH__)
++  SwitchPinCurrentThread(1, 0x2C);
++#endif
+   {
+     std::lock_guard lock(g_frameWorker.mutex);
+     g_frameWorker.threadId = std::this_thread::get_id();
+@@ -1164,7 +1170,12 @@ PresenterState g_presenter;
+ std::atomic<bool> g_presenterStarted{false};
+ 
+ void presenter_main() noexcept {
++#if defined(__SWITCH__)
++  SwitchPinCurrentThread(2, 0x2C);
++  if (false) {
++#else
+   if (!SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH)) {
++#endif
+     Log.warn("Could not raise the asynchronous presenter thread priority: {}", SDL_GetError());
+   }
+   for (;;) {
 diff --git a/aurora-main/lib/dawn/BackendBinding.cpp b/aurora-main/lib/dawn/BackendBinding.cpp
 index 75b3c51..6b36882 100644
 --- a/aurora-main/lib/dawn/BackendBinding.cpp
@@ -80,6 +111,22 @@ index 75b3c51..6b36882 100644
  #elif defined(SDL_PLATFORM_LINUX)
    const char* driver = SDL_GetCurrentVideoDriver();
    if (SDL_strcmp(driver, "wayland") == 0) {
+diff --git a/aurora-main/lib/dolphin/gx/GXLighting.cpp b/aurora-main/lib/dolphin/gx/GXLighting.cpp
+index f7331c6..3d029b6 100644
+--- a/aurora-main/lib/dolphin/gx/GXLighting.cpp
++++ b/aurora-main/lib/dolphin/gx/GXLighting.cpp
+@@ -131,7 +131,11 @@ void GXInitLightColor(GXLightObj* light_, GXColor col) {
+ }
+ 
+ void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
++#if defined(__SWITCH__)
++  u32 idx = static_cast<u32>(__builtin_ctz(static_cast<u32>(id)));  // one-hot GX_LIGHTn
++#else
+   u32 idx = std::log2<u32>(id);
++#endif
+   auto* light = reinterpret_cast<const GXLightObj_*>(light_);
+ 
+   // XF bulk write: 16 values at light base address
 diff --git a/aurora-main/lib/window.cpp b/aurora-main/lib/window.cpp
 index c73ad5e..a531866 100644
 --- a/aurora-main/lib/window.cpp
@@ -105,7 +152,7 @@ index c73ad5e..a531866 100644
    const Sint32 posX = g_config.hasWindowPosition ? g_config.windowPosX : SDL_WINDOWPOS_CENTERED;
    const Sint32 posY = g_config.hasWindowPosition ? g_config.windowPosY : SDL_WINDOWPOS_CENTERED;
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index 0063653..d18efce 100644
+index 0063653..021a6a4 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
 @@ -10,8 +10,9 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
@@ -141,14 +188,16 @@ index 0063653..d18efce 100644
  endif()
  
  if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
-@@ -59,6 +70,15 @@ if(MKW_PLATFORM_LINUX_ARM64)
+@@ -59,6 +70,17 @@ if(MKW_PLATFORM_LINUX_ARM64)
      endif()
  endif()
  
 +if(MKW_PLATFORM_SWITCH)
 +    # AArch64 makes plain char unsigned; the translated code and the runtime assume signed (see the
 +    # Linux ARM64 block above). The default graphics backend: "null" for the headless console test.
-+    add_compile_options(-fsigned-char -fno-semantic-interposition)
++    # -fPIE: devkitPro builds everything -fPIC, which reaches every global of another file through
++    # the GOT; the NRO is one executable, so its own globals can be addressed directly.
++    add_compile_options(-fsigned-char -fno-semantic-interposition -fPIE)
 +    set(MKW_SWITCH_GRAPHICS "vulkan" CACHE STRING "Default graphics_api of the Switch build (vulkan or null)")
 +    # Dawn for Horizon's tree (tools/switch/dawn/build-dawn.sh): NVK's newlib gap-fill comes from it.
 +    set(MKW_SWITCH_DAWN_DIR "/cache/dawn" CACHE PATH "Dawn for Horizon source/build tree")
@@ -157,7 +206,7 @@ index 0063653..d18efce 100644
  option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
  option(MKW_BUILD_PSQ_TESTS "Build focused PSQ ISA tests" OFF)
  
-@@ -109,7 +129,7 @@ set_target_properties(mkw_pugixml PROPERTIES UNITY_BUILD OFF)
+@@ -109,7 +131,7 @@ set_target_properties(mkw_pugixml PROPERTIES UNITY_BUILD OFF)
  # separately BSD-style licensed, see third_party/libco/LICENSE). Windows keeps native Fibers;
  # Apple Silicon uses the project's x18-safe AArch64 assembly backend, while Intel macOS uses
  # libco's existing System V AMD64 backend.
@@ -166,7 +215,7 @@ index 0063653..d18efce 100644
      add_library(mkw_libco STATIC third_party/libco/libco.c)
      add_library(mkw::libco ALIAS mkw_libco)
      target_include_directories(mkw_libco PUBLIC third_party/libco)
-@@ -185,6 +205,13 @@ if(NOT MKW_PLATFORM_WINDOWS)
+@@ -185,6 +207,13 @@ if(NOT MKW_PLATFORM_WINDOWS)
          set(DISABLE_PACKAGE_CONFIG_AND_INSTALL ON CACHE BOOL "" FORCE)
          FetchContent_MakeAvailable(mkw_mbedtls_upstream)
          target_link_libraries(mkw_mbedtls INTERFACE MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
@@ -180,7 +229,7 @@ index 0063653..d18efce 100644
      endif()
  endif()
  
-@@ -215,7 +242,7 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
+@@ -215,7 +244,7 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
      COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS}")
  # Match the optimization policy of the translated callers as well as their FP policy.
  set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp" APPEND PROPERTY
@@ -189,7 +238,7 @@ index 0063653..d18efce 100644
  
  # ----------------------------------------------------------------------
  # Third-party: aurora-main (provides SDL3 + GPU backends)
-@@ -278,7 +305,10 @@ else()
+@@ -278,7 +307,10 @@ else()
      set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
      # Isolate aurora build products to a subdirectory under the main build dir.
      add_subdirectory(${MKW_AURORA_DIR} ${CMAKE_BINARY_DIR}/aurora-build EXCLUDE_FROM_ALL)
@@ -201,7 +250,7 @@ index 0063653..d18efce 100644
  
      # Keep upstream Aurora split: several sources intentionally use file-local
      # names that collide under this repo's aggressive unity build settings.
-@@ -381,7 +411,7 @@ if(MKW_BUILD_PSQ_TESTS)
+@@ -381,7 +413,7 @@ if(MKW_BUILD_PSQ_TESTS)
          "${CMAKE_CURRENT_LIST_DIR}/include")
      target_compile_features(mkw_psq_helpers_tests PRIVATE cxx_std_17)
      target_compile_options(mkw_psq_helpers_tests PRIVATE
@@ -277,6 +326,82 @@ index 251c83a..08be853 100644
  target_precompile_headers(WiiCompiled PRIVATE
      "${MKW_RUNTIME_SOURCE_DIR}/include/mkw_pch.h")
  if(TARGET mkw_base_sensitive)
+diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
+index 6b76fa6..1b2520b 100644
+--- a/runtime/include/abi_bridge.h
++++ b/runtime/include/abi_bridge.h
+@@ -297,6 +297,17 @@ struct KnownTypedNativeCpuCall {
+     static constexpr bool kAvailable = false;
+ };
+ 
++#if defined(__SWITCH__)
++// A native that reads and writes only the registers it names in its CpuContext (r14-r31 never),
++// does not re-enter guest code and computes the same thing in any FP mode: InvokeDirectCpu calls
++// it straight, without the nonvolatile-GPR guard and the current-context check (a
++// __aarch64_read_tp call under -mtp=soft; its translated caller already runs in that context).
++template <uint32_t Target>
++struct MkwLeafNativeCpuCall {
++    static constexpr bool kAvailable = false;
++};
++#endif
++
+ #include "native_cpu_calls.inc"
+ 
+ // Direct-mapped thread-local memo in front of the sorted registry lookup every bctrl performs;
+@@ -545,6 +556,12 @@ inline void InvokeDirectCpu(CpuContext* ctx) {
+     static_assert(Target != 0, "InvokeDirectCpu cannot target address 0");
+     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+     ApplyRuntimeCallOptions(Target, cpu);
++#if defined(__SWITCH__)
++    if constexpr (MkwLeafNativeCpuCall<Target>::kAvailable) {
++        MkwLeafNativeCpuCall<Target>::Invoke(cpu);
++        return;
++    }
++#endif
+     if constexpr (KnownNativeCpuCall<Target>::kAvailable) {
+         const auto invokeKnownNative = [&]() {
+             PpcNonvolatileGprGuard gprGuard(cpu);
+diff --git a/runtime/include/guest_flat_memory.h b/runtime/include/guest_flat_memory.h
+index 2514913..c7cd6fd 100644
+--- a/runtime/include/guest_flat_memory.h
++++ b/runtime/include/guest_flat_memory.h
+@@ -40,7 +40,22 @@ inline constexpr uintptr_t kFixedFlatGuestBase = 0x0000'0010'0000'0000ull;
+ #error "guest_flat_memory.h has no fixed flat guest base chosen for this architecture"
+ #endif
+ 
++#if defined(__SWITCH__)
++// Horizon: the base is a slice found at startup (no fixed address is free in every process). The
++// asm load names no memory operand, so GCC treats it as a pure function of a link-time address and
++// hoists/CSEs it like the constant above, where a plain global read would be reloaded after every
++// guest store (byte stores alias it). Sound only because Initialize writes the base once, before
++// any guest code runs, and never again.
++extern uint8_t* g_flatBase __attribute__((visibility("hidden")));
++inline uint8_t* FlatBase() noexcept {
++    uint8_t* base;
++    asm("ldr %0, [%1]" : "=r"(base) : "r"(&g_flatBase));
++    return base;
++}
++#define MKW_FLAT_GUEST_BASE (GuestFlat::FlatBase())
++#else
+ #define MKW_FLAT_GUEST_BASE (reinterpret_cast<uint8_t*>(GuestFlat::kFixedFlatGuestBase))
++#endif
+ 
+ enum class Backing {
+     Owned,
+diff --git a/runtime/include/hle_stubs.h b/runtime/include/hle_stubs.h
+index f83b85d..3784b6e 100644
+--- a/runtime/include/hle_stubs.h
++++ b/runtime/include/hle_stubs.h
+@@ -42,7 +42,9 @@ extern "C" void OS_HLE_EndDeferredGuestCallbacks();
+ // TranslatedBuildShardEmitter.cs and RuntimeNativeFunctionAbiProvider.cs together.
+ 
+ // WIICOMPILED_TRACE_NATIVES=<frame>: log every native hook entered during that GX frame.
++#if !defined(__SWITCH__)  // Horizon: inline in native_cpu_calls.inc (through abi_bridge.h)
+ void HleTraceCall(const char* name) noexcept;
++#endif
+ 
+ // Hooks that tools/wiicompiled_rebind.py could not rebind to the current game.
+ #define PPC_NATIVE_UNBOUND(addr_hex, name, ret_type, arg_list, call_list) static_assert(true)
 diff --git a/runtime/include/isa/ppc_isa_config.h b/runtime/include/isa/ppc_isa_config.h
 index b062184..ac26a07 100644
 --- a/runtime/include/isa/ppc_isa_config.h
@@ -359,6 +484,26 @@ index 7ac535d..3aca2aa 100644
      uint64_t bits = 0;
      std::memcpy(&bits, &value, sizeof(bits));
      FlatStore<uint64_t>(address, bits);
+diff --git a/runtime/include/native_cpu_calls.inc b/runtime/include/native_cpu_calls.inc
+index 0856e7b..2b67756 100644
+--- a/runtime/include/native_cpu_calls.inc
++++ b/runtime/include/native_cpu_calls.inc
+@@ -43,7 +43,15 @@ extern "C" void GX__SetBlendMode_8017277c(uint32_t t, uint32_t s, uint32_t d, ui
+ extern "C" void GX__LoadPosMtxImm_8017310c(uint32_t ma, uint32_t id);
+ extern "C" void GX__SetCurrentMtx_80173214(uint32_t id);
+ 
++#if defined(__SWITCH__)
++extern const int g_hleTraceFrame;  // -1: not tracing
++void HleTraceCallSlow(const char* name) noexcept;
++inline void HleTraceCall(const char* name) noexcept {
++    if (g_hleTraceFrame >= 0) [[unlikely]] HleTraceCallSlow(name);
++}
++#else
+ void HleTraceCall(const char* name) noexcept;  // hle_stubs.h
++#endif
+ #define MKW_KNOWN_TYPED_UNBOUND(addr, fn, ...) static_assert(true)
+ #define MKW_KNOWN_NATIVE_CPU_UNBOUND(addr, fn) static_assert(true)
+ #ifdef WIICOMPILED_NO_MKW_NATIVES
 diff --git a/runtime/include/power_pros_ui.h b/runtime/include/power_pros_ui.h
 index 83a67e4..159822b 100644
 --- a/runtime/include/power_pros_ui.h
@@ -501,11 +646,36 @@ index a7b9caa..1e4343a 100644
  #else
      bool ConnectLocked() {
          if (connected_) {
+diff --git a/runtime/src/fiber_manager.cpp b/runtime/src/fiber_manager.cpp
+index f2ad393..b3e5407 100644
+--- a/runtime/src/fiber_manager.cpp
++++ b/runtime/src/fiber_manager.cpp
+@@ -7,11 +7,20 @@ extern std::atomic<uint64_t> g_debugGxBeginCount;
+ extern "C" void VI_DebugDump();
+ extern "C" int g_gxFrameCount;
+ 
++#if defined(__SWITCH__)
++extern const int g_hleTraceFrame = [] {
++    const char* frame = std::getenv("WIICOMPILED_TRACE_NATIVES");
++    return frame ? std::atoi(frame) : -1;
++}();
++void HleTraceCallSlow(const char* name) noexcept {
++    const int traceFrame = g_hleTraceFrame;
++#else
+ void HleTraceCall(const char* name) noexcept {
+     static const int traceFrame = [] {
+         const char* frame = std::getenv("WIICOMPILED_TRACE_NATIVES");
+         return frame ? std::atoi(frame) : -1;
+     }();
++#endif
+     if (traceFrame >= 0 && g_gxFrameCount == traceFrame) {
+         std::fprintf(stderr, "[trace] %d %s\n", g_gxFrameCount, name);
+     }
 diff --git a/runtime/src/guest_flat_memory.cpp b/runtime/src/guest_flat_memory.cpp
-index 9504488..f321f61 100644
+index 9504488..a275af0 100644
 --- a/runtime/src/guest_flat_memory.cpp
 +++ b/runtime/src/guest_flat_memory.cpp
-@@ -27,6 +27,10 @@
+@@ -27,6 +27,16 @@
  #define WIN32_LEAN_AND_MEAN
  #endif
  #include <windows.h>
@@ -513,10 +683,26 @@ index 9504488..f321f61 100644
 +#include <cerrno>
 +#include <cstdlib>
 +#include <cstring>
++extern "C" {
++#include <switch/kernel/svc.h>
++#include <switch/kernel/virtmem.h>
++#include <switch/result.h>
++#include <switch/runtime/env.h>
++}
  #else
  #include <cerrno>
  #include <cstring>
-@@ -56,8 +60,12 @@ constexpr size_t kHostPageSize = 0x1000;
+@@ -39,6 +49,9 @@ namespace GuestFlat {
+ #if !defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
+ bool g_requiresCheckedAccess = false;
+ #endif
++#if defined(__SWITCH__)
++uint8_t* g_flatBase = nullptr;  // MKW_FLAT_GUEST_BASE; null in checked mode
++#endif
+ namespace {
+ 
+ #if defined(_WIN32)
+@@ -56,8 +69,12 @@ constexpr size_t kHostPageSize = 0x1000;
  #if !defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
  size_t HostPageSize()
  {
@@ -529,42 +715,43 @@ index 9504488..f321f61 100644
  }
  #endif
  
-@@ -70,6 +78,11 @@ using ProtectionFlags = DWORD;
+@@ -70,6 +87,11 @@ using ProtectionFlags = DWORD;
  constexpr ProtectionFlags kProtNone = PAGE_NOACCESS;
  constexpr ProtectionFlags kProtRead = PAGE_READONLY;
  constexpr ProtectionFlags kProtReadWrite = PAGE_READWRITE;
 +#elif defined(__SWITCH__)
-+using ProtectionFlags = int;  // tokens only: ProtectRange is a no-op on Horizon
-+constexpr ProtectionFlags kProtNone = 0;
-+constexpr ProtectionFlags kProtRead = 1;
-+constexpr ProtectionFlags kProtReadWrite = 3;
++using ProtectionFlags = u32;  // svcSetMemoryPermission's permission
++constexpr ProtectionFlags kProtNone = Perm_None;
++constexpr ProtectionFlags kProtRead = Perm_R;
++constexpr ProtectionFlags kProtReadWrite = Perm_Rw;
  #else
  using ProtectionFlags = int;
  constexpr ProtectionFlags kProtNone = PROT_NONE;
-@@ -206,6 +219,11 @@ bool ProtectRange(uint8_t* address, uint64_t size, ProtectionFlags protection) {
+@@ -206,6 +228,11 @@ bool ProtectRange(uint8_t* address, uint64_t size, ProtectionFlags protection) {
  #if defined(_WIN32)
      DWORD previous = 0;
      return VirtualProtect(address, static_cast<SIZE_T>(size), protection, &previous) != FALSE;
 +#elif defined(__SWITCH__)
-+    (void)address;
-+    (void)size;
-+    (void)protection;
-+    return true;
++    // Only the AliasCodeData primary views can be reprotected: the kernel refuses the SharedCode
++    // mirrors and the holes, and every caller tolerates a refusal. Checked mode has no flat view.
++    if (RequiresCheckedAccess()) return true;
++    return R_SUCCEEDED(svcSetMemoryPermission(address, size, protection));
  #else
      return mprotect(address, static_cast<size_t>(size), protection) == 0;
  #endif
-@@ -260,6 +278,10 @@ void EnsureReservation() {
+@@ -260,6 +287,11 @@ void EnsureReservation() {
              "The flat guest reservation did not land on the fixed base the translated code was "
              "compiled against.");
      }
 +#elif defined(__SWITCH__)
-+    // Nothing is reserved: the flat view is never backed on Horizon (see Initialize), so the fixed
-+    // base only stands for "initialized" and is never dereferenced.
++    // Nothing is reserved here: BuildHorizonFlatView finds and maps the flat view once the backing
++    // stores exist. Until then, and in checked mode, the fixed base only stands for "initialized"
++    // and is never dereferenced.
 +    void* reserved = reinterpret_cast<void*>(kFixedFlatGuestBase);
  #else
      void* requested = reinterpret_cast<void*>(kFixedFlatGuestBase);
  
-@@ -323,6 +345,11 @@ void MapGuestView(const Section& section, uint64_t sectionOffset, uint32_t guest
+@@ -323,6 +355,11 @@ void MapGuestView(const Section& section, uint64_t sectionOffset, uint32_t guest
              << ")";
          throw std::runtime_error(oss.str());
      }
@@ -576,24 +763,225 @@ index 9504488..f321f61 100644
  #else
      // MAP_FIXED is safe (and needs no particular kernel version) here specifically because we're
      // deliberately overwriting a sub-range of the PROT_NONE reservation this module already owns
-@@ -510,7 +537,9 @@ bool IsActive() {
+@@ -348,6 +385,12 @@ bool CommitPlaceholder(uint8_t* address, uint64_t size, ProtectionFlags protecti
+                                    MEM_RESERVE | MEM_COMMIT | kMemReplacePlaceholder, protection,
+                                    nullptr, 0);
+     return result != nullptr;
++#elif defined(__SWITCH__)
++    // Nothing is mapped outside the backing stores' views, so a no-access window (MMIO) already
++    // traps; committing fresh pages on demand needs a resuming fault handler, which Horizon lacks.
++    (void)address;
++    (void)size;
++    return protection == kProtNone;
+ #else
+     // No separate reserve-vs-commit step is needed: the anonymous PROT_NONE reservation this
+     // range came from is already demand-zero backed, so mprotect() alone both "commits" and
+@@ -501,6 +544,184 @@ void ReportUnmappedCommit(uint32_t guestAddress, uint64_t blockBase, bool isWrit
+     std::cerr.flush();
+ }
+ 
++#if defined(__SWITCH__)
++constexpr uint64_t kHorizonBlock = 0x200000;  // 2 MiB: lets the kernel use block mappings
++VirtmemReservation* g_flatReservation = nullptr;
++VirtmemReservation* g_hostReservation = nullptr;
++
++struct HorizonMapping {
++    bool code = false;  // svcMapProcessCodeMemory, else svcMapProcessMemory
++    uint64_t dst = 0;
++    uint64_t src = 0;
++    uint64_t size = 0;
++};
++
++// The cached mirror carries the game's own addresses (and any protected range), so it gets the
++// reprotectable AliasCodeData mapping.
++bool IsCachedMirror(uint32_t base) { return (base >> 28) == 0x8u || (base >> 28) == 0x9u; }
++
++void ReleaseHorizonReservations() {
++    virtmemLock();
++    if (g_hostReservation != nullptr) virtmemRemoveReservation(g_hostReservation);
++    if (g_flatReservation != nullptr) virtmemRemoveReservation(g_flatReservation);
++    virtmemUnlock();
++    g_hostReservation = nullptr;
++    g_flatReservation = nullptr;
++}
++
++// Newest first. A code mapping that cannot be undone leaves its heap pages locked (Perm_None), so
++// no host view would remain for that backing store: that one is fatal.
++void UndoHorizonMappings(Handle self, const std::vector<HorizonMapping>& done) {
++    bool released = true;
++    for (auto it = done.rbegin(); it != done.rend(); ++it) {
++        const Result rc = it->code
++            ? svcUnmapProcessCodeMemory(self, it->dst, it->src, it->size)
++            : svcUnmapProcessMemory(reinterpret_cast<void*>(it->dst), self, it->src, it->size);
++        if (R_SUCCEEDED(rc)) continue;
++        released = false;
++        std::ostringstream oss;
++        oss << (it->code ? "svcUnmapProcessCodeMemory" : "svcUnmapProcessMemory") << " at 0x"
++            << std::hex << it->dst << " failed (0x" << rc << ") while undoing the flat view";
++        if (it->code) throw std::runtime_error(oss.str());
++        RT_LOG(RT_TAG_MEMORY) << oss.str() << std::endl;
++    }
++    if (released) ReleaseHorizonReservations();  // a stray alias keeps its address space reserved
++}
++
++// Called once from Initialize with the heap backing stores in Sections(). On success the flat view
++// is live: g_base/g_flatBase point at it, every section's hostView is its SharedCode host alias and
++// checked access is off. On any failure everything is undone and the heap views stay.
++void BuildHorizonFlatView(const std::vector<RegionRequest>& regions) {
++    if (const char* value = std::getenv("WIICOMPILED_SWITCH_FLATMEM");
++        value != nullptr && std::strcmp(value, "0") == 0) {
++        RT_LOG(RT_TAG_MEMORY) << "Horizon flat view off (WIICOMPILED_SWITCH_FLATMEM=0): checked access"
++                              << std::endl;
++        return;
++    }
++    const Handle self = envGetOwnProcessHandle();
++    for (const unsigned svc : {0x02u, 0x73u, 0x74u, 0x75u, 0x77u, 0x78u}) {
++        if (!envIsSyscallHinted(svc)) {
++            RT_LOG(RT_TAG_MEMORY) << "Horizon flat view unavailable: SVC 0x" << std::hex << svc
++                                  << std::dec << " not granted; checked access" << std::endl;
++            return;
++        }
++    }
++    if (self == INVALID_HANDLE) {
++        RT_LOG(RT_TAG_MEMORY) << "Horizon flat view unavailable: no own process handle; checked access"
++                              << std::endl;
++        return;
++    }
++
++    std::unordered_map<SectionKey, const RegionRequest*, SectionKeyHash> primary;
++    for (const auto& region : regions) {
++        if (region.size == 0) continue;
++        const RegionRequest*& chosen = primary[KeyFor(region)];
++        if (chosen == nullptr || (IsCachedMirror(region.base) && !IsCachedMirror(chosen->base))) {
++            chosen = &region;
++        }
++    }
++    uint64_t hostSpan = kHorizonBlock;
++    for (const auto& [key, section] : Sections()) hostSpan += RoundUp(section.size, kHorizonBlock);
++
++    // Found and reserved under one lock, so libnx's own mappings (threads, shared memory...) keep
++    // out. The flat slice has room to align the base plus a granule after the 4 GiB that stays
++    // unmapped, so an access straddling 0xFFFFFFFF faults.
++    const uint64_t flatSpan = kGuestSpaceSize + kAllocationGranularity + kHorizonBlock;
++    virtmemLock();
++    void* flatSlice = virtmemFindAslr(flatSpan, 0);
++    if (flatSlice != nullptr) g_flatReservation = virtmemAddReservation(flatSlice, flatSpan);
++    void* hostSlice = g_flatReservation != nullptr ? virtmemFindAslr(hostSpan, kGuestPageSize) : nullptr;
++    if (hostSlice != nullptr) g_hostReservation = virtmemAddReservation(hostSlice, hostSpan);
++    virtmemUnlock();
++    if (g_flatReservation == nullptr || g_hostReservation == nullptr) {
++        ReleaseHorizonReservations();
++        RT_LOG(RT_TAG_MEMORY) << "Horizon flat view unavailable: no free 4 GiB slice in the address "
++                                 "space; checked access" << std::endl;
++        return;
++    }
++
++    const uint64_t base = RoundUp(reinterpret_cast<uint64_t>(flatSlice), kHorizonBlock);
++    uint64_t hostCursor = RoundUp(reinterpret_cast<uint64_t>(hostSlice), kHorizonBlock);
++    std::unordered_map<SectionKey, uint64_t, SectionKeyHash> primaryView;
++    std::unordered_map<SectionKey, uint64_t, SectionKeyHash> hostView;
++    std::vector<HorizonMapping> done;
++    const char* failed = nullptr;
++    Result failedRc = 0;
++    uint64_t failedAt = 0;
++    const auto ok = [&](const char* what, Result rc, uint64_t at) {
++        if (R_SUCCEEDED(rc)) return true;
++        failed = what;
++        failedRc = rc;
++        failedAt = at;
++        return false;
++    };
++
++    for (const auto& [key, section] : Sections()) {
++        const RegionRequest& owner = *primary[key];
++        const uint64_t offset = SectionOffsetFor(owner);
++        if (offset > owner.base || owner.base - offset + section.size > kGuestSpaceSize) {
++            failed = "placing a backing store";
++            failedAt = owner.base;
++            break;
++        }
++        const uint64_t view = base + owner.base - offset;
++        const uint64_t heap = reinterpret_cast<uint64_t>(section.hostView);
++        if (!ok("svcMapProcessCodeMemory", svcMapProcessCodeMemory(self, view, heap, section.size), view)) {
++            break;
++        }
++        done.push_back(HorizonMapping{true, view, heap, section.size});
++        if (!ok("svcSetProcessMemoryPermission",
++                svcSetProcessMemoryPermission(self, view, section.size, Perm_Rw), view)) {
++            break;
++        }
++        if (!ok("svcMapProcessMemory (host view)",
++                svcMapProcessMemory(reinterpret_cast<void*>(hostCursor), self, view, section.size),
++                hostCursor)) {
++            break;
++        }
++        done.push_back(HorizonMapping{false, hostCursor, view, section.size});
++        primaryView[key] = view;
++        hostView[key] = hostCursor;
++        hostCursor += RoundUp(section.size, kHorizonBlock);
++    }
++
++    uint32_t mirrors = 0;
++    for (const auto& region : regions) {
++        if (failed != nullptr) break;
++        if (region.size == 0 || primary[KeyFor(region)] == &region) continue;
++        // The same window MapGuestView gives a region on the other platforms.
++        const uint64_t sectionSize = Sections()[KeyFor(region)].size;
++        const uint64_t offset = SectionOffsetFor(region);
++        const uint64_t mappedSize =
++            std::min<uint64_t>(RoundUp(region.size, kAllocationGranularity), sectionSize - offset);
++        const uint64_t dst = base + region.base;
++        const uint64_t src = primaryView[KeyFor(region)] + offset;
++        if (!ok("svcMapProcessMemory (mirror)",
++                svcMapProcessMemory(reinterpret_cast<void*>(dst), self, src, mappedSize), dst)) {
++            break;
++        }
++        done.push_back(HorizonMapping{false, dst, src, mappedSize});
++        ++mirrors;
++    }
++
++    if (failed != nullptr) {
++        UndoHorizonMappings(self, done);
++        RT_LOG(RT_TAG_MEMORY) << "Horizon flat view unavailable: " << failed << " at 0x" << std::hex
++                              << failedAt << " failed (0x" << failedRc << ")" << std::dec
++                              << "; checked access" << std::endl;
++        return;
++    }
++
++    for (auto& [key, section] : Sections()) section.hostView = reinterpret_cast<uint8_t*>(hostView[key]);
++    g_base = reinterpret_cast<uint8_t*>(base);
++    g_flatBase = g_base;
++    g_requiresCheckedAccess = false;
++    RT_LOG(RT_TAG_MEMORY) << "Horizon flat view at 0x" << std::hex << base << std::dec
++                          << " (aliases: " << (mirrors + hostView.size()) << ", backing stores: "
++                          << Sections().size() << ")" << std::endl;
++}
++#endif
++
+ } // namespace
+ 
+ bool IsActive() {
+@@ -510,7 +731,9 @@ bool IsActive() {
  void Initialize(const std::vector<RegionRequest>& regions) {
      std::lock_guard<std::mutex> lock(StateMutex());
  
 -#if !defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
 +#if defined(__SWITCH__)
-+    g_requiresCheckedAccess = true;  // no flat alias on Horizon: every access goes through the views
++    if (!g_initialized) g_requiresCheckedAccess = true;  // until BuildHorizonFlatView maps the view
 +#elif !defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
      g_requiresCheckedAccess = HostPageSize() > kGuestPageSize;
  #elif defined(MKW_AARCH64_4K_PAGES)
      if (const long page = sysconf(_SC_PAGESIZE); page != 4096) {
-@@ -572,6 +601,14 @@ void Initialize(const std::vector<RegionRequest>& regions) {
+@@ -572,6 +795,17 @@ void Initialize(const std::vector<RegionRequest>& regions) {
          if (section.hostView == nullptr) {
              throw std::runtime_error(LastErrorText("MapViewOfFile for the host guest-RAM alias"));
          }
 +#elif defined(__SWITCH__)
-+        // Plain zeroed heap memory: the only view on Horizon.
-+        section.hostView = static_cast<uint8_t*>(std::aligned_alloc(kAllocationGranularity, rounded));
++        // Zeroed heap memory: the host view in checked mode, else the pages BuildHorizonFlatView
++        // moves into the flat view. 2 MiB aligned for block mappings; the spare page keeps malloc's
++        // next chunk header off the pages that move.
++        section.hostView = static_cast<uint8_t*>(
++            std::aligned_alloc(kHorizonBlock, rounded + kGuestPageSize));
 +        if (section.hostView == nullptr) {
 +            throw std::runtime_error("Not enough memory for guest RAM (open the game over a title, "
 +                                     "holding R, for the full memory)");
@@ -602,6 +990,40 @@ index 9504488..f321f61 100644
  #else
          // The section is an anonymous shared-memory object: the SAME physical pages get mapped
          // twice below (once here as the always-accessible host view, once per-region as the
+@@ -593,6 +827,9 @@ void Initialize(const std::vector<RegionRequest>& regions) {
+ #endif
+         Sections()[key] = section;
+     }
++#if defined(__SWITCH__)
++    BuildHorizonFlatView(regions);
++#endif
+ 
+     for (const auto& region : regions) {
+         if (region.size == 0) continue;
+diff --git a/runtime/src/hle/audio/ax_mix.cpp b/runtime/src/hle/audio/ax_mix.cpp
+index 0bb8fa0..697d98c 100644
+--- a/runtime/src/hle/audio/ax_mix.cpp
++++ b/runtime/src/hle/audio/ax_mix.cpp
+@@ -30,6 +30,9 @@
+ #include <string>
+ #include <thread>
+ 
++#if defined(__SWITCH__)
++extern "C" void SwitchPinCurrentThread(int core, int priority);  // platform/switch/switch_threads.cpp
++#endif
+ namespace AxDspHle {
+ namespace {
+ 
+@@ -1395,6 +1398,9 @@ private:
+     }
+ 
+     void MixWorkerMain() {
++#if defined(__SWITCH__)
++        SwitchPinCurrentThread(2, 0x2B);  // short bursts that must land on time
++#endif
+         t_onMixWorker = true;
+         for (;;) {
+             {
 diff --git a/runtime/src/hle/storage/dvd.cpp b/runtime/src/hle/storage/dvd.cpp
 index 8f4c9b4..238a064 100644
 --- a/runtime/src/hle/storage/dvd.cpp
@@ -777,10 +1199,21 @@ index 7269747..13bd595 100644
  }
  extern "C" bool g_dynamicAspectRatioEnabled = false;
 diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
-index 280cfd6..191d32e 100644
+index 280cfd6..005446f 100644
 --- a/runtime/src/match_benchmark_overlay.inc
 +++ b/runtime/src/match_benchmark_overlay.inc
-@@ -172,6 +172,9 @@ void DrawMatchBenchmark() {
+@@ -156,6 +156,10 @@ void DrawMatchBenchmark() {
+         std::error_code ec;
+         std::filesystem::create_directories(folder, ec);
+         report = folder / ("match-" + std::to_string(id));
++#if defined(__SWITCH__)
++        static char csvBuffer[1 << 20];  // flush to the SD card at the end, not every few frames
++        csv.rdbuf()->pubsetbuf(csvBuffer, sizeof csvBuffer);
++#endif
+         csv.open(report.string() + ".csv");
+         if (!csv) { message = "No se pudo crear el informe"; return; }
+         csv << "utc_unix_ms,elapsed_s,frame_ms,draws,scale,force_16_9,backend,shader_queue,gpu_render_ms,gpu_samples,cpu_encode_ms,efb_copies,efb_source_pixels,efb_snapshots,efb_readbacks,efb_readback_wait_ms,presents,process_cpu_pct,gpu_3d_pct,process_ram_mb,vram_mb,system_ram_used_gb\n";
+@@ -172,6 +176,9 @@ void DrawMatchBenchmark() {
          recording = true;
          message = "Midiendo";
          std::fprintf(stderr, "[match-bench] recording %s scale=%.0f force169=%d\n", report.string().c_str(), g_resolutionScale, g_forceAspect169);
@@ -790,7 +1223,7 @@ index 280cfd6..191d32e 100644
      };
      const auto finish = [&] {
          recording = false;
-@@ -204,6 +207,10 @@ void DrawMatchBenchmark() {
+@@ -204,6 +211,10 @@ void DrawMatchBenchmark() {
          summary << "process_cpu_pct is over all logical cores, like Task Manager. GPU/VRAM from Windows GPU counters.\n"
                  << "GPU markers exclude presenter work and demanded EFB prefixes. CPU autoplay is not a bit-exact replay.\n";
          summary.close();
@@ -803,10 +1236,10 @@ index 280cfd6..191d32e 100644
      };
 diff --git a/runtime/src/platform/switch/switch_crash.cpp b/runtime/src/platform/switch/switch_crash.cpp
 new file mode 100644
-index 0000000..cb6ce4d
+index 0000000..a133027
 --- /dev/null
 +++ b/runtime/src/platform/switch/switch_crash.cpp
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,46 @@
 +// A CPU exception on Horizon (data abort, undefined instruction...): libnx calls this handler instead
 +// of letting the system close the program with a bare "an error has occurred". It prints the fault
 +// to stdout (nxlink's console on the PC, else the log file) and exits. PC and LR are printed against
@@ -814,6 +1247,8 @@ index 0000000..cb6ce4d
 +#if defined(__SWITCH__)
 +#include <cstdio>
 +#include <switch.h>
++
++#include "guest_flat_memory.h"
 +
 +extern "C" {
 +alignas(16) u8 __nx_exception_stack[0x4000];
@@ -823,6 +1258,11 @@ index 0000000..cb6ce4d
 +void __libnx_exception_handler(ThreadExceptionDump* ctx) {
 +    const auto anchor = reinterpret_cast<u64>(&__libnx_exception_handler);
 +    std::printf("\n[crash] CPU exception 0x%x esr=0x%x far=0x%lx\n", ctx->error_desc, ctx->esr, ctx->far.x);
++    // In the flat view, far - base is the guest address the translated code touched.
++    if (const auto flat = reinterpret_cast<u64>(GuestFlat::g_flatBase); flat != 0) {
++        std::printf("[crash] far - flat base = 0x%lx%s (flat base 0x%lx)\n", ctx->far.x - flat,
++                    ctx->far.x - flat < GuestFlat::kGuestSpaceSize ? " (guest address)" : "", flat);
++    }
 +    std::printf("[crash] pc=0x%lx lr=0x%lx sp=0x%lx fp=0x%lx (__libnx_exception_handler at 0x%lx)\n",
 +                ctx->pc.x, ctx->lr.x, ctx->sp.x, ctx->fp.x, anchor);
 +    for (int i = 0; i < 29; ++i) {
@@ -1004,6 +1444,23 @@ index 0000000..4eab794
 +extern "C" bool SwitchStdioToNxlink() {
 +    if (__nxlink_host.s_addr == 0 || R_FAILED(socketInitializeDefault())) return false;
 +    return nxlinkStdio() >= 0;
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_threads.cpp b/runtime/src/platform/switch/switch_threads.cpp
+new file mode 100644
+index 0000000..e8aa273
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_threads.cpp
+@@ -0,0 +1,11 @@
++// Core and priority for threads that libnx would start at 0x3B on the default core
++// (aurora.cpp's frame worker and presenter, the AX mixer). Lower number = higher priority;
++// the game's main thread runs at 0x2C on core 0.
++#if defined(__SWITCH__)
++#include <switch.h>
++
++extern "C" void SwitchPinCurrentThread(int core, int priority) {
++    svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
++    svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
 +}
 +#endif
 diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp

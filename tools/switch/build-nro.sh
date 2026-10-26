@@ -127,7 +127,8 @@ dotnet "$translator" emit-build-shards "${project[@]}" --base-metadata "$gen/tra
 # ---- 4. Compile for Horizon -----------------------------------------------------------------------
 # GCC on a translated shard peaks near 1.6 GB (more than clang): one job per 2.5 GB free now, or the
 # host (Docker Desktop's VM, in the image) runs out of memory and drops the build.
-jobs=$(awk -v n="$(nproc)" '/^MemFree:/ { j = int($2 / 2621440); print (j < 1 ? 1 : (j > n ? n : j)) }' /proc/meminfo)
+# MLB_SWITCH_JOBS overrides it (when the host is short of memory or swap).
+jobs=${MLB_SWITCH_JOBS:-$(awk -v n="$(nproc)" '/^MemFree:/ { j = int($2 / 2621440); print (j < 1 ? 1 : (j > n ? n : j)) }' /proc/meminfo)}
 step "Configuring for Horizon (graphics: $graphics)"
 # Precompiled headers stay off: under MSYS2, devkitA64 (a native Windows compiler) cannot open the
 # absolute MSYS paths the generated PCH header #includes (only command lines get converted), so unity
