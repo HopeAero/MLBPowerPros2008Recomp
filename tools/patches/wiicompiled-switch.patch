@@ -1,0 +1,652 @@
+diff --git a/aurora-main/extern/CMakeLists.txt b/aurora-main/extern/CMakeLists.txt
+index 59eeab3..cf1a9e3 100644
+--- a/aurora-main/extern/CMakeLists.txt
++++ b/aurora-main/extern/CMakeLists.txt
+@@ -292,6 +292,18 @@ if (AURORA_ENABLE_GX)
+ 
+     add_library(sqlite3 STATIC ${sqlite3_SOURCE_DIR}/sqlite3.c)
+     target_include_directories(sqlite3 PUBLIC ${sqlite3_SOURCE_DIR})
++    if (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++      FetchContent_Declare(sqlite_nx
++        URL https://github.com/nx-mod/sqlite-nx/archive/77103483f20795f744044f931596e7f4cc7858e0.tar.gz
++        URL_HASH SHA256=cd11514fed328fae37aeb880e4ec678ca87008da419795eaa361a22eed25d3d9
++        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
++        EXCLUDE_FROM_ALL
++      )
++      FetchContent_Populate(sqlite_nx)
++      target_sources(sqlite3 PRIVATE ${sqlite_nx_SOURCE_DIR}/source/nx-vfs.c)
++      target_compile_definitions(sqlite3 PRIVATE SQLITE_OS_OTHER=1 SQLITE_THREADSAFE=1 HAVE_USLEEP=1
++        SQLITE_OMIT_WAL SQLITE_OMIT_LOAD_EXTENSION SQLITE_TEMP_STORE=3)
++    endif ()
+   else ()
+     message(STATUS "aurora: Using existing sqlite3")
+   endif ()
+@@ -352,7 +364,13 @@ if (NOT TARGET TracyClient)
+           DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+           EXCLUDE_FROM_ALL
+   )
+-  FetchContent_MakeAvailable(tracy)
++  if (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    FetchContent_Populate(tracy)
++    add_library(TracyClient INTERFACE)
++    target_include_directories(TracyClient INTERFACE ${tracy_SOURCE_DIR}/public)
++  else ()
++    FetchContent_MakeAvailable(tracy)
++  endif ()
+ 
+   if (NOT TARGET TracyClient)
+     message(FATAL_ERROR "Failed to make TracyClient available")
+diff --git a/aurora-main/include/dolphin/gx/GXGeometry.h b/aurora-main/include/dolphin/gx/GXGeometry.h
+index a71eb74..c6538d9 100644
+--- a/aurora-main/include/dolphin/gx/GXGeometry.h
++++ b/aurora-main/include/dolphin/gx/GXGeometry.h
+@@ -22,9 +22,11 @@ void GXSetPointSize(u8 pointSize, GXTexOffset texOffsets);
+ void GXEnableTexOffsets(GXTexCoordID coord, GXBool line_enable, GXBool point_enable);
+ #ifdef TARGET_PC
+ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le);
++extern "C++" {
+ static inline void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride) {
+   GXSetArray(attr, data, size, stride, false);
+ }
++} // extern "C++"
+ #define GXSETARRAY(attr, data, size, stride, le) GXSetArray((attr), (data), (size), (stride), (le))
+ #else
+ void GXSetArray(GXAttr attr, const void* data, u8 stride);
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 0063653..d18efce 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -10,8 +10,9 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+ endif()
+ project(mkw_recompiled)
+ 
+-if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+-    message(FATAL_ERROR "WiiCompiled requires a 64-bit Clang toolchain")
++if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR (NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" AND
++        NOT (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")))
++    message(FATAL_ERROR "WiiCompiled requires a 64-bit Clang toolchain (devkitA64 GCC for Nintendo Switch)")
+ endif()
+ 
+ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+@@ -40,9 +41,19 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(
+     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+         set(MKW_PLATFORM_LINUX_ARM64 TRUE)
+     endif()
++elseif(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    # devkitPro's toolchain (devkitA64 + libnx): tools/switch/build-nro.sh in tools/switch/Dockerfile.
++    set(MKW_PLATFORM_SWITCH TRUE)
+ else()
+     message(FATAL_ERROR
+-        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS x86_64/arm64")
++        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, Apple Clang on macOS x86_64/arm64, or devkitA64 for Nintendo Switch")
++endif()
++
++# -fno-slp-vectorize is Clang's spelling; devkitA64 GCC has no such option.
++if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++    set(MKW_NO_SLP_VECTORIZE "")
++else()
++    set(MKW_NO_SLP_VECTORIZE -fno-slp-vectorize)
+ endif()
+ 
+ if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+@@ -59,6 +70,15 @@ if(MKW_PLATFORM_LINUX_ARM64)
+     endif()
+ endif()
+ 
++if(MKW_PLATFORM_SWITCH)
++    # AArch64 makes plain char unsigned; the translated code and the runtime assume signed (see the
++    # Linux ARM64 block above). The default graphics backend: "null" for the headless console test.
++    add_compile_options(-fsigned-char -fno-semantic-interposition)
++    set(MKW_SWITCH_GRAPHICS "vulkan" CACHE STRING "Default graphics_api of the Switch build (vulkan or null)")
++    # Dawn for Horizon's tree (tools/switch/dawn/build-dawn.sh): NVK's newlib gap-fill comes from it.
++    set(MKW_SWITCH_DAWN_DIR "/cache/dawn" CACHE PATH "Dawn for Horizon source/build tree")
++endif()
++
+ option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
+ option(MKW_BUILD_PSQ_TESTS "Build focused PSQ ISA tests" OFF)
+ 
+@@ -109,7 +129,7 @@ set_target_properties(mkw_pugixml PROPERTIES UNITY_BUILD OFF)
+ # separately BSD-style licensed, see third_party/libco/LICENSE). Windows keeps native Fibers;
+ # Apple Silicon uses the project's x18-safe AArch64 assembly backend, while Intel macOS uses
+ # libco's existing System V AMD64 backend.
+-if(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
++if(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64 OR MKW_PLATFORM_SWITCH)
+     add_library(mkw_libco STATIC third_party/libco/libco.c)
+     add_library(mkw::libco ALIAS mkw_libco)
+     target_include_directories(mkw_libco PUBLIC third_party/libco)
+@@ -185,6 +205,13 @@ if(NOT MKW_PLATFORM_WINDOWS)
+         set(DISABLE_PACKAGE_CONFIG_AND_INSTALL ON CACHE BOOL "" FORCE)
+         FetchContent_MakeAvailable(mkw_mbedtls_upstream)
+         target_link_libraries(mkw_mbedtls INTERFACE MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
++        if(MKW_PLATFORM_SWITCH)
++            foreach(mkw_mbedtls_target mbedcrypto mbedx509 mbedtls)
++                target_compile_definitions(${mkw_mbedtls_target} PRIVATE __unix__=1)
++                target_compile_definitions(${mkw_mbedtls_target} PUBLIC
++                    "MBEDTLS_USER_CONFIG_FILE=\"${CMAKE_CURRENT_LIST_DIR}/include/mbedtls_switch_config.h\"")
++            endforeach()
++        endif()
+     endif()
+ endif()
+ 
+@@ -215,7 +242,7 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
+     COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS}")
+ # Match the optimization policy of the translated callers as well as their FP policy.
+ set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp" APPEND PROPERTY
+-    COMPILE_OPTIONS -O2 -fno-slp-vectorize)
++    COMPILE_OPTIONS -O2 ${MKW_NO_SLP_VECTORIZE})
+ 
+ # ----------------------------------------------------------------------
+ # Third-party: aurora-main (provides SDL3 + GPU backends)
+@@ -278,7 +305,10 @@ else()
+     set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
+     # Isolate aurora build products to a subdirectory under the main build dir.
+     add_subdirectory(${MKW_AURORA_DIR} ${CMAKE_BINARY_DIR}/aurora-build EXCLUDE_FROM_ALL)
+-    set(CMAKE_DISABLE_PRECOMPILE_HEADERS OFF)
++    unset(CMAKE_DISABLE_PRECOMPILE_HEADERS)  # back to the cache's choice (default: precompiled)
++    if(MKW_PLATFORM_SWITCH)
++        target_compile_definitions(imgui PRIVATE IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
++    endif()
+ 
+     # Keep upstream Aurora split: several sources intentionally use file-local
+     # names that collide under this repo's aggressive unity build settings.
+@@ -381,7 +411,7 @@ if(MKW_BUILD_PSQ_TESTS)
+         "${CMAKE_CURRENT_LIST_DIR}/include")
+     target_compile_features(mkw_psq_helpers_tests PRIVATE cxx_std_17)
+     target_compile_options(mkw_psq_helpers_tests PRIVATE
+-        -O2 ${MKW_TRANSLATED_PPC_FP_OPTIONS} -fno-slp-vectorize)
++        -O2 ${MKW_TRANSLATED_PPC_FP_OPTIONS} ${MKW_NO_SLP_VECTORIZE})
+     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+         target_compile_options(mkw_psq_helpers_tests PRIVATE -march=x86-64-v3)
+     endif()
+diff --git a/runtime/cmake/PublicProducts.cmake b/runtime/cmake/PublicProducts.cmake
+index 251c83a..9e4f5a1 100644
+--- a/runtime/cmake/PublicProducts.cmake
++++ b/runtime/cmake/PublicProducts.cmake
+@@ -18,6 +18,9 @@ if(EXISTS "${GUEST_SYMBOL_TABLE_FILE}")
+ else()
+     list(APPEND SOURCES "${MKW_RUNTIME_SOURCE_DIR}/cmake/guest_symbol_table_stub.cpp")
+ endif()
++if(CMAKE_HOST_SYSTEM_NAME MATCHES "^MSYS")
++    set_source_files_properties("${DATA_INIT_FILE}" "${GUEST_SYMBOL_TABLE_FILE}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++endif()
+ if(EXISTS "${DATA_INIT_BLOB_ASM}")
+     enable_language(ASM)
+     set_source_files_properties("${DATA_INIT_BLOB_ASM}" PROPERTIES LANGUAGE ASM SKIP_UNITY_BUILD_INCLUSION ON)
+@@ -37,7 +40,7 @@ endfunction()
+ 
+ function(mkw_apply_translated_compile_options target)
+     target_compile_options(${target} PRIVATE
+-        -O2 ${MKW_TRANSLATED_PPC_FP_OPTIONS} -fno-slp-vectorize -w -pipe)
++        -O2 ${MKW_TRANSLATED_PPC_FP_OPTIONS} ${MKW_NO_SLP_VECTORIZE} -w -pipe)
+ endfunction()
+ 
+ function(mkw_configure_object_target target)
+@@ -89,6 +92,8 @@ elseif(MKW_PLATFORM_LINUX)
+     # ${CMAKE_DL_LIBS} for music_attenuation.cpp's dlopen of libdbus-1 (MPRIS
+     # media monitoring).
+     target_link_libraries(mkw_runtime_common PRIVATE mkw::libco ${CMAKE_DL_LIBS})
++elseif(MKW_PLATFORM_SWITCH)
++    target_link_libraries(mkw_runtime_common PRIVATE mkw::libco)
+ endif()
+ 
+ if(MKW_PLATFORM_MACOS)
+@@ -231,6 +236,8 @@ function(mkw_configure_product target)
+             dbghelp user32 winmm ws2_32 iphlpapi secur32 crypt32 windowsapp)
+ 
+         set_target_properties(${target} PROPERTIES WIN32_EXECUTABLE TRUE)
++    elseif(MKW_PLATFORM_SWITCH)
++        target_link_libraries(${target} PRIVATE mkw::libco)
+     elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
+         # mkw_runtime_common is an OBJECT library: WiiCompiled/RetroRewind only pull in its .o
+         # files via $<TARGET_OBJECTS:>, which does not propagate mkw_runtime_common's own
+@@ -310,6 +317,23 @@ endfunction()
+ 
+ add_executable(WiiCompiled "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})
+ mkw_configure_product(WiiCompiled)
++if(MKW_PLATFORM_SWITCH)
++    target_sources(WiiCompiled PRIVATE "${MKW_SWITCH_DAWN_DIR}/src/switch_smoke_test/nvk_switch_stubs.cpp")
++    target_link_libraries(WiiCompiled PRIVATE
++        -L$ENV{DEVKITPRO}/portlibs/switch/lib
++        -Wl,-u,vk_icdGetInstanceProcAddr
++        -Wl,--whole-archive -lnvk -Wl,--no-whole-archive
++        -Wl,--start-group -lnvk_support -lz -Wl,--end-group
++        # SDL3's Switch video driver links Mesa's EGL, whose archive repeats Mesa utilities that
++        # libnvk_support carries: the first copy (NVK's) wins. The game draws through Vulkan and
++        # never creates a GL context, so EGL's code never runs.
++        -Wl,--allow-multiple-definition
++        # devkitA64's prebuilt libstdc++ carries text relocations (nx-mod's port notes).
++        -Wl,-z,notext)
++    nx_generate_nacp(MLBPowerPros2008.nacp NAME "MLB Power Pros 2008" AUTHOR "HopeAero" VERSION "0.1.0")
++    nx_create_nro(WiiCompiled OUTPUT MLBPowerPros2008.nro NACP MLBPowerPros2008.nacp
++        ICON "$ENV{DEVKITPRO}/libnx/default_icon.jpg")
++endif()
+ target_precompile_headers(WiiCompiled PRIVATE
+     "${MKW_RUNTIME_SOURCE_DIR}/include/mkw_pch.h")
+ if(TARGET mkw_base_sensitive)
+diff --git a/runtime/include/isa/ppc_isa_config.h b/runtime/include/isa/ppc_isa_config.h
+index b062184..ac26a07 100644
+--- a/runtime/include/isa/ppc_isa_config.h
++++ b/runtime/include/isa/ppc_isa_config.h
+@@ -35,4 +35,13 @@ inline constexpr bool MkwStateFreeAbiEnabled(uint32_t) noexcept
+ #define MKW_PPC_COLD __attribute__((cold))
+ 
+ 
++#if defined(__clang__)
+ using MkwStateFreeResult2 = uint64_t __attribute__((ext_vector_type(2)));
++#else
++struct MkwStateFreeResult2 {
++    uint64_t lo;
++    uint64_t hi;
++    uint64_t& operator[](size_t index) { return index == 0 ? lo : hi; }
++    const uint64_t& operator[](size_t index) const { return index == 0 ? lo : hi; }
++};
++#endif
+diff --git a/runtime/include/isa/ppc_isa_int.h b/runtime/include/isa/ppc_isa_int.h
+index a9e93cc..74c2c96 100644
+--- a/runtime/include/isa/ppc_isa_int.h
++++ b/runtime/include/isa/ppc_isa_int.h
+@@ -11,7 +11,13 @@
+ 
+ inline uint32_t PpcRotl32Inline(uint32_t value, uint32_t shift)
+ {
++#if defined(__clang__)
+     return __builtin_rotateleft32(value, shift);
++#else
++    // GCC has no rotate builtin; it turns this masked form into one ROR.
++    shift &= 31;
++    return (value << shift) | (value >> ((0u - shift) & 31));
++#endif
+ }
+ 
+ extern "C" uint32_t OSSystemCall();
+diff --git a/runtime/include/mbedtls_switch_config.h b/runtime/include/mbedtls_switch_config.h
+new file mode 100644
+index 0000000..0f8d25e
+--- /dev/null
++++ b/runtime/include/mbedtls_switch_config.h
+@@ -0,0 +1,7 @@
++#pragma once
++// mbed TLS on Horizon (Nintendo Switch): no entropy device, so the entropy source is libnx's CSRNG
++// through mbedtls_hardware_poll (src/platform/switch/switch_mbedtls.cpp); newlib has no _POSIX_VERSION, so
++// the millisecond clock is there too.
++#define MBEDTLS_NO_PLATFORM_ENTROPY
++#define MBEDTLS_ENTROPY_HARDWARE_ALT
++#define MBEDTLS_PLATFORM_MS_TIME_ALT
+diff --git a/runtime/include/power_pros_ui.h b/runtime/include/power_pros_ui.h
+index 83a67e4..159822b 100644
+--- a/runtime/include/power_pros_ui.h
++++ b/runtime/include/power_pros_ui.h
+@@ -89,6 +89,11 @@ inline ImFont* LoadFirstFont(std::initializer_list<const char*> paths, float siz
+ // Font paths differ per distribution (Fedora and SteamOS have no DejaVu where Debian and Arch keep
+ // it): when none of the listed files exists, ask fontconfig for the closest match to the pattern.
+ inline ImFont* LoadFontconfigFont(const char* pattern, float size) {
++#if defined(__SWITCH__)
++    (void)pattern;
++    (void)size;
++    return nullptr;
++#else
+     const std::string command = std::string("fc-match -f '%{file}' '") + pattern + "' 2>/dev/null";
+     FILE* pipe = popen(command.c_str(), "r");
+     if (pipe == nullptr) return nullptr;
+@@ -98,6 +103,7 @@ inline ImFont* LoadFontconfigFont(const char* pattern, float size) {
+     if (length == 0) return nullptr;
+     path[length] = '\0';
+     return LoadFirstFont({path}, size);
++#endif
+ }
+ #endif
+ 
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index 3198082..d9baee0 100644
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -193,6 +193,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
+ // only vulkan for linux
+ #elif defined(__linux__)
+     static constexpr std::array<std::string_view, 4> values{"auto", "vulkan", "opengles", "null"};
++#elif defined(__SWITCH__)
++    static constexpr std::array<std::string_view, 3> values{"auto", "vulkan", "null"};
+ #elif defined(_WIN32)
+     static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
+ #endif
+diff --git a/runtime/include/system_bridge.h b/runtime/include/system_bridge.h
+index f66df4c..3ee7632 100644
+--- a/runtime/include/system_bridge.h
++++ b/runtime/include/system_bridge.h
+@@ -16,8 +16,9 @@
+ // the norm. A POSIX signal handler jumping back to here must use the sig-prefixed pair instead:
+ // only sigsetjmp/siglongjmp save and restore the process signal mask, which is what keeps SIGSEGV
+ // from staying blocked (and a second fault during the same ctor loop from escalating instead of
+-// trapping) after the first recovered fault.
+-#if defined(_WIN32)
++// trapping) after the first recovered fault. Horizon has no signals and newlib no sigjmp_buf, so
++// the Switch takes the plain pair too.
++#if defined(_WIN32) || defined(__SWITCH__)
+ using MkwJmpBuf = jmp_buf;
+ #define MKW_SETJMP(buf) setjmp(buf)
+ #else
+diff --git a/runtime/include/wii_es_crypto.h b/runtime/include/wii_es_crypto.h
+index 0c515b5..82ce075 100644
+--- a/runtime/include/wii_es_crypto.h
++++ b/runtime/include/wii_es_crypto.h
+@@ -24,6 +24,10 @@
+ #include <cryptopp/ec2n.h>
+ #include <cryptopp/oids.h>
+ #include <cryptopp/osrng.h>
++#if defined(__SWITCH__)
++#include <cryptopp/randpool.h>
++extern "C" void randomGet(void* buf, size_t len);  // libnx's CSRNG: Crypto++ has no OS RNG on Horizon
++#endif
+ #include <cryptopp/sha.h>
+ 
+ #include <algorithm>
+@@ -150,7 +154,18 @@ inline EcSignature SignMessage(const uint8_t* key, const uint8_t* data, size_t s
+         throw std::runtime_error("Crypto++ returned an unexpected sect233r1 signature size");
+     }
+ 
++#if defined(__SWITCH__)
++    thread_local CryptoPP::RandomPool random;
++    thread_local bool seeded = false;
++    if (!seeded) {
++        uint8_t seed[32];
++        randomGet(seed, sizeof seed);
++        random.IncorporateEntropy(seed, sizeof seed);
++        seeded = true;
++    }
++#else
+     thread_local CryptoPP::AutoSeededRandomPool random;
++#endif
+     EcSignature signature{};
+     const size_t written = signer.SignMessage(random, data, size, signature.data());
+     if (written != signature.size()) {
+diff --git a/runtime/src/discord_presence.cpp b/runtime/src/discord_presence.cpp
+index a7b9caa..1e4343a 100644
+--- a/runtime/src/discord_presence.cpp
++++ b/runtime/src/discord_presence.cpp
+@@ -21,7 +21,7 @@
+ #define WIN32_LEAN_AND_MEAN
+ #endif
+ #include <windows.h>
+-#else
++#elif !defined(__SWITCH__)
+ #include <sys/socket.h>
+ #include <sys/un.h>
+ #include <unistd.h>
+@@ -320,6 +320,12 @@ private:
+     }
+ 
+     HANDLE handle_ = INVALID_HANDLE_VALUE;
++#elif defined(__SWITCH__)
++    // No Discord client to reach on the Switch.
++    bool ConnectLocked() { return false; }
++    bool WriteAllLocked(const uint8_t*, size_t) { return false; }
++    bool ReadAllLocked(uint8_t*, size_t) { return false; }
++    void CloseLocked() { connected_ = false; }
+ #else
+     bool ConnectLocked() {
+         if (connected_) {
+diff --git a/runtime/src/guest_flat_memory.cpp b/runtime/src/guest_flat_memory.cpp
+index 9504488..f321f61 100644
+--- a/runtime/src/guest_flat_memory.cpp
++++ b/runtime/src/guest_flat_memory.cpp
+@@ -27,6 +27,10 @@
+ #define WIN32_LEAN_AND_MEAN
+ #endif
+ #include <windows.h>
++#elif defined(__SWITCH__)
++#include <cerrno>
++#include <cstdlib>
++#include <cstring>
+ #else
+ #include <cerrno>
+ #include <cstring>
+@@ -56,8 +60,12 @@ constexpr size_t kHostPageSize = 0x1000;
+ #if !defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
+ size_t HostPageSize()
+ {
++#if defined(__SWITCH__)
++    return kGuestPageSize;
++#else
+     const long size = sysconf(_SC_PAGESIZE);
+     return size > 0 ? static_cast<size_t>(size) : kGuestPageSize;
++#endif
+ }
+ #endif
+ 
+@@ -70,6 +78,11 @@ using ProtectionFlags = DWORD;
+ constexpr ProtectionFlags kProtNone = PAGE_NOACCESS;
+ constexpr ProtectionFlags kProtRead = PAGE_READONLY;
+ constexpr ProtectionFlags kProtReadWrite = PAGE_READWRITE;
++#elif defined(__SWITCH__)
++using ProtectionFlags = int;  // tokens only: ProtectRange is a no-op on Horizon
++constexpr ProtectionFlags kProtNone = 0;
++constexpr ProtectionFlags kProtRead = 1;
++constexpr ProtectionFlags kProtReadWrite = 3;
+ #else
+ using ProtectionFlags = int;
+ constexpr ProtectionFlags kProtNone = PROT_NONE;
+@@ -206,6 +219,11 @@ bool ProtectRange(uint8_t* address, uint64_t size, ProtectionFlags protection) {
+ #if defined(_WIN32)
+     DWORD previous = 0;
+     return VirtualProtect(address, static_cast<SIZE_T>(size), protection, &previous) != FALSE;
++#elif defined(__SWITCH__)
++    (void)address;
++    (void)size;
++    (void)protection;
++    return true;
+ #else
+     return mprotect(address, static_cast<size_t>(size), protection) == 0;
+ #endif
+@@ -260,6 +278,10 @@ void EnsureReservation() {
+             "The flat guest reservation did not land on the fixed base the translated code was "
+             "compiled against.");
+     }
++#elif defined(__SWITCH__)
++    // Nothing is reserved: the flat view is never backed on Horizon (see Initialize), so the fixed
++    // base only stands for "initialized" and is never dereferenced.
++    void* reserved = reinterpret_cast<void*>(kFixedFlatGuestBase);
+ #else
+     void* requested = reinterpret_cast<void*>(kFixedFlatGuestBase);
+ 
+@@ -323,6 +345,11 @@ void MapGuestView(const Section& section, uint64_t sectionOffset, uint32_t guest
+             << ")";
+         throw std::runtime_error(oss.str());
+     }
++#elif defined(__SWITCH__)
++    (void)target;
++    (void)section;
++    (void)sectionOffset;
++    (void)mappedSize;
+ #else
+     // MAP_FIXED is safe (and needs no particular kernel version) here specifically because we're
+     // deliberately overwriting a sub-range of the PROT_NONE reservation this module already owns
+@@ -510,7 +537,9 @@ bool IsActive() {
+ void Initialize(const std::vector<RegionRequest>& regions) {
+     std::lock_guard<std::mutex> lock(StateMutex());
+ 
+-#if !defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
++#if defined(__SWITCH__)
++    g_requiresCheckedAccess = true;  // no flat alias on Horizon: every access goes through the views
++#elif !defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
+     g_requiresCheckedAccess = HostPageSize() > kGuestPageSize;
+ #elif defined(MKW_AARCH64_4K_PAGES)
+     if (const long page = sysconf(_SC_PAGESIZE); page != 4096) {
+@@ -572,6 +601,14 @@ void Initialize(const std::vector<RegionRequest>& regions) {
+         if (section.hostView == nullptr) {
+             throw std::runtime_error(LastErrorText("MapViewOfFile for the host guest-RAM alias"));
+         }
++#elif defined(__SWITCH__)
++        // Plain zeroed heap memory: the only view on Horizon.
++        section.hostView = static_cast<uint8_t*>(std::aligned_alloc(kAllocationGranularity, rounded));
++        if (section.hostView == nullptr) {
++            throw std::runtime_error("Not enough memory for guest RAM (open the game over a title, "
++                                     "holding R, for the full memory)");
++        }
++        std::memset(section.hostView, 0, static_cast<size_t>(rounded));
+ #else
+         // The section is an anonymous shared-memory object: the SAME physical pages get mapped
+         // twice below (once here as the always-accessible host view, once per-region as the
+diff --git a/runtime/src/host_context.cpp b/runtime/src/host_context.cpp
+index 502f72c..885f8bb 100644
+--- a/runtime/src/host_context.cpp
++++ b/runtime/src/host_context.cpp
+@@ -14,7 +14,7 @@
+ 
+ extern "C" void mkw_co_switch(void** targetSp, void** sourceSp);
+ extern "C" void* mkw_co_init(void* stackTop, void (*entry)(void*), void* argument);
+-#elif defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
++#elif defined(__linux__) || defined(__SWITCH__) || (defined(__APPLE__) && defined(__x86_64__))
+ #include <libco.h>
+ 
+ #include <cstdlib>
+@@ -158,7 +158,7 @@ void Switch(Handle target)
+     g_current = source;
+ }
+ 
+-#elif defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
++#elif defined(__linux__) || defined(__SWITCH__) || (defined(__APPLE__) && defined(__x86_64__))
+ 
+ namespace {
+ struct Context {
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 4eef06f..6e0b7f9 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -47,6 +47,8 @@
+ #if defined(_WIN32)
+ #include <windows.h>
+ #include <shellapi.h>
++#elif defined(__SWITCH__)
++#include <unistd.h>
+ #else
+ #include <signal.h>
+ #include <spawn.h>
+@@ -429,6 +431,12 @@ constexpr const char* kRosterEditorPage =
+ 
+ #if defined(_WIN32)
+ std::wstring Quoted(const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; }
++#elif defined(__SWITCH__)
++// A homebrew title cannot start other programs: desktop tools stay on the PC.
++bool SpawnDetached(const std::vector<std::string>& command) {
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: " << command[0] << " is not available on the Switch" << std::endl;
++    return false;
++}
+ #else
+ // Starts a program without waiting for it; the game keeps running. Steam's overlay preload is
+ // dropped so desktop tools (xdg-open, the file manager) do not inherit it.
+@@ -507,6 +515,8 @@ void OpenRosterEditor() {
+     const fs::path page = data / "abrir.html";
+     std::ofstream(page, std::ios::binary | std::ios::trunc) << kRosterEditorPage;
+     ShellExecuteW(nullptr, L"open", page.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++#elif defined(__SWITCH__)
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: PowerUp+ is not available on the Switch" << std::endl;
+ #else
+     namespace fs = std::filesystem;
+     const auto exeDir = RuntimeConfigFile::ExecutableDirectory();
+@@ -692,6 +702,9 @@ bool Relaunch() {
+     CloseHandle(process.hThread);
+     CloseHandle(process.hProcess);
+     return true;
++#elif defined(__SWITCH__)
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: restarting is not available on the Switch" << std::endl;
++    return false;
+ #else
+     setenv("WIICOMPILED_SKIP_LAUNCHER", "1", 1);
+     std::vector<char*> args(g_argv, g_argv + g_argc);
+diff --git a/runtime/src/launcher_controls.cpp b/runtime/src/launcher_controls.cpp
+index 5f029c0..0b51bbe 100644
+--- a/runtime/src/launcher_controls.cpp
++++ b/runtime/src/launcher_controls.cpp
+@@ -51,7 +51,8 @@ void LoadPromptStyle() {
+     if (loaded) return;
+     loaded = true;
+     int value = 1;
+-    if (std::ifstream(PromptPath()) >> value; value >= 0 && value <= 2) promptStyle = value;
++    std::ifstream prompts(PromptPath());
++    if (prompts >> value && value >= 0 && value <= 2) promptStyle = value;
+ }
+ enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
+ struct Capture {
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 7269747..52b4372 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1133,6 +1133,9 @@ void InstallSehLogger() {
+         SetUnhandledExceptionFilter(UnhandledSehFilter);
+     }
+ }
++#elif defined(__SWITCH__)
++// Horizon delivers no signals: a crash ends in Atmosphère's crash report instead.
++void InstallPosixMemoryFaultHandler() {}
+ #else
+ // POSIX counterpart to SehLogger above. Unlike Windows' AddVectoredExceptionHandler, which lets
+ // GuestFlat and this module each install their own handler and defensively re-check each other,
+@@ -1441,6 +1444,10 @@ int RuntimeMain(int argc, char** argv) {
+             {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
+             {"null", BACKEND_NULL},
+         }};
++#elif defined(__SWITCH__)
++        static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
++            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"null", BACKEND_NULL},
++        }};
+ #elif defined(_WIN32)
+         static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
+             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN}, {"d3d11", BACKEND_D3D11},
+diff --git a/runtime/src/platform/switch/switch_mbedtls.cpp b/runtime/src/platform/switch/switch_mbedtls.cpp
+new file mode 100644
+index 0000000..d37b613
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_mbedtls.cpp
+@@ -0,0 +1,21 @@
++// mbed TLS's platform hooks on Horizon (include/mbedtls_switch_config.h): entropy from libnx's CSRNG,
++// milliseconds from the monotonic clock.
++#if defined(__SWITCH__)
++#include <cstddef>
++#include <cstdint>
++#include <ctime>
++
++extern "C" void randomGet(void* buf, size_t len);  // libnx
++
++extern "C" int mbedtls_hardware_poll(void*, unsigned char* output, size_t length, size_t* written) {
++    randomGet(output, length);
++    *written = length;
++    return 0;
++}
++
++extern "C" int64_t mbedtls_ms_time(void) {  // mbedtls_ms_time_t
++    timespec now{};
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return int64_t{now.tv_sec} * 1000 + now.tv_nsec / 1000000;
++}
++#endif
+diff --git a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
+index 2201e54..42a7f98 100644
+--- a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
++++ b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
+@@ -22,15 +22,17 @@ internal static class AssemblyBlobWriter
+         var expectedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+         var assembly = new StringBuilder();
+         foreach (var header in headerLines) assembly.AppendLine(header);
+-        // PE/COFF (Windows), Mach-O (macOS), and ELF (Linux) spell a read-only data section
+-        // differently in GNU-as syntax. The build always targets
+-        // whichever platform the translator itself runs on (there is no cross-compilation
+-        // support), so that's what this picks the section syntax from.
+-        assembly.AppendLine(OperatingSystem.IsWindows()
+-            ? ".section .rdata,\"dr\""
+-            : OperatingSystem.IsMacOS()
+-                ? ".section __TEXT,__const"
+-                : ".section .rodata,\"a\",@progbits");
++        // PE/COFF (Windows), Mach-O (macOS), and ELF (Linux, Horizon) spell a read-only data
++        // section differently in GNU-as syntax. The target can differ from the platform the
++        // translator runs on (the Switch build translates on Windows), so the preprocessor that
++        // .S files go through picks it.
++        assembly.AppendLine("#if defined(_WIN32)");
++        assembly.AppendLine(".section .rdata,\"dr\"");
++        assembly.AppendLine("#elif defined(__APPLE__)");
++        assembly.AppendLine(".section __TEXT,__const");
++        assembly.AppendLine("#else");
++        assembly.AppendLine(".section .rodata,\"a\",@progbits");
++        assembly.AppendLine("#endif");
+         assembly.AppendLine();
+ 
+         foreach (var blob in blobs)
