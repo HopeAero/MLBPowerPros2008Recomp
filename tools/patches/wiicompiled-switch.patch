@@ -384,7 +384,7 @@ index 83a67e4..159822b 100644
  #endif
  
 diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
-index 3198082..6ad79c1 100644
+index 3198082..653e868 100644
 --- a/runtime/include/runtime_config.h
 +++ b/runtime/include/runtime_config.h
 @@ -193,6 +193,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
@@ -415,6 +415,16 @@ index 3198082..6ad79c1 100644
      if (const auto& portableRoot = PortableRootDirectory()) {
          return *portableRoot / kPortableUserDataDirectoryName;
      }
+@@ -695,6 +702,9 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
+         }
+     }
+ 
++#if defined(__SWITCH__)
++    input.close();  // Horizon: a file open for reading cannot be opened for writing
++#endif
+     std::error_code ec;
+     if (path.has_parent_path()) {
+         std::filesystem::create_directories(path.parent_path(), ec);
 diff --git a/runtime/include/system_bridge.h b/runtime/include/system_bridge.h
 index f66df4c..3ee7632 100644
 --- a/runtime/include/system_bridge.h
@@ -696,7 +706,7 @@ index 5f029c0..0b51bbe 100644
  enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
  struct Capture {
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
-index 7269747..1e294be 100644
+index 7269747..ee40b27 100644
 --- a/runtime/src/main.cpp
 +++ b/runtime/src/main.cpp
 @@ -429,6 +429,9 @@ std::string ReadInstalledSetupVersion() {
@@ -750,6 +760,36 @@ index 7269747..1e294be 100644
  #elif defined(_WIN32)
          static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
              {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN}, {"d3d11", BACKEND_D3D11},
+@@ -1587,6 +1610,15 @@ int RuntimeMain(int argc, char** argv) {
+ }
+ 
+ int main(int argc, char** argv) {
++#if defined(__SWITCH__)
++    for (int i = 1; i < argc; ++i) {
++        const char* equals = std::strchr(argv[i], '=');
++        if (std::strncmp(argv[i], "WIICOMPILED_", 12) == 0 && equals != nullptr) {
++            setenv(std::string(argv[i], equals).c_str(), equals + 1, 1);
++        }
++    }
++    argc = 1;
++#endif
+     return RuntimeMain(argc, argv);
+ }
+ extern "C" bool g_dynamicAspectRatioEnabled = false;
+diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
+index 280cfd6..9d26de0 100644
+--- a/runtime/src/match_benchmark_overlay.inc
++++ b/runtime/src/match_benchmark_overlay.inc
+@@ -204,6 +204,9 @@ void DrawMatchBenchmark() {
+         summary << "process_cpu_pct is over all logical cores, like Task Manager. GPU/VRAM from Windows GPU counters.\n"
+                 << "GPU markers exclude presenter work and demanded EFB prefixes. CPU autoplay is not a bit-exact replay.\n";
+         summary.close();
++#if defined(__SWITCH__)
++        if (std::ifstream echo(report.string() + ".txt"); echo) std::cerr << echo.rdbuf() << std::flush;
++#endif
+         message = "Informe guardado en UserData/Benchmarks";
+         std::fprintf(stderr, "[match-bench] saved %s.txt\n", report.string().c_str());
+     };
 diff --git a/runtime/src/platform/switch/switch_crash.cpp b/runtime/src/platform/switch/switch_crash.cpp
 new file mode 100644
 index 0000000..cb6ce4d
