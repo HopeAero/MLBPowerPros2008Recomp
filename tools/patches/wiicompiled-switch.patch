@@ -53,10 +53,10 @@ index a71eb74..c6538d9 100644
  #else
  void GXSetArray(GXAttr attr, const void* data, u8 stride);
 diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
-index bc80c3c..649c657 100644
+index bc80c3c..04480f4 100644
 --- a/aurora-main/lib/aurora.cpp
 +++ b/aurora-main/lib/aurora.cpp
-@@ -311,7 +311,13 @@ bool frame_worker_requested() noexcept {
+@@ -311,7 +311,14 @@ bool frame_worker_requested() noexcept {
  bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept;
  #endif
  
@@ -65,12 +65,13 @@ index bc80c3c..649c657 100644
 +#endif
  void frame_worker_main() noexcept {
 +#if defined(__SWITCH__)
-+  SwitchPinCurrentThread(1, 0x2C);
++  // Core 1 belongs to the GX FIFO worker in WIICOMPILED_GX_FIFO=thread (gx/fifo_async.inc).
++  SwitchPinCurrentThread(gx::fifo::mode() == gx::fifo::Mode::Thread ? 2 : 1, 0x2C);
 +#endif
    {
      std::lock_guard lock(g_frameWorker.mutex);
      g_frameWorker.threadId = std::this_thread::get_id();
-@@ -1164,7 +1170,12 @@ PresenterState g_presenter;
+@@ -1164,7 +1171,12 @@ PresenterState g_presenter;
  std::atomic<bool> g_presenterStarted{false};
  
  void presenter_main() noexcept {
