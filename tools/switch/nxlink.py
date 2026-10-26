@@ -109,7 +109,7 @@ def main() -> int:
     parser.add_argument("--no-server", action="store_true", help="send and launch only")
     parser.add_argument("--wait", type=float, default=30, help="seconds to wait for the NRO to connect back")
     parser.add_argument("args", nargs="*", help="arguments passed to the NRO")
-    options = parser.parse_args()
+    options = parser.parse_intermixed_args()
     root = pathlib.Path(__file__).resolve().parents[2]
     logs = root / "local" / "switch" / "logs"
     logs.mkdir(parents=True, exist_ok=True)
