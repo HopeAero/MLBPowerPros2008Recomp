@@ -706,7 +706,7 @@ index 5f029c0..0b51bbe 100644
  enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
  struct Capture {
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
-index 7269747..ee40b27 100644
+index 7269747..13bd595 100644
 --- a/runtime/src/main.cpp
 +++ b/runtime/src/main.cpp
 @@ -429,6 +429,9 @@ std::string ReadInstalledSetupVersion() {
@@ -768,7 +768,7 @@ index 7269747..ee40b27 100644
 +    for (int i = 1; i < argc; ++i) {
 +        const char* equals = std::strchr(argv[i], '=');
 +        if (std::strncmp(argv[i], "WIICOMPILED_", 12) == 0 && equals != nullptr) {
-+            setenv(std::string(argv[i], equals).c_str(), equals + 1, 1);
++            setenv(std::string(argv[i], equals - argv[i]).c_str(), equals + 1, 1);
 +        }
 +    }
 +    argc = 1;
