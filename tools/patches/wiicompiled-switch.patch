@@ -777,15 +777,26 @@ index 7269747..13bd595 100644
  }
  extern "C" bool g_dynamicAspectRatioEnabled = false;
 diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
-index 280cfd6..9d26de0 100644
+index 280cfd6..191d32e 100644
 --- a/runtime/src/match_benchmark_overlay.inc
 +++ b/runtime/src/match_benchmark_overlay.inc
-@@ -204,6 +204,9 @@ void DrawMatchBenchmark() {
+@@ -172,6 +172,9 @@ void DrawMatchBenchmark() {
+         recording = true;
+         message = "Midiendo";
+         std::fprintf(stderr, "[match-bench] recording %s scale=%.0f force169=%d\n", report.string().c_str(), g_resolutionScale, g_forceAspect169);
++#if defined(__SWITCH__)
++        SwitchProfilerStart();
++#endif
+     };
+     const auto finish = [&] {
+         recording = false;
+@@ -204,6 +207,10 @@ void DrawMatchBenchmark() {
          summary << "process_cpu_pct is over all logical cores, like Task Manager. GPU/VRAM from Windows GPU counters.\n"
                  << "GPU markers exclude presenter work and demanded EFB prefixes. CPU autoplay is not a bit-exact replay.\n";
          summary.close();
 +#if defined(__SWITCH__)
 +        if (std::ifstream echo(report.string() + ".txt"); echo) std::cerr << echo.rdbuf() << std::flush;
++        SwitchProfilerDump();  // platform/switch/switch_profiler.cpp (step 17)
 +#endif
          message = "Informe guardado en UserData/Benchmarks";
          std::fprintf(stderr, "[match-bench] saved %s.txt\n", report.string().c_str());
@@ -917,6 +928,67 @@ index 0000000..e01a61b
 +}
 +}
 +#endif
+diff --git a/runtime/src/platform/switch/switch_profiler.cpp b/runtime/src/platform/switch/switch_profiler.cpp
+new file mode 100644
+index 0000000..024642c
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_profiler.cpp
+@@ -0,0 +1,55 @@
++// Sampling profiler on Horizon: svcSetThreadActivity pauses the main thread (which runs the guest
++// fibers), svcGetThreadContext3 reads where it is, and it resumes. Started and dumped by the match
++// benchmark (match_benchmark_overlay.inc) when WIICOMPILED_SWITCH_PROFILE=1.
++#if defined(__SWITCH__)
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <unordered_map>
++#include <switch.h>
++
++namespace {
++std::atomic<bool> g_running{false};
++Thread g_thread;
++std::unordered_map<u64, u32> g_pc, g_lr;
++u64 g_samples = 0, g_failed = 0;
++
++void Sample(void*) {
++    const Handle main = envGetMainThreadHandle();
++    while (g_running.load(std::memory_order_relaxed)) {
++        svcSleepThread(1'000'000);
++        if (R_FAILED(svcSetThreadActivity(main, ThreadActivity_Paused))) { ++g_failed; continue; }
++        ThreadContext context{};
++        const bool read = R_SUCCEEDED(svcGetThreadContext3(&context, main));
++        svcSetThreadActivity(main, ThreadActivity_Runnable);
++        if (!read) { ++g_failed; continue; }
++        ++g_pc[context.pc.x];
++        ++g_lr[context.lr];
++        ++g_samples;
++    }
++}
++} // namespace
++
++extern "C" void SwitchProfilerStart() {
++    const char* enabled = std::getenv("WIICOMPILED_SWITCH_PROFILE");
++    if (enabled == nullptr || *enabled != '1' || g_running.exchange(true)) return;
++    // Core 2, above the game's priority, so a sample does not wait for the main thread to yield.
++    if (R_FAILED(threadCreate(&g_thread, Sample, nullptr, nullptr, 0x10000, 0x2B, 2)) ||
++        R_FAILED(threadStart(&g_thread))) {
++        g_running = false;
++        std::fprintf(stderr, "[profile] could not start the sampler\n");
++    }
++}
++
++extern "C" void SwitchProfilerDump() {
++    if (!g_running.exchange(false)) return;
++    threadWaitForExit(&g_thread);
++    threadClose(&g_thread);
++    std::fprintf(stderr, "[profile] anchor=0x%lx samples=%lu failed=%lu\n",
++                 reinterpret_cast<u64>(&SwitchProfilerStart), g_samples, g_failed);
++    for (const auto& [pc, count] : g_pc) std::fprintf(stderr, "[profile] P %lx %u\n", pc, count);
++    for (const auto& [lr, count] : g_lr) std::fprintf(stderr, "[profile] L %lx %u\n", lr, count);
++    std::fprintf(stderr, "[profile] end\n");
++    std::fflush(stderr);
++}
++#endif
 diff --git a/runtime/src/platform/switch/switch_stdio.cpp b/runtime/src/platform/switch/switch_stdio.cpp
 new file mode 100644
 index 0000000..4eab794
@@ -934,6 +1006,21 @@ index 0000000..4eab794
 +    return nxlinkStdio() >= 0;
 +}
 +#endif
+diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
+index 7a2f7dd..81eae28 100644
+--- a/runtime/src/settings_overlay.cpp
++++ b/runtime/src/settings_overlay.cpp
+@@ -1220,6 +1220,10 @@ void DrawGraphicsSettings() {
+ }
+ 
+ // WIICOMPILED_BENCH=<minDraws>,<seconds>[,<maxWaitSeconds>]: event-driven benchmark. Waits until a
++#if defined(__SWITCH__)
++extern "C" void SwitchProfilerStart();  // platform/switch/switch_profiler.cpp
++extern "C" void SwitchProfilerDump();
++#endif
+ #include "match_benchmark_overlay.inc"
+ // frame issues at least minDraws draw calls (the scene under test), then records frame-to-frame
+ // times for the given seconds, prints a summary to stderr and exits. Exits with code 3 if the
 diff --git a/runtime/third_party/libco/settings.h b/runtime/third_party/libco/settings.h
 index 418c00a..d61eb79 100644
 --- a/runtime/third_party/libco/settings.h
