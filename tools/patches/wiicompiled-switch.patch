@@ -592,6 +592,28 @@ index 9504488..f321f61 100644
  #else
          // The section is an anonymous shared-memory object: the SAME physical pages get mapped
          // twice below (once here as the always-accessible host view, once per-region as the
+diff --git a/runtime/src/hle/storage/dvd.cpp b/runtime/src/hle/storage/dvd.cpp
+index 8f4c9b4..238a064 100644
+--- a/runtime/src/hle/storage/dvd.cpp
++++ b/runtime/src/hle/storage/dvd.cpp
+@@ -501,10 +501,17 @@ static void ScanDirectory(const fs::path& root, const std::string& virtualPrefix
+             return;
+         }
+ 
++#if defined(__SWITCH__)
++        const fs::path relative = entry.path().lexically_relative(root);
++        if (relative.empty()) {
++            return;
++        }
++#else
+         const fs::path relative = fs::relative(entry.path(), root, entryEc);
+         if (entryEc) {
+             return;
+         }
++#endif
+ 
+         std::string prefix = virtualPrefix.empty() ? "/" : virtualPrefix;
+         if (prefix.back() != '/' && prefix.back() != '\\') {
 diff --git a/runtime/src/host_context.cpp b/runtime/src/host_context.cpp
 index 502f72c..885f8bb 100644
 --- a/runtime/src/host_context.cpp
