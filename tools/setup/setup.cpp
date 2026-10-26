@@ -75,20 +75,31 @@ struct Build {
         HANDLE writePipe = nullptr;
         CreatePipe(&readPipe, &writePipe, &sa, 0);
         SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
-        STARTUPINFOW si{};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdOutput = writePipe;
-        si.hStdError = writePipe;
-        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-        PROCESS_INFORMATION pi{};
         job = CreateJobObjectW(nullptr, nullptr);
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+        // PowerShell starts inside the job (PROC_THREAD_ATTRIBUTE_JOB_LIST) rather than suspended and
+        // assigned afterwards: CREATE_SUSPENDED + ResumeThread is the process-hollowing pattern that
+        // antivirus behaviour rules look for, and a player's Windows Defender quarantined the Setup.
+        SIZE_T attributeSize = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
+        std::vector<char> attributes(attributeSize);
+        STARTUPINFOEXW si{};
+        si.StartupInfo.cb = sizeof(si);
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdOutput = writePipe;
+        si.StartupInfo.hStdError = writePipe;
+        si.StartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+        InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attributeSize);
+        UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, &job, sizeof(job),
+                                  nullptr, nullptr);
+        PROCESS_INFORMATION pi{};
         const bool started = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
-                                            CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
-                                            script.parent_path().c_str(), &si, &pi);
+                                            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr,
+                                            script.parent_path().c_str(), &si.StartupInfo, &pi);
+        DeleteProcThreadAttributeList(si.lpAttributeList);
         CloseHandle(writePipe);
         if (!started) {
             CloseHandle(readPipe);
@@ -96,8 +107,6 @@ struct Build {
             finished = true;
             return;
         }
-        AssignProcessToJobObject(job, pi.hProcess);
-        ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
         running = true;
         const fs::path logPath = install / "setup.log";

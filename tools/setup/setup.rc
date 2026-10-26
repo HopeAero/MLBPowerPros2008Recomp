@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Version information and manifest for the Setup. An executable without them looks more like
+// malware to Windows Defender's heuristics; SETUP_VERSION_* come from CMakeLists.txt.
+#include <winver.h>
+
+// Built here: a quoted -D value loses its quotes on the way through llvm-windres.
+#define SETUP_STR_(x) #x
+#define SETUP_STR(x) SETUP_STR_(x)
+#define SETUP_VERSION_STRING SETUP_STR(SETUP_VERSION_MAJOR.SETUP_VERSION_MINOR.SETUP_VERSION_PATCH)
+
+1 RT_MANIFEST "setup.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION SETUP_VERSION_MAJOR, SETUP_VERSION_MINOR, SETUP_VERSION_PATCH, 0
+PRODUCTVERSION SETUP_VERSION_MAJOR, SETUP_VERSION_MINOR, SETUP_VERSION_PATCH, 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "HopeAero"
+            VALUE "FileDescription", "MLB Power Pros 2008 Recomp Setup"
+            VALUE "FileVersion", SETUP_VERSION_STRING
+            VALUE "InternalName", "MLBPowerPros2008-Setup"
+            VALUE "LegalCopyright", "GPL-3.0-or-later"
+            VALUE "OriginalFilename", "MLBPowerPros2008-Setup.exe"
+            VALUE "ProductName", "MLB Power Pros 2008 Recomp"
+            VALUE "ProductVersion", SETUP_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
