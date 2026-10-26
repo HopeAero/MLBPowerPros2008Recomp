@@ -25,4 +25,4 @@ fi
 # Big trees (Dawn's checkout, build directories) live in the mlb-switch-cache volume at /cache: a
 # Windows folder mounted into the container is slow for hundreds of thousands of files. Results
 # (NROs, patches, logs) are copied to /work/local/switch.
-MSYS_NO_PATHCONV=1 docker run --rm "${publish[@]}" -v "$root:/work" -v mlb-switch-cache:/cache -w /work "$image" "$@"
+MSYS_NO_PATHCONV=1 docker run --rm "${publish[@]}" -e MLB_SWITCH_WORK=/cache -v "$root:/work" -v mlb-switch-cache:/cache -w /work "$image" "$@"
