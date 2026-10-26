@@ -297,7 +297,7 @@ index 83a67e4..159822b 100644
  #endif
  
 diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
-index 3198082..d9baee0 100644
+index 3198082..6ad79c1 100644
 --- a/runtime/include/runtime_config.h
 +++ b/runtime/include/runtime_config.h
 @@ -193,6 +193,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
@@ -309,6 +309,25 @@ index 3198082..d9baee0 100644
  #elif defined(_WIN32)
      static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
  #endif
+@@ -228,6 +230,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
+     }
+ #elif defined(__APPLE__)
+     return RuntimePlatform::ExecutableDirectory();
++#elif defined(__SWITCH__)
++    return std::filesystem::path("sdmc:/switch/mlbpowerpros2008");  // where the homebrew menu finds it
+ #else
+     // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
+     // does not NUL-terminate and silently truncates if the buffer is too small, so this grows
+@@ -275,6 +279,9 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
+ }
+ 
+ inline std::filesystem::path ApplicationDataDirectory() {
++#if defined(__SWITCH__)
++    return *ExecutableDirectory() / kPortableUserDataDirectoryName;  // always portable on the SD card
++#endif
+     if (const auto& portableRoot = PortableRootDirectory()) {
+         return *portableRoot / kPortableUserDataDirectoryName;
+     }
 diff --git a/runtime/include/system_bridge.h b/runtime/include/system_bridge.h
 index f66df4c..3ee7632 100644
 --- a/runtime/include/system_bridge.h
@@ -568,10 +587,40 @@ index 5f029c0..0b51bbe 100644
  enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
  struct Capture {
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
-index 7269747..52b4372 100644
+index 7269747..1e294be 100644
 --- a/runtime/src/main.cpp
 +++ b/runtime/src/main.cpp
-@@ -1133,6 +1133,9 @@ void InstallSehLogger() {
+@@ -429,6 +429,9 @@ std::string ReadInstalledSetupVersion() {
+     return text.substr(open + 1, close - open - 1);
+ }
+ 
++#if defined(__SWITCH__)
++extern "C" bool SwitchStdioToNxlink();  // platform/switch/switch_stdio.cpp
++#endif
+ void InitializeProcessTranscript(int argc, char** argv) {
+     auto& state = GetProcessTranscriptState();
+     if (state.initialized.exchange(true, std::memory_order_acq_rel)) {
+@@ -469,6 +472,19 @@ void InitializeProcessTranscript(int argc, char** argv) {
+         state.file.flush();
+     }
+ 
++#if defined(__SWITCH__)
++    // Horizon has no pipes to tee the standard streams through: they go to nxlink's console on the
++    // PC when it started the game, else straight into this file.
++    state.file.close();
++    state.enabled = false;
++    if (!SwitchStdioToNxlink()) {
++        (void)std::freopen(path.string().c_str(), "a", stdout);
++        (void)std::freopen(path.string().c_str(), "a", stderr);
++    }
++    std::setvbuf(stdout, nullptr, _IONBF, 0);
++    std::setvbuf(stderr, nullptr, _IONBF, 0);
++    return;
++#endif
+     state.savedStdoutFd = DuplicateFileDescriptor(GetFileDescriptor(stdout));
+     state.savedStderrFd = DuplicateFileDescriptor(GetFileDescriptor(stderr));
+ 
+@@ -1133,6 +1149,9 @@ void InstallSehLogger() {
          SetUnhandledExceptionFilter(UnhandledSehFilter);
      }
  }
@@ -581,7 +630,7 @@ index 7269747..52b4372 100644
  #else
  // POSIX counterpart to SehLogger above. Unlike Windows' AddVectoredExceptionHandler, which lets
  // GuestFlat and this module each install their own handler and defensively re-check each other,
-@@ -1441,6 +1444,10 @@ int RuntimeMain(int argc, char** argv) {
+@@ -1441,6 +1460,10 @@ int RuntimeMain(int argc, char** argv) {
              {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
              {"null", BACKEND_NULL},
          }};
@@ -617,6 +666,23 @@ index 0000000..d37b613
 +    timespec now{};
 +    clock_gettime(CLOCK_MONOTONIC, &now);
 +    return int64_t{now.tv_sec} * 1000 + now.tv_nsec / 1000000;
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_stdio.cpp b/runtime/src/platform/switch/switch_stdio.cpp
+new file mode 100644
+index 0000000..4eab794
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_stdio.cpp
+@@ -0,0 +1,11 @@
++// Standard output on Horizon (main.cpp's process transcript): over the network to nxlink's console on
++// the PC when nxlink started the game (nxlink -s), else nowhere but the log file.
++#if defined(__SWITCH__)
++#include <arpa/inet.h>  // nxlink.h uses struct in_addr without it
++#include <switch.h>
++
++extern "C" bool SwitchStdioToNxlink() {
++    if (__nxlink_host.s_addr == 0 || R_FAILED(socketInitializeDefault())) return false;
++    return nxlinkStdio() >= 0;
 +}
 +#endif
 diff --git a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
