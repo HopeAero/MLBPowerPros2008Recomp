@@ -872,6 +872,19 @@ index 0000000..4eab794
 +    return nxlinkStdio() >= 0;
 +}
 +#endif
+diff --git a/runtime/third_party/libco/settings.h b/runtime/third_party/libco/settings.h
+index 418c00a..d61eb79 100644
+--- a/runtime/third_party/libco/settings.h
++++ b/runtime/third_party/libco/settings.h
+@@ -120,6 +120,8 @@
+   #define LIBCO_STRINGIFY(x) #x
+   #define LIBCO_TOSTRING(x) LIBCO_STRINGIFY(x)
+   #define section(name) __pragma(code_seg(LIBCO_TOSTRING("." #name))) __declspec(allocate(LIBCO_TOSTRING("." #name)))
++#elif defined(__SWITCH__)
++  #define section(name) __attribute__((section("." #name ".libco")))
+ #elif defined(__APPLE__)
+   #define section(name) __attribute__((section("__TEXT,__" #name)))
+ #else
 diff --git a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
 index 2201e54..42a7f98 100644
 --- a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
