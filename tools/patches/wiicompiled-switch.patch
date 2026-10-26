@@ -53,7 +53,7 @@ index a71eb74..c6538d9 100644
  #else
  void GXSetArray(GXAttr attr, const void* data, u8 stride);
 diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
-index bc80c3c..04480f4 100644
+index bc80c3c..95b39c7 100644
 --- a/aurora-main/lib/aurora.cpp
 +++ b/aurora-main/lib/aurora.cpp
 @@ -311,7 +311,14 @@ bool frame_worker_requested() noexcept {
@@ -71,7 +71,21 @@ index bc80c3c..04480f4 100644
    {
      std::lock_guard lock(g_frameWorker.mutex);
      g_frameWorker.threadId = std::this_thread::get_id();
-@@ -1164,7 +1171,12 @@ PresenterState g_presenter;
+@@ -407,6 +414,13 @@ bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::micr
+   lock.unlock();
+   // Both phases service the guest's alarm/retrace pump identically; the
+   // producer must keep its own timing alive however long it waits.
++#ifdef AURORA_ENABLE_GX
++  // The asynchronous GX FIFO worker waits here too (gx/fifo_async.inc). The pump runs guest code,
++  // which belongs to the producer; the producer services it while it waits for that worker.
++  if (gx::fifo::on_worker_thread()) {
++    return false;
++  }
++#endif
+   if (const auto callback = g_frameWorkerWaitCallback.load(std::memory_order_acquire)) {
+     callback();
+   }
+@@ -1164,7 +1178,12 @@ PresenterState g_presenter;
  std::atomic<bool> g_presenterStarted{false};
  
  void presenter_main() noexcept {
@@ -84,6 +98,69 @@ index bc80c3c..04480f4 100644
      Log.warn("Could not raise the asynchronous presenter thread priority: {}", SDL_GetError());
    }
    for (;;) {
+@@ -1916,7 +1935,7 @@ void end_frame_impl(bool pumpEvents, bool drainFifo) {
+   gfx::SealedFrame sealedFrame;
+   SealedFrameContext ctx;
+   std::vector<PresentationJob> presentationJobs;
+-  if (drainFifo) gx::fifo::drain();
++  if (drainFifo) gx::fifo::drain(gx::fifo::DrainReason::EndFrame);
+   {
+     std::lock_guard gpuLock(g_rendererGpuMutex);
+     seal_frame_locked(sealedFrame, ctx);
+@@ -2011,7 +2030,7 @@ void end_frame() {
+ 
+   // Seal all current GX work on the CPU while the renderer is known ready.
+   // Later FIFO writes belong exclusively to the next frame.
+-  gx::fifo::drain();
++  gx::fifo::drain(gx::fifo::DrainReason::EndFrame);
+   {
+     std::lock_guard lock(g_frameWorker.mutex);
+     g_frameWorker.framePrepared = false;
+@@ -2053,6 +2072,10 @@ bool aurora_begin_frame() { return aurora::begin_frame(); }
+ void aurora_end_frame() { aurora::end_frame(); }
+ void aurora_set_frame_worker_wait_callback(AuroraFrameWorkerWaitCallback callback) {
+   aurora::g_frameWorkerWaitCallback.store(callback, std::memory_order_release);
++#ifdef AURORA_ENABLE_GX
++  // The GX FIFO producer runs the same pump while it waits for its worker (gx/fifo_async.inc).
++  aurora::gx::fifo::set_wait_service(callback);
++#endif
+ }
+ void aurora_wait_for_frame_worker() { aurora::wait_for_frame_worker(); }
+ bool aurora_wait_for_frame_worker_for(uint32_t timeoutMicros) {
+@@ -2108,8 +2131,14 @@ bool aurora_flush_efb_copies_to_ram() {
+   aurora::wait_for_frame_worker();
+   // The renderer is about to submit a prefix of the active frame. Its resumed
+   // suffix cannot safely be replayed against the same mutable EFB resources.
+-  aurora::gx::mark_frame_interpolation_replay_unsafe();
+-  aurora::gx::fifo::drain();
++  if (aurora::gx::fifo::async_mode()) {
++    // Sync decoded the queued draws before this split: decode them before marking it.
++    aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::EfbFlush);
++    aurora::gx::mark_frame_interpolation_replay_unsafe();
++  } else {
++    aurora::gx::mark_frame_interpolation_replay_unsafe();
++    aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::EfbFlush);
++  }
+   if (!aurora::gfx::efb_ram::prepare_downloads()) return false;
+   const wgpu::CommandEncoderDescriptor encoderDescriptor{
+       .label = "GX CPU-visible EFB copy encoder",
+@@ -2145,8 +2174,14 @@ bool aurora_flush_efb_copy_to_ram(void* dest) {
+   aurora::wait_for_frame_worker();
+   // Preserve the requested output cadence by duplicating the completed native
+   // image instead of replaying this split frame.
+-  aurora::gx::mark_frame_interpolation_replay_unsafe();
+-  aurora::gx::fifo::drain();
++  if (aurora::gx::fifo::async_mode()) {
++    // Sync decoded the queued draws before this split: decode them before marking it.
++    aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::EfbFlush);
++    aurora::gx::mark_frame_interpolation_replay_unsafe();
++  } else {
++    aurora::gx::mark_frame_interpolation_replay_unsafe();
++    aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::EfbFlush);
++  }
+   if (!aurora::gfx::efb_ram::prepare_downloads(dest)) return false;
+   const wgpu::CommandEncoderDescriptor encoderDescriptor{
+       .label = "GX demanded EFB copy encoder",
 diff --git a/aurora-main/lib/dawn/BackendBinding.cpp b/aurora-main/lib/dawn/BackendBinding.cpp
 index 75b3c51..6b36882 100644
 --- a/aurora-main/lib/dawn/BackendBinding.cpp
@@ -112,6 +189,400 @@ index 75b3c51..6b36882 100644
  #elif defined(SDL_PLATFORM_LINUX)
    const char* driver = SDL_GetCurrentVideoDriver();
    if (SDL_strcmp(driver, "wayland") == 0) {
+diff --git a/aurora-main/lib/dolphin/gx/GXAurora.cpp b/aurora-main/lib/dolphin/gx/GXAurora.cpp
+index eacc674..1b0e6a9 100644
+--- a/aurora-main/lib/dolphin/gx/GXAurora.cpp
++++ b/aurora-main/lib/dolphin/gx/GXAurora.cpp
+@@ -42,9 +42,13 @@ void AuroraSetViewportPolicy(AuroraViewportPolicy policy) {
+   const bool changed = g_gxState.viewportPolicy != policy;
+   if (changed) {
+     // Finish commands using the old framebuffer mapping before changing it.
+-    aurora::gx::fifo::drain();
++    aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::ViewportPolicy);
++  }
++  // Only this producer-side setter writes the policy; an asynchronous decoder may be reading it,
++  // so an unchanged value is not written again.
++  if (changed || !aurora::gx::fifo::async_mode()) {
++    g_gxState.viewportPolicy = policy;
+   }
+-  g_gxState.viewportPolicy = policy;
+   aurora::window::set_frame_buffer_aspect_fit(policy == AURORA_VIEWPORT_FIT);
+   aurora::window::set_force_aspect_16_9(policy == AURORA_VIEWPORT_16_9);
+   aurora::window::set_present_surface_fill(policy == AURORA_VIEWPORT_STRETCH);
+@@ -106,13 +110,14 @@ void WriteMappedRenderState(const aurora::gx::MappedRenderState& mapped) {
+ } // namespace
+ 
+ void GXSetViewportScissorRenderSafeArea(f32 aspect) {
++  aurora::gx::fifo::quiesce(aurora::gx::fifo::QuiesceReason::DecoderRead); // render passes are the decoder's
+   const auto [targetWidth, targetHeight] = aurora::gfx::get_render_target_size();
+   if (targetWidth == 0 || targetHeight == 0 || !std::isfinite(aspect) || aspect <= 0.0f) {
+     return;
+   }
+ 
+   // Apply queued viewport changes before direct layout draws use the safe area.
+-  aurora::gx::fifo::drain();
++  aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::RenderArea);
+   auto mapped = aurora::gx::map_logical_render_state();
+   const float targetAspect = static_cast<float>(targetWidth) / static_cast<float>(targetHeight);
+ 
+@@ -156,21 +161,30 @@ void GXSetViewportScissorRenderSafeArea(f32 aspect) {
+ 
+ void GXRestoreViewportScissorRender() {
+   // Run queued GX draws before leaving the direct layout safe area.
+-  aurora::gx::fifo::drain();
++  aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::RenderArea);
+   WriteMappedRenderState(aurora::gx::map_logical_render_state());
+ }
+ 
+-void GXSetTexCopySrcRender(u16 left, u16 top, u16 wd, u16 ht) {
+-  aurora::gx::g_gxState.texCopySrc = {left, top, wd, ht};
++namespace {
++struct TexCopySrcRenderArgs {
++  u16 left, top, wd, ht;
++};
++void SetTexCopySrcRenderOnDecoder(const TexCopySrcRenderArgs& a) {
++  aurora::gx::g_gxState.texCopySrc = {a.left, a.top, a.wd, a.ht};
+   aurora::gx::g_gxState.texCopySrcRenderSpace = true;
+ }
++} // namespace
++
++void GXSetTexCopySrcRender(u16 left, u16 top, u16 wd, u16 ht) {
++  aurora::gx::fifo::run_on_decoder<SetTexCopySrcRenderOnDecoder>(TexCopySrcRenderArgs{left, top, wd, ht});
++}
+ 
+ void GXCreateFrameBuffer(u32 width, u32 height) {
+-  aurora::gx::fifo::drain();
++  aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::Offscreen);
+   aurora::gfx::begin_offscreen(width, height);
+ }
+ 
+ void GXRestoreFrameBuffer() {
+-  aurora::gx::fifo::drain();
++  aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::Offscreen);
+   aurora::gfx::end_offscreen();
+ }
+diff --git a/aurora-main/lib/dolphin/gx/GXCpu2Efb.cpp b/aurora-main/lib/dolphin/gx/GXCpu2Efb.cpp
+index 9815bd4..e5d687a 100644
+--- a/aurora-main/lib/dolphin/gx/GXCpu2Efb.cpp
++++ b/aurora-main/lib/dolphin/gx/GXCpu2Efb.cpp
+@@ -1,6 +1,7 @@
+ #include "gx.hpp"
+ 
+ #include "../../gfx/depth_peek.hpp"
++#include "../../gx/fifo.hpp"
+ 
+ #include <dolphin/gx/GXCpu2Efb.h>
+ 
+@@ -12,6 +13,7 @@ void GXPeekZ(u16 x, u16 y, u32* z) {
+     if (aurora::gfx::depth_peek::read_latest(x, y, value)) {
+       *z = value;
+     } else {
++      aurora::gx::fifo::quiesce(aurora::gx::fifo::QuiesceReason::DecoderRead);
+       *z = g_gxState.clearDepth & 0x00ffffffu;
+     }
+   }
+diff --git a/aurora-main/lib/dolphin/gx/GXDispList.cpp b/aurora-main/lib/dolphin/gx/GXDispList.cpp
+index bf22212..9d69468 100644
+--- a/aurora-main/lib/dolphin/gx/GXDispList.cpp
++++ b/aurora-main/lib/dolphin/gx/GXDispList.cpp
+@@ -64,9 +64,9 @@ void GXCallDisplayList(const void* data, u32 nbytes) {
+     return;
+   }
+ 
+-  // Decode the display list immediately while its borrowed resources are valid.
+-  aurora::gx::fifo::drain();
+-  aurora::gx::fifo::process(static_cast<const u8*>(data), nbytes, true);
++  // Decode the display list immediately while its borrowed resources are valid (deferred/thread
++  // FIFO: copied now, decoded in order).
++  aurora::gx::fifo::call_display_list(data, nbytes, true);
+ }
+ 
+ void GXCallDisplayListLE(const void* data, u32 nbytes) {
+@@ -81,9 +81,6 @@ void GXCallDisplayListLE(const void* data, u32 nbytes) {
+   }
+ 
+   // Decode little-endian lists separately after finishing the normal FIFO work.
+-  aurora::gx::fifo::drain();
+-
+-  // Process the display list through the command processor (little-endian)
+-  aurora::gx::fifo::process(static_cast<const u8*>(data), nbytes, false);
++  aurora::gx::fifo::call_display_list(data, nbytes, false);
+ }
+ }
+diff --git a/aurora-main/lib/dolphin/gx/GXFrameBuffer.cpp b/aurora-main/lib/dolphin/gx/GXFrameBuffer.cpp
+index dfa305b..532fdea 100644
+--- a/aurora-main/lib/dolphin/gx/GXFrameBuffer.cpp
++++ b/aurora-main/lib/dolphin/gx/GXFrameBuffer.cpp
+@@ -251,6 +251,61 @@ void prune_copy_texture_pool(const void* dest) noexcept {
+ }
+ } // namespace aurora::gx
+ 
++// Copy state sync wrote straight into the decoder state at the call; a deferred/thread GX FIFO
++// writes it from the decoder, in order (fifo::run_on_decoder).
++namespace {
++struct CopyRectArgs {
++  u16 left, top, wd, ht;
++};
++struct CopyDstArgs {
++  u16 wd, ht;
++  u32 fmt;
++  u32 mipmap;
++};
++struct CopyU32Arg {
++  u32 value;
++};
++struct CopyF32Arg {
++  f32 value;
++};
++void SetDispCopySrcOnDecoder(const CopyRectArgs& a) { g_gxState.dispCopySrc = {a.left, a.top, a.wd, a.ht}; }
++void SetTexCopySrcOnDecoder(const CopyRectArgs& a) {
++  g_gxState.texCopySrc = {a.left, a.top, a.wd, a.ht};
++  g_gxState.texCopySrcRenderSpace = false;
++}
++void SetDispCopyDstOnDecoder(const CopyDstArgs& a) {
++  g_gxState.dispCopyDstWidth = a.wd;
++  g_gxState.dispCopyDstHeight = a.ht;
++}
++void SetTexCopyDstOnDecoder(const CopyDstArgs& a) {
++  g_gxState.texCopyFmt = static_cast<GXTexFmt>(a.fmt);
++  g_gxState.texCopyDstWidth = a.wd;
++  g_gxState.texCopyDstHeight = a.ht;
++  g_gxState.texCopyHalfScale = a.mipmap != GX_FALSE;
++}
++void SetDispCopyFrame2FieldOnDecoder(const CopyU32Arg& a) { g_gxState.dispCopyFrame2Field = a.value & 3; }
++void SetCopyClampOnDecoder(const CopyU32Arg& a) { g_gxState.copyClamp = static_cast<GXFBClamp>(a.value & 3); }
++void SetDispCopyYScaleOnDecoder(const CopyF32Arg& a) { g_gxState.dispCopyYScale = a.value; }
++void SetDispCopyGammaOnDecoder(const CopyU32Arg& a) {
++  g_gxState.dispCopyGamma = static_cast<GXGamma>(a.value & 3u);
++  g_gxState.bpRegCache[0x52] = (g_gxState.bpRegCache[0x52] & ~(3u << 7)) |
++                               ((static_cast<u32>(g_gxState.dispCopyGamma) & 3u) << 7);
++}
++struct CopyFilterArgs {
++  GXBool aa;
++  GXBool vf;
++  std::array<std::array<u8, 2>, 12> samples;
++  std::array<u8, 7> vfilter;
++};
++void SetCopyFilterOnDecoder(const CopyFilterArgs& a) {
++  g_gxState.copyFilterAa = a.aa;
++  g_gxState.copyFilterVf = a.vf;
++  g_gxState.copyFilterSamplePattern = a.samples;
++  g_gxState.copyFilterVFilter = a.vfilter;
++}
++void ClearBoundingBoxOnDecoder(const CopyU32Arg&) { g_gxState.boundingBox = {1023, 0, 1023, 0}; }
++} // namespace
++
+ extern "C" {
+ GXRenderModeObj GXNtsc480IntDf = {
+     VI_TVMODE_NTSC_INT,
+@@ -315,6 +370,7 @@ GXRenderModeObj GXMpal480IntDf = {
+ 
+ void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor, u16 ver) {
+   *rmout = *rmin;
++  aurora::gx::fifo::quiesce(aurora::gx::fifo::QuiesceReason::DecoderRead); // render passes are the decoder's
+   const auto renderSize = aurora::gfx::get_render_target_size();
+   rmout->fbWidth = static_cast<u16>(std::min<uint32_t>(renderSize.x, UINT16_MAX));
+   rmout->efbHeight = static_cast<u16>(std::min<uint32_t>(renderSize.y, UINT16_MAX));
+@@ -322,43 +378,40 @@ void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor,
+ }
+ 
+ void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {
+-  g_gxState.dispCopySrc = {left, top, wd, ht};
++  aurora::gx::fifo::run_on_decoder<SetDispCopySrcOnDecoder>(CopyRectArgs{left, top, wd, ht});
+   GX_WRITE_RAS_REG(0x49000000u | ((static_cast<u32>(top) & 0x3ffu) << 10) | (static_cast<u32>(left) & 0x3ffu));
+   GX_WRITE_RAS_REG(0x4a000000u | (((static_cast<u32>(ht) - 1u) * 0x400u) & 0x000ffc00u) |
+                    ((static_cast<u32>(wd) - 1u) & 0x3ffu));
+ }
+ 
+ void GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht) {
+-  g_gxState.texCopySrc = {left, top, wd, ht};
+-  g_gxState.texCopySrcRenderSpace = false;
++  aurora::gx::fifo::run_on_decoder<SetTexCopySrcOnDecoder>(CopyRectArgs{left, top, wd, ht});
+ }
+ 
+ void GXSetDispCopyDst(u16 wd, u16 ht) {
+-  g_gxState.dispCopyDstWidth = wd;
+-  g_gxState.dispCopyDstHeight = ht;
++  aurora::gx::fifo::run_on_decoder<SetDispCopyDstOnDecoder>(CopyDstArgs{wd, ht, 0, 0});
+   GX_WRITE_RAS_REG(0x4d000000u | ((((static_cast<u32>(wd) & 0x7fffu) << 1) >> 5) & 0x3ffu));
+ }
+ 
+ void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {
+-  g_gxState.texCopyFmt = fmt;
+-  g_gxState.texCopyDstWidth = wd;
+-  g_gxState.texCopyDstHeight = ht;
+-  g_gxState.texCopyHalfScale = mipmap != GX_FALSE;
++  aurora::gx::fifo::run_on_decoder<SetTexCopyDstOnDecoder>(
++      CopyDstArgs{wd, ht, static_cast<u32>(fmt), static_cast<u32>(mipmap)});
+ }
+ 
+ void GXSetDispCopyFrame2Field(u32 mode) {
+-  g_gxState.dispCopyFrame2Field = mode & 3;
++  aurora::gx::fifo::run_on_decoder<SetDispCopyFrame2FieldOnDecoder>(CopyU32Arg{mode});
+ }
+ 
+ void GXSetCopyClamp(GXFBClamp clamp) {
+-  g_gxState.copyClamp = static_cast<GXFBClamp>(static_cast<u32>(clamp) & 3);
++  aurora::gx::fifo::run_on_decoder<SetCopyClampOnDecoder>(CopyU32Arg{static_cast<u32>(clamp)});
+ }
+ 
+ u32 GXSetDispCopyYScale(f32 vscale) {
+   const u32 iScale = y_scale_to_integer(vscale);
+-  g_gxState.dispCopyYScale = vscale;
++  aurora::gx::fifo::run_on_decoder<SetDispCopyYScaleOnDecoder>(CopyF32Arg{vscale});
+   GX_WRITE_RAS_REG(0x4e000000u | iScale);
+   __gx->bpSent = 0;
++  aurora::gx::fifo::quiesce(aurora::gx::fifo::QuiesceReason::DecoderRead); // reads the decoder's copy source
+   return get_num_xfb_lines_internal(static_cast<u16>(g_gxState.dispCopySrc.height), iScale);
+ }
+ 
+@@ -386,6 +439,30 @@ void GXSetCopyClear(GXColor color, u32 depth) {
+ }
+ 
+ void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {
++  // A call that names everything it sets needs nothing from the decoder: the registers come from the
++  // arguments and the decoder's copy filter is set in stream order (MLB sets it ~56 times a frame).
++  if (aurora::gx::fifo::async_mode() && (sample_pattern != nullptr || !aa) && (vfilter != nullptr || !vf)) {
++    CopyFilterArgs args{aa, vf, {}, {0, 0, 21, 22, 21, 0, 0}};
++    for (size_t i = 0; i < args.samples.size(); ++i) {
++      args.samples[i] = aa ? std::array<u8, 2>{sample_pattern[i][0], sample_pattern[i][1]} : std::array<u8, 2>{6, 6};
++    }
++    if (vf) {
++      for (size_t i = 0; i < args.vfilter.size(); ++i) {
++        args.vfilter[i] = vfilter[i];
++      }
++    }
++    aurora::gx::fifo::run_on_decoder<SetCopyFilterOnDecoder>(args);
++    GX_WRITE_RAS_REG(pack_copy_filter_samples(0x01, args.samples, 0));
++    GX_WRITE_RAS_REG(pack_copy_filter_samples(0x02, args.samples, 6));
++    GX_WRITE_RAS_REG(pack_copy_filter_samples(0x03, args.samples, 12));
++    GX_WRITE_RAS_REG(pack_copy_filter_samples(0x04, args.samples, 18));
++    GX_WRITE_RAS_REG(pack_copy_filter0(args.vfilter));
++    GX_WRITE_RAS_REG(pack_copy_filter1(args.vfilter));
++    __gx->bpSent = 0;
++    return;
++  }
++  // Otherwise it reads the decoder's copy filter: let a deferred/thread decoder catch up first.
++  aurora::gx::fifo::quiesce(aurora::gx::fifo::QuiesceReason::CopyFilter);
+   g_gxState.copyFilterAa = aa;
+   g_gxState.copyFilterVf = vf;
+   if (sample_pattern) {
+@@ -419,16 +496,14 @@ void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[
+ }
+ 
+ void GXSetDispCopyGamma(GXGamma gamma) {
+-  g_gxState.dispCopyGamma = static_cast<GXGamma>(static_cast<u32>(gamma) & 3u);
+-  g_gxState.bpRegCache[0x52] = (g_gxState.bpRegCache[0x52] & ~(3u << 7)) |
+-                               ((static_cast<u32>(g_gxState.dispCopyGamma) & 3u) << 7);
++  aurora::gx::fifo::run_on_decoder<SetDispCopyGammaOnDecoder>(CopyU32Arg{static_cast<u32>(gamma)});
+ }
+ 
+ void GXCopyDisp(void* dest, GXBool clear) {
+   (void)dest;
+   // Finish queued commands before this copy reads live EFB state.
+-  if (aurora::gx::fifo::get_buffer_size() != 0) {
+-    aurora::gx::fifo::drain();
++  if (aurora::gx::fifo::has_unprocessed()) {
++    aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::Copy);
+   }
+   auto rect = aurora::gx::map_logical_scissor(g_gxState.dispCopySrc);
+   const float renderYScale = static_cast<float>(rect.height) / std::max<float>(g_gxState.dispCopySrc.height, 1.0f);
+@@ -474,8 +549,8 @@ uint32_t aurora_get_display_crop_lines() { return g_displayCropLines.load(std::m
+ 
+ void GXCopyTex(void* dest, GXBool clear) {
+   // Texture copies must see all earlier draws and state changes.
+-  if (aurora::gx::fifo::get_buffer_size() != 0) {
+-    aurora::gx::fifo::drain();
++  if (aurora::gx::fifo::has_unprocessed()) {
++    aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::Copy);
+   }
+   const auto sourceRect = map_texture_copy_source(g_gxState.texCopySrc, g_gxState.texCopySrcRenderSpace);
+   const auto rect = sourceRect.clearRect;
+@@ -565,13 +640,14 @@ void GXCopyTex(void* dest, GXBool clear) {
+ }
+ 
+ void GXClearBoundingBox() {
+-  g_gxState.boundingBox = {1023, 0, 1023, 0};
++  aurora::gx::fifo::run_on_decoder<ClearBoundingBoxOnDecoder>(CopyU32Arg{0});
+   GX_WRITE_RAS_REG(0x550003FFu);
+   GX_WRITE_RAS_REG(0x560003FFu);
+   __gx->bpSent = 0;
+ }
+ 
+ void GXReadBoundingBox(u16* left, u16* right, u16* top, u16* bottom) {
++  aurora::gx::fifo::quiesce(aurora::gx::fifo::QuiesceReason::DecoderRead);
+   if (left) {
+     *left = g_gxState.boundingBox[0];
+   }
+diff --git a/aurora-main/lib/dolphin/gx/GXGeometry.cpp b/aurora-main/lib/dolphin/gx/GXGeometry.cpp
+index 2e54e10..a2564b8 100644
+--- a/aurora-main/lib/dolphin/gx/GXGeometry.cpp
++++ b/aurora-main/lib/dolphin/gx/GXGeometry.cpp
+@@ -153,7 +153,18 @@ static inline void SETVAT(u32* va, u32* vb, u32* vc, GXAttr attr, GXCompCnt cnt,
+   }
+ }
+ 
++// These compare with the decoder's state, which a deferred/thread GX FIFO (fifo_async.inc) has not
++// reached yet. There the comparison is queued for the decoder (a probe), and the next flush sends
++// the VCD/VAT only where a probe found a difference (GXManage.cpp); dirtyState bit 0x20 makes sure
++// that flush happens.
+ static inline bool AuroraVtxDescDiffers(GXAttr attr, GXAttrType type) {
++  if (aurora::gx::fifo::async_mode()) UNLIKELY {
++    if (attr >= GX_VA_PNMTXIDX && attr < GX_VA_MAX_ATTR && !aurora::gx::fifo::in_display_list()) {
++      aurora::gx::fifo::probe_vtx_desc(attr, type);
++      __gx->dirtyState |= 0x20;
++    }
++    return false;
++  }
+   return attr >= GX_VA_PNMTXIDX && attr < GX_VA_MAX_ATTR && g_gxState.vtxDesc[attr] != type;
+ }
+ 
+@@ -161,10 +172,27 @@ static inline bool AuroraVtxAttrFmtDiffers(GXVtxFmt vtxfmt, GXAttr attr, GXCompC
+   if (vtxfmt < GX_VTXFMT0 || vtxfmt >= GX_MAX_VTXFMT || attr < GX_VA_POS || attr >= GX_VA_MAX_ATTR) {
+     return true;
+   }
++  if (aurora::gx::fifo::async_mode()) UNLIKELY {
++    if (!aurora::gx::fifo::in_display_list()) {
++      aurora::gx::fifo::probe_vtx_attr_fmt(vtxfmt, attr, cnt, type, frac);
++      __gx->dirtyState |= 0x20;
++    }
++    return false;
++  }
+   const auto& fmt = g_gxState.vtxFmts[vtxfmt].attrs[attr];
+   return fmt.cnt != cnt || fmt.type != type || fmt.frac != frac;
+ }
+ 
++namespace {
++struct SourceVtxDescArgs {
++  u32 attr;
++  u32 type;
++};
++void SetSourceVtxDescOnDecoder(const SourceVtxDescArgs& args) {
++  g_gxState.sourceVtxDesc[args.attr] = static_cast<GXAttrType>(args.type);
++}
++} // namespace
++
+ extern "C" {
+ 
+ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
+@@ -190,7 +218,8 @@ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
+ 
+ void GXSetSourceVtxDesc(GXAttr attr, GXAttrType type) {
+   if (attr >= GX_VA_PNMTXIDX && attr < GX_VA_MAX_ATTR) {
+-    g_gxState.sourceVtxDesc[attr] = type;
++    aurora::gx::fifo::run_on_decoder<SetSourceVtxDescOnDecoder>(
++        SourceVtxDescArgs{static_cast<u32>(attr), static_cast<u32>(type)});
+   }
+ }
+ 
+@@ -290,6 +319,7 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
+ 
+   // Write array stride
+   GX_WRITE_CP_REG(CP_REG_ARRAYSTRIDE_ID | cpIdx, stride);
++  aurora::gx::fifo::note_array(cpAttr, data, size); // WIICOMPILED_GX_FIFO_CHECK only
+ }
+ 
+ void GXSetTexCoordGen2(GXTexCoordID dst, GXTexGenType type, GXTexGenSrc src, u32 mtx, GXBool normalize, u32 postMtx) {
 diff --git a/aurora-main/lib/dolphin/gx/GXLighting.cpp b/aurora-main/lib/dolphin/gx/GXLighting.cpp
 index f7331c6..3d029b6 100644
 --- a/aurora-main/lib/dolphin/gx/GXLighting.cpp
@@ -128,6 +599,1576 @@ index f7331c6..3d029b6 100644
    auto* light = reinterpret_cast<const GXLightObj_*>(light_);
  
    // XF bulk write: 16 values at light base address
+diff --git a/aurora-main/lib/dolphin/gx/GXManage.cpp b/aurora-main/lib/dolphin/gx/GXManage.cpp
+index 80b3b92..789dc44 100644
+--- a/aurora-main/lib/dolphin/gx/GXManage.cpp
++++ b/aurora-main/lib/dolphin/gx/GXManage.cpp
+@@ -262,13 +262,13 @@ GXFifoObj* GXInit(void* base, u32 size) {
+ }
+ 
+ void GXDrawDone() {
+-  aurora::gx::fifo::drain();
++  aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::DrawDone);
+   if (DrawDoneCB != nullptr)
+     DrawDoneCB();
+ }
+ 
+ void GXSetDrawDone() {
+-  aurora::gx::fifo::drain();
++  aurora::gx::fifo::drain(aurora::gx::fifo::DrainReason::DrawDone);
+   if (DrawDoneCB != nullptr)
+     DrawDoneCB();
+ }
+@@ -297,6 +297,25 @@ void GXTexModeSync() {
+ 
+ // Dirty state flush functions
+ 
++// Deferred/thread GX FIFO: whether sync re-sent the VCD/VAT here could depend on the decoder's state
++// (AuroraVtx*Differs, GXGeometry.cpp). The block is written as sync would write it, and the decoder
++// keeps the part its probes say sync sent (fifo::queue_vtx_cond).
++static void SetVtxStateDecidedByDecoder() {
++  const u32 probes = aurora::gx::fifo::vtx_probes();
++  const bool vcdForce = (__gx->dirtyState & 8) != 0;
++  const u8 vatForce = (__gx->dirtyState & 0x10) != 0 ? __gx->dirtyVAT : 0;
++  const u32 start = aurora::gx::fifo::get_buffer_size();
++  if (vcdForce || (probes & 0x100u) != 0) {
++    __GXSetVCD();
++  }
++  const u32 vcdEnd = aurora::gx::fifo::get_buffer_size();
++  __gx->dirtyVAT = static_cast<u8>(vatForce | (probes & 0xFFu));
++  if (__gx->dirtyVAT != 0) {
++    __GXSetVAT();
++  }
++  aurora::gx::fifo::queue_vtx_cond(start, vcdEnd, vcdForce, vatForce);
++}
++
+ void __GXSetDirtyState() {
+   if (__gx->dirtyState & 1) {
+     __GXSetSUTexRegs();
+@@ -307,11 +326,16 @@ void __GXSetDirtyState() {
+   if (__gx->dirtyState & 4) {
+     __GXSetGenMode();
+   }
+-  if (__gx->dirtyState & 8) {
+-    __GXSetVCD();
+-  }
+-  if (__gx->dirtyState & 0x10) {
+-    __GXSetVAT();
++  if (aurora::gx::fifo::async_mode() && aurora::gx::fifo::vtx_probes() != 0 &&
++      !aurora::gx::fifo::in_display_list()) UNLIKELY {
++    SetVtxStateDecidedByDecoder();
++  } else {
++    if (__gx->dirtyState & 8) {
++      __GXSetVCD();
++    }
++    if (__gx->dirtyState & 0x10) {
++      __GXSetVAT();
++    }
+   }
+   __gx->dirtyState = 0;
+ }
+diff --git a/aurora-main/lib/dolphin/gx/GXTransform.cpp b/aurora-main/lib/dolphin/gx/GXTransform.cpp
+index b881d38..bb8a159 100644
+--- a/aurora-main/lib/dolphin/gx/GXTransform.cpp
++++ b/aurora-main/lib/dolphin/gx/GXTransform.cpp
+@@ -2,6 +2,26 @@
+ #include "__gx.h"
+ #include "dolphin/mtx/GeoTypes.h"
+ 
++// Decoder state sync wrote at the call (fifo::run_on_decoder).
++namespace {
++struct ZScaleOffsetArgs {
++  f32 scale;
++  f32 offset;
++};
++void SetZScaleOffsetOnDecoder(const ZScaleOffsetArgs& a) {
++  g_gxState.zScale = a.scale;
++  g_gxState.zOffset = a.offset;
++}
++struct ScissorBoxOffsetArgs {
++  s32 x;
++  s32 y;
++};
++void SetScissorBoxOffsetOnDecoder(const ScissorBoxOffsetArgs& a) {
++  g_gxState.scissorOffsetX = a.x;
++  g_gxState.scissorOffsetY = a.y;
++}
++} // namespace
++
+ static inline void CacheProjectionVector(const f32* ptr, GXProjectionType type) {
+   __gx->projType = type;
+   for (int i = 0; i < 6; ++i) {
+@@ -189,8 +209,7 @@ void GXProject(f32 x, f32 y, f32 z, const f32 mtx[3][4], const f32* pm, const f3
+ // TODO GXLoadNrmMtxIndx3x3
+ // TODO GXLoadTexMtxIndx
+ void GXSetZScaleOffset(f32 scale, f32 offset) {
+-  g_gxState.zScale = scale;
+-  g_gxState.zOffset = offset;
++  aurora::gx::fifo::run_on_decoder<SetZScaleOffsetOnDecoder>(ZScaleOffsetArgs{scale, offset});
+   constexpr f32 z24Scale = 16777215.0f;
+   const f32 sz = z24Scale * offset;
+   const f32 oz = 1.0f + z24Scale * scale;
+@@ -205,8 +224,7 @@ void GXSetZScaleOffset(f32 scale, f32 offset) {
+ }
+ 
+ void GXSetScissorBoxOffset(s32 x_off, s32 y_off) {
+-  g_gxState.scissorOffsetX = x_off;
+-  g_gxState.scissorOffsetY = y_off;
++  aurora::gx::fifo::run_on_decoder<SetScissorBoxOffsetOnDecoder>(ScissorBoxOffsetArgs{x_off, y_off});
+ 
+   const u32 reg = 0x59000000u | (((static_cast<u32>(y_off + 0x156) * 0x200u) & 0x000ffc00u)) |
+                   ((static_cast<u32>(x_off + 0x156) >> 1) & 0x000003ffu);
+diff --git a/aurora-main/lib/dolphin/gx/GXVert.cpp b/aurora-main/lib/dolphin/gx/GXVert.cpp
+index 6f71945..0ca5c7d 100644
+--- a/aurora-main/lib/dolphin/gx/GXVert.cpp
++++ b/aurora-main/lib/dolphin/gx/GXVert.cpp
+@@ -570,7 +570,7 @@ void GXEnd() {
+     sWriteAttrComps = 0;
+   }
+   if (!aurora::gx::fifo::in_display_list()) {
+-    aurora::gx::fifo::drain();
++    aurora::gx::fifo::publish_draw(); // sync: drain()
+   }
+ }
+ 
+diff --git a/aurora-main/lib/gfx/texture_replacement.cpp b/aurora-main/lib/gfx/texture_replacement.cpp
+index 8b55612..1afac0a 100644
+--- a/aurora-main/lib/gfx/texture_replacement.cpp
++++ b/aurora-main/lib/gfx/texture_replacement.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "../internal.hpp"
+ #include "../gx/gx.hpp"
++#include "../gx/fifo.hpp"
+ #include "../webgpu/gpu.hpp"
+ #include "auto_mips.hpp"
+ #include "dds_io.hpp"
+@@ -746,6 +747,36 @@ void register_tlut(const GXTlutObj* obj, const void* data, GXTlutFmt format, uin
+   };
+ }
+ 
++// load_tlut's decoder half for a deferred/thread GX FIFO: find_replacement reads s_loadedTluts
++// while decoding draws, so it is written in FIFO order. `pending` is the registration load_tlut took.
++struct InstallTlutArgs {
++  const GXTlutObj* obj;
++  uint32_t idx;
++  TlutMetadata* pending;
++};
++void install_loaded_tlut(const InstallTlutArgs& args) {
++  if (args.pending != nullptr) {
++    s_loadedTluts[args.idx] = std::move(*args.pending);
++    delete args.pending;
++    return;
++  }
++  for (const auto& loaded : s_loadedTluts) {
++    if (!loaded.valid || loaded.source != args.obj) {
++      continue;
++    }
++    s_loadedTluts[args.idx] = {
++        .size = loaded.size,
++        .format = loaded.format,
++        .entries = loaded.entries,
++        .valid = loaded.valid,
++        .source = loaded.source,
++        .data = loaded.data.clone(),
++    };
++    return;
++  }
++  s_loadedTluts[args.idx] = {};
++}
++
+ void load_tlut(const GXTlutObj* obj, uint32_t idx) noexcept {
+   if (!g_config.allowTextureReplacements) {
+     return;
+@@ -753,6 +784,15 @@ void load_tlut(const GXTlutObj* obj, uint32_t idx) noexcept {
+   if (idx >= s_loadedTluts.size()) {
+     return;
+   }
++  if (aurora::gx::fifo::async_mode()) {
++    TlutMetadata* pending = nullptr;
++    if (const auto it = s_pendingTluts.find(obj); it != s_pendingTluts.end()) {
++      pending = new TlutMetadata(std::move(it->second));
++      s_pendingTluts.erase(it);
++    }
++    aurora::gx::fifo::run_on_decoder<install_loaded_tlut>(InstallTlutArgs{obj, idx, pending});
++    return;
++  }
+ 
+   // Consume the pending registration. The map is keyed by a guest object address that can be freed
+   // or reused at any time, and entries used to live until shutdown.
+diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/command_processor.cpp
+index a9443c6..2aefcbe 100644
+--- a/aurora-main/lib/gx/command_processor.cpp
++++ b/aurora-main/lib/gx/command_processor.cpp
+@@ -1393,6 +1393,11 @@ static void handle_bp(u32 value, bool bigEndian) {
+ }
+ 
+ extern "C" void GXApplyBPReg(u8 reg, u32 value) {
++  if (async_mode()) UNLIKELY {
++    // Sync applies it now, ahead of the bytes still in its buffer: the queue puts it there.
++    queue_bp((static_cast<u32>(reg) << 24) | (value & 0x00FFFFFFu));
++    return;
++  }
+   handle_bp((static_cast<u32>(reg) << 24) | (value & 0x00FFFFFFu), true);
+ }
+ 
+@@ -2122,6 +2127,115 @@ static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t verte
+   return gfx::staging_has_space(demand);
+ }
+ 
++static bool decode_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
++                            uint32_t vertexBytes);
++
++// The vertex size calculate_last_vtx_size will find once the decoder has applied the VCD/VAT in the
++// producer's shadow registers (__gx), decoded as handle_cp decodes them. 0 when the shadow names a
++// component type the size tables reject: the decoder judges that draw.
++static u32 shadow_vtx_size(GXVtxFmt fmt) {
++  if (fmt < GX_VTXFMT0 || fmt >= GX_MAX_VTXFMT) {
++    return 0;
++  }
++  struct AttrShadow {
++    GXAttrType type = GX_NONE;
++    GXCompCnt cnt = static_cast<GXCompCnt>(0);
++    GXCompType comp = static_cast<GXCompType>(0);
++  };
++  std::array<AttrShadow, GX_VA_TEX7 + 1> attrs{};
++  const u32 lo = __gx->vcdLo;
++  const u32 hi = __gx->vcdHi;
++  for (u32 i = 0; i < 9; ++i) {
++    attrs[GX_VA_PNMTXIDX + i].type = static_cast<GXAttrType>(bp_get(lo, 1, i));
++  }
++  attrs[GX_VA_POS].type = static_cast<GXAttrType>(bp_get(lo, 2, 9));
++  attrs[GX_VA_NRM].type = static_cast<GXAttrType>(bp_get(lo, 2, 11));
++  attrs[GX_VA_CLR0].type = static_cast<GXAttrType>(bp_get(lo, 2, 13));
++  attrs[GX_VA_CLR1].type = static_cast<GXAttrType>(bp_get(lo, 2, 15));
++  for (u32 i = 0; i < 8; ++i) {
++    attrs[GX_VA_TEX0 + i].type = static_cast<GXAttrType>(bp_get(hi, 2, i * 2));
++  }
++  const u32 a = __gx->vatA[fmt];
++  const u32 b = __gx->vatB[fmt];
++  const u32 c = __gx->vatC[fmt];
++  const auto set = [&](GXAttr attr, u32 cnt, u32 comp) {
++    attrs[attr].cnt = static_cast<GXCompCnt>(cnt);
++    attrs[attr].comp = static_cast<GXCompType>(comp);
++  };
++  set(GX_VA_POS, bp_get(a, 1, 0), bp_get(a, 3, 1));
++  set(GX_VA_NRM, bp_get(a, 1, 31) != 0 ? GX_NRM_NBT3 : (bp_get(a, 1, 9) != 0 ? GX_NRM_NBT : GX_NRM_XYZ),
++      bp_get(a, 3, 10));
++  set(GX_VA_CLR0, bp_get(a, 1, 13), bp_get(a, 3, 14));
++  set(GX_VA_CLR1, bp_get(a, 1, 17), bp_get(a, 3, 18));
++  set(GX_VA_TEX0, bp_get(a, 1, 21), bp_get(a, 3, 22));
++  set(GX_VA_TEX1, bp_get(b, 1, 0), bp_get(b, 3, 1));
++  set(GX_VA_TEX2, bp_get(b, 1, 9), bp_get(b, 3, 10));
++  set(GX_VA_TEX3, bp_get(b, 1, 18), bp_get(b, 3, 19));
++  set(GX_VA_TEX4, bp_get(b, 1, 27), bp_get(b, 3, 28));
++  set(GX_VA_TEX5, bp_get(c, 1, 5), bp_get(c, 3, 6));
++  set(GX_VA_TEX6, bp_get(c, 1, 14), bp_get(c, 3, 15));
++  set(GX_VA_TEX7, bp_get(c, 1, 23), bp_get(c, 3, 24));
++  u32 size = 0;
++  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
++    const auto attr = static_cast<GXAttr>(i);
++    const auto& shadow = attrs[i];
++    switch (shadow.type) {
++    case GX_NONE:
++      break;
++    case GX_DIRECT:
++      if (attr >= GX_VA_POS) {
++        const u32 maxComp = (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) ? static_cast<u32>(GX_RGBA8)
++                                                                        : static_cast<u32>(GX_F32);
++        if (static_cast<u32>(shadow.comp) > maxComp) {
++          return 0;
++        }
++      }
++      size += comp_type_size(attr, shadow.comp) * comp_cnt_count(attr, shadow.cnt);
++      break;
++    case GX_INDEX8:
++      size += (attr == GX_VA_NRM && shadow.cnt == GX_NRM_NBT3) ? 3 : 1;
++      break;
++    case GX_INDEX16:
++      size += (attr == GX_VA_NRM && shadow.cnt == GX_NRM_NBT3) ? 6 : 2;
++      break;
++    }
++  }
++  return size;
++}
++
++// The decoder half of a raw draw queued by submit_raw_draw (fifo_async.inc). `accepted` is what the
++// producer answered from its shadow; sync answered from the decoder state used here.
++void execute_raw_draw(uint8_t prim, uint8_t fmt, const uint8_t* vertices, uint16_t vtxCount, uint32_t vertexBytes,
++                      bool accepted) {
++  const auto gxPrim = static_cast<GXPrimitive>(prim);
++  const auto gxFmt = static_cast<GXVtxFmt>(fmt);
++  if (accepted) {
++    if (!decode_raw_draw(gxPrim, gxFmt, vertices, vtxCount, vertexBytes)) {
++      note_raw_draw_mismatch();
++    }
++    return;
++  }
++  // Refused by the producer, so the HLE drew it another way. Keep what sync did on the decoder for
++  // a refused draw (the vertex-size lookup and its warning) and count a disagreement.
++  u32 vtxSize;
++  if (g_gxState.lastVtxFmt == gxFmt) LIKELY {
++    vtxSize = g_gxState.lastVtxSize;
++  } else UNLIKELY {
++    vtxSize = calculate_last_vtx_size(gxFmt);
++  }
++  const u32 expectedVertexBytes = static_cast<u32>(vtxCount) * vtxSize;
++  if (expectedVertexBytes != 0 && expectedVertexBytes == vertexBytes) {
++    note_raw_draw_mismatch();
++    return;
++  }
++  static uint32_t refusedLogCount = 0;
++  if (refusedLogCount++ < 64) {
++    Log.warn("raw draw vertex-size mismatch prim={} fmt={} count={} cached_stride={} expected={} supplied={}",
++             static_cast<uint32_t>(gxPrim), static_cast<uint32_t>(gxFmt), vtxCount, vtxSize, expectedVertexBytes,
++             vertexBytes);
++  }
++}
++
+ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
+                      uint32_t vertexBytes) {
+   ZoneScoped;
+@@ -2133,9 +2247,27 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
+     __GXSetDirtyState();
+   }
+ 
++  if (async_mode()) UNLIKELY {
++    if (exact_raw_draws()) {
++      // WIICOMPILED_GX_FIFO_EXACT_RAW=1: the decoder answers, after a full drain, as in sync mode.
++      drain(DrainReason::RawDraw);
++      return decode_raw_draw(prim, fmt, vertices, vtxCount, vertexBytes);
++    }
++    // Answer now from the producer's shadow of the VCD/VAT flushed above; the decoder checks the
++    // answer when it reaches the draw (execute_raw_draw).
++    const u32 shadowSize = shadow_vtx_size(fmt);
++    const bool accepted = shadowSize != 0 && static_cast<u32>(vtxCount) * shadowSize == vertexBytes;
++    queue_raw_draw(static_cast<uint8_t>(prim), static_cast<uint8_t>(fmt), vertices, vtxCount, vertexBytes, accepted);
++    return accepted;
++  }
+   // Raw bridge draws consume live decoded GX state that is also maintained by the HLE producer.
+-  drain();
++  drain(DrainReason::RawDraw);
++  return decode_raw_draw(prim, fmt, vertices, vtxCount, vertexBytes);
++}
+ 
++// submit_raw_draw after its drain; the asynchronous FIFO's decoder runs it too.
++static bool decode_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
++                            uint32_t vertexBytes) {
+   u32 vtxSize;
+   if (g_gxState.lastVtxFmt == fmt) LIKELY {
+     vtxSize = g_gxState.lastVtxSize;
+@@ -2514,6 +2646,18 @@ bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
+   } else if (subCmd == GX_LOAD_AURORA_DEBUG_MARKER_INSERT) {
+     auto label = read_string(data, pos, size, bigEndian);
+     gfx::insert_debug_marker(std::move(label));
++  } else if (subCmd == kAuroraVtxCondSubCmd) {
++    // Deferred/thread FIFO only (fifo_async.inc, queue_vtx_cond): a VCD/VAT flush decided here.
++    if (pos + 4 > size) {
++      return false;
++    }
++    const u32 length = read_u32(data + pos, bigEndian);
++    pos += 4;
++    if (size - pos < length) {
++      return false;
++    }
++    run_vtx_cond_record(data + pos, length);
++    pos += length;
+   }
+ 
+   else {
+diff --git a/aurora-main/lib/gx/fifo.cpp b/aurora-main/lib/gx/fifo.cpp
+index 9818084..319df6f 100644
+--- a/aurora-main/lib/gx/fifo.cpp
++++ b/aurora-main/lib/gx/fifo.cpp
+@@ -23,7 +23,21 @@ uint32_t sDlSize = 0;
+ uint32_t sDlWritePos = 0;
+ } // namespace detail
+ 
++namespace {
++// fifo_async.inc, included at the end of this file.
++void note_drain(DrainReason reason) noexcept;
++void note_decode(uint32_t bytes) noexcept;
++void note_split(bool displayList) noexcept;
++void async_drain(DrainReason reason);
++void async_write_grow(const void* data, uint32_t length);
++void async_init_begin();
++void async_init_end();
++} // namespace
++
+ void init() {
++  if (async_mode()) {
++    async_init_begin();
++  }
+   constexpr uint32_t initialCapacity = 64 * 1024;
+   reset_cp_register_cache();
+   free(detail::sBufferData);
+@@ -34,9 +48,17 @@ void init() {
+   detail::sDlBuffer = nullptr;
+   detail::sDlSize = 0;
+   detail::sDlWritePos = 0;
++  if (async_mode()) {
++    async_init_end();
++  }
+ }
+ 
+ void write_data_grow(const void* data, uint32_t length) {
++  if (async_mode()) UNLIKELY {
++    // Queued bytes may be under the decoder: make room without moving them.
++    async_write_grow(data, length);
++    return;
++  }
+   uint32_t needed = detail::sBufferSize + length;
+   uint32_t newCap = std::max(detail::sBufferCapacity * 2, needed);
+   detail::sBufferData = static_cast<uint8_t*>(realloc(detail::sBufferData, newCap));
+@@ -73,7 +95,32 @@ static void note_drain_wait(uint64_t nanos) noexcept {
+   TracyPlot("aurora: fifoDrainWaitUs", static_cast<int64_t>(nanos / 1000));
+ }
+ 
+-void drain() {
++// drain()'s retry loop below, over any buffer. Display lists use it too: they ignored process()'s
++// result, so a draw that found the staging batch full dropped the rest of its list.
++void process_all(const uint8_t* data, uint32_t size, bool bigEndian, bool displayList) {
++  uint32_t consumed = 0;
++  bool retried = false;
++  while (consumed < size) {
++    const auto count = process(data + consumed, size - consumed, bigEndian);
++    if (count == 0 && retried)
++      throw gfx::StagingCapacityError("FIFO draw does not fit after capacity submission");
++    consumed += count;
++    if (consumed == size) break;
++    // process returned with its renderer lock released. No recursive drain.
++    gfx::split_staging_batch();
++    note_split(displayList);
++    retried = true;
++  }
++}
++
++void drain() { drain(DrainReason::Other); }
++
++void drain(DrainReason reason) {
++  if (async_mode()) UNLIKELY {
++    async_drain(reason);
++    return;
++  }
++  note_drain(reason);
+   // SEALED, not DONE.
+   const auto waited = aurora::wait_for_frame_worker_sealed();
+   if (waited.count() > 0) UNLIKELY {
+@@ -82,6 +129,7 @@ void drain() {
+   if (detail::sBufferSize == 0) {
+     return;
+   }
++  note_decode(detail::sBufferSize);
+   uint32_t consumed = 0;
+   bool retried = false;
+   while (consumed < detail::sBufferSize) {
+@@ -92,15 +140,19 @@ void drain() {
+     if (consumed == detail::sBufferSize) break;
+     // process returned with its renderer lock released. No recursive drain.
+     gfx::split_staging_batch();
++    note_split(false);
+     retried = true;
+   }
+   detail::sBufferSize = 0;
+ }
+ 
+ const uint8_t* get_buffer_data() { return detail::sBufferData; }
+-uint32_t get_buffer_size() { return detail::sBufferSize; }
++// A position in the whole stream: the asynchronous modes drop decoded bytes from the front.
++uint32_t get_buffer_size() { return detail::sVirtualBase + detail::sBufferSize; }
+ void clear_buffer() {
+   detail::sBufferSize = 0;
+ }
+ 
+ } // namespace aurora::gx::fifo
++
++#include "fifo_async.inc"
+diff --git a/aurora-main/lib/gx/fifo.hpp b/aurora-main/lib/gx/fifo.hpp
+index b01ea45..22fa6c1 100644
+--- a/aurora-main/lib/gx/fifo.hpp
++++ b/aurora-main/lib/gx/fifo.hpp
+@@ -16,6 +16,18 @@ extern uint32_t sDlSize;
+ extern uint32_t sDlWritePos;
+ } // namespace detail
+ 
++// GX FIFO processing mode, WIICOMPILED_GX_FIFO=sync|deferred|thread (fifo_async.inc). Sync, the
++// default, keeps every path as it was.
++enum class Mode : uint8_t { Sync, Deferred, Thread };
++namespace detail {
++extern Mode sMode;
++extern bool sModeResolved;
++extern uint32_t sVirtualBase; // bytes the asynchronous modes dropped from the front of the buffer
++Mode resolve_mode() noexcept;
++} // namespace detail
++inline Mode mode() noexcept { return detail::sModeResolved ? detail::sMode : detail::resolve_mode(); }
++inline bool async_mode() noexcept { return mode() != Mode::Sync; }
++
+ void init();
+ 
+ // Out-of-line slow path: grows internal buffer then appends data
+@@ -81,6 +93,73 @@ bool in_display_list();
+ // Drain the internal FIFO buffer through the command processor
+ void drain();
+ 
++// ---- Asynchronous decoding (fifo_async.inc). In sync mode each of these does what its caller did.
++enum class DrainReason : uint8_t {
++  Other,
++  Draw,
++  DisplayList,
++  RawDraw,
++  DrawDone,
++  Copy,
++  EndFrame,
++  EfbFlush,
++  Offscreen,
++  RenderArea,
++  ViewportPolicy,
++  Count
++};
++enum class QuiesceReason : uint8_t { DecoderRead, CopyFilter, NativeWrite, VIConfigure, Room, Count };
++void drain(DrainReason reason);
++// Where sync drains after a draw (GXEnd): deferred/thread publish the bytes to the decoder instead.
++void publish_draw();
++// GXCallDisplayList: sync drains, then decodes the list; deferred/thread queue a copy of it.
++void call_display_list(const void* data, uint32_t nbytes, bool bigEndian);
++// drain()'s StagingBatchFull retry loop over any buffer.
++void process_all(const uint8_t* data, uint32_t size, bool bigEndian, bool displayList);
++// Bytes written or queued that the decoder has not run yet.
++bool has_unprocessed();
++// Before the producer reads decoder state where sync did not drain: waits until the decoder holds
++// the state sync held at this point. Nothing to do in sync mode.
++void quiesce(QuiesceReason reason);
++bool on_worker_thread() noexcept;
++// The guest timing pump (aurora_set_frame_worker_wait_callback), run while the producer waits.
++void set_wait_service(void (*service)()) noexcept;
++bool exact_raw_draws() noexcept;
++void queue_bp(uint32_t word);
++void queue_raw_draw(uint8_t prim, uint8_t fmt, const uint8_t* vertices, uint16_t vtxCount, uint32_t vertexBytes,
++                    bool accepted);
++void note_raw_draw_mismatch() noexcept;
++// Comparisons with the decoder's vertex state (GXGeometry.cpp), made by the decoder in FIFO order,
++// and the flush that acts on them (GXManage.cpp).
++void probe_vtx_desc(uint32_t attr, uint32_t type);
++void probe_vtx_attr_fmt(uint32_t fmt, uint32_t attr, uint32_t cnt, uint32_t type, uint32_t frac);
++uint32_t vtx_probes() noexcept;
++void queue_vtx_cond(uint32_t start, uint32_t vcdEnd, bool vcdForce, uint8_t vatForce);
++// GX_LOAD_AURORA subcommand carrying queue_vtx_cond's flush (never in a sync-mode stream).
++constexpr uint16_t kAuroraVtxCondSubCmd = 0x00F0;
++void run_vtx_cond_record(const uint8_t* payload, uint32_t length);
++void note_array(uint32_t attr, const void* data, uint32_t size);
++
++// A write sync made straight into the decoder state (g_gxState) at the call: sync makes it now;
++// deferred/thread queue it in front of the unpublished FIFO bytes, where sync's decoder applied it.
++using DecoderCall = void (*)(const void* args);
++void queue_decoder_call(DecoderCall call, const void* args, uint32_t size);
++template <auto Fn, typename Args>
++inline void run_on_decoder(const Args& args) {
++  static_assert(std::is_trivially_copyable_v<Args>);
++  if (!async_mode()) LIKELY {
++    Fn(args);
++    return;
++  }
++  queue_decoder_call(
++      [](const void* data) {
++        Args copy;
++        std::memcpy(static_cast<void*>(&copy), data, sizeof(Args));
++        Fn(static_cast<const Args&>(copy));
++      },
++      &args, sizeof(Args));
++}
++
+ // Internal buffer inspection
+ const uint8_t* get_buffer_data();
+ uint32_t get_buffer_size();
+diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
+new file mode 100644
+index 0000000..077fa48
+--- /dev/null
++++ b/aurora-main/lib/gx/fifo_async.inc
+@@ -0,0 +1,983 @@
++// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
++// at the end of fifo.cpp.
++//
++//  sync      (default) every caller behaves as before: the producer decodes its FIFO inline each
++//            time it drains (each draw, display list, raw draw and sync point).
++//  deferred  the producer queues what it would have decoded as segments and decodes them itself,
++//            on the same thread, only at a sync point. A correctness test of the reordering.
++//  thread    a worker thread decodes the segments while the game keeps running.
++//
++// What makes deferred and thread decode exactly what sync decodes:
++//  * MAIN segments are the FIFO bytes written since the last point where sync drained, published
++//    at that same point (publish_draw, call_display_list, raw draws, drains).
++//  * Work sync did directly on the decoder state at the call (GXApplyBPReg, the copy setters,
++//    GXSetSourceVtxDesc, TLUT replacement metadata, comparisons with the decoder's vertex state) is
++//    queued as records in a side buffer that goes in front of the unpublished FIFO tail: the
++//    decoder applies it after everything sync had decoded and before what sync still held unread.
++//  * Where sync decided from the decoder's vertex state whether to re-send the VCD/VAT, those
++//    comparisons are records ("probes") and the flush is a GX_LOAD_AURORA subcommand in the FIFO
++//    bytes that sends what the probes found sync would have sent.
++//  * A producer read of decoder state (bounding box, PeekZ fallback, ...) waits until every queued
++//    segment is decoded (quiesce): that is the state sync read there.
++//  * Full sync points (copies, DrawDone, end of frame, ...) publish everything and wait (drain).
++//  * Copies, not pointers: display lists and raw draws are copied when submitted.
++// Guest memory the decoder reads through pointers (textures, TLUTs, vertex and matrix arrays) is
++// read when decoded, as the real GPU does; WIICOMPILED_GX_FIFO_CHECK=1 counts display lists whose
++// arrays the guest wrote between submit and decode.
++
++#include "gx.hpp"
++
++#include <atomic>
++#include <bit>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <mutex>
++#include <thread>
++
++#if defined(__SWITCH__)
++extern "C" void SwitchPinCurrentThread(int core, int priority); // runtime platform/switch
++#endif
++
++namespace aurora::gx::fifo {
++// command_processor.cpp: the decoder half of submit_raw_draw.
++void execute_raw_draw(uint8_t prim, uint8_t fmt, const uint8_t* vertices, uint16_t vtxCount, uint32_t vertexBytes,
++                      bool accepted);
++
++namespace detail {
++Mode sMode = Mode::Sync;
++bool sModeResolved = false;
++uint32_t sVirtualBase = 0;
++
++Mode resolve_mode() noexcept {
++  const char* env = std::getenv("WIICOMPILED_GX_FIFO");
++  Mode mode = Mode::Sync;
++  if (env != nullptr && std::strcmp(env, "deferred") == 0) {
++    mode = Mode::Deferred;
++  } else if (env != nullptr && std::strcmp(env, "thread") == 0) {
++    mode = Mode::Thread;
++  }
++  sMode = mode;
++  sModeResolved = true;
++  if (mode != Mode::Sync) {
++    Log.info("GX FIFO: {} processing (WIICOMPILED_GX_FIFO)", mode == Mode::Thread ? "thread" : "deferred");
++  }
++  return mode;
++}
++} // namespace detail
++
++namespace {
++using Clock = std::chrono::steady_clock;
++
++uint64_t nanos_since(Clock::time_point start) noexcept {
++  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
++}
++
++inline void cpu_relax() noexcept {
++#if defined(__aarch64__)
++  asm volatile("yield" ::: "memory");
++#elif defined(__x86_64__) || defined(__i386__)
++  __builtin_ia32_pause();
++#else
++  std::this_thread::yield();
++#endif
++}
++
++// Producer-side counters are plain (one thread); the decoder's are atomic.
++struct Stats {
++  uint64_t drains[static_cast<size_t>(DrainReason::Count)]{};
++  uint64_t quiesces[static_cast<size_t>(QuiesceReason::Count)]{};
++  uint64_t segments = 0;
++  uint64_t bytes = 0;
++  uint64_t waitNs = 0;
++  uint64_t copiesQueued = 0; // EFB copies decoded in stream order (no producer wait)
++  uint64_t copiesInline = 0; // EFB copies the producer ran itself after a drain
++  std::atomic<uint64_t> decodeNs{0};
++  std::atomic<uint64_t> rawMismatches{0};
++  std::atomic<uint64_t> drainSplits{0};
++  std::atomic<uint64_t> listSplits{0};
++  std::atomic<uint64_t> arrayHazards{0};
++  std::atomic<uint64_t> decodeErrors{0};
++};
++Stats sStats;
++
++struct Snapshot {
++  uint64_t drains[static_cast<size_t>(DrainReason::Count)]{};
++  uint64_t quiesces[static_cast<size_t>(QuiesceReason::Count)]{};
++  uint64_t segments = 0, bytes = 0, waitNs = 0, decodeNs = 0, rawMismatches = 0, drainSplits = 0, listSplits = 0,
++           arrayHazards = 0, decodeErrors = 0, copiesQueued = 0, copiesInline = 0;
++};
++Snapshot sMark;
++
++Snapshot take_snapshot() noexcept {
++  Snapshot s;
++  std::memcpy(s.drains, sStats.drains, sizeof(s.drains));
++  std::memcpy(s.quiesces, sStats.quiesces, sizeof(s.quiesces));
++  s.segments = sStats.segments;
++  s.bytes = sStats.bytes;
++  s.waitNs = sStats.waitNs;
++  s.decodeNs = sStats.decodeNs.load(std::memory_order_relaxed);
++  s.rawMismatches = sStats.rawMismatches.load(std::memory_order_relaxed);
++  s.drainSplits = sStats.drainSplits.load(std::memory_order_relaxed);
++  s.listSplits = sStats.listSplits.load(std::memory_order_relaxed);
++  s.arrayHazards = sStats.arrayHazards.load(std::memory_order_relaxed);
++  s.decodeErrors = sStats.decodeErrors.load(std::memory_order_relaxed);
++  s.copiesQueued = sStats.copiesQueued;
++  s.copiesInline = sStats.copiesInline;
++  return s;
++}
++
++void note_drain(DrainReason reason) noexcept { ++sStats.drains[static_cast<size_t>(reason)]; }
++
++// Sync mode: one process() run over `bytes` (the counterpart of a queued segment).
++void note_decode(uint32_t bytes) noexcept {
++  ++sStats.segments;
++  sStats.bytes += bytes;
++}
++
++void note_split(bool displayList) noexcept {
++  (displayList ? sStats.listSplits : sStats.drainSplits).fetch_add(1, std::memory_order_relaxed);
++}
++
++// ---- Queue ---------------------------------------------------------------------------------------
++
++enum : uint8_t { kSegMain = 0, kSegSide = 1 };
++struct Segment {
++  uint32_t begin = 0;
++  uint32_t end = 0;
++  uint8_t source = kSegMain;
++};
++constexpr uint64_t kRingSize = 1u << 14;
++
++// Side-buffer records: an 8-byte header, then the payload padded to 8 bytes.
++enum : uint8_t { kRecStream = 1, kRecRawDraw, kRecCall, kRecProbeVcd, kRecProbeVat };
++constexpr uint8_t kRecBigEndian = 1u << 0; // stream: big-endian bytes
++constexpr uint8_t kRecSealed = 1u << 1;    // sync drained (and so waited for SEALED) before this work
++constexpr uint8_t kRecList = 1u << 2;      // stream: a display list
++constexpr uint8_t kRecArrayCheck = 1u << 3; // stream: starts with the producer's array fingerprint
++struct RecordHeader {
++  uint8_t type;
++  uint8_t flags;
++  uint16_t aux; // probes: the conditional vertex flush they belong to
++  uint32_t length;
++};
++static_assert(sizeof(RecordHeader) == 8);
++constexpr uint32_t align8(uint32_t v) noexcept { return (v + 7u) & ~7u; }
++
++struct RawDrawArgs {
++  uint8_t prim;
++  uint8_t fmt;
++  uint8_t accepted;
++  uint8_t pad0;
++  uint16_t vtxCount;
++  uint16_t pad1;
++  uint32_t vertexBytes;
++  uint32_t pad2;
++};
++static_assert(sizeof(RawDrawArgs) == 16);
++
++// The payload of the in-stream kAuroraVtxCondSubCmd (queue_vtx_cond), then the VCD block and one
++// VAT block per candidate format, as __GXSetVCD/__GXSetVAT wrote them.
++struct VtxCondArgs {
++  uint8_t vcdForce;
++  uint8_t vcdProbed;
++  uint8_t vatForce;
++  uint8_t vatProbed;
++  uint16_t id;
++  uint16_t pad;
++  uint32_t vcdBytes;
++};
++static_assert(sizeof(VtxCondArgs) == 12);
++constexpr uint32_t kVatBlockBytes = 18; // __GXSetVAT: three CP writes per format
++
++// Probes of flush `id` are decoded before the flush's block, but probes of the next flush can be
++// decoded before it too (they go in front of the unpublished bytes that hold it), hence per id.
++struct ProbeSlot {
++  uint32_t id = UINT32_MAX;
++  bool vcd = false;
++  uint8_t vat = 0;
++};
++constexpr uint32_t kProbeSlots = 64;
++
++// Shared with the worker; never destroyed, since the worker may still sleep on it at exit.
++struct Shared {
++  std::mutex mutex;
++  std::condition_variable workerCv;
++  std::condition_variable mainCv;
++  std::atomic<uint64_t> pushed{0};
++  std::atomic<uint64_t> processed{0};
++  std::atomic<bool> workerSleeping{false};
++  std::atomic<bool> mainWaiting{false};
++  Segment ring[kRingSize];
++};
++
++constexpr uint32_t kMainCapacity = 8u << 20;
++constexpr uint32_t kSideCapacity = 4u << 20;
++constexpr uint32_t kKickDraws = 16;
++constexpr uint32_t kKickBytes = 32u << 10;
++constexpr auto kWorkerSpin = std::chrono::microseconds(40);
++constexpr auto kMainSpin = std::chrono::microseconds(50);
++
++Shared* sShared = nullptr;
++bool sStarted = false;
++thread_local bool tWorker = false;
++thread_local bool tStreamCall = false; // decoding a stream-ordered call (GXCopyTex/GXCopyDisp)
++// The guest's alarm/retrace/audio pump the frame-worker waits run (aurora_set_frame_worker_wait_callback).
++std::atomic<void (*)()> sWaitService{nullptr};
++
++// Producer state. The decoder reads detail::sBufferData[segment) and sSide[segment) only for
++// pushed segments, and the producer moves or reallocates a buffer only when every pushed segment
++// is decoded.
++uint8_t* sSide = nullptr;
++uint32_t sSideSize = 0;
++uint32_t sSideCapacity = 0;
++uint32_t sSideOpen = 0;             // [sSideOpen, sSideSize): records not in a segment yet
++uint32_t sLastRecord = UINT32_MAX;  // the newest open record, which a like record may extend
++uint32_t sMainPublished = 0;        // detail::sBufferData[0, sMainPublished) is in segments
++uint64_t sPushed = 0;               // the producer's copy of Shared::pushed
++uint32_t sKickDraws = 0;
++uint32_t sKickBytes = 0;
++uint32_t sVtxProbes = 0;            // bit 8: VCD probed; bits 0-7: VAT formats probed (since the last flush)
++uint16_t sNextCondId = 0;           // the conditional vertex flush the queued probes belong to
++uint16_t sPublishedCondId = 0;      // sNextCondId when the main buffer was last published
++uint64_t sFrameEpoch = 0;           // completed end-of-frame drains
++bool sExactRawDraws = false;
++bool sCheckArrays = false;
++struct ArrayShadow {
++  const void* data = nullptr;
++  uint32_t size = 0;
++};
++std::array<ArrayShadow, MaxVtxAttr> sArrayShadow{};
++
++// Decoder state (the worker, or the producer itself in deferred mode).
++std::array<ProbeSlot, kProbeSlots> sProbeSlots{};
++
++ProbeSlot& probe_slot(uint16_t id) noexcept {
++  ProbeSlot& slot = sProbeSlots[id % kProbeSlots];
++  if (slot.id != id) {
++    slot = ProbeSlot{id, false, 0};
++  }
++  return slot;
++}
++
++void worker_main() noexcept;
++
++// A frame of FIFO bytes stays queued, so start large enough not to move it mid-frame. Only called
++// with nothing queued.
++void ensure_main_capacity() {
++  if (detail::sBufferCapacity < kMainCapacity) {
++    auto* grown = static_cast<uint8_t*>(realloc(detail::sBufferData, kMainCapacity));
++    ASSERT(grown != nullptr, "GX FIFO: cannot allocate {} bytes", kMainCapacity);
++    detail::sBufferData = grown;
++    detail::sBufferCapacity = kMainCapacity;
++  }
++}
++
++void ensure_started() {
++  if (sStarted) LIKELY {
++    return;
++  }
++  sStarted = true;
++  sShared = new Shared();
++  const char* exact = std::getenv("WIICOMPILED_GX_FIFO_EXACT_RAW");
++  sExactRawDraws = exact != nullptr && exact[0] == '1';
++  const char* check = std::getenv("WIICOMPILED_GX_FIFO_CHECK");
++  sCheckArrays = check != nullptr && check[0] == '1';
++  ensure_main_capacity();
++  sSide = static_cast<uint8_t*>(malloc(kSideCapacity));
++  ASSERT(sSide != nullptr, "GX FIFO: cannot allocate {} bytes", kSideCapacity);
++  sSideCapacity = kSideCapacity;
++  if (mode() == Mode::Thread) {
++    // Lives as long as the process. Not detached: libnx's pthread_detach fails, and
++    // std::thread::detach turns that into std::terminate.
++    static auto* worker = new std::thread(worker_main);
++    (void)worker;
++  }
++}
++
++void wait_sealed() {
++  // SEALED, not DONE, as drain() waits in sync mode.
++  const auto waited = aurora::wait_for_frame_worker_sealed();
++  if (waited.count() > 0) UNLIKELY {
++    note_drain_wait(static_cast<uint64_t>(waited.count()));
++  }
++}
++
++// ---- Decoder ---------------------------------------------------------------------------------------
++
++uint64_t decoder_array_fingerprint() noexcept {
++  uint64_t sum = 0;
++  for (const auto& array : g_gxState.arrays) {
++    if (array.data != nullptr && array.size != 0) {
++      const uint64_t generation = guest_write_generation(array.data, array.size);
++      if (generation != kGuestWriteUntracked) {
++        sum += generation;
++      }
++    }
++  }
++  return sum;
++}
++
++uint64_t producer_array_fingerprint() noexcept {
++  uint64_t sum = 0;
++  for (const auto& array : sArrayShadow) {
++    if (array.data != nullptr && array.size != 0) {
++      const uint64_t generation = guest_write_generation(array.data, array.size);
++      if (generation != kGuestWriteUntracked) {
++        sum += generation;
++      }
++    }
++  }
++  return sum;
++}
++
++void run_vtx_cond(const uint8_t* payload, uint32_t length) {
++  if (length < sizeof(VtxCondArgs)) UNLIKELY {
++    Log.error("GX FIFO: truncated conditional vertex flush ({} bytes)", length);
++    return;
++  }
++  VtxCondArgs args;
++  std::memcpy(&args, payload, sizeof(args));
++  const uint8_t candidates = args.vatForce | args.vatProbed;
++  const uint32_t expected = sizeof(args) + args.vcdBytes + kVatBlockBytes * std::popcount(candidates);
++  const uint8_t* vcd = payload + sizeof(args);
++  const uint8_t* vat = vcd + args.vcdBytes;
++  // GXGeometry.cpp's AuroraVtx*Differs, evaluated by the probes where sync evaluated them.
++  ProbeSlot& slot = probe_slot(args.id);
++  const bool vcdDiff = slot.vcd;
++  const uint8_t vatDiff = slot.vat;
++  // __GXSetDirtyState clears the VCD/VAT dirty state whether or not it sent anything.
++  slot = ProbeSlot{};
++  uint8_t bytes[64 + 8 * kVatBlockBytes];
++  uint32_t size = 0;
++  if (expected != length || args.vcdBytes > 64) UNLIKELY {
++    Log.error("GX FIFO: malformed conditional vertex flush ({} != {}); applying it whole", length, expected);
++    size = std::min<uint32_t>(length - sizeof(args), sizeof(bytes));
++    std::memcpy(bytes, vcd, size);
++  } else {
++    if (args.vcdBytes != 0 && (args.vcdForce != 0 || (args.vcdProbed != 0 && vcdDiff))) {
++      std::memcpy(bytes, vcd, args.vcdBytes);
++      size = args.vcdBytes;
++    }
++    for (uint32_t fmt = 0; fmt < 8; ++fmt) {
++      const uint8_t bit = static_cast<uint8_t>(1u << fmt);
++      if ((candidates & bit) == 0) {
++        continue;
++      }
++      if ((args.vatForce & bit) != 0 || ((args.vatProbed & bit) != 0 && (vatDiff & bit) != 0)) {
++        std::memcpy(bytes + size, vat, kVatBlockBytes);
++        size += kVatBlockBytes;
++      }
++      vat += kVatBlockBytes;
++    }
++  }
++  if (size != 0) {
++    // Plain CP/XF register writes: decoded inside the process() that met the subcommand.
++    process_all(bytes, size, true, false);
++  }
++}
++
++void run_records(const uint8_t* data, uint32_t size) {
++  uint32_t pos = 0;
++  while (pos + sizeof(RecordHeader) <= size) {
++    RecordHeader header;
++    std::memcpy(&header, data + pos, sizeof(header));
++    const uint8_t* payload = data + pos + sizeof(header);
++    pos += sizeof(header) + align8(header.length);
++    if ((header.flags & kRecSealed) != 0) {
++      wait_sealed();
++    }
++    switch (header.type) {
++    case kRecStream: {
++      const uint8_t* bytes = payload;
++      uint32_t length = header.length;
++      if ((header.flags & kRecArrayCheck) != 0) {
++        uint64_t submitted = 0;
++        std::memcpy(&submitted, bytes, sizeof(submitted));
++        bytes += sizeof(submitted);
++        length -= sizeof(submitted);
++        if (decoder_array_fingerprint() != submitted) UNLIKELY {
++          const uint64_t n = sStats.arrayHazards.fetch_add(1, std::memory_order_relaxed);
++          if (n < 16) {
++            Log.warn("GX FIFO: guest RAM behind a vertex/matrix array changed between submit and decode");
++          }
++        }
++      }
++      process_all(bytes, length, (header.flags & kRecBigEndian) != 0, (header.flags & kRecList) != 0);
++      break;
++    }
++    case kRecRawDraw: {
++      RawDrawArgs args;
++      std::memcpy(&args, payload, sizeof(args));
++      execute_raw_draw(args.prim, args.fmt, payload + sizeof(args), args.vtxCount, args.vertexBytes,
++                       args.accepted != 0);
++      break;
++    }
++    case kRecCall: {
++      DecoderCall call;
++      std::memcpy(&call, payload, sizeof(call));
++      // A stream-ordered call (queue_decoder_call_in_stream) runs the work sync did after its drain.
++      const bool streamCall = (header.flags & kRecSealed) != 0;
++      tStreamCall = streamCall;
++      call(payload + 8);
++      tStreamCall = false;
++      break;
++    }
++    case kRecProbeVcd: {
++      ProbeSlot& slot = probe_slot(header.aux);
++      for (uint32_t i = 0; i + 2 <= header.length; i += 2) {
++        slot.vcd = slot.vcd || g_gxState.vtxDesc[payload[i]] != static_cast<GXAttrType>(payload[i + 1]);
++      }
++      break;
++    }
++    case kRecProbeVat: {
++      ProbeSlot& slot = probe_slot(header.aux);
++      for (uint32_t i = 0; i + 5 <= header.length; i += 5) {
++        const auto& fmt = g_gxState.vtxFmts[payload[i]].attrs[payload[i + 1]];
++        if (fmt.cnt != static_cast<GXCompCnt>(payload[i + 2]) || fmt.type != static_cast<GXCompType>(payload[i + 3]) ||
++            fmt.frac != payload[i + 4]) {
++          slot.vat = static_cast<uint8_t>(slot.vat | (1u << payload[i]));
++        }
++      }
++      break;
++    }
++    default:
++      Log.error("GX FIFO: unknown queued record {}", header.type);
++      return;
++    }
++  }
++}
++
++void run_segment(const Segment& segment) {
++  ZoneScopedN("GX FIFO segment");
++  try {
++    if (segment.source == kSegMain) {
++      wait_sealed();
++      process_all(detail::sBufferData + segment.begin, segment.end - segment.begin, true, false);
++    } else {
++      run_records(sSide + segment.begin, segment.end - segment.begin);
++    }
++  } catch (const std::exception& e) {
++    // Sync mode let this reach the GX call that drained; there is no such caller here.
++    if (sStats.decodeErrors.fetch_add(1, std::memory_order_relaxed) < 16) {
++      Log.error("GX FIFO: decoding a queued segment failed: {}", e.what());
++    }
++  } catch (...) {
++    if (sStats.decodeErrors.fetch_add(1, std::memory_order_relaxed) < 16) {
++      Log.error("GX FIFO: decoding a queued segment failed");
++    }
++  }
++}
++
++void worker_main() noexcept {
++  tWorker = true;
++#if defined(__SWITCH__)
++  // Core 1 at the game's priority; the frame worker moves to core 2 in this mode (aurora.cpp).
++  SwitchPinCurrentThread(1, 0x2C);
++#endif
++  Shared& shared = *sShared;
++  uint64_t done = shared.processed.load(std::memory_order_acquire);
++  for (;;) {
++    uint64_t available = shared.pushed.load(std::memory_order_acquire);
++    if (available == done) {
++      // The producer usually publishes its next draw within a few tens of microseconds.
++      const auto spinUntil = Clock::now() + kWorkerSpin;
++      for (uint32_t i = 1;; ++i) {
++        cpu_relax();
++        available = shared.pushed.load(std::memory_order_acquire);
++        if (available != done || ((i & 63) == 0 && Clock::now() >= spinUntil)) {
++          break;
++        }
++      }
++      if (available == done) {
++        std::unique_lock lock(shared.mutex);
++        shared.workerSleeping.store(true, std::memory_order_seq_cst);
++        shared.workerCv.wait(lock, [&] { return shared.pushed.load(std::memory_order_seq_cst) != done; });
++        shared.workerSleeping.store(false, std::memory_order_relaxed);
++        continue;
++      }
++    }
++    const auto start = Clock::now();
++    while (done < available) {
++      run_segment(shared.ring[done % kRingSize]);
++      ++done;
++      shared.processed.store(done, std::memory_order_seq_cst);
++      if (shared.mainWaiting.load(std::memory_order_seq_cst)) {
++        std::lock_guard lock(shared.mutex);
++        shared.mainCv.notify_all();
++      }
++      available = shared.pushed.load(std::memory_order_acquire);
++    }
++    sStats.decodeNs.fetch_add(nanos_since(start), std::memory_order_relaxed);
++  }
++}
++
++// ---- Producer --------------------------------------------------------------------------------------
++
++void kick(bool urgent) {
++  if (mode() != Mode::Thread) {
++    return;
++  }
++  Shared& shared = *sShared;
++  if (!shared.workerSleeping.load(std::memory_order_seq_cst)) {
++    // Awake (spinning or decoding): it will see the new segments on its own.
++    sKickDraws = 0;
++    sKickBytes = 0;
++    return;
++  }
++  if (!urgent && sKickDraws < kKickDraws && sKickBytes < kKickBytes) {
++    return;
++  }
++  sKickDraws = 0;
++  sKickBytes = 0;
++  {
++    // Pairs with the worker's check under the mutex: the wake cannot fall between check and wait.
++    std::lock_guard lock(shared.mutex);
++  }
++  shared.workerCv.notify_one();
++}
++
++// Decodes queued segments on this thread (deferred mode).
++void run_inline_until(uint64_t target) {
++  Shared& shared = *sShared;
++  uint64_t done = shared.processed.load(std::memory_order_relaxed);
++  if (done >= target) {
++    return;
++  }
++  const auto start = Clock::now();
++  while (done < target) {
++    run_segment(shared.ring[done % kRingSize]);
++    ++done;
++    shared.processed.store(done, std::memory_order_relaxed);
++  }
++  sStats.decodeNs.fetch_add(nanos_since(start), std::memory_order_relaxed);
++}
++
++void wait_processed(uint64_t target) {
++  Shared& shared = *sShared;
++  if (mode() != Mode::Thread) {
++    run_inline_until(target);
++    return;
++  }
++  if (shared.processed.load(std::memory_order_acquire) >= target) {
++    return;
++  }
++  ZoneScopedN("GX FIFO wait");
++  const auto start = Clock::now();
++  kick(true);
++  const auto spinUntil = start + kMainSpin;
++  for (uint32_t i = 1; shared.processed.load(std::memory_order_acquire) < target; ++i) {
++    if ((i & 63) != 0 || Clock::now() < spinUntil) {
++      cpu_relax();
++      continue;
++    }
++    bool reached;
++    {
++      std::unique_lock lock(shared.mutex);
++      shared.mainWaiting.store(true, std::memory_order_seq_cst);
++      reached = shared.mainCv.wait_for(lock, std::chrono::milliseconds(1), [&] {
++        return shared.processed.load(std::memory_order_seq_cst) >= target;
++      });
++      shared.mainWaiting.store(false, std::memory_order_relaxed);
++    }
++    if (!reached) {
++      // As the frame-worker waits do: keep the guest's VI/alarm/audio timing alive. This thread
++      // runs the guest; the worker never calls it (aurora.cpp checks on_worker_thread()).
++      if (const auto service = sWaitService.load(std::memory_order_acquire)) {
++        service();
++      }
++    }
++  }
++  sStats.waitNs += nanos_since(start);
++}
++
++void wait_idle() { wait_processed(sPushed); }
++
++void push_segment(uint32_t begin, uint32_t end, uint8_t source) {
++  Shared& shared = *sShared;
++  if (sPushed - shared.processed.load(std::memory_order_acquire) >= kRingSize) UNLIKELY {
++    wait_processed(sPushed - kRingSize + 1);
++  }
++  shared.ring[sPushed % kRingSize] = Segment{begin, end, source};
++  ++sPushed;
++  shared.pushed.store(sPushed, std::memory_order_seq_cst);
++  ++sStats.segments;
++  sStats.bytes += end - begin;
++  sKickBytes += end - begin;
++}
++
++void flush_records() {
++  if (sSideOpen == sSideSize) {
++    return;
++  }
++  const uint32_t begin = sSideOpen;
++  sSideOpen = sSideSize;
++  sLastRecord = UINT32_MAX;
++  push_segment(begin, sSideSize, kSegSide);
++}
++
++void publish_main() {
++  flush_records();
++  sPublishedCondId = sNextCondId;
++  if (sMainPublished == detail::sBufferSize) {
++    return;
++  }
++  const uint32_t begin = sMainPublished;
++  sMainPublished = detail::sBufferSize;
++  push_segment(begin, sMainPublished, kSegMain);
++}
++
++// Everything queued is decoded: move the unpublished FIFO tail (a GXBegin block being written,
++// say) to the front. Offsets the producer keeps are virtual (get_buffer_size).
++void compact_main() {
++  const uint32_t tail = detail::sBufferSize - sMainPublished;
++  if (sMainPublished != 0 && tail != 0) {
++    std::memmove(detail::sBufferData, detail::sBufferData + sMainPublished, tail);
++  }
++  detail::sVirtualBase += sMainPublished;
++  detail::sBufferSize = tail;
++  sMainPublished = 0;
++}
++
++void reserve_side(uint32_t bytes) {
++  if (bytes <= sSideCapacity - sSideSize) LIKELY {
++    return;
++  }
++  ++sStats.quiesces[static_cast<size_t>(QuiesceReason::Room)];
++  flush_records();
++  wait_idle();
++  sSideSize = 0;
++  sSideOpen = 0;
++  sLastRecord = UINT32_MAX;
++  if (bytes > sSideCapacity) {
++    const uint32_t capacity = std::max(sSideCapacity * 2, bytes);
++    auto* grown = static_cast<uint8_t*>(realloc(sSide, capacity));
++    ASSERT(grown != nullptr, "GX FIFO: cannot allocate {} bytes", capacity);
++    sSide = grown;
++    sSideCapacity = capacity;
++  }
++}
++
++// A record in the open (not yet pushed) part of the side buffer; `extend` appends to the newest
++// open record instead when it has the same type, flags and aux.
++uint8_t* open_record(uint8_t type, uint8_t flags, uint32_t payload, bool extend, uint16_t aux = 0) {
++  ensure_started();
++  if (extend && sLastRecord != UINT32_MAX) {
++    RecordHeader header;
++    std::memcpy(&header, sSide + sLastRecord, sizeof(header));
++    const uint32_t end = sLastRecord + sizeof(header) + align8(header.length + payload);
++    if (header.type == type && header.flags == flags && header.aux == aux && end <= sSideCapacity) {
++      uint8_t* out = sSide + sLastRecord + sizeof(header) + header.length;
++      header.length += payload;
++      std::memcpy(sSide + sLastRecord, &header, sizeof(header));
++      sSideSize = end;
++      return out;
++    }
++  }
++  const uint32_t total = sizeof(RecordHeader) + align8(payload);
++  reserve_side(total);
++  const RecordHeader header{type, flags, aux, payload};
++  std::memcpy(sSide + sSideSize, &header, sizeof(header));
++  sLastRecord = sSideSize;
++  sSideSize += total;
++  return sSide + sLastRecord + sizeof(header);
++}
++
++void async_drain(DrainReason reason) {
++  ensure_started();
++  note_drain(reason);
++  // A guest timing callback run while waiting could queue more; finish only on a quiet FIFO.
++  do {
++    publish_main();
++    wait_idle();
++  } while (sMainPublished != detail::sBufferSize || sSideOpen != sSideSize);
++  // Sync drained after waiting for SEALED even with nothing to decode; callers rely on it.
++  wait_sealed();
++  detail::sVirtualBase += detail::sBufferSize;
++  detail::sBufferSize = 0;
++  sMainPublished = 0;
++  sSideSize = 0;
++  sSideOpen = 0;
++  sLastRecord = UINT32_MAX;
++  if (reason == DrainReason::EndFrame) {
++    ++sFrameEpoch;
++  }
++}
++
++void async_write_grow(const void* data, uint32_t length) {
++  ensure_started();
++  if (length > detail::sBufferCapacity - detail::sBufferSize) {
++    if (sMainPublished != 0) {
++      ++sStats.quiesces[static_cast<size_t>(QuiesceReason::Room)];
++      flush_records();
++      wait_idle();
++      compact_main();
++    }
++    if (length > detail::sBufferCapacity - detail::sBufferSize) {
++      // Nothing queued reads the main buffer now (sMainPublished == 0).
++      const uint64_t needed = static_cast<uint64_t>(detail::sBufferSize) + length;
++      const auto capacity = static_cast<uint32_t>(
++          std::min<uint64_t>(std::max<uint64_t>(static_cast<uint64_t>(detail::sBufferCapacity) * 2, needed),
++                             UINT32_MAX));
++      auto* grown = static_cast<uint8_t*>(realloc(detail::sBufferData, capacity));
++      ASSERT(grown != nullptr, "GX FIFO: cannot allocate {} bytes", capacity);
++      detail::sBufferData = grown;
++      detail::sBufferCapacity = capacity;
++    }
++  }
++  std::memcpy(detail::sBufferData + detail::sBufferSize, data, length);
++  detail::sBufferSize += length;
++}
++
++void async_init_begin() {
++  if (sStarted) {
++    flush_records();
++    wait_idle();
++  }
++}
++
++void async_init_end() {
++  sMainPublished = 0;
++  sSideSize = 0;
++  sSideOpen = 0;
++  sLastRecord = UINT32_MAX;
++  sVtxProbes = 0;
++  sPublishedCondId = sNextCondId;
++  sArrayShadow = {};
++  ensure_started();
++  ensure_main_capacity(); // init() just reallocated it at 64 KiB
++}
++} // namespace
++
++// ---- Producer API (fifo.hpp) ---------------------------------------------------------------------
++
++bool on_worker_thread() noexcept { return tWorker; }
++
++void set_wait_service(void (*service)()) noexcept { sWaitService.store(service, std::memory_order_release); }
++
++bool exact_raw_draws() noexcept { return sExactRawDraws; }
++
++void publish_draw() {
++  if (!async_mode()) LIKELY {
++    drain(DrainReason::Draw);
++    return;
++  }
++  ensure_started();
++  note_drain(DrainReason::Draw);
++  publish_main();
++  ++sKickDraws;
++  kick(false);
++}
++
++void call_display_list(const void* data, uint32_t nbytes, bool bigEndian) {
++  if (!async_mode()) LIKELY {
++    drain(DrainReason::DisplayList);
++    note_decode(nbytes);
++    process_all(static_cast<const uint8_t*>(data), nbytes, bigEndian, true);
++    return;
++  }
++  ensure_started();
++  note_drain(DrainReason::DisplayList);
++  publish_main(); // what sync drained before decoding the list
++  const uint32_t check = sCheckArrays ? 8u : 0u;
++  const uint8_t flags = static_cast<uint8_t>(kRecSealed | kRecList | (bigEndian ? kRecBigEndian : 0) |
++                                             (sCheckArrays ? kRecArrayCheck : 0));
++  uint8_t* out = open_record(kRecStream, flags, check + nbytes, false);
++  if (sCheckArrays) {
++    const uint64_t fingerprint = producer_array_fingerprint();
++    std::memcpy(out, &fingerprint, sizeof(fingerprint));
++  }
++  if (nbytes != 0) {
++    std::memcpy(out + check, data, nbytes);
++  }
++  flush_records();
++  if (nbytes >= 64) {
++    ++sKickDraws;
++  }
++  kick(false);
++}
++
++bool has_unprocessed() {
++  if (!async_mode() || !sStarted) LIKELY {
++    return detail::sBufferSize != 0;
++  }
++  return detail::sBufferSize != sMainPublished || sSideSize != sSideOpen ||
++         sShared->processed.load(std::memory_order_acquire) != sPushed;
++}
++
++void quiesce(QuiesceReason reason) {
++  if (!async_mode()) LIKELY {
++    return;
++  }
++  ensure_started();
++  ++sStats.quiesces[static_cast<size_t>(reason)];
++  // Records already queued are state sync had applied by now.
++  flush_records();
++  wait_idle();
++}
++
++void queue_bp(uint32_t word) {
++  uint8_t* out = open_record(kRecStream, kRecBigEndian, 5, true);
++  out[0] = 0x61; // GX_LOAD_BP_REG
++  const uint32_t be = bswap(word);
++  std::memcpy(out + 1, &be, sizeof(be));
++}
++
++void queue_decoder_call(DecoderCall call, const void* args, uint32_t size) {
++  static_assert(sizeof(DecoderCall) == 8);
++  uint8_t* out = open_record(kRecCall, 0, 8 + size, false);
++  std::memcpy(out, &call, sizeof(call));
++  std::memcpy(out + 8, args, size);
++}
++
++void queue_raw_draw(uint8_t prim, uint8_t fmt, const uint8_t* vertices, uint16_t vtxCount, uint32_t vertexBytes,
++                    bool accepted) {
++  ensure_started();
++  note_drain(DrainReason::RawDraw);
++  publish_main(); // what sync drained before the draw
++  const RawDrawArgs args{prim, fmt, static_cast<uint8_t>(accepted ? 1 : 0), 0, vtxCount, 0, vertexBytes, 0};
++  const uint32_t copy = accepted ? vertexBytes : 0;
++  uint8_t* out = open_record(kRecRawDraw, kRecSealed, sizeof(args) + copy, false);
++  std::memcpy(out, &args, sizeof(args));
++  if (copy != 0) {
++    std::memcpy(out + sizeof(args), vertices, copy);
++  }
++  flush_records();
++  ++sKickDraws;
++  kick(false);
++}
++
++void note_raw_draw_mismatch() noexcept {
++  const uint64_t n = sStats.rawMismatches.fetch_add(1, std::memory_order_relaxed);
++  if (n < 16) {
++    Log.warn("GX FIFO: a raw draw's vertex size differed between the producer shadow and the decoder");
++  }
++}
++
++// Probes are records (decoded in front of the unpublished bytes, where sync compared); each belongs
++// to the next conditional flush, which goes into the FIFO bytes at its place.
++void probe_vtx_desc(uint32_t attr, uint32_t type) {
++  uint8_t* out = open_record(kRecProbeVcd, 0, 2, true, sNextCondId);
++  out[0] = static_cast<uint8_t>(attr);
++  out[1] = static_cast<uint8_t>(type);
++  sVtxProbes |= 0x100u;
++}
++
++void probe_vtx_attr_fmt(uint32_t fmt, uint32_t attr, uint32_t cnt, uint32_t type, uint32_t frac) {
++  uint8_t* out = open_record(kRecProbeVat, 0, 5, true, sNextCondId);
++  out[0] = static_cast<uint8_t>(fmt);
++  out[1] = static_cast<uint8_t>(attr);
++  out[2] = static_cast<uint8_t>(cnt);
++  out[3] = static_cast<uint8_t>(type);
++  out[4] = static_cast<uint8_t>(frac);
++  sVtxProbes |= 1u << fmt;
++}
++
++uint32_t vtx_probes() noexcept { return sVtxProbes; }
++
++// GXManage.cpp's __GXSetDirtyState has just written the VCD block [start, vcdEnd) and the VAT
++// blocks of every candidate format [vcdEnd, end) as sync would have. They are wrapped, in place,
++// into an Aurora subcommand the decoder applies in part (run_vtx_cond).
++void queue_vtx_cond(uint32_t start, uint32_t vcdEnd, bool vcdForce, uint8_t vatForce) {
++  const uint32_t probes = sVtxProbes;
++  sVtxProbes = 0;
++  // Flushes whose blocks are still unpublished hold probe slots; keep them well below the slots.
++  if (static_cast<uint16_t>(sNextCondId - sPublishedCondId) >= kProbeSlots / 2) UNLIKELY {
++    publish_main();
++  }
++  // Virtual positions: the blocks are unpublished, so compaction kept them.
++  const uint32_t begin = start - detail::sVirtualBase;
++  const uint32_t vcdBytes = vcdEnd - start;
++  const uint32_t total = detail::sBufferSize - begin;
++  uint8_t block[64 + 8 * kVatBlockBytes];
++  ASSERT(total <= sizeof(block) && vcdBytes <= total, "GX FIFO: vertex flush of {} bytes", total);
++  std::memcpy(block, detail::sBufferData + begin, total);
++  detail::sBufferSize = begin;
++  const VtxCondArgs args{static_cast<uint8_t>(vcdForce ? 1 : 0),
++                         static_cast<uint8_t>((probes & 0x100u) != 0 ? 1 : 0),
++                         vatForce,
++                         static_cast<uint8_t>(probes & 0xFFu),
++                         sNextCondId,
++                         0,
++                         vcdBytes};
++  ++sNextCondId;
++  write_u8(0x50); // GX_LOAD_AURORA
++  write_u16(kAuroraVtxCondSubCmd);
++  write_u32(static_cast<uint32_t>(sizeof(args)) + total);
++  write_data(&args, sizeof(args));
++  write_data(block, total);
++}
++
++// command_processor.cpp's handle_aurora, on kAuroraVtxCondSubCmd.
++void run_vtx_cond_record(const uint8_t* payload, uint32_t length) { run_vtx_cond(payload, length); }
++
++void note_array(uint32_t attr, const void* data, uint32_t size) {
++  if (sCheckArrays && attr < sArrayShadow.size() && !in_display_list()) UNLIKELY {
++    sArrayShadow[attr] = {data, size};
++  }
++}
++
++} // namespace aurora::gx::fifo
++
++// ---- C API (runtime) -------------------------------------------------------------------------------
++
++// Native code is about to write guest memory the GX may read (0), or VIConfigure (1).
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason) {
++  using namespace aurora::gx::fifo;
++  quiesce(reason == 1 ? QuiesceReason::VIConfigure : QuiesceReason::NativeWrite);
++}
++
++extern "C" int aurora_gx_fifo_async(void) { return aurora::gx::fifo::async_mode() ? 1 : 0; }
++
++// Completed end-of-frame drains: memory a display list pointed at may be reused after it changes.
++extern "C" uint64_t aurora_gx_fifo_frame_epoch(void) { return aurora::gx::fifo::sFrameEpoch; }
++
++extern "C" void aurora_gx_fifo_stats_mark(void) { aurora::gx::fifo::sMark = aurora::gx::fifo::take_snapshot(); }
++
++// Per-frame averages since aurora_gx_fifo_stats_mark, one "key=value" line per group.
++extern "C" int aurora_gx_fifo_stats_report(char* out, int size) {
++  using namespace aurora::gx::fifo;
++  if (out == nullptr || size <= 0) {
++    return 0;
++  }
++  const Snapshot now = take_snapshot();
++  const Snapshot& base = sMark;
++  const auto delta = [&](uint64_t a, uint64_t b) { return static_cast<double>(a - b); };
++  const auto drains = [&](DrainReason r) {
++    const auto i = static_cast<size_t>(r);
++    return delta(now.drains[i], base.drains[i]);
++  };
++  const auto quiesces = [&](QuiesceReason r) {
++    const auto i = static_cast<size_t>(r);
++    return delta(now.quiesces[i], base.quiesces[i]);
++  };
++  const double frames = std::max(1.0, drains(DrainReason::EndFrame));
++  const char* modeName = mode() == Mode::Thread ? "thread" : (mode() == Mode::Deferred ? "deferred" : "sync");
++  const int n = std::snprintf(
++      out, static_cast<size_t>(size),
++      "gx_fifo_mode=%s gx_fifo_frames=%.0f exact_raw=%d check_arrays=%d\n"
++      "gx_fifo_drains_per_frame draw=%.1f display_list=%.1f raw_draw=%.1f draw_done=%.2f copy=%.2f "
++      "end_frame=%.2f efb_flush=%.2f offscreen=%.2f render_area=%.2f viewport_policy=%.2f other=%.2f\n"
++      "gx_fifo_quiesce_per_frame decoder_read=%.2f copy_filter=%.2f native_write=%.2f vi=%.2f room=%.2f\n"
++      "gx_fifo_segments_per_frame=%.1f gx_fifo_bytes_per_frame_kib=%.1f\n"
++      "gx_fifo_decode_ms_per_frame=%.3f gx_fifo_producer_wait_ms_per_frame=%.3f%s\n"
++      "gx_fifo_raw_draw_mismatches=%.0f gx_fifo_staging_splits drain=%.0f display_list=%.0f "
++      "gx_fifo_array_hazards=%.0f gx_fifo_decode_errors=%.0f\n",
++      modeName, frames, sExactRawDraws ? 1 : 0, sCheckArrays ? 1 : 0, drains(DrainReason::Draw) / frames,
++      drains(DrainReason::DisplayList) / frames, drains(DrainReason::RawDraw) / frames,
++      drains(DrainReason::DrawDone) / frames, drains(DrainReason::Copy) / frames,
++      drains(DrainReason::EndFrame) / frames, drains(DrainReason::EfbFlush) / frames,
++      drains(DrainReason::Offscreen) / frames, drains(DrainReason::RenderArea) / frames,
++      drains(DrainReason::ViewportPolicy) / frames, drains(DrainReason::Other) / frames,
++      quiesces(QuiesceReason::DecoderRead) / frames, quiesces(QuiesceReason::CopyFilter) / frames,
++      quiesces(QuiesceReason::NativeWrite) / frames, quiesces(QuiesceReason::VIConfigure) / frames,
++      quiesces(QuiesceReason::Room) / frames, delta(now.segments, base.segments) / frames,
++      delta(now.bytes, base.bytes) / frames / 1024.0, delta(now.decodeNs, base.decodeNs) / frames / 1e6,
++      delta(now.waitNs, base.waitNs) / frames / 1e6, mode() == Mode::Sync ? " (sync: decode time not measured)" : "",
++      delta(now.rawMismatches, base.rawMismatches), delta(now.drainSplits, base.drainSplits),
++      delta(now.listSplits, base.listSplits), delta(now.arrayHazards, base.arrayHazards),
++      delta(now.decodeErrors, base.decodeErrors));
++  return n < 0 ? 0 : std::min(n, size - 1);
++}
 diff --git a/aurora-main/lib/window.cpp b/aurora-main/lib/window.cpp
 index c73ad5e..a531866 100644
 --- a/aurora-main/lib/window.cpp
@@ -421,6 +2462,54 @@ index b062184..ac26a07 100644
 +    const uint64_t& operator[](size_t index) const { return index == 0 ? lo : hi; }
 +};
 +#endif
+diff --git a/runtime/include/isa/ppc_isa_float.h b/runtime/include/isa/ppc_isa_float.h
+index 592098a..99b5135 100644
+--- a/runtime/include/isa/ppc_isa_float.h
++++ b/runtime/include/isa/ppc_isa_float.h
+@@ -205,6 +205,15 @@ inline float PpcForceSingleValueInline(double value)
+     const __m128d flush = _mm_cmplt_sd(magnitude, _mm_set_sd(g_mkwNiFlushThreshold));
+     const __m128d kept = _mm_andnot_pd(_mm_andnot_pd(signMask, flush), v);
+     return static_cast<float>(_mm_cvtsd_f64(kept));
++#elif defined(__aarch64__) && defined(__SWITCH__)
++    // FPCR.FZ is FPSCR[NI] (MkwApplyHostNiMode), and FCVT under FZ flushes, with its sign, a
++    // subnormal input and any value whose unrounded exponent is below -126 (ARMv8.0 FPRound
++    // flushes before rounding, so also those that would round up to FLT_MIN): the values the mask
++    // below flushes. Without FZ the threshold is 0 and the mask flushes nothing. The instruction
++    // stays opaque: GCC folds (float)(double)f to f, which would skip FZ's flush of a subnormal f.
++    float result;
++    __asm__("fcvt %s0, %d1" : "=w"(result) : "w"(value));
++    return result;
+ #elif defined(__aarch64__)
+     const float64x1_t v = vdup_n_f64(value);
+     const uint64x1_t signMask = vdup_n_u64(0x8000000000000000ULL);
+diff --git a/runtime/include/isa/ppc_isa_fpenv.h b/runtime/include/isa/ppc_isa_fpenv.h
+index f3bc7b9..cc9e823 100644
+--- a/runtime/include/isa/ppc_isa_fpenv.h
++++ b/runtime/include/isa/ppc_isa_fpenv.h
+@@ -25,13 +25,23 @@ inline constexpr uint32_t kMkwFpControlFlushToZeroBits = (1u << 24); // FZ
+ #error "ppc_isa_fpenv.h has no host FP control register mapping for this architecture"
+ #endif
+ 
++#if defined(__SWITCH__)
++// Horizon: only the main thread runs guest code (its fibers are libco contexts on it), and with
++// -mtp=soft every thread_local access calls __aarch64_read_tp. Plain globals, as for the threshold.
++inline bool g_mkwHostNiActive = false;
++#else
+ inline thread_local bool g_mkwHostNiActive = false;
++#endif
+ 
+ // Same state in the form PpcForceSingleValueInline consumes: the pre-round subnormal threshold
+ // while NI is active, 0.0 (identity, `|value| < 0.0` is always false) otherwise, so that path
+ // needs no branch. Every writer of g_mkwHostNiActive must write this beside it in agreement.
+ inline constexpr double kMkwNiFlushThreshold = 0x1p-126;  // 0x3810000000000000
++#if defined(__SWITCH__)
++inline double g_mkwNiFlushThreshold = 0.0;  // a plain global: see g_mkwHostNiActive
++#else
+ inline thread_local double g_mkwNiFlushThreshold = 0.0;
++#endif
+ 
+ // Host FP control register access (MXCSR on x86_64, FPCR on AArch64), abstracted so
+ // MkwApplyHostNiMode/MkwRestoreHostMxcsr and CpuContextScope (ppc_isa_context.h) don't each need
 diff --git a/runtime/include/isa/ppc_isa_int.h b/runtime/include/isa/ppc_isa_int.h
 index a9e93cc..74c2c96 100644
 --- a/runtime/include/isa/ppc_isa_int.h
@@ -486,7 +2575,7 @@ index 7ac535d..3aca2aa 100644
      std::memcpy(&bits, &value, sizeof(bits));
      FlatStore<uint64_t>(address, bits);
 diff --git a/runtime/include/native_cpu_calls.inc b/runtime/include/native_cpu_calls.inc
-index 0856e7b..2b67756 100644
+index 0856e7b..3c931e9 100644
 --- a/runtime/include/native_cpu_calls.inc
 +++ b/runtime/include/native_cpu_calls.inc
 @@ -43,7 +43,15 @@ extern "C" void GX__SetBlendMode_8017277c(uint32_t t, uint32_t s, uint32_t d, ui
@@ -505,6 +2594,26 @@ index 0856e7b..2b67756 100644
  #define MKW_KNOWN_TYPED_UNBOUND(addr, fn, ...) static_assert(true)
  #define MKW_KNOWN_NATIVE_CPU_UNBOUND(addr, fn) static_assert(true)
  #ifdef WIICOMPILED_NO_MKW_NATIVES
+@@ -108,3 +116,18 @@ MKW_KNOWN_NATIVE_CPU_CALL(0x800847C0u, nw4r__lyt__detail__DrawQuad_800847c0);
+ MKW_KNOWN_NATIVE_CPU_CALL(0x80084D20u, nw4r__lyt__detail__DrawQuad_80084d20);
+ 
+ #undef MKW_KNOWN_NATIVE_CPU_CALL
++
++#if defined(__SWITCH__) && defined(WIICOMPILED_GAME_RL8E54) && !defined(WIICOMPILED_NO_MKW_NATIVES)
++// MLB's MSL leaves (hle/mlb/msl_natives.cpp), registered with REGISTER_NATIVE_FUNCTION. Spelled
++// base + offset: tools/wiicompiled_rebind.py remaps 0x80xxxxxx literals here as MKW addresses.
++extern "C" void MLB_Sqrt_80126AE8(CpuContext* ctx);
++extern "C" void MLB_FillMem_80006508(CpuContext* ctx);
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0x126AE8u> {
++    static constexpr bool kAvailable = true;
++    static void Invoke(CpuContext* cpu) { MLB_Sqrt_80126AE8(cpu); }
++};
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0x6508u> {
++    static constexpr bool kAvailable = true;
++    static void Invoke(CpuContext* cpu) { MLB_FillMem_80006508(cpu); }
++};
++#endif
+\ No newline at end of file
 diff --git a/runtime/include/power_pros_ui.h b/runtime/include/power_pros_ui.h
 index 83a67e4..159822b 100644
 --- a/runtime/include/power_pros_ui.h
@@ -529,6 +2638,24 @@ index 83a67e4..159822b 100644
  }
  #endif
  
+diff --git a/runtime/include/recomp_mod_loader.h b/runtime/include/recomp_mod_loader.h
+index f527424..b55cc83 100644
+--- a/runtime/include/recomp_mod_loader.h
++++ b/runtime/include/recomp_mod_loader.h
+@@ -24,7 +24,13 @@ struct MemoryReservation {
+ // Defined here as `inline thread_local` with a constant initializer, not `extern thread_local`
+ // in the .cpp: every indirect dispatch scopes this, so an out-of-line ctor/dtor would cost two
+ // un-inlinable calls plus a register spill each for three instructions of work.
++#if defined(__SWITCH__)
++// Horizon: guest code runs on the main thread only, and a thread_local access is a
++// __aarch64_read_tp call (-mtp=soft) on every indirect dispatch.
++inline uint32_t g_currentTranslatedExecutionAddress = 0;
++#else
+ inline thread_local uint32_t g_currentTranslatedExecutionAddress = 0;
++#endif
+ 
+ class ScopedTranslatedExecutionAddress {
+ public:
 diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
 index 3198082..653e868 100644
 --- a/runtime/include/runtime_config.h
@@ -1025,6 +3152,348 @@ index 0bb8fa0..697d98c 100644
          t_onMixWorker = true;
          for (;;) {
              {
+diff --git a/runtime/src/hle/gx/gx_dl.cpp b/runtime/src/hle/gx/gx_dl.cpp
+index 818478d..e31183b 100644
+--- a/runtime/src/hle/gx/gx_dl.cpp
++++ b/runtime/src/hle/gx/gx_dl.cpp
+@@ -10,6 +10,11 @@
+ // bytes with a 64-bit XXH3 digest (see GxDisplayListScanCache::CanReuse).
+ #include <xxhash.h>
+ 
++#include <memory>
++
++extern "C" int aurora_gx_fifo_async(void);            // aurora gx/fifo_async.inc
++extern "C" uint64_t aurora_gx_fifo_frame_epoch(void);
++
+ namespace aurora::gx::fifo {
+ bool in_display_list();
+ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
+@@ -1206,6 +1211,44 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
+     SyncAppliedVtxStateFromHleReal();
+ }
+ 
++// A deferred/thread GX FIFO (WIICOMPILED_GX_FIFO) decodes the list after this call returns, when
++// the two rotating pack buffers below may hold another list's data: each pack is copied to memory
++// that lives until the end-of-frame drain, at an address of its own within the frame (the
++// decoder's array state and upload cache go by address).
++static const uint8_t* KeepPackedArrayForAsyncFifo(const std::vector<uint8_t>& packed) {
++    struct Chunk {
++        std::unique_ptr<uint8_t[]> data;
++        size_t size = 0;
++        size_t used = 0;
++    };
++    static std::vector<Chunk> chunks;
++    static size_t current = 0;
++    static uint64_t epoch = ~0ull;
++    const uint64_t now = aurora_gx_fifo_frame_epoch();
++    if (now != epoch) {
++        epoch = now;
++        current = 0;
++        for (auto& chunk : chunks) {
++            chunk.used = 0;
++        }
++    }
++    const size_t need = (packed.size() + 15u) & ~size_t{15};
++    while (current < chunks.size() && chunks[current].size - chunks[current].used < need) {
++        ++current;
++    }
++    if (current == chunks.size()) {
++        const size_t size = std::max<size_t>(need, size_t{1} << 20);
++        chunks.push_back(Chunk{std::make_unique<uint8_t[]>(size), size, 0});
++    }
++    Chunk& chunk = chunks[current];
++    uint8_t* out = chunk.data.get() + chunk.used;
++    chunk.used += need;
++    if (!packed.empty()) {
++        std::memcpy(out, packed.data(), packed.size());
++    }
++    return out;
++}
++
+ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX_ATTR>& maxIdx,
+                                             const std::array<bool, GX_VA_MAX_ATTR>& sawIdx,
+                                             GXVtxFmt vtxfmt,
+@@ -1252,7 +1295,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
+             ok = false;
+             continue;
+         }
+-        ApplyAuroraArrayIfChanged(gxAttr, packed.data(), static_cast<uint32_t>(packed.size()), static_cast<uint8_t>(elemSize));
++        const uint8_t* packedData = packed.data();
++        if (aurora_gx_fifo_async() != 0) {
++            packedData = KeepPackedArrayForAsyncFifo(packed);
++        }
++        ApplyAuroraArrayIfChanged(gxAttr, packedData, static_cast<uint32_t>(packed.size()), static_cast<uint8_t>(elemSize));
+     }
+     return ok;
+ }
+diff --git a/runtime/src/hle/mlb/msl_natives.cpp b/runtime/src/hle/mlb/msl_natives.cpp
+new file mode 100644
+index 0000000..0c55151
+--- /dev/null
++++ b/runtime/src/hle/mlb/msl_natives.cpp
+@@ -0,0 +1,209 @@
++// MLB Power Pros 2008 (RL8E54): native leaves for two MSL routines the match spends ~8% of the
++// Switch main thread in (profile 1).
++//
++// __ieee754_sqrt (0x80126AE8, reached through sqrt at 0x80128FD0) is fdlibm's bit-by-bit loop:
++// 54 iterations of integer work plus its frame stores. Its rounding test compares the constant
++// 1.0 (r2-28672) with itself, so it always rounds to nearest, whatever FPSCR[RN] says, and fdlibm
++// rounded to nearest is the correctly rounded root for every positive input, subnormals
++// included: fsqrt in round-to-nearest gives the same bits.
++//
++// __fill_mem (0x80006508, under memset at 0x800065BC) stores byte by byte up to a word boundary,
++// then words, then bytes. All of its stores to plain RAM land as one memset; a range touching
++// anything else keeps the original store sequence.
++//
++// Both leave the result, every guest store and the FP registers as the originals do; the scratch
++// integer registers (r0, r3-r12), cr0/cr1 and XER[CA] keep their entry values (volatile in the
++// EABI: nothing reads them after the call). The registered bodies touch the CpuContext only
++// through constant indexes and pass it nowhere, which gives the translator a precise contract.
++#if defined(__SWITCH__)
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "memory.h"
++
++namespace mlb_msl {
++
++constexpr uint64_t kFraction = 0x000FFFFFFFFFFFFFull, kImplicit = 1ull << 52;
++
++uint64_t Bits(double value) {
++    uint64_t bits;
++    std::memcpy(&bits, &value, sizeof bits);
++    return bits;
++}
++
++double FromBits(uint64_t bits) {
++    double value;
++    std::memcpy(&value, &bits, sizeof value);
++    return value;
++}
++
++// One instruction each: the runtime builds with -ffast-math, which may contract, reassociate or
++// approximate host FP; the translated code they stand for builds with -fno-fast-math.
++double Mul(double a, double b) {
++    double result;
++    __asm__("fmul %d0, %d1, %d2" : "=w"(result) : "w"(a), "w"(b));
++    return result;
++}
++
++double Add(double a, double b) {
++    double result;
++    __asm__("fadd %d0, %d1, %d2" : "=w"(result) : "w"(a), "w"(b));
++    return result;
++}
++
++double Widen(float value) {
++    double result;
++    __asm__("fcvt %d0, %s1" : "=w"(result) : "w"(value));
++    return result;
++}
++
++double ToDouble(uint64_t value) {  // exact below 2^53
++    double result;
++    __asm__("ucvtf %d0, %x1" : "=w"(result) : "r"(value));
++    return result;
++}
++
++// fsqrt rounded to nearest. The runtime never changes FPCR.RMode (only FZ), so the second branch
++// is a guarantee, not a path.
++double SqrtNearest(double value) {
++    uint64_t fpcr;
++    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
++    double result;
++    if ((fpcr & (3ull << 22)) == 0) [[likely]] {
++        __asm__("fsqrt %d0, %d1" : "=w"(result) : "w"(value));
++        return result;
++    }
++    __asm__ __volatile__("msr fpcr, %1\n\tfsqrt %d0, %d2\n\tmsr fpcr, %3"
++                         : "=&w"(result) : "r"(fpcr & ~(3ull << 22)), "w"(value), "r"(fpcr) : "memory");
++    return result;
++}
++
++// The correctly rounded root of a positive, finite, nonzero double, and whether it is exact.
++// fdlibm's remainder is zero exactly then: an odd root of 54 significant bits squares to more
++// than the 53 a double holds.
++uint64_t PositiveSqrt(uint64_t x, bool& exact) {
++    uint64_t root, mantissa;
++    int exponent;  // x = mantissa * 2^exponent
++    if ((x >> 52) == 0) {
++        // Subnormal x = m * 2^-1074: sqrt(m) * 2^-537, m converted exactly and the scale applied to
++        // the exponent field (the root stays normal), so FPCR.FZ never meets a subnormal.
++        root = Bits(SqrtNearest(ToDouble(x))) - (537ull << 52);
++        mantissa = x;
++        exponent = -1074;
++    } else {
++        root = Bits(SqrtNearest(FromBits(x)));
++        mantissa = (x & kFraction) | kImplicit;
++        exponent = static_cast<int>(x >> 52) - 1075;
++    }
++    // root^2 == x  <=>  rootMantissa^2 == mantissa << shift
++    const uint64_t rootMantissa = (root & kFraction) | kImplicit;
++    const int shift = exponent - 2 * (static_cast<int>(root >> 52) - 1075);
++    const unsigned __int128 square = static_cast<unsigned __int128>(rootMantissa) * rootMantissa;
++    exact = shift >= 0 && shift < 128 && (square >> shift) == mantissa &&
++            (square & ((static_cast<unsigned __int128>(1) << shift) - 1u)) == 0;
++    return root;
++}
++
++// Host bytes for guest [address, address + length), inside one 1 MiB page, when every
++// __fill_mem store there takes the plain-RAM path; nullptr otherwise.
++uint8_t* PlainRam(uint32_t address, uint32_t length) {
++    if (uint8_t* host = MemoryInline::ResolveRangeHost(address, 0, length, false, true)) return host;
++    if (!GuestFlat::RequiresCheckedAccess()) return nullptr;
++    // Checked access (Horizon): Memory::Write8/Write32 store through the page's writable bias when
++    // it has one (TryWriteGuestScalar; the word stores are aligned, so none crosses the page).
++    const uintptr_t bias = MemoryInline::g_fullWritablePageBias[address >> MemoryInline::kPageShift];
++    return bias != 0 ? reinterpret_cast<uint8_t*>((bias - 1u) + address) : nullptr;
++}
++
++// All or nothing: one special page keeps the whole original store sequence.
++bool FillPlainRam(uint32_t dst, uint8_t value, uint32_t count) {
++    if (count - 1u > UINT32_MAX - dst) return false;  // wraps around the address space
++    const uint32_t last = dst + (count - 1u);
++    for (uint32_t at = dst;;) {
++        const uint32_t end = std::min(last, at | MemoryInline::kPageMask);
++        if (PlainRam(at, end - at + 1u) == nullptr) return false;
++        if (end == last) break;
++        at = end + 1u;
++    }
++    for (uint32_t at = dst;;) {
++        const uint32_t end = std::min(last, at | MemoryInline::kPageMask);
++        std::memset(PlainRam(at, end - at + 1u), value, end - at + 1u);
++        if (end == last) break;
++        at = end + 1u;
++    }
++    return true;
++}
++
++// __fill_mem's own stores, in its order and widths.
++void FillStores(uint32_t dst, uint8_t value, uint32_t count) {
++    uint32_t last = dst - 1u;  // r6: the last byte stored
++    if (count >= 32) {
++        uint32_t align = (0u - dst) & 3u;
++        count -= align;
++        for (; align != 0; --align) MemoryInline::FlatWrite8(++last, value);
++        const uint32_t word = value * 0x01010101u;
++        uint32_t base = last - 3u;  // r3: words go to base + 4
++        for (uint32_t blocks = count >> 5; blocks != 0; --blocks) {
++            for (uint32_t offset = 4; offset <= 32; offset += 4) MemoryInline::FlatWrite32(base + offset, word);
++            base += 32;
++        }
++        for (uint32_t words = (count >> 2) & 7u; words != 0; --words) {
++            MemoryInline::FlatWrite32(base + 4, word);
++            base += 4;
++        }
++        last = base + 3u;
++        count &= 3u;
++    }
++    for (; count != 0; --count) MemoryInline::FlatWrite8(++last, value);
++}
++
++}  // namespace mlb_msl
++
++// double __ieee754_sqrt(double x): f1 in, f1 out; errno (r13-26456) = EDOM for NaN, infinities
++// and negatives.
++extern "C" void MLB_Sqrt_80126AE8(CpuContext* ctx) {
++    HleTraceCall("MLB_Sqrt_80126AE8");
++    const uint32_t frame = ctx->gpr[1] - 32u;
++    const double x = ctx->fpr[1].d;
++    const uint64_t bits = mlb_msl::Bits(x);
++    const uint32_t high = static_cast<uint32_t>(bits >> 32);
++    // The original's frame (back chain, x), below the stack pointer: the stack keeps its bytes.
++    MemoryInline::FlatWriteRam32(frame, ctx->gpr[1]);
++    MemoryInline::FlatWriteRamFloat64(frame + 8u, x);
++    if ((high & 0x7FF00000u) == 0x7FF00000u) {  // NaN or infinity: x*x + x
++        const double square = mlb_msl::Mul(x, x);
++        MemoryInline::FlatWrite32(ctx->gpr[13] - 26456u, 33u);
++        ctx->fpr[0].d = square;
++        ctx->fpr[1].d = mlb_msl::Add(x, square);
++        return;
++    }
++    if (static_cast<int32_t>(high) <= 0) {
++        if ((bits << 1) == 0) return;  // +-0
++        if (static_cast<int32_t>(high) < 0) {  // negative: the float NaN at 0x8031AA10 (lfs)
++            MemoryInline::FlatWrite32(ctx->gpr[13] - 26456u, 33u);
++            ctx->fpr[1].d = mlb_msl::Widen(MemoryInline::FlatReadFloat32(0x8031AA10u));
++            return;
++        }
++    }
++    bool exact = false;
++    const uint64_t root = mlb_msl::PositiveSqrt(bits, exact);
++    if (!exact) ctx->fpr[0].d = MemoryInline::FlatReadFloat64(ctx->gpr[2] - 28672u);  // its rounding test's 1.0
++    MemoryInline::FlatWriteRam32(frame + 20u, static_cast<uint32_t>(root));
++    MemoryInline::FlatWriteRam32(frame + 16u, static_cast<uint32_t>(root >> 32));
++    ctx->fpr[1].d = mlb_msl::FromBits(root);
++}
++REGISTER_NATIVE_FUNCTION(0x80126AE8, MLB_Sqrt_80126AE8);
++
++// void __fill_mem(void* dst, int value, unsigned long count)
++extern "C" void MLB_FillMem_80006508(CpuContext* ctx) {
++    HleTraceCall("MLB_FillMem_80006508");
++    const uint32_t dst = ctx->gpr[3];
++    const uint8_t value = static_cast<uint8_t>(ctx->gpr[4]);
++    const uint32_t count = ctx->gpr[5];
++    if (count == 0) return;
++    if (!mlb_msl::FillPlainRam(dst, value, count)) mlb_msl::FillStores(dst, value, count);
++}
++REGISTER_NATIVE_FUNCTION(0x80006508, MLB_FillMem_80006508);
++#endif
+diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
+index eeedef2..a6fb804 100644
+--- a/runtime/src/hle/mlb/season_cap.cpp
++++ b/runtime/src/hle/mlb/season_cap.cpp
+@@ -15,6 +15,9 @@
+ #include "mods.h"
+ #include "runtime_config.h"
+ 
++// The year atlas may still be read by queued GX draws (WIICOMPILED_GX_FIFO=deferred|thread).
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason); // aurora gx/fifo_async.inc
++
+ namespace season_cap {
+ 
+ namespace {
+@@ -558,6 +561,7 @@ bool PaintYearPicture(CpuContext* ctx, int year) {
+     }
+     if (!PictureTexels(ctx, kFirstPictureYear, texels, u0, v0)) return false;
+     const YearPicture picture = ComposeYearPicture(year, units);
++    aurora_gx_fifo_quiesce(0);
+     for (int y = 0; y < kYearPictureHeight; ++y)
+         for (int x = 0; x < kYearPictureWidth; ++x)
+             Memory::Write8(texels + C8Offset(u0 + x, v0 + y, 512), picture[y * kYearPictureWidth + x]);
+diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
+index 83faaac..15fb008 100644
+--- a/runtime/src/hle/mlb/two_way.cpp
++++ b/runtime/src/hle/mlb/two_way.cpp
+@@ -36,6 +36,10 @@
+ #include "runtime_config.h"
+ #include "season_cap.h"
+ 
++// The atlas below may still be read by queued GX draws (WIICOMPILED_GX_FIFO=deferred|thread):
++// wait for the decoder before writing it. Nothing to wait for in sync mode.
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason); // aurora gx/fifo_async.inc
++
+ namespace two_way {
+ namespace {
+ 
+@@ -305,6 +309,7 @@ void SetTexel(int x, int y, uint8_t v) { Memory::Write8(g_texels + season_cap::C
+ 
+ void Restore() {
+     if (!g_texels) return;
++    aurora_gx_fifo_quiesce(0);
+     for (int y = 0; y < kTitleH; ++y)
+         for (int x = 0; x < kTitleW; ++x) SetTexel(g_titleU + x, g_titleV + y, g_titleBackup[y * kTitleW + x]);
+     for (int y = 0; y < kButtonH; ++y)
+@@ -328,6 +333,7 @@ void Paint(CpuContext* ctx) {
+         !Picture(ctx, kPitcherButton + 3 * 0x48, kButtonW, kButtonH, sourceTexels, su, sv) ||
+         pitcherTexels != texels || sourceTexels != texels || !Memory::Contains(texels, kAtlasWidth * 256 + 512))
+         return;
++    aurora_gx_fifo_quiesce(0);
+     g_texels = texels;
+     g_titleBackup.resize(kTitleW * kTitleH);
+     g_buttonBackup.resize(kButtonW * kButtonH);
 diff --git a/runtime/src/hle/storage/dvd.cpp b/runtime/src/hle/storage/dvd.cpp
 index 8f4c9b4..238a064 100644
 --- a/runtime/src/hle/storage/dvd.cpp
@@ -1047,6 +3516,29 @@ index 8f4c9b4..238a064 100644
  
          std::string prefix = virtualPrefix.empty() ? "/" : virtualPrefix;
          if (prefix.back() != '/' && prefix.back() != '\\') {
+diff --git a/runtime/src/hle/vi.cpp b/runtime/src/hle/vi.cpp
+index b1feb54..ee71ab7 100644
+--- a/runtime/src/hle/vi.cpp
++++ b/runtime/src/hle/vi.cpp
+@@ -31,6 +31,10 @@
+ 
+ #include <aurora/aurora.h>
+ 
++// aurora gx/fifo_async.inc: the GX decoder maps viewports with the configured size, so queued GX
++// work (WIICOMPILED_GX_FIFO=deferred|thread) is decoded before VIConfigure changes it.
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason);
++
+ // Forward declaration for OSWakeupThread - used to wake threads on VI retrace queue
+ extern "C" void OSWakeupThread_HLE_801aaaa4(CpuContext* ctx);
+ 
+@@ -752,6 +756,7 @@ extern "C" void VIConfigure_HLE_801b9f6c(CpuContext* ctx)
+             renderMode.xfbHeight != 0 ? renderMode.xfbHeight : renderMode.efbHeight;
+     }
+ 
++    aurora_gx_fifo_quiesce(1);
+     ::VIConfigure(&renderMode);
+ 
+     ViSetR3(ctx, 0);
 diff --git a/runtime/src/host_context.cpp b/runtime/src/host_context.cpp
 index 502f72c..885f8bb 100644
 --- a/runtime/src/host_context.cpp
@@ -1129,7 +3621,7 @@ index 5f029c0..0b51bbe 100644
  enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
  struct Capture {
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
-index 7269747..13bd595 100644
+index 7269747..49093ee 100644
 --- a/runtime/src/main.cpp
 +++ b/runtime/src/main.cpp
 @@ -429,6 +429,9 @@ std::string ReadInstalledSetupVersion() {
@@ -1172,7 +3664,19 @@ index 7269747..13bd595 100644
  #else
  // POSIX counterpart to SehLogger above. Unlike Windows' AddVectoredExceptionHandler, which lets
  // GuestFlat and this module each install their own handler and defensively re-check each other,
-@@ -1441,6 +1460,10 @@ int RuntimeMain(int argc, char** argv) {
+@@ -1322,6 +1341,11 @@ static void TerminateHandler() {
+     } else {
+         terminateDetails = "std::terminate() without current exception.";
+     }
++#if defined(__SWITCH__)
++    std::fprintf(stderr, "[terminate] %s\n", terminateDetails.c_str());
++    std::fflush(stderr);
++    __builtin_trap();
++#endif
+     ShowRuntimeFatalPopup("an unhandled C++ exception occurred", terminateDetails);
+     const std::string hostStackSummary = FormatHostStackTrace(1);
+     if (!hostStackSummary.empty()) {
+@@ -1441,6 +1465,10 @@ int RuntimeMain(int argc, char** argv) {
              {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
              {"null", BACKEND_NULL},
          }};
@@ -1183,7 +3687,7 @@ index 7269747..13bd595 100644
  #elif defined(_WIN32)
          static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
              {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN}, {"d3d11", BACKEND_D3D11},
-@@ -1587,6 +1610,15 @@ int RuntimeMain(int argc, char** argv) {
+@@ -1587,6 +1615,15 @@ int RuntimeMain(int argc, char** argv) {
  }
  
  int main(int argc, char** argv) {
@@ -1200,7 +3704,7 @@ index 7269747..13bd595 100644
  }
  extern "C" bool g_dynamicAspectRatioEnabled = false;
 diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
-index 280cfd6..005446f 100644
+index 280cfd6..25faec6 100644
 --- a/runtime/src/match_benchmark_overlay.inc
 +++ b/runtime/src/match_benchmark_overlay.inc
 @@ -156,6 +156,10 @@ void DrawMatchBenchmark() {
@@ -1214,7 +3718,15 @@ index 280cfd6..005446f 100644
          csv.open(report.string() + ".csv");
          if (!csv) { message = "No se pudo crear el informe"; return; }
          csv << "utc_unix_ms,elapsed_s,frame_ms,draws,scale,force_16_9,backend,shader_queue,gpu_render_ms,gpu_samples,cpu_encode_ms,efb_copies,efb_source_pixels,efb_snapshots,efb_readbacks,efb_readback_wait_ms,presents,process_cpu_pct,gpu_3d_pct,process_ram_mb,vram_mb,system_ram_used_gb\n";
-@@ -172,6 +176,9 @@ void DrawMatchBenchmark() {
+@@ -163,6 +167,7 @@ void DrawMatchBenchmark() {
+         start = last = now;
+         base = previous = waits;
+         gpuBase = gpuPrevious = gpu;
++        aurora_gx_fifo_stats_mark();
+         intervals.clear();
+         valid = true;
+         recordedScale = g_resolutionScale;
+@@ -172,6 +177,9 @@ void DrawMatchBenchmark() {
          recording = true;
          message = "Midiendo";
          std::fprintf(stderr, "[match-bench] recording %s scale=%.0f force169=%d\n", report.string().c_str(), g_resolutionScale, g_forceAspect169);
@@ -1224,7 +3736,14 @@ index 280cfd6..005446f 100644
      };
      const auto finish = [&] {
          recording = false;
-@@ -204,6 +211,10 @@ void DrawMatchBenchmark() {
+@@ -201,9 +209,17 @@ void DrawMatchBenchmark() {
+             if (loadCount[i]) summary << loadNames[i] << "_mean=" << loadSum[i] / loadCount[i] << ' ' << loadNames[i] << "_peak=" << loadPeak[i] << '\n';
+             else summary << loadNames[i] << "=unavailable\n";
+         }
++        {
++            char fifo[1024];
++            if (aurora_gx_fifo_stats_report(fifo, sizeof fifo) > 0) summary << fifo;
++        }
          summary << "process_cpu_pct is over all logical cores, like Task Manager. GPU/VRAM from Windows GPU counters.\n"
                  << "GPU markers exclude presenter work and demanded EFB prefixes. CPU autoplay is not a bit-exact replay.\n";
          summary.close();
@@ -1465,10 +3984,20 @@ index 0000000..e8aa273
 +}
 +#endif
 diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
-index 7a2f7dd..81eae28 100644
+index 7a2f7dd..5265221 100644
 --- a/runtime/src/settings_overlay.cpp
 +++ b/runtime/src/settings_overlay.cpp
-@@ -1220,6 +1220,10 @@ void DrawGraphicsSettings() {
+@@ -76,6 +76,9 @@ namespace two_way {
+ void OnHostFrame();  // two_way.cpp: the MLB Life drill list's "X Change"
+ }
+ 
++extern "C" void aurora_gx_fifo_stats_mark(void); // aurora gx/fifo_async.inc (match benchmark)
++extern "C" int aurora_gx_fifo_stats_report(char* out, int size);
++
+ namespace settings_overlay {
+ namespace {
+ 
+@@ -1220,6 +1223,10 @@ void DrawGraphicsSettings() {
  }
  
  // WIICOMPILED_BENCH=<minDraws>,<seconds>[,<maxWaitSeconds>]: event-driven benchmark. Waits until a
