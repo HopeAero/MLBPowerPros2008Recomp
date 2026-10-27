@@ -59,8 +59,11 @@ enum class BindingScheme : uint8_t {
 // Slot 15 of each stage holds the immediates block (Aurora's DrawImmediateData, 64 bytes).
 constexpr uint32_t kImmediatesUboSlot = 15;
 // Changes whenever this file's output for the same input changes (Tint options, post-pass rules):
-// part of the DKSH cache's compiler id.
+// part of the DKSH cache's compiler id. (tev_fast_rewrite does not change it: its modules have keys
+// of their own, kTevFastSeed, so both variants share one cache file.)
 constexpr uint32_t kTranslateRevision = 2;  // 2: std140 scalar arrays (array_start)
+// The XXH3 seed of a GX module's key when tev_fast_rewrite applies (0: the plain XXH3 of the WGSL)
+constexpr uint64_t kTevFastSeed = 0x7465765f66617374ull;  // "tev_fast"
 
 struct SlotBinding {
     enum class Kind : uint8_t { Uniform, Storage, Sampler, Immediates };
@@ -96,5 +99,26 @@ struct SamplerSlot {
 };
 bool post_pass(std::string* glsl, const std::vector<SamplerSlot>& samplerSlots, std::string* error,
                uint32_t* std140Rewrites = nullptr);
+
+// The TEV byte conversions of Aurora's GX WGSL (gx/shader.cpp's helpers) without the GPU's
+// conversion unit, bit for bit (2026-10-27, stream H3; the deko3d NRO applies it by default,
+// WIICOMPILED_DK_TEV_FAST=0 turns it off, core/shaders.cpp):
+//   tev_byte_f32/vec3f   i32(round(x * 255.0))   (Maxwell: F2F.RNI, Tint's ftoi clamp, F2I: two
+//                                                  quarter-rate conversions and two FMNMX)
+//                     -> bitcast<i32>(max(x * 255.0, -2^22) + 1.5 * 2^23) - 0x4B400000
+//                        (one FMNMX, one FADD, one IADD: full rate)
+//   f32(tev_regular_i32(...)) / 255.0   (I2F, quarter rate)
+//                     -> tev_i2f(...) / 255.0, tev_i2f(n) = bitcast<f32>(n + 0x4B400000) - 1.5 * 2^23
+// Exact: adding 1.5 * 2^23 to a float y with |y| < 2^22 rounds it to the nearest integer, ties to
+// even (the FADD's rounding, as round()), and leaves that integer in the low mantissa bits; the
+// reverse holds for any integer |n| < 2^22. y = x * 255.0 is rounded first exactly as before: the
+// max() keeps uam (nv50_ir's ADD(MUL) -> MAD fusion) from contracting the multiply into the add,
+// which would round once instead of twice (host check: 1 052 322 of the 1.13e9 overflow results
+// would differ fused, 0 differ unfused; local/tmp/cpu/h3_tev_check.c). Every TEV input GX can
+// produce is within range (|x * 255| <= 1024, the colour registers' S10 range; the combiner's
+// results <= ~2^14). Only NaN or |x * 255| >= 2^22, which GX cannot produce, would differ.
+// All-or-nothing: unless every helper is found as gx/shader.cpp writes it, the text is unchanged.
+// Returns the number of rewritten sites (0: unchanged).
+uint32_t tev_fast_rewrite(std::string* wgsl);
 
 }  // namespace swdk

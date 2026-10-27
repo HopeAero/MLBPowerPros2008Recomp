@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -60,6 +61,7 @@ std::unordered_map<uint64_t, std::unique_ptr<ShaderModule>> g_modules;
 // ---- the worker (g_jobMutex)
 struct Job {
     ShaderModule* module = nullptr;  // a module to translate and compile
+    bool dumpOnly = false;           // (or only to write its WGSL and GLSL: WIICOMPILED_DK_DUMP_MODULES)
     WgslSource source;
     ShaderEntry* entry = nullptr;  // or one stage's GLSL (the fixed shaders)
     std::string glsl;
@@ -191,12 +193,65 @@ ShaderEntry* module_stage(ShaderStage stage, const std::string& glsl) {
     return e;
 }
 
+void write_text(const char* path, const std::string& text) {
+    if (FILE* f = fopen(path, "wb")) {
+        fwrite(text.data(), 1, text.size(), f);
+        fclose(f);
+    }
+}
+
+// WIICOMPILED_DK_DUMP_MODULES: a module's WGSL as Aurora generated it, and its two stages' GLSL as
+// translated now (with WIICOMPILED_DK_TEV_FAST as set), next to the cache as
+// mod_<key>.wgsl / mod_<key>_{vs,fs}.glsl. Nothing is compiled or recorded.
+void run_dump_job(Job& job) {
+    const uint64_t key = job.module->key;
+    std::string wgsl = job.source ? job.source() : std::string();
+    if (wgsl.empty()) return;
+    char path[256];
+    snprintf(path, sizeof path, "%s/mod_%016llx.wgsl", kCacheDir, (unsigned long long)key);
+    write_text(path, wgsl);
+    const uint32_t rewritten = tev_fast_enabled() ? tev_fast_rewrite(&wgsl) : 0;
+    const TranslateResult tv = wgsl_to_glsl(wgsl, "vs_main", ShaderStage::Vertex, BindingScheme::GX);
+    const TranslateResult tf = wgsl_to_glsl(wgsl, "fs_main", ShaderStage::Fragment, BindingScheme::GX);
+    for (int st = 0; st < 2; st++) {
+        const TranslateResult& r = st == 0 ? tv : tf;
+        snprintf(path, sizeof path, "%s/mod_%016llx_%s.glsl", kCacheDir, (unsigned long long)key, st == 0 ? "vs" : "fs");
+        write_text(path, r.ok ? r.glsl : "/* translation failed: " + r.error + " */\n");
+    }
+    dklog("shaders: module %016llx dumped to %s/mod_%016llx{.wgsl,_vs.glsl,_fs.glsl} (WIICOMPILED_DK_DUMP_MODULES; "
+          "TEV fast rewrite: %u sites; vs %016llx fs %016llx)",
+          (unsigned long long)key, kCacheDir, (unsigned long long)key, rewritten,
+          (unsigned long long)(tv.ok ? glsl_hash(tv.glsl) : 0), (unsigned long long)(tf.ok ? glsl_hash(tf.glsl) : 0));
+}
+
 void run_module_job(Job& job) {
     ShaderModule* m = job.module;
     const uint64_t t0 = now_ns();
-    const std::string wgsl = job.source ? job.source() : std::string();
+    std::string wgsl = job.source ? job.source() : std::string();
+    std::string original;  // (the WGSL as generated, when the TEV rewrite changed it)
+    // the TEV byte conversions without the conversion unit (shader_translate.h; same pixels)
+    if (!wgsl.empty() && tev_fast_enabled()) {
+        original = wgsl;
+        const uint32_t sites = tev_fast_rewrite(&wgsl);
+        if (!sites) original.clear();
+        static uint64_t rewritten = 0, unchanged = 0;
+        std::lock_guard<std::mutex> lock(g_jobMutex);
+        (sites ? rewritten : unchanged)++;
+        if (!sites && unchanged <= 4)
+            dklog("shaders: module %016llx: the TEV helpers are not as gx/shader.cpp writes them; translated as they "
+                  "are (WIICOMPILED_DK_TEV_FAST; %llu rewritten, %llu unchanged so far)",
+                  (unsigned long long)m->key, (unsigned long long)rewritten, (unsigned long long)unchanged);
+    }
     TranslateResult tv, tf;
     if (!wgsl.empty()) {
+        tv = wgsl_to_glsl(wgsl, "vs_main", ShaderStage::Vertex, BindingScheme::GX);
+        tf = wgsl_to_glsl(wgsl, "fs_main", ShaderStage::Fragment, BindingScheme::GX);
+    }
+    if (!original.empty() && (!tv.ok || !tf.ok)) {
+        // (Tint refused the rewritten text: the module as generated, rather than no module)
+        dklog("shaders: module %016llx: Tint refused the TEV rewrite (%s); translated as generated",
+              (unsigned long long)m->key, (!tv.ok ? tv.error : tf.error).substr(0, 300).c_str());
+        wgsl = std::move(original);
         tv = wgsl_to_glsl(wgsl, "vs_main", ShaderStage::Vertex, BindingScheme::GX);
         tf = wgsl_to_glsl(wgsl, "fs_main", ShaderStage::Fragment, BindingScheme::GX);
     }
@@ -266,7 +321,9 @@ void* worker_main(void*) {
             g_jobCv.wait(lock, [] { return !g_foreground.empty() || !g_background.empty(); });
             take_job(&job);
         }
-        if (job.module) {
+        if (job.module && job.dumpOnly) {
+            run_dump_job(job);
+        } else if (job.module) {
             run_module_job(job);
         } else if (job.entry) {
             compile_entry(job.entry, job.glsl);
@@ -406,12 +463,60 @@ void module_compile(ShaderModule* m, WgslSource source, bool foreground) {
     // already queued as background: a draw needs it now
     std::lock_guard<std::mutex> lock(g_jobMutex);
     for (auto it = g_background.begin(); it != g_background.end(); ++it) {
-        if (it->module == m) {
+        if (it->module == m && !it->dumpOnly) {
             g_foreground.push_back(std::move(*it));
             g_background.erase(it);
             break;
         }
     }
+}
+
+bool tev_fast_enabled() {
+    static const bool on = [] {
+        const bool v = env_flag("WIICOMPILED_DK_TEV_FAST", true);
+        dklog("shaders: TEV byte conversions %s (WIICOMPILED_DK_TEV_FAST; same pixels, GX modules keyed %s)",
+              v ? "without the conversion unit" : "as generated", v ? "with the tev_fast seed" : "by their plain XXH3");
+        return v;
+    }();
+    return on;
+}
+
+bool module_dump_wanted(uint64_t key) {
+    // WIICOMPILED_DK_DUMP_MODULES=<hex key>[,<hex key>...] (the "module" of the draw-times lines), or "all"
+    static const std::vector<uint64_t> keys = [] {
+        std::vector<uint64_t> v;
+        const char* s = getenv("WIICOMPILED_DK_DUMP_MODULES");
+        if (!s || !*s) return v;
+        if (strcmp(s, "all") == 0) return std::vector<uint64_t>{0};
+        while (*s) {
+            char* end = nullptr;
+            const unsigned long long k = strtoull(s, &end, 16);
+            if (end == s) break;
+            v.push_back(uint64_t(k));
+            s = end;
+            while (*s == ',' || *s == ' ') s++;
+        }
+        dklog("shaders: %zu modules to dump when their pipelines are made (WIICOMPILED_DK_DUMP_MODULES)", v.size());
+        return v;
+    }();
+    for (uint64_t k : keys)
+        if (k == 0 || k == key) return true;
+    return false;
+}
+
+void module_dump(ShaderModule* m, WgslSource source) {
+    if (!g_workerUp || !source) return;
+    {
+        std::lock_guard<std::mutex> lock(g_jobMutex);
+        static std::unordered_map<uint64_t, bool> dumped;
+        if (dumped[m->key] || dumped.size() > 256) return;
+        dumped[m->key] = true;
+    }
+    Job job;
+    job.module = m;
+    job.dumpOnly = true;
+    job.source = std::move(source);
+    queue_job(std::move(job), false);
 }
 
 bool module_wait(ShaderModule* m) {

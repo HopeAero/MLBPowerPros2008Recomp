@@ -39,10 +39,19 @@
 //                                   remembered; a draw or conversion that samples it before the next
 //                                   image barrier (the next pass end) gets one first, as do the batch's
 //                                   end and the present.
-//   WIICOMPILED_DK_TILED_CACHE=1    Maxwell's tiled cache (binning), which deko3d leaves off: on at every
+//   WIICOMPILED_DK_TILED_CACHE=0    turns off Maxwell's tiled cache (binning; deko3d leaves it off, we turn it on
+//                                   since run 6: -0.5 ms GPU per frame handheld, same image): on at every
 //                                   frame's start, flushed before every barrier and render-target change.
 //   WIICOMPILED_DK_AB=n             the two above in turn every n frames (off, lean, tiled, both), the GPU
 //                                   time per frame of each logged with the 30 s statistics ("A/B").
+//   WIICOMPILED_DK_HW_CLEARS=1      (experiment, off by default) Aurora's partial clear draws (GX copy
+//                                   clears of a rectangle: a triangle over the target, scissored, the
+//                                   colour as blend constant, the depth from the uniform) as the 3D
+//                                   engine's clears, which deko3d sets up to honour the scissor: no
+//                                   fragment shader, no blending. Same values (the colour converted to
+//                                   RGBA8 from the same floats, the depth clamped to 0..1 as the uniform),
+//                                   but ClearBuffers' handling of the bound write masks is not documented:
+//                                   check with WIICOMPILED_DK_SHOT before making it the default.
 // GPU timing (diagnostics):
 //   WIICOMPILED_DK_PASS_TIMES=n     timestamps around every pass and clear draw; every n frames (1: 600)
 //                                   the GPU time per pass index (palette conversions, load clears, clear
@@ -51,6 +60,16 @@
 //   WIICOMPILED_DK_DRAW_TIMES=1     with PASS_TIMES: a timestamp after every GX draw too, and the GPU time
 //                                   by pipeline (the time between a draw's timestamp and the one before;
 //                                   the GPU overlaps draws, so this is where the time goes, roughly).
+//                                   Each line also has the draws' raster rectangle (viewport and scissor,
+//                                   as bound: kpx per draw) and the first texture bound (size, count);
+//                                   each pass line the EFB rectangle its copy reads and the bounding box
+//                                   of its GX draws' raster rectangles.
+//   WIICOMPILED_DK_DRAW_PIXELS=1|2  with DRAW_TIMES: beside every timestamp a counter report, 1 samples
+//                                   passed (depth test; deko3d enables it), 2 fragment shader invocations
+//                                   (0 if the GPU's statistics counters are off); per pipeline and pass the
+//                                   pixels, ps per pixel and SM lane-cycles per pixel at 307 MHz (256 lanes):
+//                                   is a pipeline expensive per pixel, or does it cover many pixels?
+//                                   (Counter reports flush the tiled cache too: times skew upwards.)
 #include "dk_encode.hpp"
 
 #include "dk_gfx.hpp"
@@ -153,6 +172,8 @@ struct Options {
     uint32_t abFrames = 0;             // WIICOMPILED_DK_AB
     uint32_t passTimes = 0;            // WIICOMPILED_DK_PASS_TIMES (frames per report; 0: off)
     bool drawTimes = false;            // WIICOMPILED_DK_DRAW_TIMES
+    uint8_t pixels = 0;                // WIICOMPILED_DK_DRAW_PIXELS (1 samples passed, 2 FS invocations)
+    bool hwClears = false;             // WIICOMPILED_DK_HW_CLEARS
 } g_opt;
 // this frame's configuration (bit 0 lean barriers, bit 1 tiled cache): the switches, or the A/B turn
 uint8_t g_config = 0;
@@ -163,7 +184,8 @@ std::vector<const Tex*> g_pending;
 // ---- GPU timestamps: every frame, at its first batch, the end of every pass and copy, the present
 // and ImGui; read when the frame's slot comes round again (its fence waited for in frame_open). With
 // WIICOMPILED_DK_PASS_TIMES each one also says which pass and which part of it it ends.
-constexpr uint32_t kMaxMarks = swdk::kQuerySize / swdk::kFrames / 16;
+// (half of a frame's query region: timestamps; the other half: WIICOMPILED_DK_DRAW_PIXELS's counters)
+constexpr uint32_t kMaxMarks = swdk::kQuerySize / swdk::kFrames / 16 / 2;
 constexpr uint32_t kMaxPasses = 64;
 enum Seg : uint8_t { kSegNone, kSegPalette, kSegLoad, kSegClears, kSegDraws, kSegCopy, kSegCount };
 struct Tag {
@@ -173,6 +195,8 @@ struct Tag {
 // one pass of a frame as recorded (WIICOMPILED_DK_PASS_TIMES)
 struct PassRec {
     uint32_t width = 0, height = 0, clearPixels = 0, copyW = 0, copyH = 0;
+    int32_t srcX = 0, srcY = 0, srcW = 0, srcH = 0;     // the EFB rectangle its copy reads
+    uint32_t drawX0 = ~0u, drawY0 = ~0u, drawX1 = 0, drawY1 = 0;  // bounding box of its GX draws' raster rects
     int32_t format = 0;
     uint16_t gxDraws = 0, clearDraws = 0;
     bool depth = false, loadColor = false, loadDepth = false;
@@ -184,6 +208,9 @@ struct Marks {
     Tag tag[kMaxMarks];
     const Pipe* pipe[kMaxMarks];  // the GX draw a mark follows (WIICOMPILED_DK_DRAW_TIMES), else null
     uint32_t indices[kMaxMarks];  // (and its index count times instances)
+    uint32_t area[kMaxMarks];     // (its raster rectangle, viewport and scissor: pixels)
+    uint32_t texWH[kMaxMarks];    // (its first bound texture: width << 16 | height; 0 none)
+    uint8_t texCount[kMaxMarks];  // (bound textures)
     uint32_t count = 0;
     uint64_t cpuNs = 0;  // when the frame was opened
     uint8_t config = 0;
@@ -196,6 +223,14 @@ uint64_t g_statsStart = 0;
 Tag g_tag;                     // what the next mark without a tag of its own ends
 bool g_passEnded = false;      // a pass ended since the walk's last pass_prologue
 uint32_t g_drawsSinceMark = 0; // GX draws of the open pass since its last mark
+// (diagnostics) the viewport and scissor the GPU has, whatever the state cache says: pass_begin and
+// draw_clear set their own
+DkViewport g_curVp{};
+DkScissor g_curSc{};
+struct DrawInfo {
+    uint32_t area = 0, texWH = 0;
+    uint8_t texCount = 0;
+};
 
 Marks& frame_marks() { return g_marks[(R.frame + 1) % swdk::kFrames]; }
 PassRec* open_pass_rec() {
@@ -203,7 +238,7 @@ PassRec* open_pass_rec() {
     return m.passCount && m.passCount <= kMaxPasses ? &m.passes[m.passCount - 1] : nullptr;
 }
 
-void gpu_mark_tag(GpuWork work, Tag tag, const Pipe* pipe = nullptr, uint32_t indices = 0) {
+void gpu_mark_tag(GpuWork work, Tag tag, const Pipe* pipe = nullptr, uint32_t indices = 0, DrawInfo info = {}) {
     if (!g_gpuTimers || !R.frameOpen) return;
     const uint64_t frame = R.frame + 1;
     Marks& m = g_marks[frame % swdk::kFrames];
@@ -213,10 +248,17 @@ void gpu_mark_tag(GpuWork work, Tag tag, const Pipe* pipe = nullptr, uint32_t in
     }
     const swdk::QueryRegion q = swdk::query_region(frame);
     dkCmdBufReportCounter(R.cmd, DkCounter_Timestamp, q.gpu + uint64_t(m.count) * 16);
+    if (g_opt.pixels) {
+        dkCmdBufReportCounter(R.cmd, g_opt.pixels == 2 ? DkCounter_FragmentShaderInvocations : DkCounter_SamplesPassed,
+                              q.gpu + uint64_t(kMaxMarks + m.count) * 16);
+    }
     m.work[m.count] = work;
     m.tag[m.count] = tag;
     m.pipe[m.count] = pipe;
     m.indices[m.count] = indices;
+    m.area[m.count] = info.area;
+    m.texWH[m.count] = info.texWH;
+    m.texCount[m.count] = info.texCount;
     m.count++;
     g_drawsSinceMark = 0;
 }
@@ -227,12 +269,17 @@ struct PassAgg {
     uint64_t ns[kSegCount] = {};
     uint64_t gxDraws = 0, clearDraws = 0, clearPixels = 0, loadColor = 0, loadDepth = 0, depth = 0;
     uint64_t copies[4] = {};
+    uint64_t pixels = 0, drawPixels = 0;  // WIICOMPILED_DK_DRAW_PIXELS: all its marks', its GX draws'
     uint32_t width = 0, height = 0, copyW = 0, copyH = 0;
+    int32_t srcX = 0, srcY = 0, srcW = 0, srcH = 0;
+    uint32_t drawX0 = 0, drawY0 = 0, drawX1 = 0, drawY1 = 0;  // the last frame's bounding box
     int32_t format = 0;
     char label[24] = {};
 };
 struct DrawAgg {
     uint64_t ns = 0, draws = 0, indices = 0, passMask = 0;
+    uint64_t area = 0, pixels = 0, texCount = 0;
+    uint32_t texWH = 0;  // (the last draw's)
 };
 struct PassTimes {
     uint64_t frames = 0, totalNs = 0, otherNs = 0, passes = 0;
@@ -268,14 +315,28 @@ void log_pass_times() {
         for (uint32_t s = 0; s < kSegCount; s++) total += a.ns[s];
         char varied[48] = "";
         if (a.varied) snprintf(varied, sizeof varied, " (another target in %.0f%%)", 100.0 * double(a.varied) / f);
+        char extra[200] = "";
+        if (g_opt.drawTimes) {
+            int o = snprintf(extra, sizeof extra, "; copy reads %dx%d at (%d,%d), GX draws within ", a.srcW, a.srcH,
+                             a.srcX, a.srcY);
+            if (a.drawX1 > a.drawX0)
+                o += snprintf(extra + o, sizeof extra - size_t(o), "%ux%u at (%u,%u)", a.drawX1 - a.drawX0,
+                              a.drawY1 - a.drawY0, a.drawX0, a.drawY0);
+            else
+                o += snprintf(extra + o, sizeof extra - size_t(o), "-");
+            if (g_opt.pixels)
+                snprintf(extra + o, sizeof extra - size_t(o), "; %s %.0f kpx (GX draws %.0f kpx)",
+                         g_opt.pixels == 2 ? "FS invocations" : "samples passed", double(a.pixels) / f / 1000.0,
+                         double(a.drawPixels) / f / 1000.0);
+        }
         dklog("  pass %2u: %ux%u fmt %d '%s'%s%s, in %.0f%% of frames; load clear colour %.0f%% depth %.0f%%; %.1f "
               "draws, %.1f clear draws (%.0f kpx); then %s %ux%u (%.0f%%) | GPU %.3f ms = palette %.3f + load %.3f + "
-              "clears %.3f + draws %.3f + copy %.3f",
+              "clears %.3f + draws %.3f + copy %.3f%s",
               p, a.width, a.height, int(a.format), a.label, a.depth ? " +depth" : "", varied, 100.0 * f / n,
               100.0 * double(a.loadColor) / f, 100.0 * double(a.loadDepth) / f, double(a.gxDraws) / f,
               double(a.clearDraws) / f, double(a.clearPixels) / f / 1000.0, kCopy[copyKind], a.copyW, a.copyH,
               100.0 * double(a.copies[copyKind]) / f, ms(total), ms(a.ns[kSegPalette]), ms(a.ns[kSegLoad]),
-              ms(a.ns[kSegClears]), ms(a.ns[kSegDraws]), ms(a.ns[kSegCopy]));
+              ms(a.ns[kSegClears]), ms(a.ns[kSegDraws]), ms(a.ns[kSegCopy]), extra);
     }
     if (g_opt.drawTimes && !g_pt.draws.empty()) {
         std::vector<std::pair<const Pipe*, DrawAgg>> v(g_pt.draws.begin(), g_pt.draws.end());
@@ -292,13 +353,24 @@ void log_pass_times() {
             for (uint32_t b = 0; b < 64 && o < int(sizeof passes) - 8; b++)
                 if (d.passMask >> b & 1) o += snprintf(passes + o, sizeof passes - size_t(o), "%s%u", o ? "," : "", b);
             if (!o) snprintf(passes, sizeof passes, "-");
+            const double dr = double(std::max<uint64_t>(d.draws, 1));
+            char px[160] = "";
+            if (g_opt.pixels) {
+                // ps per pixel, and what that is in SM lane-cycles (2 SMs x 128 lanes) at 307 MHz
+                const double ps = d.pixels ? double(d.ns) * 1000.0 / double(d.pixels) : 0.0;
+                snprintf(px, sizeof px, "; %.1f kpx/draw %s, %.0f ps/px = %.0f lane-cycles/px at 307 MHz",
+                         double(d.pixels) / dr / 1000.0, g_opt.pixels == 2 ? "shaded" : "passed", ps,
+                         ps * 1e-12 * 307e6 * 256.0);
+            }
             dklog("    %.3f ms (%.1f%%): %.1f draws/frame, %.0f indices/draw; pipe %016llx module %016llx; depth "
-                  "test %u write %u, blend %s, cull %d; passes %s",
+                  "test %u write %u, blend %s, cull %d; passes %s; raster rect %.1f kpx/draw; textures %.1f (first "
+                  "%ux%u)%s",
                   ms(d.ns), all ? 100.0 * double(d.ns) / double(all) : 0.0, double(d.draws) / n,
                   d.draws ? double(d.indices) / double(d.draws) : 0.0, (unsigned long long)p->ref,
                   (unsigned long long)(p->module ? p->module->key : 0), unsigned(p->depthStencil.depthTestEnable),
                   unsigned(p->depthStencil.depthWriteEnable), p->color.blendEnableMask ? "on" : "off",
-                  int(p->rasterizer.cullMode), passes);
+                  int(p->rasterizer.cullMode), passes, double(d.area) / dr / 1000.0, double(d.texCount) / dr,
+                  d.texWH >> 16, d.texWH & 0xFFFF, px);
         }
     }
     g_pt = PassTimes{};
@@ -306,17 +378,23 @@ void log_pass_times() {
 
 // a frame's timestamps read: the intervals by pass and part (each interval belongs to the mark that
 // ends it), the pass records
-void add_pass_times(const Marks& m, const uint64_t* dt) {
+void add_pass_times(const Marks& m, const uint64_t* dt, const uint64_t* dpx) {
     for (uint32_t i = 1; i < m.count; i++) {
         const Tag t = m.tag[i];
         if (t.seg != kSegNone && t.pass < m.passCount && t.pass < kMaxPasses) {
             g_pt.agg[t.pass].ns[t.seg] += dt[i];
+            g_pt.agg[t.pass].pixels += dpx[i];
             if (m.pipe[i]) {
                 DrawAgg& d = g_pt.draws[m.pipe[i]];
                 d.ns += dt[i];
                 d.draws++;
                 d.indices += m.indices[i];
                 d.passMask |= uint64_t(1) << t.pass;
+                d.area += m.area[i];
+                d.pixels += dpx[i];
+                d.texCount += m.texCount[i];
+                if (m.texWH[i]) d.texWH = m.texWH[i];
+                g_pt.agg[t.pass].drawPixels += dpx[i];
             }
         } else {
             g_pt.otherNs += dt[i];
@@ -345,6 +423,16 @@ void add_pass_times(const Marks& m, const uint64_t* dt) {
         if (r.copyKind) {
             a.copyW = r.copyW;
             a.copyH = r.copyH;
+            a.srcX = r.srcX;
+            a.srcY = r.srcY;
+            a.srcW = r.srcW;
+            a.srcH = r.srcH;
+        }
+        if (r.drawX1 > r.drawX0) {
+            a.drawX0 = r.drawX0;
+            a.drawY0 = r.drawY0;
+            a.drawX1 = r.drawX1;
+            a.drawY1 = r.drawY1;
         }
     }
     g_pt.passes += m.passCount;
@@ -372,14 +460,34 @@ void read_marks(uint64_t frame) {
     Marks& m = g_marks[frame % swdk::kFrames];
     if (m.count >= 2) {
         const swdk::QueryRegion q = swdk::query_region(frame);
-        uint64_t ts[kMaxMarks];
+        static uint64_t ts[kMaxMarks];  // (command buffer owner only; off the stack)
         for (uint32_t i = 0; i < m.count; i++) memcpy(&ts[i], q.cpu + size_t(i) * 16 + 8, 8);
         g_clock.sample(m.cpuNs, dkTimestampToNs(ts[0]));
         bool ok = true;
         for (uint32_t i = 1; i < m.count && ok; i++) ok = ts[i] >= ts[i - 1];
         if (ok) {
-            static uint64_t dt[kMaxMarks];
+            static uint64_t dt[kMaxMarks], dpx[kMaxMarks];
             uint64_t passNs = 0, convNs = 0;
+            dpx[0] = 0;
+            if (g_opt.pixels) {
+                // samples passed: a 32-bit count in the record's second word; the statistics counters: 64 bits
+                uint64_t last = 0;
+                for (uint32_t i = 0; i < m.count; i++) {
+                    const uint8_t* rec = q.cpu + size_t(kMaxMarks + i) * 16;
+                    uint64_t v = 0;
+                    if (g_opt.pixels == 2) {
+                        memcpy(&v, rec, 8);
+                    } else {
+                        uint32_t v32;
+                        memcpy(&v32, rec + 4, 4);
+                        v = v32;
+                    }
+                    if (i) dpx[i] = g_opt.pixels == 2 ? v - last : uint64_t(uint32_t(v - last));
+                    last = v;
+                }
+            } else {
+                memset(dpx, 0, sizeof(uint64_t) * m.count);
+            }
             for (uint32_t i = 1; i < m.count; i++) {
                 dt[i] = uint64_t(double(dkTimestampToNs(ts[i] - ts[i - 1])) * g_clock.factor);
                 g_stats.gpuNs[size_t(m.work[i])] += dt[i];
@@ -395,7 +503,7 @@ void read_marks(uint64_t frame) {
             g_ab.passNs[c] += passNs;
             g_ab.convNs[c] += convNs;
             if (g_opt.passTimes && (!g_opt.abFrames || c == 0)) {  // (with the A/B: its base turns)
-                add_pass_times(m, dt);
+                add_pass_times(m, dt, dpx);
                 g_pt.totalNs += total;
                 if (++g_pt.frames >= g_opt.passTimes) log_pass_times();
             }
@@ -652,22 +760,27 @@ void batch_begin(uint32_t stagingSlot) {
         g_submitDraws = uint32_t(std::max(0L, swdk::env_long("WIICOMPILED_DK_SUBMIT_DRAWS", 256)));
         g_gpuTimers = swdk::env_flag("WIICOMPILED_DK_GPU_TIMERS", true);
         g_opt.lean = swdk::env_flag("WIICOMPILED_DK_LEAN_BARRIERS", false);
-        g_opt.tiled = swdk::env_flag("WIICOMPILED_DK_TILED_CACHE", false);
+        g_opt.tiled = swdk::env_flag("WIICOMPILED_DK_TILED_CACHE", true);
+        g_opt.hwClears = swdk::env_flag("WIICOMPILED_DK_HW_CLEARS", false);
+        if (g_opt.hwClears) dklog("encoder: partial clears as 3D engine clears (WIICOMPILED_DK_HW_CLEARS, experiment)");
         g_opt.abFrames = uint32_t(std::clamp(swdk::env_long("WIICOMPILED_DK_AB", 0), 0L, 1L << 20));
         const long passTimes = swdk::env_long("WIICOMPILED_DK_PASS_TIMES", 0);
         g_opt.passTimes = passTimes <= 0 ? 0u : passTimes == 1 ? 600u : uint32_t(std::min(passTimes, 1L << 20));
         g_opt.drawTimes = g_opt.passTimes && swdk::env_flag("WIICOMPILED_DK_DRAW_TIMES", false);
-        if (!g_gpuTimers) g_opt.passTimes = 0, g_opt.drawTimes = false;  // (they are GPU timestamps)
+        g_opt.pixels = g_opt.drawTimes ? uint8_t(std::clamp(swdk::env_long("WIICOMPILED_DK_DRAW_PIXELS", 0), 0L, 2L)) : 0;
+        if (!g_gpuTimers) g_opt.passTimes = 0, g_opt.drawTimes = false, g_opt.pixels = 0;  // (GPU timestamps)
         dklog("encoder: Aurora's passes recorded into deko3d; submits every %u draws (WIICOMPILED_DK_SUBMIT_DRAWS), "
               "a barrier at every pass end, GPU timestamps %s (WIICOMPILED_DK_GPU_TIMERS)",
               g_submitDraws, g_gpuTimers ? "on" : "off");
         char ab[96];
         snprintf(ab, sizeof ab, "taken in turn every %u frames: off, lean, tiled, both", g_opt.abFrames);
         dklog("encoder: lean barriers %s (WIICOMPILED_DK_LEAN_BARRIERS), tiled cache %s (WIICOMPILED_DK_TILED_CACHE)%s%s; "
-              "per-pass GPU times %s%u frames (WIICOMPILED_DK_PASS_TIMES), per-draw %s (WIICOMPILED_DK_DRAW_TIMES)",
+              "per-pass GPU times %s%u frames (WIICOMPILED_DK_PASS_TIMES), per-draw %s (WIICOMPILED_DK_DRAW_TIMES), "
+              "pixel counters %s (WIICOMPILED_DK_DRAW_PIXELS)",
               g_opt.lean ? "ON" : "off", g_opt.tiled ? "ON" : "off", g_opt.abFrames ? ", A/B: " : "",
               g_opt.abFrames ? ab : "", g_opt.passTimes ? "every " : "off; ", g_opt.passTimes,
-              g_opt.drawTimes ? "on" : "off");
+              g_opt.drawTimes ? "on" : "off",
+              g_opt.pixels == 2 ? "FS invocations" : g_opt.pixels == 1 ? "samples passed" : "off");
         return true;
     }();
     (void)once;
@@ -796,6 +909,8 @@ bool pass_begin(const PassTargets& t) {
     const DkViewport vp = {0.f, 0.f, float(t.width), float(t.height), 0.f, 1.f};
     dkCmdBufSetViewports(R.cmd, 0, &vp, 1);
     g_cache.vpValid = false;
+    g_curVp = vp;
+    g_curSc = full;
     g_cache.emptyTextures = false;
     bind_empty_textures();
     g_batch.workSinceTransfer = true;
@@ -828,6 +943,7 @@ void pass_viewport(const webgpu::Viewport& vp) {
     const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
     const DkViewport v = {vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth};
     if (changed(g_cache.vpValid, g_cache.vp, v)) dkCmdBufSetViewports(R.cmd, 0, &v, 1);
+    g_curVp = v;
 }
 
 void pass_scissor(const ClipRect& sc) {
@@ -840,6 +956,7 @@ void pass_scissor(const ClipRect& sc) {
     const int32_t bottom = std::clamp(sc.y + sc.height, top, h);
     const DkScissor s = {uint32_t(left), uint32_t(top), uint32_t(right - left), uint32_t(bottom - top)};
     if (changed(g_cache.scValid, g_cache.sc, s)) dkCmdBufSetScissors(R.cmd, 0, &s, 1);
+    g_curSc = s;
 }
 
 void draw_gx(const gx::DrawData& d, const Range* uniformOverride) {
@@ -892,8 +1009,37 @@ void draw_gx(const gx::DrawData& d, const Range* uniformOverride) {
         if (PassRec* r = open_pass_rec()) r->gxDraws++;
         g_drawsSinceMark++;
         // (a reserve of marks kept for the passes' own and the present's)
-        if (g_opt.drawTimes && frame_marks().count + 256 < kMaxMarks)
-            gpu_mark_tag(GpuWork::Efb, g_tag, p, d.indexCount * std::max<uint32_t>(d.instanceCount, 1));
+        if (g_opt.drawTimes && frame_marks().count + 256 < kMaxMarks) {
+            // the raster rectangle (viewport and scissor as the GPU has them) and the textures bound
+            DrawInfo info;
+            const float vx0 = std::max(g_curVp.x, 0.f), vy0 = std::max(g_curVp.y, 0.f);
+            const float vx1 = std::min(g_curVp.x + g_curVp.width, float(g_pass.width));
+            const float vy1 = std::min(g_curVp.y + g_curVp.height, float(g_pass.height));
+            const float x0 = std::max(vx0, float(g_curSc.x)), y0 = std::max(vy0, float(g_curSc.y));
+            const float x1 = std::min(vx1, float(g_curSc.x + g_curSc.width));
+            const float y1 = std::min(vy1, float(g_curSc.y + g_curSc.height));
+            if (x1 > x0 && y1 > y0) {
+                info.area = uint32_t((x1 - x0) * (y1 - y0));
+                if (PassRec* r = open_pass_rec()) {
+                    r->drawX0 = std::min(r->drawX0, uint32_t(x0));
+                    r->drawY0 = std::min(r->drawY0, uint32_t(y0));
+                    r->drawX1 = std::max(r->drawX1, uint32_t(x1 + 0.999f));
+                    r->drawY1 = std::max(r->drawY1, uint32_t(y1 + 0.999f));
+                }
+            }
+            if (g_cache.textures) {
+                if (BindGroup* g = find_bind_group(g_cache.textures)) {
+                    for (const BindGroup::Entry& e : g->entries) {
+                        if (!e.view || !e.view->tex) continue;
+                        if (!info.texCount)
+                            info.texWH = std::min<uint32_t>(e.view->tex->width, 0xFFFF) << 16 |
+                                         std::min<uint32_t>(e.view->tex->height, 0xFFFF);
+                        info.texCount++;
+                    }
+                }
+            }
+            gpu_mark_tag(GpuWork::Efb, g_tag, p, d.indexCount * std::max<uint32_t>(d.instanceCount, 1), info);
+        }
     }
     g_batch.workSinceTransfer = true;
     g_stats.encodeNs += swdk::now_ns() - t0;
@@ -925,6 +1071,42 @@ void draw_clear(const clear::DrawData& d) {
     }
     // (pass times: the GX draws before this clear end there, the clear draw at its own mark)
     if (g_opt.passTimes && g_drawsSinceMark) gpu_mark_tag(GpuWork::Efb, g_tag);
+    if (g_opt.hwClears && p->clearMask) {
+        // WIICOMPILED_DK_HW_CLEARS: the 3D engine's clears in the scissor, with every channel's write and
+        // the depth write on so that no state bound before can mask them
+        dkCmdBufSetScissors(R.cmd, 0, &s, 1);
+        g_cache.scValid = false;
+        g_curSc = s;
+        if (const uint32_t colorMask = p->clearMask & 0xFu) {
+            DkColorWriteState cw;
+            dkColorWriteStateDefaults(&cw);
+            dkCmdBufBindColorWriteState(R.cmd, &cw);
+            g_cache.cwValid = false;
+            dkCmdBufClearColorFloat(R.cmd, 0, colorMask, float(d.color.r), float(d.color.g), float(d.color.b),
+                                    float(d.color.a));
+        }
+        if (p->clearMask & 0x10u) {
+            DkDepthStencilState ds;
+            dkDepthStencilStateDefaults(&ds);
+            ds.depthTestEnable = true;
+            ds.depthWriteEnable = true;
+            ds.depthCompareOp = DkCompareOp_Always;
+            dkCmdBufBindDepthStencilState(R.cmd, &ds);
+            g_cache.dsValid = false;
+            dkCmdBufClearDepthStencil(R.cmd, true, std::clamp(d.depth, 0.f, 1.f), 0, 0);
+        }
+        g_cache.pipe = nullptr;  // (its write and depth states were replaced)
+        g_stats.clears++;
+        g_batch.workSinceTransfer = true;
+        if (g_opt.passTimes) {
+            if (PassRec* r = open_pass_rec()) {
+                r->clearDraws++;
+                r->clearPixels += s.width * s.height;
+            }
+            gpu_mark_tag(GpuWork::Efb, Tag{kSegClears, g_tag.pass});
+        }
+        return;
+    }
     ensure_globals();
     bind_pipe(p);
     set_blend_const(float(d.color.r), float(d.color.g), float(d.color.b), float(d.color.a));
@@ -934,6 +1116,8 @@ void draw_clear(const clear::DrawData& d) {
     g_cache.vpValid = false;
     dkCmdBufSetScissors(R.cmd, 0, &s, 1);
     g_cache.scValid = false;
+    g_curVp = v;
+    g_curSc = s;
     dkCmdBufDraw(R.cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
     g_stats.clears++;
     g_batch.workSinceTransfer = true;
@@ -1053,12 +1237,16 @@ void pass_prologue() {
     }
 }
 
-void note_pass_copy(uint8_t kind, uint32_t width, uint32_t height) {
+void note_pass_copy(uint8_t kind, uint32_t width, uint32_t height, const ClipRect& source) {
     if (!g_opt.passTimes || !g_passEnded) return;
     if (PassRec* r = open_pass_rec()) {
         r->copyKind = kind;
         r->copyW = width;
         r->copyH = height;
+        r->srcX = source.x;
+        r->srcY = source.y;
+        r->srcW = source.width;
+        r->srcH = source.height;
     }
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
-// From SwitchWaker (switch/deko/shader_translate.cpp at 56c0758; LICENSE.SwitchWaker), unchanged but for
-// this note. Needs Tint's GLSL writer with dawn-switch-tint-{depth-zero-to-one,position-y-up}.patch
+// From SwitchWaker (switch/deko/shader_translate.cpp at 56c0758; LICENSE.SwitchWaker). Modified for MLB
+// Power Pros 2008 Recomp (2026-10-27): tev_fast_rewrite (the GX TEV helpers' byte conversions without
+// the conversion unit, bit for bit; shader_translate.h). Needs Tint's GLSL writer with dawn-switch-tint-{depth-zero-to-one,position-y-up}.patch
 // (workstream A's Dawn build: Options::depth_zero_to_one, Options::disable_position_y_negation).
 // WGSL -> uam GLSL (shader_translate.h). The post-pass follows the pattern of SwitchWakerHD's
 // runtime/src/gfx/deko/glsl_convert.cpp (MPL-2.0): fix the source line by line where uam's dialect
@@ -12,6 +13,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <sstream>
 #include <tuple>
@@ -415,6 +417,59 @@ bool post_pass(std::string* glsl, const std::vector<SamplerSlot>& samplerSlots, 
     }
     *glsl = std::move(out);
     return true;
+}
+
+// shader_translate.h: the helpers exactly as gx/shader.cpp's build_shader_source writes them (after
+// fmt's brace unescaping), and what replaces them.
+uint32_t tev_fast_rewrite(std::string* wgsl) {
+    static const char kByteF32[] =
+        "fn tev_byte_f32(in: f32) -> i32 {\n"
+        "  return i32(round(in * 255.0));\n"
+        "}\n";
+    static const char kByteF32New[] =
+        "fn tev_byte_f32(in: f32) -> i32 {\n"
+        "  return bitcast<i32>(max(in * 255.0, -4194304.0) + 12582912.0) - 0x4B400000;\n"
+        "}\n";
+    static const char kByteVec3[] =
+        "fn tev_byte_vec3f(in: vec3f) -> vec3i {\n"
+        "  return vec3i(round(in * 255.0));\n"
+        "}\n";
+    static const char kByteVec3New[] =
+        "fn tev_byte_vec3f(in: vec3f) -> vec3i {\n"
+        "  return bitcast<vec3i>(max(in * 255.0, vec3f(-4194304.0)) + 12582912.0) - vec3i(0x4B400000);\n"
+        "}\n"
+        "\n"
+        "fn tev_i2f(v: i32) -> f32 {\n"
+        "  return bitcast<f32>(v + 0x4B400000) - 12582912.0;\n"
+        "}\n";
+    static const char kRegularF32[] = "  return f32(tev_regular_i32(tev_byte_f32(a), tev_byte_f32(b), tev_byte_f32(c), "
+                                      "tev_byte_f32(d), bias, scale, is_sub)) /\n";
+    static const char kRegularF32New[] = "  return tev_i2f(tev_regular_i32(tev_byte_f32(a), tev_byte_f32(b), "
+                                         "tev_byte_f32(c), tev_byte_f32(d), bias, scale, is_sub)) /\n";
+    static const char* const kRegularVec3[3] = {
+        "    f32(tev_regular_i32(ai.x, bi.x, ci.x, di.x, bias, scale, is_sub)) / 255.0,\n",
+        "    f32(tev_regular_i32(ai.y, bi.y, ci.y, di.y, bias, scale, is_sub)) / 255.0,\n",
+        "    f32(tev_regular_i32(ai.z, bi.z, ci.z, di.z, bias, scale, is_sub)) / 255.0,\n",
+    };
+    struct Site {
+        const char* from;
+        std::string to;
+        size_t at;
+    };
+    std::vector<Site> sites = {{kByteF32, kByteF32New, 0}, {kByteVec3, kByteVec3New, 0}, {kRegularF32, kRegularF32New, 0}};
+    for (const char* v : kRegularVec3) {
+        std::string to = v;
+        to.replace(4, 3, "tev_i2f");  // "    f32(" -> "    tev_i2f("
+        sites.push_back({v, to, 0});
+    }
+    // every site exactly once (a module without TEV regular ops still has the helpers)
+    for (Site& s : sites) {
+        s.at = wgsl->find(s.from);
+        if (s.at == std::string::npos || wgsl->find(s.from, s.at + 1) != std::string::npos) return 0;
+    }
+    std::sort(sites.begin(), sites.end(), [](const Site& a, const Site& b) { return a.at > b.at; });
+    for (const Site& s : sites) wgsl->replace(s.at, strlen(s.from), s.to);
+    return uint32_t(sites.size());
 }
 
 }  // namespace swdk

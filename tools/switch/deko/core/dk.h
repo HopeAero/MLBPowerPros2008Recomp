@@ -49,7 +49,7 @@ constexpr uint32_t kCmdChunk = 64u << 10;          // fed at frame_begin, then a
 constexpr uint32_t kImageChunkSize = 64u << 20;    // image heap chunks
 constexpr uint32_t kCodeSize = 48u << 20;          // shader code (DKSH), bump allocated, never freed
 constexpr uint32_t kImageDescriptors = 8192, kSamplerDescriptors = 1024;
-constexpr uint32_t kQuerySize = 64u << 10;         // GPU timestamps (kFrames regions)
+constexpr uint32_t kQuerySize = 256u << 10;        // GPU timestamps and counters (kFrames regions)
 constexpr uint32_t kQueueCommandMemory = 1u << 20; // the queue's own command memory
 // Thread priorities: 0x3B at most (SwitchWakerHD's first deko3d NRO died on a thread created with
 // 0x3C, which the NPDM refuses); the uam worker uses this.
@@ -270,6 +270,15 @@ using WgslSource = std::function<std::string()>;
 void module_compile(ShaderModule* m, WgslSource source, bool foreground);
 // Blocks until the module and both its stages have left Queued. False if anything failed.
 bool module_wait(ShaderModule* m);
+// WIICOMPILED_DK_TEV_FAST (default on): GX modules are translated with tev_fast_rewrite
+// (shader_translate.h: the TEV byte conversions without the conversion unit, same pixels) and keyed
+// by XXH3_64bits_withSeed(wgsl, kTevFastSeed), so the two variants never share a cache record.
+bool tev_fast_enabled();
+// WIICOMPILED_DK_DUMP_MODULES=<hex key>[,...] or "all": the module's WGSL and GLSL written next to the
+// cache (mod_<key>.wgsl, mod_<key>_{vs,fs}.glsl) once per session, also for modules the cache already
+// holds (WIICOMPILED_DK_DUMP_GLSL only sees modules translated in the session). Any thread.
+bool module_dump_wanted(uint64_t key);
+void module_dump(ShaderModule* m, WgslSource source);
 // Render thread: both stages loaded (see shader_usable). Counts a skipped draw when not.
 bool module_usable(ShaderModule* m, bool force);
 // GLSL of the renderer's own shaders (fixed_shaders.cpp): compiled now (cache or uam worker, waits),

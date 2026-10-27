@@ -19,6 +19,7 @@
 #include "gfx/clear.hpp"
 #include "gfx/common.hpp"
 #include "gx/pipeline.hpp"
+#include "webgpu/gpu.hpp"
 
 #include <cstring>
 #include <mutex>
@@ -142,12 +143,24 @@ void create_gx_pipeline(const gx::PipelineConfig& config) {
     if (find_pipe(ref)) return;
     // the module: by the hash of its WGSL (the cache's key); a new one is compiled in the background
     const std::string wgsl = gx::build_shader_source(config.shaderConfig);
-    swdk::ShaderModule* m = swdk::shader_module(XXH3_64bits(wgsl.data(), wgsl.size()));
+    // (WIICOMPILED_DK_TEV_FAST: the rewritten translation has keys of its own, dk.h tev_fast_enabled)
+    const uint64_t seed = swdk::tev_fast_enabled() ? swdk::kTevFastSeed : 0;
+    swdk::ShaderModule* m = swdk::shader_module(XXH3_64bits_withSeed(wgsl.data(), wgsl.size(), seed));
     if (m->state.load(std::memory_order_acquire) == swdk::ModuleState::Unresolved) {
         const gx::ShaderConfig shaderConfig = config.shaderConfig;
         swdk::module_compile(m, [shaderConfig] { return gx::build_shader_source(shaderConfig); }, false);
         std::lock_guard<std::mutex> lock(g_mutex);
         g_stats.modulesNew++;
+    }
+    // (WIICOMPILED_DK_DUMP_MODULES: by this key or by the plain XXH3, the key of a session without the
+    // TEV rewrite, e.g. run 6's draw-times lines)
+    const uint64_t plainKey = seed ? XXH3_64bits(wgsl.data(), wgsl.size()) : m->key;
+    if (swdk::module_dump_wanted(m->key) || swdk::module_dump_wanted(plainKey)) {
+        if (plainKey != m->key)
+            dklog("pipelines: module %016llx (plain XXH3 %016llx) to be dumped", (unsigned long long)m->key,
+                  (unsigned long long)plainKey);
+        const gx::ShaderConfig shaderConfig = config.shaderConfig;
+        swdk::module_dump(m, [shaderConfig] { return gx::build_shader_source(shaderConfig); });
     }
     // the fixed state: build_pipeline's
     const gx::PipelineStateDesc d = gx::pipeline_state_desc(config);
@@ -178,7 +191,20 @@ void create_gx_pipeline(const gx::PipelineConfig& config) {
     (void)logged;
     if (noCull) rs.cullMode = DkFace_None;
     if (depthAlways) ds.depthCompareOp = DkCompareOp_Always;
-    dkColorStateSetBlendEnable(&p->color, 0, true);
+    // Blending off where it computes src * One + dst * Zero for both colour and alpha (GX_BM_NONE,
+    // and the logic op Copy): the colour target is RGBA8 Unorm, where the blend unit's result is the
+    // clamped source either way, so the ROP need not read the destination
+    // (WIICOMPILED_DK_BLEND_SKIP=0 keeps it on, as WebGPU's pipeline has it).
+    static const bool blendSkip = swdk::env_flag("WIICOMPILED_DK_BLEND_SKIP", true);
+    const wgpu::TextureFormat efb = webgpu::g_graphicsConfig.surfaceConfiguration.format;
+    const bool unorm8 = efb == wgpu::TextureFormat::RGBA8Unorm || efb == wgpu::TextureFormat::BGRA8Unorm;
+    const auto copies = [unorm8](const wgpu::BlendComponent& c) {
+        if (!unorm8) return false;  // (a float target would turn dst * Zero into NaN for a NaN or inf dst)
+        return c.operation == wgpu::BlendOperation::Add && c.srcFactor == wgpu::BlendFactor::One &&
+               c.dstFactor == wgpu::BlendFactor::Zero;
+    };
+    const bool blendOn = !(blendSkip && copies(d.blend.color) && copies(d.blend.alpha));
+    dkColorStateSetBlendEnable(&p->color, 0, blendOn);
     dkColorWriteStateSetMask(&p->colorWrite, 0, uint32_t(d.writeMask) & 0xF);
     set_blend(p, d.blend);
     register_pipe(p);
@@ -203,6 +229,7 @@ void create_clear_pipeline(const clear::PipelineConfig& config) {
     const uint32_t mask = (config.clearColor ? uint32_t(DkColorMask_RGB) : 0u) |
                           (config.clearAlpha ? uint32_t(DkColorMask_A) : 0u);
     dkColorWriteStateSetMask(&p->colorWrite, 0, mask);
+    p->clearMask = uint8_t(mask | (config.clearDepth ? 0x10u : 0u));
     register_pipe(p);
 }
 

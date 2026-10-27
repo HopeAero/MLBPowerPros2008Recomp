@@ -105,9 +105,9 @@ void pass_end();
 void copy_texture(WGPUTexture src, uint32_t srcX, uint32_t srcY, WGPUTexture dst, uint32_t width, uint32_t height);
 // For the per-pass GPU times (WIICOMPILED_DK_PASS_TIMES): the walk is at its next pass (its palette
 // conversions follow), and the pass that just ended got its EFB copy (kind 1 conversion, 2 shader-
-// sampled blit, 3 copy engine; the destination's size)
+// sampled blit, 3 copy engine; the destination's size; the EFB rectangle it reads)
 void pass_prologue();
-void note_pass_copy(uint8_t kind, uint32_t width, uint32_t height);
+void note_pass_copy(uint8_t kind, uint32_t width, uint32_t height, const ClipRect& source);
 
 // ---- workstream C (dk_copy_conv.cpp, dk_depth_peek.cpp, dk_efb_ram.cpp; the command buffer owner)
 // tex_copy_conv::run (shaderSampled false) / tex_copy_conv::blit (true) after the pass: Aurora's

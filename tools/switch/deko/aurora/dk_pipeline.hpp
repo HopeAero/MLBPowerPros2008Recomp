@@ -25,6 +25,8 @@ struct Pipe {
     DkBlendState blend{};
     DkDepthStencilState depthStencil{};
     uint64_t ref = 0;  // Aurora's PipelineRef
+    // a clear pipeline's channels (DkColorMask bits 0-3) and depth (bit 4): WIICOMPILED_DK_HW_CLEARS
+    uint8_t clearMask = 0;
 };
 
 // The pipe registered for Aurora's PipelineRef, or null (not created yet). Any thread.

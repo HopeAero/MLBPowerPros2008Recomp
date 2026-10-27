@@ -729,7 +729,7 @@ index dfa305b..f77455d 100644
      *left = g_gxState.boundingBox[0];
    }
 diff --git a/aurora-main/lib/dolphin/gx/GXGeometry.cpp b/aurora-main/lib/dolphin/gx/GXGeometry.cpp
-index 2e54e10..2ad5ad4 100644
+index 2e54e10..f6ac5c4 100644
 --- a/aurora-main/lib/dolphin/gx/GXGeometry.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXGeometry.cpp
 @@ -3,6 +3,32 @@
@@ -820,7 +820,41 @@ index 2e54e10..2ad5ad4 100644
  extern "C" {
  
  void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
-@@ -190,7 +245,8 @@ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
+@@ -173,6 +228,33 @@ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
+   const u8 oldHasNrms = __gx->hasNrms;
+   const u8 oldHasBiNrms = __gx->hasBiNrms;
+   const u32 oldNrmType = __gx->nrmType;
++#if defined(__SWITCH__)
++  // A3 (fifo.hpp): a probe only decides whether the next flush re-sends the VCD. When this call
++  // changes the VCD, or bit 8 is already set, that flush sends it whatever the probes find
++  // (GXManage.cpp, SetVtxStateDecidedByDecoder: vcdForce; only __GXSetDirtyState and GXInit clear
++  // bit 8), so the probe is not queued. Same CP/XF state reaches the decoder; sync mode and
++  // display-list recording keep the code below.
++  if (aurora::gx::fifo::async_mode() && aurora::gx::fifo::a3_enabled() && !aurora::gx::fifo::in_display_list())
++    LIKELY {
++      SETVCDATTR(attr, type);
++      if (__gx->hasNrms || __gx->hasBiNrms) {
++        SET_REG_FIELD(0, __gx->vcdLo, 2, 11, __gx->nrmType);
++      } else {
++        SET_REG_FIELD(0, __gx->vcdLo, 2, 11, 0);
++      }
++      const bool changed = __gx->vcdLo != oldVcdLo || __gx->vcdHi != oldVcdHi || __gx->hasNrms != oldHasNrms ||
++                           __gx->hasBiNrms != oldHasBiNrms || __gx->nrmType != oldNrmType;
++      if (!changed && (__gx->dirtyState & 8) == 0) {
++        (void)AuroraVtxDescDiffers(attr, type); // queues the probe; false in this mode
++      } else if (attr >= GX_VA_PNMTXIDX && attr < GX_VA_MAX_ATTR) {
++        ++aurora_gx_a3_counters[aurora::gx::fifo::kA3VtxProbesElided];
++      }
++      if (changed) {
++        __gx->dirtyState |= 8;
++      }
++      return;
++    }
++#endif
+   const bool auroraStateChanged = AuroraVtxDescDiffers(attr, type);
+ 
+   SETVCDATTR(attr, type);
+@@ -190,7 +272,8 @@ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
  
  void GXSetSourceVtxDesc(GXAttr attr, GXAttrType type) {
    if (attr >= GX_VA_PNMTXIDX && attr < GX_VA_MAX_ATTR) {
@@ -830,7 +864,36 @@ index 2e54e10..2ad5ad4 100644
    }
  }
  
-@@ -282,6 +338,22 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
+@@ -238,6 +321,28 @@ void GXSetVtxAttrFmt(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType typ
+   const u32 oldVa = *va;
+   const u32 oldVb = *vb;
+   const u32 oldVc = *vc;
++#if defined(__SWITCH__)
++  // A3, as GXSetVtxDesc: with this format's VAT changed here or already forced (bit 0x10 and its
++  // dirtyVAT bit, both cleared only by the flush and GXInit), the flush re-sends it whatever the
++  // probe finds (vatForce), so the probe is not queued.
++  if (aurora::gx::fifo::async_mode() && aurora::gx::fifo::a3_enabled() && !aurora::gx::fifo::in_display_list() &&
++      vtxfmt >= GX_VTXFMT0 && vtxfmt < GX_MAX_VTXFMT && attr >= GX_VA_POS && attr < GX_VA_MAX_ATTR)
++    LIKELY {
++      SETVAT(va, vb, vc, attr, cnt, type, frac);
++      const bool changed = *va != oldVa || *vb != oldVb || *vc != oldVc;
++      const u8 bit = static_cast<u8>(1 << vtxfmt);
++      if (!changed && ((__gx->dirtyState & 0x10) == 0 || (__gx->dirtyVAT & bit) == 0)) {
++        (void)AuroraVtxAttrFmtDiffers(vtxfmt, attr, cnt, type, frac); // queues the probe; false here
++      } else {
++        ++aurora_gx_a3_counters[aurora::gx::fifo::kA3VtxProbesElided];
++      }
++      if (changed) {
++        __gx->dirtyState |= 0x10;
++        __gx->dirtyVAT |= bit;
++      }
++      return;
++    }
++#endif
+   const bool auroraStateChanged = AuroraVtxAttrFmtDiffers(vtxfmt, attr, cnt, type, frac);
+   SETVAT(va, vb, vc, attr, cnt, type, frac);
+   if (aurora::gx::fifo::in_display_list() || auroraStateChanged || *va != oldVa || *vb != oldVb ||
+@@ -282,6 +387,22 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
  
    assert((cpIdx & ~0xF) == 0);
  
@@ -853,7 +916,7 @@ index 2e54e10..2ad5ad4 100644
    // Write array base
    GX_WRITE_AURORA(GX_LOAD_AURORA_ARRAYBASE | cpIdx);
    GX_WRITE_U64(reinterpret_cast<u64>(data));
-@@ -290,6 +362,7 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
+@@ -290,6 +411,7 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
  
    // Write array stride
    GX_WRITE_CP_REG(CP_REG_ARRAYSTRIDE_ID | cpIdx, stride);
@@ -1058,10 +1121,69 @@ index 80b3b92..789dc44 100644
    __gx->dirtyState = 0;
  }
 diff --git a/aurora-main/lib/dolphin/gx/GXTexture.cpp b/aurora-main/lib/dolphin/gx/GXTexture.cpp
-index 684ba79..ac15ce6 100644
+index 684ba79..0d5db3b 100644
 --- a/aurora-main/lib/dolphin/gx/GXTexture.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXTexture.cpp
-@@ -174,6 +174,34 @@ void emit_loaded_tlut_metadata(const GXTlutObj_& obj, u32 idx) {
+@@ -60,6 +60,10 @@ struct TlutIdentityRecord {
+   u32 objId = 0;
+   u32 dataVersion = 0;
+   u64 digest = 0;
++#if defined(__SWITCH__)
++  // Guest-write generation sampled before `digest` was taken (A3, resolve_tlut_identity).
++  u64 generation = aurora::kGuestWriteUntracked;
++#endif
+ };
+ 
+   // Limit cached palette IDs; evicted palettes are safely uploaded again.
+@@ -81,6 +85,47 @@ std::pair<u32, u32> resolve_tlut_identity(const void* data, GXTlutFmt format, u1
+     return {next_tlut_obj_id(), 1};
+   }
+ 
++#if defined(__SWITCH__)
++  // A3 (fifo.hpp): MLB re-inits its palettes every frame. While no guest write was notified over
++  // the palette since its digest (the contract gx.cpp's get_tlut_texture and the texture caches
++  // already rely on), the digest would come out the same, so the record's answer stands as is.
++  if (aurora::gx::fifo::a3_enabled()) LIKELY {
++    const size_t bytes = static_cast<size_t>(entries) * sizeof(u16);
++    // Sampled before the bytes are read: a racing write costs a digest, never a skipped one.
++    const u64 generation = aurora::guest_write_generation(data, bytes);
++    if (sTlutIdentities.size() >= MaxTlutIdentities) {
++      sTlutIdentities.clear();
++    }
++    const TlutIdentity key{
++        .data = data,
++        .format = static_cast<u32>(format),
++        .entries = entries,
++    };
++    auto [it, inserted] = sTlutIdentities.try_emplace(key);
++    auto& record = it->second;
++    if (!inserted && aurora::guest_write_generation_matches(record.generation, generation)) {
++      ++aurora_gx_a3_counters[aurora::gx::fifo::kA3TlutDigestsSkipped];
++      return {record.objId, record.dataVersion};
++    }
++    ++aurora_gx_a3_counters[aurora::gx::fifo::kA3TlutDigests];
++    const auto digest = static_cast<u64>(aurora::xxh3_hash_s(data, bytes));
++    if (inserted) {
++      record.objId = next_tlut_obj_id();
++      record.dataVersion = 1;
++      record.digest = digest;
++    } else if (record.digest != digest) {
++      record.digest = digest;
++      if (record.dataVersion >= 0x7FFFFFFFu) {
++        record.dataVersion = 1;
++      } else {
++        ++record.dataVersion;
++      }
++    }
++    record.generation = generation;
++    return {record.objId, record.dataVersion};
++  }
++#endif
++
+   const auto digest =
+       static_cast<u64>(aurora::xxh3_hash_s(data, static_cast<size_t>(entries) * sizeof(u16)));
+   if (sTlutIdentities.size() >= MaxTlutIdentities) {
+@@ -174,6 +219,34 @@ void emit_loaded_tlut_metadata(const GXTlutObj_& obj, u32 idx) {
    GX_WRITE_U32(obj.tlutObjId);
    GX_WRITE_U32(obj.tlutDataVersion);
  }
@@ -1096,7 +1218,7 @@ index 684ba79..ac15ce6 100644
  } // namespace
  
  extern "C" {
-@@ -290,6 +318,32 @@ void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
+@@ -290,6 +363,32 @@ void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
    SET_REG_FIELD(0, image2, 8, 24, GXTexImage2Ids[id]);
    SET_REG_FIELD(0, obj->image3, 8, 24, GXTexImage3Ids[id]);
  
@@ -1129,7 +1251,7 @@ index 684ba79..ac15ce6 100644
    GX_WRITE_RAS_REG(obj->mode0);
    GX_WRITE_RAS_REG(obj->mode1);
    GX_WRITE_RAS_REG(obj->image0);
-@@ -419,6 +473,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
+@@ -419,6 +518,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
  
  void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
    auto* obj = reinterpret_cast<const GXTlutObj_*>(obj_);
@@ -2458,10 +2580,10 @@ index 9818084..bd1b21a 100644
 +
 +#include "fifo_async.inc"
 diff --git a/aurora-main/lib/gx/fifo.hpp b/aurora-main/lib/gx/fifo.hpp
-index b01ea45..e07a35d 100644
+index b01ea45..3f6028f 100644
 --- a/aurora-main/lib/gx/fifo.hpp
 +++ b/aurora-main/lib/gx/fifo.hpp
-@@ -16,6 +16,18 @@ extern uint32_t sDlSize;
+@@ -16,6 +16,48 @@ extern uint32_t sDlSize;
  extern uint32_t sDlWritePos;
  } // namespace detail
  
@@ -2477,10 +2599,40 @@ index b01ea45..e07a35d 100644
 +inline Mode mode() noexcept { return detail::sModeResolved ? detail::sMode : detail::resolve_mode(); }
 +inline bool async_mode() noexcept { return mode() != Mode::Sync; }
 +
++#if defined(__SWITCH__)
++// Producer savings that change no decoded state (switch phase 33, local/tmp/cpu/A3-gxoffload.py):
++// VCD/VAT probes skipped where the flush sends the VCD/VAT whatever they find (GXGeometry.cpp),
++// TLUT digests skipped while the palette's guest-write generation is unchanged (GXTexture.cpp),
++// and the runtime's display-list scan shortcuts (gx_dl.cpp). WIICOMPILED_GX_A3=0 turns them off.
++namespace detail {
++extern bool sA3;
++} // namespace detail
++inline bool a3_enabled() noexcept {
++  if (!detail::sModeResolved) {
++    detail::resolve_mode();
++  }
++  return detail::sA3;
++}
++// Producer-thread counters for the benchmark summary (gx_a3_per_frame).
++enum A3Counter : uint32_t {
++  kA3VtxProbes = 0,       // VCD/VAT probes queued for the decoder
++  kA3VtxProbesElided,     // probes skipped: the flush re-sends that VCD/VAT anyway
++  kA3TlutDigests,         // GXInitTlutObj palette digests computed
++  kA3TlutDigestsSkipped,  // digests skipped on an unchanged guest-write generation
++  kA3DlFrontHits,         // display-list scan cache lookups answered by the front table (runtime)
++  kA3LayoutHashes,        // display-list layout hashes recomputed (runtime)
++  kA3LayoutRowsHashed,    // vtxAttrFmt rows rehashed by those (runtime; 8 per hash without A3)
++  kA3CounterCount
++};
++} // namespace aurora::gx::fifo
++extern "C" uint64_t aurora_gx_a3_counters[aurora::gx::fifo::kA3CounterCount];
++namespace aurora::gx::fifo {
++#endif
++
  void init();
  
  // Out-of-line slow path: grows internal buffer then appends data
-@@ -76,11 +88,98 @@ inline void write_f32(const float val) {
+@@ -76,11 +118,98 @@ inline void write_f32(const float val) {
  // Display list recording
  void begin_display_list(uint8_t* buf, uint32_t size);
  uint32_t end_display_list();
@@ -2582,10 +2734,10 @@ index b01ea45..e07a35d 100644
  uint32_t get_buffer_size();
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 new file mode 100644
-index 0000000..f1b5000
+index 0000000..078cb98
 --- /dev/null
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -0,0 +1,1041 @@
+@@ -0,0 +1,1085 @@
 +// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
 +// at the end of fifo.cpp.
 +//
@@ -2638,8 +2790,17 @@ index 0000000..f1b5000
 +Mode sMode = Mode::Sync;
 +bool sModeResolved = false;
 +uint32_t sVirtualBase = 0;
++#if defined(__SWITCH__)
++bool sA3 = true;
++#endif
 +
 +Mode resolve_mode() noexcept {
++#if defined(__SWITCH__)
++  {
++    const char* a3 = std::getenv("WIICOMPILED_GX_A3");
++    sA3 = !(a3 != nullptr && a3[0] == '0');
++  }
++#endif
 +  const char* env = std::getenv("WIICOMPILED_GX_FIFO");
 +#if defined(__SWITCH__)
 +  // Measured on the console: same frames, 43.8 -> 58 fps in the match benchmark.
@@ -2704,6 +2865,9 @@ index 0000000..f1b5000
 +  uint64_t quiesces[static_cast<size_t>(QuiesceReason::Count)]{};
 +  uint64_t segments = 0, bytes = 0, waitNs = 0, decodeNs = 0, rawMismatches = 0, drainSplits = 0, listSplits = 0,
 +           arrayHazards = 0, decodeErrors = 0, copiesQueued = 0, copiesInline = 0;
++#if defined(__SWITCH__)
++  uint64_t a3[kA3CounterCount]{};
++#endif
 +};
 +Snapshot sMark;
 +
@@ -2722,6 +2886,9 @@ index 0000000..f1b5000
 +  s.decodeErrors = sStats.decodeErrors.load(std::memory_order_relaxed);
 +  s.copiesQueued = sStats.copiesQueued;
 +  s.copiesInline = sStats.copiesInline;
++#if defined(__SWITCH__)
++  std::memcpy(s.a3, aurora_gx_a3_counters, sizeof(s.a3));
++#endif
 +  return s;
 +}
 +
@@ -3503,6 +3670,9 @@ index 0000000..f1b5000
 +// Probes are records (decoded in front of the unpublished bytes, where sync compared); each belongs
 +// to the next conditional flush, which goes into the FIFO bytes at its place.
 +void probe_vtx_desc(uint32_t attr, uint32_t type) {
++#if defined(__SWITCH__)
++  ++aurora_gx_a3_counters[kA3VtxProbes];
++#endif
 +  uint8_t* out = open_record(kRecProbeVcd, 0, 2, true, sNextCondId);
 +  out[0] = static_cast<uint8_t>(attr);
 +  out[1] = static_cast<uint8_t>(type);
@@ -3510,6 +3680,9 @@ index 0000000..f1b5000
 +}
 +
 +void probe_vtx_attr_fmt(uint32_t fmt, uint32_t attr, uint32_t cnt, uint32_t type, uint32_t frac) {
++#if defined(__SWITCH__)
++  ++aurora_gx_a3_counters[kA3VtxProbes];
++#endif
 +  uint8_t* out = open_record(kRecProbeVat, 0, 5, true, sNextCondId);
 +  out[0] = static_cast<uint8_t>(fmt);
 +  out[1] = static_cast<uint8_t>(attr);
@@ -3567,6 +3740,13 @@ index 0000000..f1b5000
 +
 +// ---- C API (runtime) -------------------------------------------------------------------------------
 +
++#if defined(__SWITCH__)
++// fifo.hpp's A3Counter, bumped by the producer thread only (plain increments). The runtime's
++// display-list scan cache bumps the last three (gx_dl.cpp).
++uint64_t aurora_gx_a3_counters[aurora::gx::fifo::kA3CounterCount] = {}; // extern "C" in fifo.hpp
++extern "C" int aurora_gx_a3_enabled(void) { return aurora::gx::fifo::a3_enabled() ? 1 : 0; }
++#endif
++
 +// Native code is about to write guest memory the GX may read (0), or VIConfigure (1).
 +extern "C" void aurora_gx_fifo_quiesce(uint32_t reason) {
 +  using namespace aurora::gx::fifo;
@@ -3609,7 +3789,12 @@ index 0000000..f1b5000
 +      "gx_fifo_decode_ms_per_frame=%.3f gx_fifo_producer_wait_ms_per_frame=%.3f%s\n"
 +      "gx_fifo_raw_draw_mismatches=%.0f gx_fifo_staging_splits drain=%.0f display_list=%.0f "
 +      "gx_fifo_array_hazards=%.0f gx_fifo_decode_errors=%.0f\n"
-+      "gx_fifo_copies_per_frame queued=%.2f inline=%.2f\n",
++      "gx_fifo_copies_per_frame queued=%.2f inline=%.2f\n"
++#if defined(__SWITCH__)
++      "gx_a3_per_frame enabled=%d vtx_probes=%.1f vtx_probes_elided=%.1f tlut_digests=%.1f "
++      "tlut_digests_skipped=%.1f dl_front_hits=%.1f layout_hashes=%.1f layout_rows_hashed=%.1f\n"
++#endif
++      ,
 +      modeName, frames, sExactRawDraws ? 1 : 0, sCheckArrays ? 1 : 0, drains(DrainReason::Draw) / frames,
 +      drains(DrainReason::DisplayList) / frames, drains(DrainReason::RawDraw) / frames,
 +      drains(DrainReason::DrawDone) / frames, drains(DrainReason::Copy) / frames,
@@ -3624,7 +3809,18 @@ index 0000000..f1b5000
 +      delta(now.rawMismatches, base.rawMismatches), delta(now.drainSplits, base.drainSplits),
 +      delta(now.listSplits, base.listSplits), delta(now.arrayHazards, base.arrayHazards),
 +      delta(now.decodeErrors, base.decodeErrors), delta(now.copiesQueued, base.copiesQueued) / frames,
-+      delta(now.copiesInline, base.copiesInline) / frames);
++      delta(now.copiesInline, base.copiesInline) / frames
++#if defined(__SWITCH__)
++      ,
++      a3_enabled() ? 1 : 0, delta(now.a3[kA3VtxProbes], base.a3[kA3VtxProbes]) / frames,
++      delta(now.a3[kA3VtxProbesElided], base.a3[kA3VtxProbesElided]) / frames,
++      delta(now.a3[kA3TlutDigests], base.a3[kA3TlutDigests]) / frames,
++      delta(now.a3[kA3TlutDigestsSkipped], base.a3[kA3TlutDigestsSkipped]) / frames,
++      delta(now.a3[kA3DlFrontHits], base.a3[kA3DlFrontHits]) / frames,
++      delta(now.a3[kA3LayoutHashes], base.a3[kA3LayoutHashes]) / frames,
++      delta(now.a3[kA3LayoutRowsHashed], base.a3[kA3LayoutRowsHashed]) / frames
++#endif
++  );
 +  return n < 0 ? 0 : std::min(n, size - 1);
 +}
 diff --git a/aurora-main/lib/gx/gx.cpp b/aurora-main/lib/gx/gx.cpp
@@ -3983,7 +4179,7 @@ index c73ad5e..08482bd 100644
    TRY(SDL_DisableScreenSaver(), "Error disabling screensaver: {}", SDL_GetError());
    if (g_config.allowJoystickBackgroundEvents) {
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index 0063653..33ec28f 100644
+index 0063653..9f228c9 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
 @@ -10,8 +10,9 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
@@ -4060,12 +4256,21 @@ index 0063653..33ec28f 100644
      endif()
  endif()
  
-@@ -215,7 +244,21 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
+@@ -215,7 +244,30 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
      COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS}")
  # Match the optimization policy of the translated callers as well as their FP policy.
  set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp" APPEND PROPERTY
 -    COMPILE_OPTIONS -O2 -fno-slp-vectorize)
 +    COMPILE_OPTIONS -O2 ${MKW_NO_SLP_VECTORIZE})
++if(MKW_PLATFORM_SWITCH)
++    # MLB's sphere-map native (hle/mlb/envmap_natives.cpp) computes in host singles what the
++    # translation computes and shares its frsqrte/fmuls helpers: the translated shards' FP policy
++    # (no contraction, no fast-math) and -O2.
++    set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/hle/mlb/envmap_natives.cpp" PROPERTIES
++        SKIP_UNITY_BUILD_INCLUSION ON
++        SKIP_PRECOMPILE_HEADERS ON
++        COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS};-O2")
++endif()
 +if(MKW_PLATFORM_SWITCH)
 +    # MLB's MIXUpdateSettings native (hle/mlb/mix_natives.cpp) defines file-local macros for its body.
 +    set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/hle/mlb/mix_natives.cpp" PROPERTIES
@@ -4083,7 +4288,7 @@ index 0063653..33ec28f 100644
  
  # ----------------------------------------------------------------------
  # Third-party: aurora-main (provides SDL3 + GPU backends)
-@@ -278,7 +321,44 @@ else()
+@@ -278,7 +330,44 @@ else()
      set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
      # Isolate aurora build products to a subdirectory under the main build dir.
      add_subdirectory(${MKW_AURORA_DIR} ${CMAKE_BINARY_DIR}/aurora-build EXCLUDE_FROM_ALL)
@@ -4129,7 +4334,7 @@ index 0063653..33ec28f 100644
  
      # Keep upstream Aurora split: several sources intentionally use file-local
      # names that collide under this repo's aggressive unity build settings.
-@@ -381,7 +461,7 @@ if(MKW_BUILD_PSQ_TESTS)
+@@ -381,7 +470,7 @@ if(MKW_BUILD_PSQ_TESTS)
          "${CMAKE_CURRENT_LIST_DIR}/include")
      target_compile_features(mkw_psq_helpers_tests PRIVATE cxx_std_17)
      target_compile_options(mkw_psq_helpers_tests PRIVATE
@@ -4426,25 +4631,22 @@ index 6b76fa6..4de26b3 100644
  template <typename Signature>
  class AbiTrampoline;
 diff --git a/runtime/include/guest_flat_memory.h b/runtime/include/guest_flat_memory.h
-index 2514913..c7cd6fd 100644
+index 2514913..4b52f5b 100644
 --- a/runtime/include/guest_flat_memory.h
 +++ b/runtime/include/guest_flat_memory.h
-@@ -40,7 +40,22 @@ inline constexpr uintptr_t kFixedFlatGuestBase = 0x0000'0010'0000'0000ull;
+@@ -40,7 +40,19 @@ inline constexpr uintptr_t kFixedFlatGuestBase = 0x0000'0010'0000'0000ull;
  #error "guest_flat_memory.h has no fixed flat guest base chosen for this architecture"
  #endif
  
 +#if defined(__SWITCH__)
-+// Horizon: the base is a slice found at startup (no fixed address is free in every process). The
-+// asm load names no memory operand, so GCC treats it as a pure function of a link-time address and
-+// hoists/CSEs it like the constant above, where a plain global read would be reloaded after every
-+// guest store (byte stores alias it). Sound only because Initialize writes the base once, before
-+// any guest code runs, and never again.
-+extern uint8_t* g_flatBase __attribute__((visibility("hidden")));
-+inline uint8_t* FlatBase() noexcept {
-+    uint8_t* base;
-+    asm("ldr %0, [%1]" : "=r"(base) : "r"(&g_flatBase));
-+    return base;
-+}
++// Horizon: the base is a slice found at startup (no fixed address is free in every process).
++// Declared const everywhere: GCC never treats a read-only global as clobbered by a store (guest byte
++// stores alias everything) or by a call, so it loads the base once per function and keeps it in a
++// register, like the constant above. Sound only because Initialize writes it once, before any guest
++// code runs, and never again; guest_flat_memory.cpp defines the storage in assembly and writes it
++// with one asm store (WriteFlatBase), so no TU sees a writable definition next to this declaration.
++extern uint8_t* const g_flatBase __attribute__((visibility("hidden")));
++inline uint8_t* FlatBase() noexcept { return g_flatBase; }
 +#define MKW_FLAT_GUEST_BASE (GuestFlat::FlatBase())
 +#else
  #define MKW_FLAT_GUEST_BASE (reinterpret_cast<uint8_t*>(GuestFlat::kFixedFlatGuestBase))
@@ -4452,6 +4654,26 @@ index 2514913..c7cd6fd 100644
  
  enum class Backing {
      Owned,
+@@ -77,8 +89,19 @@ bool IsActive();
+ #define MKW_GUEST_FLAT_FIXED_PAGE_SIZE 1
+ #endif
+ 
++// Horizon: the translated code assumes the flat view (Initialize throws when it cannot be built),
++// so the checked copy of every access is not compiled. g_requiresCheckedAccess stays as
++// guest_flat_memory.cpp's own "view not built yet" state. -DMKW_SWITCH_CHECKED_ACCESS restores
++// the runtime checked fallback of phase 20 (A/B, or a loader without the mapping SVCs).
++#if defined(__SWITCH__) && !defined(MKW_SWITCH_CHECKED_ACCESS)
++#define MKW_SWITCH_FLAT_ONLY 1
++#endif
++
+ #if defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
+ inline constexpr bool RequiresCheckedAccess() noexcept { return false; }
++#elif defined(MKW_SWITCH_FLAT_ONLY)
++extern bool g_requiresCheckedAccess;
++inline constexpr bool RequiresCheckedAccess() noexcept { return false; }
+ #else
+ extern bool g_requiresCheckedAccess;
+ inline bool RequiresCheckedAccess() noexcept { return g_requiresCheckedAccess; }
 diff --git a/runtime/include/hle_stubs.h b/runtime/include/hle_stubs.h
 index f83b85d..3784b6e 100644
 --- a/runtime/include/hle_stubs.h
@@ -4547,7 +4769,7 @@ index 227987e..f9bab9f 100644
  
  inline CpuContext* CurrentCpuContext()
 diff --git a/runtime/include/isa/ppc_isa_float.h b/runtime/include/isa/ppc_isa_float.h
-index 592098a..99b5135 100644
+index 592098a..b0474be 100644
 --- a/runtime/include/isa/ppc_isa_float.h
 +++ b/runtime/include/isa/ppc_isa_float.h
 @@ -205,6 +205,15 @@ inline float PpcForceSingleValueInline(double value)
@@ -4566,6 +4788,23 @@ index 592098a..99b5135 100644
  #elif defined(__aarch64__)
      const float64x1_t v = vdup_n_f64(value);
      const uint64x1_t signMask = vdup_n_u64(0x8000000000000000ULL);
+@@ -243,6 +252,16 @@ inline double PpcForce25BitInline(double value)
+     const uint64_t exponent = integral & kDoubleExpMask;
+     const uint64_t fraction = integral & kDoubleFracMask;
+ 
++#if defined(__aarch64__) && defined(__SWITCH__)
++    // The normal case without a trip through a GPR: (x & ~0x7FFFFFF) + (x & 0x8000000) equals
++    // URSHR(x, #28) << 28 for every 64-bit x (both are ceil((x >> 27) / 2) << 28, modulo 2^64).
++    if (!(exponent == 0 && fraction != 0)) [[likely]]
++    {
++        double rounded;
++        __asm__("urshr %d0, %d1, #28\n\tshl %d0, %d0, #28" : "=w"(rounded) : "w"(value));
++        return rounded;
++    }
++#endif
+     if (exponent == 0 && fraction != 0)
+     {
+         int64_t keepMask = 0xFFFFFFFFF8000000LL;
 diff --git a/runtime/include/isa/ppc_isa_fpenv.h b/runtime/include/isa/ppc_isa_fpenv.h
 index f3bc7b9..cc9e823 100644
 --- a/runtime/include/isa/ppc_isa_fpenv.h
@@ -4612,6 +4851,55 @@ index a9e93cc..74c2c96 100644
  }
  
  extern "C" uint32_t OSSystemCall();
+diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_isa_quantized.h
+index a5066f8..8f8bf4f 100644
+--- a/runtime/include/isa/ppc_isa_quantized.h
++++ b/runtime/include/isa/ppc_isa_quantized.h
+@@ -655,6 +655,14 @@ inline void PpcWritePairPsqStackInline(uint32_t addr, T first, T second)
+     }
+ }
+ 
++#if defined(MKW_SWITCH_FLAT_ONLY)
++// Horizon flat-only build: a translator-proven stack slot goes through the flat view like
++// MemoryInline::FlatWriteRam* (same proof, same physical bytes as the page-table host pointer).
++MKW_PPC_FORCE_INLINE double PpcLoadPairPsqFloatStackInline(uint32_t addr)
++{
++    return PpcLoadPairPsqFloatFromHostInline(MKW_FLAT_GUEST_BASE + addr);
++}
++#else
+ inline double PpcLoadPairPsqFloatStackInline(uint32_t addr)
+ {
+     // MemoryInline::ReadStack64's exact proof (TryGetPointerFast), then the
+@@ -664,6 +672,7 @@ inline double PpcLoadPairPsqFloatStackInline(uint32_t addr)
+         return PpcLoadPairPsqFloatFromHostInline(host);
+     return PpcBitCastToDoubleInline(PpcLoadPairPsqFloatBitsPackedInline(Memory::Read64(addr)));
+ }
++#endif
+ 
+ inline double PpcLoadSinglePsqFloatStackInline(uint32_t addr)
+ {
+@@ -707,6 +716,13 @@ inline double PpcLoadSinglePsqQuantizedStackInline(uint32_t addr, uint32_t scale
+         1.0f).d;
+ }
+ 
++#if defined(MKW_SWITCH_FLAT_ONLY)
++// Flat view, as PpcLoadPairPsqFloatStackInline above.
++MKW_PPC_FORCE_INLINE void PpcStorePairPsqFloatStackInline(uint32_t addr, double value)
++{
++    PpcStorePairPsqFloatToHostInline(MKW_FLAT_GUEST_BASE + addr, value);
++}
++#else
+ inline void PpcStorePairPsqFloatStackInline(uint32_t addr, double value)
+ {
+     // MemoryInline::WriteStack64's exact proof (WriteStackScalarFast ->
+@@ -719,6 +735,7 @@ inline void PpcStorePairPsqFloatStackInline(uint32_t addr, double value)
+     }
+     Memory::Write64(addr, PpcStorePairPsqFloatBitsPackedInline(PpcBitCastToU64Inline(value)));
+ }
++#endif
+ 
+ template <typename QuantizedType>
+ inline void PpcStorePairPsqQuantizedStackInline(uint32_t addr, double value, uint32_t scale)
 diff --git a/runtime/include/mbedtls_switch_config.h b/runtime/include/mbedtls_switch_config.h
 new file mode 100644
 index 0000000..0f8d25e
@@ -4625,8 +4913,24 @@ index 0000000..0f8d25e
 +#define MBEDTLS_NO_PLATFORM_ENTROPY
 +#define MBEDTLS_ENTROPY_HARDWARE_ALT
 +#define MBEDTLS_PLATFORM_MS_TIME_ALT
+diff --git a/runtime/include/memory.h b/runtime/include/memory.h
+index 14fe9ca..1ee1f37 100644
+--- a/runtime/include/memory.h
++++ b/runtime/include/memory.h
+@@ -101,6 +101,11 @@ public:
+     static uint8_t* GetPointer(uint32_t addr);
+     static uint8_t* GetPointer(uint32_t addr, size_t length);
+     static bool Contains(uint32_t addr, size_t length = 1);
++#if defined(__SWITCH__)
++    // The out-of-line miss paths of the inline GetPointer/Contains (memory_access.h).
++    static uint8_t* GetPointerSlow(uint32_t addr, size_t length);
++    static bool ContainsSlow(uint32_t addr, size_t length);
++#endif
+ 
+     static uint64_t RegisterDeferredRead(uint32_t addr, size_t length,
+                                          DeferredReadCallback callback, void* user);
 diff --git a/runtime/include/memory_access.h b/runtime/include/memory_access.h
-index 7ac535d..3aca2aa 100644
+index 7ac535d..2062fdf 100644
 --- a/runtime/include/memory_access.h
 +++ b/runtime/include/memory_access.h
 @@ -618,23 +618,28 @@ MKW_MEMORY_FORCE_INLINE void FlatWriteFloat64(uint32_t address, double value) {
@@ -4658,8 +4962,123 @@ index 7ac535d..3aca2aa 100644
      uint64_t bits = 0;
      std::memcpy(&bits, &value, sizeof(bits));
      FlatStore<uint64_t>(address, bits);
+@@ -646,21 +651,69 @@ MKW_MEMORY_FORCE_INLINE void FlatWriteRamFloat64(uint32_t address, double value)
+ #undef MKW_MEMORY_NO_INLINE
+ #undef MKW_MEMORY_COLD
+ 
+-inline uint8_t Memory::Read8(uint32_t addr) {
++#if defined(__SWITCH__)
++// Horizon: forced inline into the runtime's HLE callers (GCC outlined them in the big unity TUs).
++#define MKW_MEMORY_API_INLINE __attribute__((always_inline)) inline
++#else
++#define MKW_MEMORY_API_INLINE inline
++#endif
++
++#if defined(__SWITCH__)
++MKW_MEMORY_API_INLINE uint8_t* Memory::GetPointer(uint32_t addr, size_t length) {
++    if (auto* ptr = MemoryInline::GetPointerFast(addr, length)) [[likely]]
++        return ptr;
++    return GetPointerSlow(addr, length);
++}
++
++MKW_MEMORY_API_INLINE bool Memory::Contains(uint32_t addr, size_t length) {
++    if (MemoryInline::GetPointerFast(addr, length)) [[likely]]
++        return true;
++    return ContainsSlow(addr, length);
++}
++
++// The unchanged write sequence, out of line: what every Memory::Write* did before.
++template <typename T, void (*Slow)(uint32_t, T)>
++__attribute__((noinline)) void MkwWriteGuestScalarMiss(uint32_t address, T value) {
++    if (!MemoryInline::TryWriteGuestScalar(address, value)) [[unlikely]]
++        Slow(address, value);
++}
++
++// TryWriteGuestScalar's first tier (a full writable 1 MiB page) only; false sends the access to
++// MkwWriteGuestScalarMiss, which repeats the whole check.
++template <typename T>
++__attribute__((always_inline)) inline bool MkwTryWriteGuestScalarCoarse(uint32_t address, T value) {
++    const uint32_t end = address + static_cast<uint32_t>(sizeof(T) - 1u);
++    if (end < address || (end >> MemoryInline::kPageShift) != (address >> MemoryInline::kPageShift))
++        [[unlikely]] return false;
++    const uintptr_t encodedBias = MemoryInline::g_fullWritablePageBias[address >> MemoryInline::kPageShift];
++    if (encodedBias == 0) [[unlikely]]
++        return false;
++    auto* ptr = reinterpret_cast<uint8_t*>((encodedBias - 1u) + address);
++    if constexpr (sizeof(T) == 1) {
++        *ptr = static_cast<uint8_t>(value);
++    } else {
++        const T swapped = MemoryInline::MaybeByteSwap(value);
++        std::memcpy(ptr, &swapped, sizeof(T));
++    }
++    return true;
++}
++#endif
++
++MKW_MEMORY_API_INLINE uint8_t Memory::Read8(uint32_t addr) {
+     uint8_t value = 0;
+     if (!MemoryInline::TryReadGuestScalar(addr, value)) [[unlikely]]
+         return MemoryInline::Read8Slow(addr);
+     return value;
+ }
+ 
+-inline uint16_t Memory::Read16(uint32_t addr) {
++MKW_MEMORY_API_INLINE uint16_t Memory::Read16(uint32_t addr) {
+     uint16_t value = 0;
+     if (!MemoryInline::TryReadGuestScalar(addr, value)) [[unlikely]]
+         return MemoryInline::Read16Slow(addr);
+     return value;
+ }
+ 
+-inline uint32_t Memory::Read32(uint32_t addr) {
++MKW_MEMORY_API_INLINE uint32_t Memory::Read32(uint32_t addr) {
+     uint32_t value = 0;
+     if (!MemoryInline::TryReadGuestScalar(addr, value)) [[unlikely]]
+         return MemoryInline::Read32Slow(addr);
+@@ -692,20 +745,41 @@ inline double Memory::ReadFloat64(uint32_t addr) {
+     return value;
+ }
+ 
++#if defined(__SWITCH__)
++MKW_MEMORY_API_INLINE void Memory::Write8(uint32_t addr, uint8_t val) {
++    if (!MkwTryWriteGuestScalarCoarse(addr, val)) [[unlikely]]
++        MkwWriteGuestScalarMiss<uint8_t, MemoryInline::Write8Slow>(addr, val);
++}
++#else
+ inline void Memory::Write8(uint32_t addr, uint8_t val) {
+     if (!MemoryInline::TryWriteGuestScalar(addr, val)) [[unlikely]]
+         MemoryInline::Write8Slow(addr, val);
+ }
++#endif
+ 
++#if defined(__SWITCH__)
++MKW_MEMORY_API_INLINE void Memory::Write16(uint32_t addr, uint16_t val) {
++    if (!MkwTryWriteGuestScalarCoarse(addr, val)) [[unlikely]]
++        MkwWriteGuestScalarMiss<uint16_t, MemoryInline::Write16Slow>(addr, val);
++}
++#else
+ inline void Memory::Write16(uint32_t addr, uint16_t val) {
+     if (!MemoryInline::TryWriteGuestScalar(addr, val)) [[unlikely]]
+         MemoryInline::Write16Slow(addr, val);
+ }
++#endif
+ 
++#if defined(__SWITCH__)
++MKW_MEMORY_API_INLINE void Memory::Write32(uint32_t addr, uint32_t val) {
++    if (!MkwTryWriteGuestScalarCoarse(addr, val)) [[unlikely]]
++        MkwWriteGuestScalarMiss<uint32_t, MemoryInline::Write32Slow>(addr, val);
++}
++#else
+ inline void Memory::Write32(uint32_t addr, uint32_t val) {
+     if (!MemoryInline::TryWriteGuestScalar(addr, val)) [[unlikely]]
+         MemoryInline::Write32Slow(addr, val);
+ }
++#endif
+ 
+ inline void Memory::Write64(uint32_t addr, uint64_t val) {
+     if (!MemoryInline::TryWriteGuestScalar(addr, val)) [[unlikely]]
 diff --git a/runtime/include/native_cpu_calls.inc b/runtime/include/native_cpu_calls.inc
-index 0856e7b..92f255e 100644
+index 0856e7b..1603960 100644
 --- a/runtime/include/native_cpu_calls.inc
 +++ b/runtime/include/native_cpu_calls.inc
 @@ -43,7 +43,15 @@ extern "C" void GX__SetBlendMode_8017277c(uint32_t t, uint32_t s, uint32_t d, ui
@@ -4696,10 +5115,182 @@ index 0856e7b..92f255e 100644
  #ifdef WIICOMPILED_NO_MKW_NATIVES
  #define MKW_KNOWN_NATIVE_CPU_CALL(addr, fn) static_assert(true)
  #else
-@@ -108,3 +127,30 @@ MKW_KNOWN_NATIVE_CPU_CALL(0x800847C0u, nw4r__lyt__detail__DrawQuad_800847c0);
+@@ -108,3 +127,202 @@ MKW_KNOWN_NATIVE_CPU_CALL(0x800847C0u, nw4r__lyt__detail__DrawQuad_800847c0);
  MKW_KNOWN_NATIVE_CPU_CALL(0x80084D20u, nw4r__lyt__detail__DrawQuad_80084d20);
  
  #undef MKW_KNOWN_NATIVE_CPU_CALL
++
++#if defined(__SWITCH__) && defined(WIICOMPILED_GAME_RL8E54) && !defined(WIICOMPILED_NO_MKW_NATIVES)
++// MLB's sphere-map pass 0x8000D770 (hle/mlb/envmap_natives.cpp), registered with
++// REGISTER_NATIVE_FUNCTION_AS (the translation stays for GQR0 != 0 and checked access). Not a leaf: it
++// calls guest code (0x80059350, GXInvalidateVtxCache), so callers reach it as a known native. Spelled
++// base + offset: tools/wiicompiled_rebind.py remaps 0x80xxxxxx literals here as MKW addresses.
++extern "C" void MLB_EnvMapCoords_8000D770(CpuContext* ctx);
++template <> struct KnownNativeCpuCall<0x80000000u + 0xD770u> {
++    static constexpr bool kAvailable = true;
++    static constexpr uint32_t kNonvolatileFprWriteMask = 0;
++    static constexpr void (*Entry)(CpuContext*) = &MLB_EnvMapCoords_8000D770;
++};
++
++// The pure-state GX natives (hle/gx: PPC_NATIVE_OVERRIDE_VOID registrations and the typed list above)
++// as leaves: InvokeDirectCpu calls them straight, without the registry lookup, the r14-r31 copy-out
++// and copy-back and the current-context check (run 5: 4.2% of the main thread in those wrappers).
++// Each one reads its arguments as its registry thunk (AbiTrampoline::BuildArgs) or typed entry does,
++// returns nothing, never touches the CpuContext otherwise, never re-enters guest code and never
++// switches guest threads: no callbacks, no VI/OS alarm processing, no preemption point. Left out on
++// purpose: GXBegin (it services VI retraces and OS alarms, ServiceDeferredTimingDuringGxWork),
++// GXCopyDisp (frame present and OS_HLE_PreemptionPoint), GXCopyTex, GXSetDrawSync, GXDrawDone and
++// the PE finish handler (draw-done/token state), everything in gx_init.cpp and gx_dl.cpp
++// (GXInit, FIFO setup, display lists), and the two with stack arguments (GXSetTevIndirect,
++// GXInitTexObjCI). Generated from the hle/gx registrations; a changed signature there is a
++// conflicting extern "C" declaration, a compile error, not a silent mismatch.
++extern "C" void __GX__InitRevisionBits_8016b720();
++extern "C" void GX__SetVtxAttrFmtv_8016de08(uint32_t vf, uint32_t la);
++extern "C" void GX__SetArray_8016e32c(uint32_t a, uint32_t ba, uint32_t str);
++extern "C" void GX__ResetWriteGatherPipe_8016e6b0();
++extern "C" void GX__SetDirtyState_8016ee78();
++extern "C" void GX__EnableTexOffsets_8016f37c(uint32_t coord, uint32_t lineEnable, uint32_t pointEnable);
++extern "C" void GX__SetCoPlanar_8016f3e0(uint32_t en);
++extern "C" void GX__SetDispCopySrc_8016f438(uint32_t l, uint32_t t, uint32_t w, uint32_t h);
++extern "C" void GX__SetTexCopySrc_8016f478(uint32_t l, uint32_t t, uint32_t w, uint32_t h);
++extern "C" void GX__SetDispCopyDst_8016f4b8(uint32_t w, uint32_t h);
++extern "C" void GX__SetTexCopyDst_8016f4dc(uint32_t w, uint32_t h, uint32_t f, uint32_t m);
++extern "C" void GX__SetDispCopyFrame2Field_8016f5f8(uint32_t f);
++extern "C" void GX__SetCopyClamp_8016f618(uint32_t c);
++extern "C" void GX__SetCopyFilter_8016fa40(uint32_t aa, uint32_t spa, uint32_t vf, uint32_t vfa);
++extern "C" void GX__SetDispCopyGamma_8016fc24(uint32_t g);
++extern "C" void GX__ClearBoundingBox_8016fecc();
++extern "C" void GX__LoadLightObjImm_80170320(uint32_t la, uint32_t lid);
++extern "C" void GX__SetChanAmbColor_8017039c(uint32_t c, uint32_t cp);
++extern "C" void GX__SetChanMatColor_80170474(uint32_t c, uint32_t cp);
++extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32_t wt);
++extern "C" void GX__InitTexObjTlut_80170b64(uint32_t oa, uint32_t tl);
++extern "C" void GX__LoadTexObjPreLoaded_80170dc8(uint32_t oa, uint32_t tid);
++extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, uint32_t e);
++extern "C" void GX__LoadTlut_80170fa8(uint32_t oa, uint32_t tl);
++extern "C" void GX__SetTexCoordScaleManually_80171180(uint32_t c, uint32_t en, uint32_t ss, uint32_t ts);
++extern "C" void GX__SetTexCoordBias_801711fc(uint32_t c, uint32_t se, uint32_t te);
++extern "C" void __GX__SetSUTexRegs_801712f0();
++extern "C" void __GX__SetTmemConfig_80171458(uint32_t mode);
++extern "C" void GX__SetIndTexMtx_80171814(uint32_t id, uint32_t ma, uint32_t se);
++extern "C" void GX__SetIndTexCoordScale_80171968(uint32_t s, uint32_t ss, uint32_t ts);
++extern "C" void GX__SetIndTexOrder_80171a6c(uint32_t s, uint32_t c, uint32_t m);
++extern "C" void __GX__FlushTextureState_80171c28();
++extern "C" void GX__SetTevOp_80171c4c(uint32_t s, uint32_t m);
++extern "C" void GX__SetTevColor_80171e10(uint32_t id, uint32_t cp);
++extern "C" void GX__SetAlphaCompare_80172088(uint32_t c0, uint32_t r0, uint32_t op, uint32_t c1, uint32_t r1);
++extern "C" void GX__SetZTexture_801720c0(uint32_t op, uint32_t f, uint32_t b);
++extern "C" void GX__SetFog_801722cc(uint32_t t, float sz, float ez, float nz, float fz, uint32_t cp);
++extern "C" void GX__SetColorUpdate_801727cc(uint32_t en);
++extern "C" void GX__SetAlphaUpdate_801727f8(uint32_t en);
++extern "C" void GX__SetZMode_80172824(uint32_t ce, uint32_t f, uint32_t ue);
++extern "C" void GX__SetZCompLoc_80172858(uint32_t bt);
++extern "C" void GX__SetPixelFmt_80172888(uint32_t pf, uint32_t zf);
++extern "C" void GX__SetDither_80172930(uint32_t d);
++extern "C" void GX__SetDstAlpha_8017295c(uint32_t en, uint32_t a);
++extern "C" void GX__SetProjection_8017301c(uint32_t ma, uint32_t pt);
++extern "C" void GX__SetProjectionv_80173080(uint32_t pa);
++extern "C" void GX__LoadPosMtxIndx_8017315c(uint32_t mi, uint32_t id);
++extern "C" void GX__LoadNrmMtxImm_80173188(uint32_t ma, uint32_t id);
++extern "C" void GX__LoadNrmMtxIndx3x3_801731e0(uint32_t mi, uint32_t id);
++extern "C" void GX__LoadTexMtxImm_80173234(uint32_t ma, uint32_t id, uint32_t t);
++extern "C" void GX__SetViewportJitter_80173378(float l, float t, float w, float h, float nz, float fz, uint32_t f);
++extern "C" void GX__SetViewport_801733b4(float l, float t, float w, float h, float nz, float fz);
++extern "C" void GX__GetViewportv_801733e0(uint32_t oa);
++extern "C" void GX__SetZScaleOffset_80173400(float s, float o);
++extern "C" void GX__SetScissor_80173430(uint32_t l, uint32_t t, uint32_t w, uint32_t h);
++extern "C" void GX__SetScissorBoxOffset_801734e0(int32_t xo, int32_t yo);
++extern "C" void GX__SetClipMode_8017351c(uint32_t m);
++
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC249Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { __GX__InitRevisionBits_8016b720(); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC403Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC403Cu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC447Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC447Cu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC44B0u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC44B0u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC4650u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetVtxAttrFmtv_8016de08(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC4894u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetArray_8016e32c(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC48E4u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC48E4u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC4B0Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC4B0Cu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC4C18u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__ResetWriteGatherPipe_8016e6b0(); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC54A8u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetDirtyState_8016ee78(); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC5944u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC5944u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC5978u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC5978u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC59ACu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__EnableTexOffsets_8016f37c(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC59E8u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC59E8u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC5A2Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetCoPlanar_8016f3e0(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC5A84u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetDispCopySrc_8016f438(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC5AC4u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetTexCopySrc_8016f478(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC5B04u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetDispCopyDst_8016f4b8(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC5B28u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetTexCopyDst_8016f4dc(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC5C44u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetDispCopyFrame2Field_8016f5f8(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC5C64u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetCopyClamp_8016f618(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC6000u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetCopyFilter_8016fa40(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC61E4u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetDispCopyGamma_8016fc24(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC648Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__ClearBoundingBox_8016fecc(); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC64E0u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__LoadLightObjImm_80170320(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC655Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetChanAmbColor_8017039c(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC6634u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetChanMatColor_80170474(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC670Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC670Cu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC6730u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC6730u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC69B8u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC69B8u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC6C0Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC6C0Cu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC6D10u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__InitTexObjWrapMode_80170b50(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC6D24u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__InitTexObjTlut_80170b64(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC6D90u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__LoadTexObjPreLoaded_80170dc8(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC6EF4u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC6EF4u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC6F48u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__InitTlutObj_80170f80(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC6F70u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__LoadTlut_80170fa8(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7114u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7114u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7184u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetTexCoordScaleManually_80171180(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7200u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetTexCoordBias_801711fc(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC72F4u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { __GX__SetSUTexRegs_801712f0(); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC745Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { __GX__SetTmemConfig_80171458(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7818u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetIndTexMtx_80171814(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC796Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetIndTexCoordScale_80171968(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7A70u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetIndTexOrder_80171a6c(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7B3Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7B3Cu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7B5Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7B5Cu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7BD8u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { __GX__FlushTextureState_80171c28(); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7BFCu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetTevOp_80171c4c(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7C90u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7C90u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7CD0u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7CD0u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7D10u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7D10u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7D68u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7D68u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7DC0u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetTevColor_80171e10(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7E20u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7E20u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7E84u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7E84u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7EE0u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7EE0u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7F30u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7F30u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7F80u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7F80u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC7FBCu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC7FBCu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8038u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetAlphaCompare_80172088(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6], cpu->gpr[7]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8070u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetZTexture_801720c0(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC80FCu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC80FCu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8258u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC8258u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC827Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetFog_801722cc(cpu->gpr[3], static_cast<float>(cpu->fpr[1].d), static_cast<float>(cpu->fpr[2].d), static_cast<float>(cpu->fpr[3].d), static_cast<float>(cpu->fpr[4].d), cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC85CCu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC85CCu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC861Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetColorUpdate_801727cc(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8648u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetAlphaUpdate_801727f8(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8674u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetZMode_80172824(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC86A8u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetZCompLoc_80172858(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC86D8u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetPixelFmt_80172888(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8780u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetDither_80172930(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC87ACu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetDstAlpha_8017295c(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8A9Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetProjection_8017301c(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8B00u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetProjectionv_80173080(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8B4Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC8B4Cu>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8B9Cu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__LoadPosMtxIndx_8017315c(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8BC8u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__LoadNrmMtxImm_80173188(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8C70u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__LoadNrmMtxIndx3x3_801731e0(cpu->gpr[3], cpu->gpr[4]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8CA4u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { KnownTypedNativeCpuCall<0x80000000u + 0xC8CA4u>::Invoke(cpu); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8CC4u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__LoadTexMtxImm_80173234(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8E08u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetViewportJitter_80173378(static_cast<float>(cpu->fpr[1].d), static_cast<float>(cpu->fpr[2].d), static_cast<float>(cpu->fpr[3].d), static_cast<float>(cpu->fpr[4].d), static_cast<float>(cpu->fpr[5].d), static_cast<float>(cpu->fpr[6].d), cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8E44u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetViewport_801733b4(static_cast<float>(cpu->fpr[1].d), static_cast<float>(cpu->fpr[2].d), static_cast<float>(cpu->fpr[3].d), static_cast<float>(cpu->fpr[4].d), static_cast<float>(cpu->fpr[5].d), static_cast<float>(cpu->fpr[6].d)); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8E70u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__GetViewportv_801733e0(cpu->gpr[3]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8E90u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetZScaleOffset_80173400(static_cast<float>(cpu->fpr[1].d), static_cast<float>(cpu->fpr[2].d)); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8EC0u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetScissor_80173430(cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6]); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8F70u> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetScissorBoxOffset_801734e0(static_cast<int32_t>(cpu->gpr[3]), static_cast<int32_t>(cpu->gpr[4])); } };
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xC8FACu> { static constexpr bool kAvailable = true; static void Invoke(CpuContext* cpu) { GX__SetClipMode_8017351c(cpu->gpr[3]); } };
++#endif
 +
 +#if defined(__SWITCH__) && defined(WIICOMPILED_GAME_RL8E54) && !defined(WIICOMPILED_NO_MKW_NATIVES)
 +// MLB's MIXUpdateSettings (hle/mlb/mix_natives.cpp), registered with REGISTER_NATIVE_FUNCTION_AS (the
@@ -5017,7 +5608,7 @@ index f2ad393..b3e5407 100644
          std::fprintf(stderr, "[trace] %d %s\n", g_gxFrameCount, name);
      }
 diff --git a/runtime/src/guest_flat_memory.cpp b/runtime/src/guest_flat_memory.cpp
-index 9504488..a275af0 100644
+index 9504488..019f48f 100644
 --- a/runtime/src/guest_flat_memory.cpp
 +++ b/runtime/src/guest_flat_memory.cpp
 @@ -27,6 +27,16 @@
@@ -5037,17 +5628,31 @@ index 9504488..a275af0 100644
  #else
  #include <cerrno>
  #include <cstring>
-@@ -39,6 +49,9 @@ namespace GuestFlat {
+@@ -39,6 +49,23 @@ namespace GuestFlat {
  #if !defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
  bool g_requiresCheckedAccess = false;
  #endif
 +#if defined(__SWITCH__)
-+uint8_t* g_flatBase = nullptr;  // MKW_FLAT_GUEST_BASE; null in checked mode
++// MKW_FLAT_GUEST_BASE; null until BuildHorizonFlatView succeeds (and in checked mode). The header
++// declares it `uint8_t* const` to every TU (the translated code keeps it in a register); the
++// storage is defined here in assembly and written only by WriteFlatBase, once, before guest code.
++asm(".pushsection .bss._ZN9GuestFlat10g_flatBaseE,\"aw\",%nobits\n"
++    ".p2align 3\n"
++    ".globl _ZN9GuestFlat10g_flatBaseE\n"
++    ".hidden _ZN9GuestFlat10g_flatBaseE\n"
++    ".type _ZN9GuestFlat10g_flatBaseE, %object\n"
++    ".size _ZN9GuestFlat10g_flatBaseE, 8\n"
++    "_ZN9GuestFlat10g_flatBaseE:\n"
++    ".zero 8\n"
++    ".popsection");
++inline void WriteFlatBase(uint8_t* base) noexcept {
++    asm volatile("str %1, [%0]" : : "r"(&g_flatBase), "r"(base) : "memory");
++}
 +#endif
  namespace {
  
  #if defined(_WIN32)
-@@ -56,8 +69,12 @@ constexpr size_t kHostPageSize = 0x1000;
+@@ -56,8 +83,12 @@ constexpr size_t kHostPageSize = 0x1000;
  #if !defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
  size_t HostPageSize()
  {
@@ -5060,7 +5665,7 @@ index 9504488..a275af0 100644
  }
  #endif
  
-@@ -70,6 +87,11 @@ using ProtectionFlags = DWORD;
+@@ -70,6 +101,11 @@ using ProtectionFlags = DWORD;
  constexpr ProtectionFlags kProtNone = PAGE_NOACCESS;
  constexpr ProtectionFlags kProtRead = PAGE_READONLY;
  constexpr ProtectionFlags kProtReadWrite = PAGE_READWRITE;
@@ -5072,7 +5677,7 @@ index 9504488..a275af0 100644
  #else
  using ProtectionFlags = int;
  constexpr ProtectionFlags kProtNone = PROT_NONE;
-@@ -206,6 +228,11 @@ bool ProtectRange(uint8_t* address, uint64_t size, ProtectionFlags protection) {
+@@ -206,6 +242,11 @@ bool ProtectRange(uint8_t* address, uint64_t size, ProtectionFlags protection) {
  #if defined(_WIN32)
      DWORD previous = 0;
      return VirtualProtect(address, static_cast<SIZE_T>(size), protection, &previous) != FALSE;
@@ -5084,7 +5689,7 @@ index 9504488..a275af0 100644
  #else
      return mprotect(address, static_cast<size_t>(size), protection) == 0;
  #endif
-@@ -260,6 +287,11 @@ void EnsureReservation() {
+@@ -260,6 +301,11 @@ void EnsureReservation() {
              "The flat guest reservation did not land on the fixed base the translated code was "
              "compiled against.");
      }
@@ -5096,7 +5701,7 @@ index 9504488..a275af0 100644
  #else
      void* requested = reinterpret_cast<void*>(kFixedFlatGuestBase);
  
-@@ -323,6 +355,11 @@ void MapGuestView(const Section& section, uint64_t sectionOffset, uint32_t guest
+@@ -323,6 +369,11 @@ void MapGuestView(const Section& section, uint64_t sectionOffset, uint32_t guest
              << ")";
          throw std::runtime_error(oss.str());
      }
@@ -5108,7 +5713,7 @@ index 9504488..a275af0 100644
  #else
      // MAP_FIXED is safe (and needs no particular kernel version) here specifically because we're
      // deliberately overwriting a sub-range of the PROT_NONE reservation this module already owns
-@@ -348,6 +385,12 @@ bool CommitPlaceholder(uint8_t* address, uint64_t size, ProtectionFlags protecti
+@@ -348,6 +399,12 @@ bool CommitPlaceholder(uint8_t* address, uint64_t size, ProtectionFlags protecti
                                     MEM_RESERVE | MEM_COMMIT | kMemReplacePlaceholder, protection,
                                     nullptr, 0);
      return result != nullptr;
@@ -5121,7 +5726,7 @@ index 9504488..a275af0 100644
  #else
      // No separate reserve-vs-commit step is needed: the anonymous PROT_NONE reservation this
      // range came from is already demand-zero backed, so mprotect() alone both "commits" and
-@@ -501,6 +544,184 @@ void ReportUnmappedCommit(uint32_t guestAddress, uint64_t blockBase, bool isWrit
+@@ -501,6 +558,184 @@ void ReportUnmappedCommit(uint32_t guestAddress, uint64_t blockBase, bool isWrit
      std::cerr.flush();
  }
  
@@ -5295,7 +5900,7 @@ index 9504488..a275af0 100644
 +
 +    for (auto& [key, section] : Sections()) section.hostView = reinterpret_cast<uint8_t*>(hostView[key]);
 +    g_base = reinterpret_cast<uint8_t*>(base);
-+    g_flatBase = g_base;
++    WriteFlatBase(g_base);
 +    g_requiresCheckedAccess = false;
 +    RT_LOG(RT_TAG_MEMORY) << "Horizon flat view at 0x" << std::hex << base << std::dec
 +                          << " (aliases: " << (mirrors + hostView.size()) << ", backing stores: "
@@ -5306,7 +5911,7 @@ index 9504488..a275af0 100644
  } // namespace
  
  bool IsActive() {
-@@ -510,7 +731,9 @@ bool IsActive() {
+@@ -510,7 +745,9 @@ bool IsActive() {
  void Initialize(const std::vector<RegionRequest>& regions) {
      std::lock_guard<std::mutex> lock(StateMutex());
  
@@ -5317,7 +5922,7 @@ index 9504488..a275af0 100644
      g_requiresCheckedAccess = HostPageSize() > kGuestPageSize;
  #elif defined(MKW_AARCH64_4K_PAGES)
      if (const long page = sysconf(_SC_PAGESIZE); page != 4096) {
-@@ -572,6 +795,17 @@ void Initialize(const std::vector<RegionRequest>& regions) {
+@@ -572,6 +809,17 @@ void Initialize(const std::vector<RegionRequest>& regions) {
          if (section.hostView == nullptr) {
              throw std::runtime_error(LastErrorText("MapViewOfFile for the host guest-RAM alias"));
          }
@@ -5335,7 +5940,7 @@ index 9504488..a275af0 100644
  #else
          // The section is an anonymous shared-memory object: the SAME physical pages get mapped
          // twice below (once here as the always-accessible host view, once per-region as the
-@@ -593,6 +827,9 @@ void Initialize(const std::vector<RegionRequest>& regions) {
+@@ -593,6 +841,9 @@ void Initialize(const std::vector<RegionRequest>& regions) {
  #endif
          Sections()[key] = section;
      }
@@ -5345,6 +5950,22 @@ index 9504488..a275af0 100644
  
      for (const auto& region : regions) {
          if (region.size == 0) continue;
+@@ -605,6 +856,15 @@ void Initialize(const std::vector<RegionRequest>& regions) {
+             MappedRegion{region.base, region.size, mappedSize, offset, section.hostView});
+     }
+ 
++#if defined(MKW_SWITCH_FLAT_ONLY)
++    // The translated code of this build has no checked path (guest_flat_memory.h).
++    if (g_requiresCheckedAccess) {
++        throw std::runtime_error(
++            "The flat guest memory view could not be built (see the [memory] line above), and this "
++            "build has no checked-access fallback. Launch the NRO from the Homebrew Menu over a title "
++            "(the loader grants the memory-mapping SVCs), or rebuild with -DMKW_SWITCH_CHECKED_ACCESS.");
++    }
++#endif
+     // MMIO stays inaccessible in both directions so the vectored handler can report missing HLE; the old
+     // PAGE_READONLY read window that returned zero turned missing devices into silent hangs instead.
+     if (!CommitPlaceholder(g_base + 0xCC000000u, 0x02000000u, kProtNone)) {
 diff --git a/runtime/src/hle/audio/ax_mix.cpp b/runtime/src/hle/audio/ax_mix.cpp
 index 0bb8fa0..697d98c 100644
 --- a/runtime/src/hle/audio/ax_mix.cpp
@@ -5406,11 +6027,60 @@ index eaf6809..f9821a8 100644
      const uint16_t rawSrcLeft = g_texCopyState.srcLeft;
      const uint16_t rawSrcTop = g_texCopyState.srcTop;
      const uint16_t rawSrcWidth = g_texCopyState.srcWidth;
+diff --git a/runtime/src/hle/gx/gx_cp_decode.h b/runtime/src/hle/gx/gx_cp_decode.h
+index 49fed99..2593379 100644
+--- a/runtime/src/hle/gx/gx_cp_decode.h
++++ b/runtime/src/hle/gx/gx_cp_decode.h
+@@ -27,7 +27,7 @@ inline void VcdLo(uint32_t value) {
+     assign(g_hleGxState.vtxDesc[GX_VA_CLR1], AttrType2(value >> 15));
+     assign(g_hleGxState.vtxDesc[GX_VA_NBT], GX_NONE);
+     if (changed) {
+-        g_hleGxState.InvalidateVtxLayoutHash();
++        g_hleGxState.InvalidateVtxDescHash();
+     }
+ }
+ 
+@@ -40,7 +40,7 @@ inline void VcdHi(uint32_t value) {
+         dst = next;
+     }
+     if (changed) {
+-        g_hleGxState.InvalidateVtxLayoutHash();
++        g_hleGxState.InvalidateVtxDescHash();
+     }
+ }
+ 
+@@ -80,7 +80,7 @@ inline void VatA(uint8_t fmt, uint32_t value) {
+     if (!SameVtxAttrFmt(oldPos, pos) || !SameVtxAttrFmt(oldNrm, nrm) ||
+         !SameVtxAttrFmt(oldClr0, clr0) || !SameVtxAttrFmt(oldClr1, clr1) ||
+         !SameVtxAttrFmt(oldTex0, tex0)) {
+-        g_hleGxState.InvalidateVtxLayoutHash();
++        g_hleGxState.InvalidateVtxAttrFmtRowHash(fmt);
+     }
+ }
+ 
+@@ -100,7 +100,7 @@ inline void VatB(uint8_t fmt, uint32_t value) {
+     bool changed = false;
+     for (int tex = 1; tex <= 4; ++tex) changed |= !SameVtxAttrFmt(before[tex - 1], attrs[GX_VA_TEX0 + tex]);
+     if (changed) {
+-        g_hleGxState.InvalidateVtxLayoutHash();
++        g_hleGxState.InvalidateVtxAttrFmtRowHash(fmt);
+     }
+ }
+ 
+@@ -119,7 +119,7 @@ inline void VatC(uint8_t fmt, uint32_t value) {
+     bool changed = false;
+     for (int tex = 4; tex <= 7; ++tex) changed |= !SameVtxAttrFmt(before[tex - 4], attrs[GX_VA_TEX0 + tex]);
+     if (changed) {
+-        g_hleGxState.InvalidateVtxLayoutHash();
++        g_hleGxState.InvalidateVtxAttrFmtRowHash(fmt);
+     }
+ }
+ 
 diff --git a/runtime/src/hle/gx/gx_dl.cpp b/runtime/src/hle/gx/gx_dl.cpp
-index 818478d..d187550 100644
+index 818478d..3d888f3 100644
 --- a/runtime/src/hle/gx/gx_dl.cpp
 +++ b/runtime/src/hle/gx/gx_dl.cpp
-@@ -10,8 +10,12 @@
+@@ -10,14 +10,37 @@
  // bytes with a 64-bit XXH3 digest (see GxDisplayListScanCache::CanReuse).
  #include <xxhash.h>
  
@@ -5424,7 +6094,32 @@ index 818478d..d187550 100644
  bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
                       uint32_t vertexBytes);
  }
-@@ -330,10 +334,13 @@ static void ApplyAuroraVtxStateForDlBegin(GXVtxFmt fmt) {
+ 
++#if defined(__SWITCH__)
++// A3 (aurora gx/fifo.hpp): WIICOMPILED_GX_A3=0 turns off the layout-hash rows and the scan-cache
++// front table below; the counters land in the benchmark summary's gx_a3_per_frame line.
++extern "C" int aurora_gx_a3_enabled(void);
++extern "C" uint64_t aurora_gx_a3_counters[];
++#endif
++
+ namespace {
+ 
++#if defined(__SWITCH__)
++// Read once: the layout hash formula must not change within a run.
++bool GxA3() noexcept {
++    static const bool enabled = aurora_gx_a3_enabled() != 0;
++    return enabled;
++}
++// aurora gx/fifo.hpp A3Counter indices.
++constexpr uint32_t kA3DlFrontHits = 4;
++constexpr uint32_t kA3LayoutHashes = 5;
++constexpr uint32_t kA3LayoutRowsHashed = 6;
++#endif
++
+ // Opcode constants and the stream helpers this file shares with gx_fifo.cpp /
+ // gx_vertex.cpp; see gx_stream_common.h.
+ using namespace GxCmd;
+@@ -330,10 +353,13 @@ static void ApplyAuroraVtxStateForDlBegin(GXVtxFmt fmt) {
  }
  
  
@@ -5440,7 +6135,7 @@ index 818478d..d187550 100644
      GXVtxFmt currentVtxFmt;
      uint64_t vtxLayoutHash;
      bool vtxLayoutHashDirty;
-@@ -345,6 +352,10 @@ struct HleGxVertexStateSnapshot {
+@@ -345,6 +371,10 @@ struct HleGxVertexStateSnapshot {
  };
  
  constexpr uint32_t kAllVtxAttrFmtRows = 0xFFu;
@@ -5451,7 +6146,47 @@ index 818478d..d187550 100644
  
  static HleGxVertexStateSnapshot CaptureGxVertexState() {
      HleGxVertexStateSnapshot snapshot;
-@@ -495,22 +506,25 @@ static uint64_t HashScanLayoutState() {
+@@ -384,6 +414,11 @@ static void RestoreGxVertexState(const HleGxVertexStateSnapshot& snapshot) {
+     }
+     g_hleGxState.vtxLayoutHash = snapshot.vtxLayoutHash;
+     g_hleGxState.vtxLayoutHashDirty = snapshot.vtxLayoutHashDirty;
++#if defined(__SWITCH__)
++    // The rows written back may differ from what their cached row hashes were taken over.
++    g_hleGxState.vtxAttrFmtRowsDirty =
++        static_cast<uint8_t>(g_hleGxState.vtxAttrFmtRowsDirty | (snapshot.vtxAttrFmtRows & 0xFFu));
++#endif
+     // The wholesale desc/attr-fmt overwrite above bypasses the per-field change
+     // checks that normally bump this, so mirrors must be told to resync.
+     ++g_hleGxState.vtxStateGeneration;
+@@ -486,31 +521,84 @@ struct DlScanCacheRecord {
+     std::vector<uint8_t> flattened{};
+ };
+ 
++#if defined(__SWITCH__)
++// A3: a direct-mapped table in front of `entries`. A hit in the unordered_map costs three
++// dependent cache misses (bucket, previous node, node key: ~0.7% of the main thread in
++// profile-run5 at GX__CallDisplayList+0xb7c..0xb88); a hit here, one 16-byte slot. Node addresses
++// are stable until entries.clear(), which also clears this table; insert_or_assign on an existing
++// key keeps the node. The record's own identity check still runs after either lookup.
++struct DlScanFrontSlot {
++    uint64_t key = 0;
++    DlScanCacheRecord* record = nullptr;
++};
++constexpr uint32_t kDlScanFrontSlots = 1024;
++inline uint32_t DlScanFrontIndex(uint64_t key) noexcept {
++    return static_cast<uint32_t>((key ^ (key >> 29) ^ (key >> 47)) & (kDlScanFrontSlots - 1u));
++}
++#endif
++
+ struct DlScanCacheState {
+     std::unordered_map<uint64_t, DlScanCacheRecord> entries{};
+     size_t storedCommandBytes = 0;
++#if defined(__SWITCH__)
++    std::unique_ptr<DlScanFrontSlot[]> front{}; // kDlScanFrontSlots, allocated on first use
++#endif
+ };
+ 
+ static uint64_t HashScanLayoutState() {
      if (!g_hleGxState.vtxLayoutHashDirty) {
          return g_hleGxState.vtxLayoutHash;
      }
@@ -5460,6 +6195,37 @@ index 818478d..d187550 100644
 -        hash ^= static_cast<uint64_t>(value);
 -        hash *= 1099511628211ull;
 -    };
++#if defined(__SWITCH__)
++    if (GxA3()) {
++        // The same 650 values as below, hashed in two levels: each vtxAttrFmt row (78 words) on
++        // its own, only when it changed (vtxAttrFmtRowsDirty), then vtxDesc plus the eight row
++        // hashes (168 bytes). A cache key either way: a different formula, the same state covered.
++        static_assert(sizeof(g_hleGxState.vtxDesc) == 26 * sizeof(uint32_t));
++        uint8_t dirtyRows = g_hleGxState.vtxAttrFmtRowsDirty;
++        while (dirtyRows != 0) {
++            const int fmt = __builtin_ctz(dirtyRows);
++            dirtyRows = static_cast<uint8_t>(dirtyRows & (dirtyRows - 1u));
++            uint32_t row[26 * 3];
++            uint32_t* out = row;
++            for (int attr = 0; attr < 26; ++attr, out += 3) {
++                const auto& f = g_hleGxState.vtxAttrFmt[fmt][attr];
++                out[0] = static_cast<uint32_t>(f.cnt);
++                out[1] = static_cast<uint32_t>(f.type);
++                out[2] = static_cast<uint32_t>(f.frac);
++            }
++            g_hleGxState.vtxAttrFmtRowHash[fmt] = static_cast<uint64_t>(XXH3_64bits(row, sizeof(row)));
++            ++aurora_gx_a3_counters[kA3LayoutRowsHashed];
++        }
++        g_hleGxState.vtxAttrFmtRowsDirty = 0;
++        uint64_t words[13 + 8];
++        std::memcpy(words, g_hleGxState.vtxDesc, sizeof(g_hleGxState.vtxDesc));
++        std::memcpy(words + 13, g_hleGxState.vtxAttrFmtRowHash, sizeof(g_hleGxState.vtxAttrFmtRowHash));
++        ++aurora_gx_a3_counters[kA3LayoutHashes];
++        g_hleGxState.vtxLayoutHash = static_cast<uint64_t>(XXH3_64bits(words, sizeof(words)));
++        g_hleGxState.vtxLayoutHashDirty = false;
++        return g_hleGxState.vtxLayoutHash;
++    }
++#endif
 +    // The same 650 values the byte-serial FNV-1a chain used to mix (one dependent 64-bit
 +    // multiply each, ~4k cycles on the Switch's A57 and run whenever the game changed its vertex
 +    // layout between lists), packed as 32-bit words and hashed with XXH3 instead. Padding bytes of
@@ -5487,7 +6253,55 @@ index 818478d..d187550 100644
      g_hleGxState.vtxLayoutHash = hash;
      g_hleGxState.vtxLayoutHashDirty = false;
      return g_hleGxState.vtxLayoutHash;
-@@ -1121,6 +1135,16 @@ static void ApplyAuroraVtxDesc() {
+@@ -544,9 +632,31 @@ static DlScanCacheProbe ProbeDlScanCache(const uint8_t* list, uint32_t listAddr,
+ 
+     auto& s_cache = DlScanCache();
+     const uint64_t key = DlScanCacheKey(listAddr, nbytes, layoutHash);
+-    const auto it = s_cache.entries.find(key);
+-    if (it != s_cache.entries.end()) {
+-        auto& record = it->second;
++    DlScanCacheRecord* found = nullptr;
++#if defined(__SWITCH__)
++    if (GxA3()) {
++        if (!s_cache.front) {
++            s_cache.front.reset(new DlScanFrontSlot[kDlScanFrontSlots]());
++        }
++        DlScanFrontSlot& slot = s_cache.front[DlScanFrontIndex(key)];
++        if (slot.record != nullptr && slot.key == key) {
++            found = slot.record;
++            ++aurora_gx_a3_counters[kA3DlFrontHits];
++        } else if (const auto it = s_cache.entries.find(key); it != s_cache.entries.end()) {
++            found = &it->second;
++            slot.key = key;
++            slot.record = found;
++        }
++    } else
++#endif
++    {
++        const auto it = s_cache.entries.find(key);
++        if (it != s_cache.entries.end()) {
++            found = &it->second;
++        }
++    }
++    if (found != nullptr) {
++        auto& record = *found;
+         const auto& entry = record.result;
+         const bool identityMatches = entry.listAddr == CanonicalizeGxMainRamAddress(listAddr) &&
+                                      entry.nbytes == nbytes && entry.layoutHash == layoutHash;
+@@ -595,7 +705,11 @@ static void StoreDlScanCache(uint32_t listAddr, uint32_t nbytes, uint64_t layout
+         s_cache.storedCommandBytes = 0;
+         replacing = false;
+         replacedBytes = 0;
+-    }
++#if defined(__SWITCH__)
++        if (s_cache.front) {
++            std::fill_n(s_cache.front.get(), kDlScanFrontSlots, DlScanFrontSlot{});
++        }
++#endif    }
+     DlScanCacheRecord record{};
+     record.result = entry;
+     record.mayContainDraw = mayContainDraw;
+@@ -1121,6 +1235,16 @@ static void ApplyAuroraVtxDesc() {
      if (!hadValidState) {
          s_appliedVtxStateMatchesHle = false;
      }
@@ -5504,7 +6318,7 @@ index 818478d..d187550 100644
      for (int attr = 0; attr < 26; ++attr) {
          if (attr == GX_VA_NBT) continue;
          const GXAttr gxAttr = static_cast<GXAttr>(attr);
-@@ -1134,15 +1158,17 @@ static void ApplyAuroraVtxDesc() {
+@@ -1134,15 +1258,17 @@ static void ApplyAuroraVtxDesc() {
          // (MLB skinned models) makes aurora mis-size each vertex and decode the rest of
          // the list as XF loads.
          if (!needsPublish && gxAttr <= GX_VA_TEX7) {
@@ -5523,7 +6337,7 @@ index 818478d..d187550 100644
          }
      }
      s_appliedVtxDescValid = true;
-@@ -1185,6 +1211,12 @@ static void ApplyAuroraVtxAttrFmtAll() {
+@@ -1185,6 +1311,12 @@ static void ApplyAuroraVtxAttrFmtAll() {
  }
  
  static void ApplyAuroraVtxAttrFmtForDisplayList(GXVtxFmt fmt, bool mixed) {
@@ -5536,7 +6350,7 @@ index 818478d..d187550 100644
      if (!mixed && fmt < GX_MAX_VTXFMT) {
          ApplyAuroraVtxAttrFmt(fmt);
          return;
-@@ -1206,6 +1238,44 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
+@@ -1206,6 +1338,44 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
      SyncAppliedVtxStateFromHleReal();
  }
  
@@ -5581,7 +6395,7 @@ index 818478d..d187550 100644
  static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX_ATTR>& maxIdx,
                                              const std::array<bool, GX_VA_MAX_ATTR>& sawIdx,
                                              GXVtxFmt vtxfmt,
-@@ -1252,7 +1322,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
+@@ -1252,7 +1422,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
              ok = false;
              continue;
          }
@@ -5595,10 +6409,45 @@ index 818478d..d187550 100644
      return ok;
  }
 diff --git a/runtime/src/hle/gx/gx_internal.h b/runtime/src/hle/gx/gx_internal.h
-index 8656dba..3351ce7 100644
+index 8656dba..7998058 100644
 --- a/runtime/src/hle/gx/gx_internal.h
 +++ b/runtime/src/hle/gx/gx_internal.h
-@@ -343,6 +343,15 @@ TexObjMeta& GetTexObjMeta(uint32_t addr);
+@@ -255,9 +255,34 @@ struct HleGxState {
+     size_t fifoReadOffset = 0;
+     size_t fifoByteCount = 0;
+ 
++#if defined(__SWITCH__)
++    // A3 (gx_dl.cpp's HashScanLayoutState): each vtxAttrFmt row is hashed on its own and the layout
++    // hash covers vtxDesc plus the eight row hashes, so a vtxDesc-only change (GXClearVtxDesc and
++    // GXSetVtxDesc before every mesh) no longer rehashes all 2.6 KB. Bit f set: rowHash[f] is stale.
++    uint8_t vtxAttrFmtRowsDirty = 0xFF;
++    uint64_t vtxAttrFmtRowHash[8]{};
++    // A vtxDesc-only mutation: every row hash stays valid.
++    void InvalidateVtxDescHash() noexcept {
++        vtxLayoutHashDirty = true;
++        ++vtxStateGeneration;
++    }
++    // A mutation of vtxAttrFmt[fmt] only.
++    void InvalidateVtxAttrFmtRowHash(uint32_t fmt) noexcept {
++        vtxLayoutHashDirty = true;
++        vtxAttrFmtRowsDirty = static_cast<uint8_t>(vtxAttrFmtRowsDirty | (fmt < 8 ? (1u << fmt) : 0xFFu));
++        ++vtxStateGeneration;
++    }
++#else
++    void InvalidateVtxDescHash() noexcept { InvalidateVtxLayoutHash(); }
++    void InvalidateVtxAttrFmtRowHash(uint32_t) noexcept { InvalidateVtxLayoutHash(); }
++#endif
+     void ResetVertex();
++    // Any vertex-layout mutation (every row hash goes stale too).
+     void InvalidateVtxLayoutHash() noexcept {
+         vtxLayoutHashDirty = true;
++#if defined(__SWITCH__)
++        vtxAttrFmtRowsDirty = 0xFF;
++#endif
+         ++vtxStateGeneration;
+     }
+     GXAttr NextEnabledAttr(int startAttr);
+@@ -343,6 +368,15 @@ TexObjMeta& GetTexObjMeta(uint32_t addr);
  TexObjMeta ExtractTexObjMetaFromGuest(uint32_t addr);
  bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta);
  TlutObjMeta& GetTlutObjMeta(uint32_t addr);
@@ -5614,7 +6463,7 @@ index 8656dba..3351ce7 100644
  GXTexObj* GetHostTexObj(uint32_t addr);
  GXTexObj* TryGetHostTexObj(uint32_t addr);
  GXTexObj* CreateHostTexObj(uint32_t addr);
-@@ -386,8 +395,29 @@ extern bool g_alphaCompareValid;
+@@ -386,8 +420,29 @@ extern bool g_alphaCompareValid;
  extern std::array<BoundTexInfo, 8> g_boundTexMaps;
  extern TexCopyState g_texCopyState;
  
@@ -6117,6 +6966,551 @@ index f2a82a5..22a237d 100644
      if(raw){
          float src[9]{};
          float m[12]{};
+diff --git a/runtime/src/hle/gx/gx_vertex.cpp b/runtime/src/hle/gx/gx_vertex.cpp
+index 80c9be0..cbf22cc 100644
+--- a/runtime/src/hle/gx/gx_vertex.cpp
++++ b/runtime/src/hle/gx/gx_vertex.cpp
+@@ -37,7 +37,7 @@ extern "C" void GX__ClearVtxDesc_8016dc34() {
+         changed |= g_hleGxState.vtxDesc[i] != GX_NONE;
+         g_hleGxState.vtxDesc[i]=GX_NONE;
+     }
+-    if (changed) g_hleGxState.InvalidateVtxLayoutHash();
++    if (changed) g_hleGxState.InvalidateVtxDescHash();
+     // GXClearVtxDesc resets descriptors only; array base/stride state persists.
+     GXClearVtxDesc();
+ }
+@@ -51,7 +51,7 @@ extern "C" void GX__SetVtxDesc_8016d3a4(uint32_t a, uint32_t t) {
+     if (a == GX_VA_NBT) {
+         g_hleGxState.vtxDesc[GX_VA_NBT] = GX_NONE;
+     }
+-    if (g_hleGxState.vtxDesc[attr] != oldType) g_hleGxState.InvalidateVtxLayoutHash();
++    if (g_hleGxState.vtxDesc[attr] != oldType) g_hleGxState.InvalidateVtxDescHash();
+     if(IsMatrixIndexAttr((GXAttr)attr)) return;
+     GXSetVtxDesc((GXAttr)a, (t==GX_INDEX8||t==GX_INDEX16)?GX_DIRECT:(GXAttrType)t);
+ }
+@@ -114,7 +114,7 @@ extern "C" void GX__SetVtxAttrFmt_8016dc68(uint32_t vf, uint32_t a, uint32_t c,
+         }
+         const auto& newFmt = g_hleGxState.vtxAttrFmt[vf][attr];
+         if (oldFmt.cnt != newFmt.cnt || oldFmt.type != newFmt.type || oldFmt.frac != newFmt.frac) {
+-            g_hleGxState.InvalidateVtxLayoutHash();
++            g_hleGxState.InvalidateVtxAttrFmtRowHash(vf);
+         }
+     }
+     if (vf >= GX_MAX_VTXFMT || a < GX_VA_POS || a >= GX_VA_MAX_ATTR) {
+diff --git a/runtime/src/hle/mlb/envmap_natives.cpp b/runtime/src/hle/mlb/envmap_natives.cpp
+new file mode 100644
+index 0000000..01ef176
+--- /dev/null
++++ b/runtime/src/hle/mlb/envmap_natives.cpp
+@@ -0,0 +1,508 @@
++// MLB Power Pros 2008 (RL8E54): a native 0x8000D770, the CPU sphere-map pass, the hottest game
++// function of a match on the Switch main thread (run 5 profile: 4.1% self plus ~0.8% in the sqrt
++// native it calls once per vertex).
++//
++// void EnvMapCoords(Model* m) (only caller 0x8000CD0C): for every vertex of every mesh of
++// m->shape (m+0x18) it computes a sphere-map texture coordinate pair. Per vertex: p = M * pos
++// (PSMTXMultVec), n = R * nrm (PSMTXMultVec with the translation column zeroed, or PSMTXMultVecSR
++// on the same skinning matrix), p normalized (PSVECNormalize 0x800635B4: frsqrte and one
++// Newton-Raphson step), r = p - 2 (p.n) n, r.z += 1, s = 0.5 / sqrt(r.r) (sqrt at 0x80128FD0, a
++// zero root replaced by 1e-7), u = su (0.5 - r.x s), v = sv (0.5 - r.y s), two floats stored per
++// vertex in the mesh's current UV buffer (the descriptor flips buffers on every call through
++// 0x80058B98). M is the view-model matrix (PSMTXConcat of the camera matrix with the model's);
++// skinned models (byte gfx+0x2030 set) take one matrix per vertex from the palette at gfx+0x2034
++// indexed by a byte stream. docs/en/reverse-engineering.md section 10 has the layout.
++//
++// The translation spends this on the scalar-single emulation of every operation (each fmuls
++// rounds its second operand to 25 bits, each result goes through a double), on the stack round
++// trips of the inlined leaves (12 psq loads, 8 psq stores, 6 lfs and 3 stfs per vertex) and on
++// the full register sync around the sqrt call. Here a vertex is the same arithmetic in host
++// single precision, on the facts below, the stack scratch and the sqrt native's frame are
++// written once (only the last vertex's values are observable) and the root is computed inline.
++//
++// Why host singles give the translation's bits (round to nearest; FPCR.FZ on or off, as it is):
++// every operand of every single op here is a single (lfs/psq loads and earlier single results),
++// so PpcForce25BitInline(c) is the identity, a*c is exact in a double, and rounding a double sum,
++// quotient or square root of singles to single equals the correctly rounded single result
++// (53 >= 2*24 + 2). FCVT and the single op flush tiny results the same way under FZ (ARMv8
++// FPRound), and FZ flushes subnormal inputs in both. ps_madd is the same fused fmla per lane.
++// psq_st (both widths) turns a subnormal into its signed zero: kept explicitly. The normalize
++// step's frsqrte, its three fmuls and the fnmsubs use the translation's own helpers (frsqrte's
++// estimate is not a single). NaN results are where the two could part (the translation resolves
++// ps lanes x86-style, and which of two NaN operands a plain double op returns depends on the
++// operand order its compiler picked), so a NaN never reaches the fast path's output: see below.
++//
++// Rollback: everything this function writes before and during the vertex loops is undoable
++// (the stack between sp-64 and r1+8 is snapshotted at entry, the UV words and the buffer flip
++// go through an undo log), and no guest code runs before the loops end. When any vertex or mesh
++// falls outside the fast path, every write is undone, the context restored, and the translation
++// (kept by REGISTER_NATIVE_FUNCTION_AS) runs the whole call: bit for bit what it would have
++// done. Outside the fast path: a vertex with a NaN anywhere (it reaches u or v) or with r.r
++// zero, infinite or NaN (the sqrt native's special paths, errno), a mesh whose arrays wrap,
++// touch the MMIO window, overlap the stack area the loop writes or caches ([sp-32, sp+0x100))
++// or whose UV buffer overlaps the small-data constants ([r2-0x8000, r2)), a descriptor, index
++// or palette read in the MMIO window or that stack area, an undo log overflow, GQR0 != 0 and
++// the checked access mode.
++//
++// Kept exactly on the fast path (cross-checked with the translation in qemu-aarch64, see the
++// snippet header): every guest store (frame, saved registers, the 3x4 copies, the descriptor
++// flip, the UV pairs, the stack scratch, the sqrt native's frame below sp), the registers each
++// callee sees (0x80059350 saves r27-r31 and LR into its frame: r21-r31 track the original,
++// ctx->lr is 0x8000DC08 there as the translation sets it), r1, r2, r13, r14-r31, f14-f31, LR,
++// CR2-CR4 and GQRs at return. The volatile registers (r0, r3-r12, f0-f13, CR0/1/5-7, XER, CTR)
++// are left as the EABI allows: the translation itself leaves different values there depending
++// on whether its callees run state-free, and the only caller reloads none of them.
++//
++// This file builds like the translated code (-O2 -fno-fast-math -ffp-contract=off, outside the
++// unity build: runtime/CMakeLists.txt): a contracted multiply-add or a reassociated sum would
++// change bits, and -ffinite-math-only would fold the NaN tests away.
++#if defined(__SWITCH__)
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++
++extern "C" void func_8000D770(CpuContext* ctx);              // the translation (kept: _AS registration)
++extern "C" void MLB_PSMTXConcat_800A890C(CpuContext* ctx);   // hle/mlb/mtx_natives.cpp
++
++namespace mlb_envmap {
++
++// ---- guest memory, flat view (callers have proven the range plain) ----
++
++inline uint8_t* Host(uint32_t address) { return MKW_FLAT_GUEST_BASE + address; }
++
++inline uint32_t Bits(float value) {
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof bits);
++    return bits;
++}
++
++inline float Float(uint32_t bits) {
++    float value;
++    std::memcpy(&value, &bits, sizeof value);
++    return value;
++}
++
++inline uint32_t Load32(uint32_t address) {
++    uint32_t raw;
++    std::memcpy(&raw, Host(address), sizeof raw);
++    return __builtin_bswap32(raw);
++}
++
++inline float LoadF(uint32_t address) { return Float(Load32(address)); }
++
++inline void Store32(uint32_t address, uint32_t value) {
++    const uint32_t raw = __builtin_bswap32(value);
++    std::memcpy(Host(address), &raw, sizeof raw);
++}
++
++inline void Store64(uint32_t address, uint64_t value) {
++    const uint64_t raw = __builtin_bswap64(value);
++    std::memcpy(Host(address), &raw, sizeof raw);
++}
++
++// psq_st's single narrowing of a non-NaN lane: a subnormal or zero keeps only its sign.
++inline float PsqStored(float value) {
++    const uint32_t bits = Bits(value);
++    return (bits & 0x7FFFFFFFu) < 0x00800000u ? Float(bits & 0x80000000u) : value;
++}
++
++// One instruction each, so nothing can be fused, reassociated or widened.
++inline float Mul(float a, float b) { float r; __asm__("fmul %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++inline float Add(float a, float b) { float r; __asm__("fadd %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++inline float Sub(float a, float b) { float r; __asm__("fsub %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++inline float Div(float a, float b) { float r; __asm__("fdiv %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++inline float Fma(float a, float c, float b) {  // a * c + b, one rounding (ps_madd's lane)
++    float r;
++    __asm__("fmadd %s0, %s1, %s2, %s3" : "=w"(r) : "w"(a), "w"(c), "w"(b));
++    return r;
++}
++inline float SqrtS(float a) { float r; __asm__("fsqrt %s0, %s1" : "=w"(r) : "w"(a)); return r; }
++inline double SqrtD(double a) { double r; __asm__("fsqrt %d0, %d1" : "=w"(r) : "w"(a)); return r; }
++inline double Widen(float a) { double r; __asm__("fcvt %d0, %s1" : "=w"(r) : "w"(a)); return r; }
++
++// ---- ranges ----
++
++constexpr uint32_t kStackBelow = 32u;    // the sqrt native's frame under sp
++constexpr uint32_t kStackAbove = 0x100u; // scratch, matrices and the palette pointer up to sp+0xFC
++
++// [address, address + length) neither wraps nor touches 0xCC000000-0xCDFFFFFF.
++inline bool Plain(uint32_t address, uint64_t length) {
++    const uint64_t end = static_cast<uint64_t>(address) + length;
++    return end <= 0x100000000ull && (end <= 0xCC000000ull || address >= 0xCE000000u);
++}
++
++inline bool Disjoint(uint64_t a, uint64_t aLength, uint64_t b, uint64_t bLength) {
++    return a + aLength <= b || b + bLength <= a;
++}
++
++// ---- rollback ----
++
++// The UV words and the buffer flip, with the values they replaced. Guest code runs on the main
++// thread only and no guest call happens while the log is live, so one log serves every call.
++struct UndoLog {
++    static constexpr uint32_t kCapacity = 16384;
++    uint32_t address[kCapacity];
++    uint32_t old[kCapacity];
++    uint32_t count;
++};
++UndoLog g_undo;
++
++[[gnu::always_inline]] inline void LoggedStore32(uint32_t address, uint32_t value) {
++    g_undo.address[g_undo.count] = address;
++    g_undo.old[g_undo.count] = Load32(address);
++    ++g_undo.count;
++    Store32(address, value);
++}
++
++struct Call {
++    CpuContext* ctx;
++    uint32_t sp, r2;
++    uint64_t stackGuard;  // sp - 32
++    uint64_t sdataGuard;  // r2 - 0x8000
++};
++
++// A read or write the loops make: plain RAM outside the stack area they write or cache.
++inline bool Clear(const Call& c, uint32_t address, uint64_t length) {
++    return Plain(address, length) && Disjoint(address, length, c.stackGuard, kStackBelow + kStackAbove);
++}
++
++// ---- the loop's constants and stack inputs ----
++
++struct Consts {
++    float two, one, zero, half, su, sv;  // registers set up before the mesh loop
++    float nz, nh, n3, alt;              // loaded per vertex by the translation (normalize, zero root)
++};
++
++struct Scratch {  // the last vertex's stack values, written once after the loops
++    float p[3], n[3], r[3];
++    float sum;
++    bool pending;
++};
++
++struct Layout {   // stack offsets of one of the two loops
++    uint32_t p, n, r;
++};
++
++// ---- one vertex in host singles ----
++
++struct Vec { float x, y, z; };
++
++// PSMTXMultVec, each row: (m0 x + m2 z) + (m1 y + m3) with ps_mul, ps_madd and ps_sum0, stored by psq_st.
++inline float Row(const float* m, float x, float y, float z) {
++    return PsqStored(Add(Fma(m[2], z, Mul(m[0], x)), Fma(m[3], 1.0f, Mul(m[1], y))));
++}
++
++inline Vec MultVec(const float* m, const Vec& v) {
++    return {Row(m, v.x, v.y, v.z), Row(m + 4, v.x, v.y, v.z), Row(m + 8, v.x, v.y, v.z)};
++}
++
++// PSMTXMultVecSR, each row: (m0 x + m1 y) + m2 z with ps_mul, ps_sum0 and ps_madd.
++inline float RowSR(const float* m, float x, float y, float z) {
++    return PsqStored(Fma(m[2], z, Add(Mul(m[0], x), Mul(m[1], y))));
++}
++
++inline Vec MultVecSR(const float* m, const Vec& v) {
++    return {RowSR(m, v.x, v.y, v.z), RowSR(m + 4, v.x, v.y, v.z), RowSR(m + 8, v.x, v.y, v.z)};
++}
++
++// PSVECNormalize in place (0x800635B4): s = (z z + x x) + y y; unchanged when s equals its zero
++// constant; else k from frsqrte and one Newton step (the translation's helpers), p *= k.
++inline Vec Normalize(const Vec& p, const Consts& k) {
++    const float s = Add(Fma(p.z, p.z, Mul(p.x, p.x)), Mul(p.y, p.y));
++    if (Widen(s) == Widen(k.nz)) return p;
++    const double sd = Widen(s);
++    const double e = PPC_Frsqrte(sd);
++    double f6 = PpcFmulsInline(e, e);
++    const double f0 = PpcFmulsInline(e, Widen(k.nh));
++    f6 = PPC_Fnmsubs(f6, sd, Widen(k.n3));
++    const float scale = static_cast<float>(PpcFmulsInline(f6, f0));
++    return {PsqStored(Mul(p.x, scale)), PsqStored(Mul(p.y, scale)), PsqStored(Mul(p.z, scale))};
++}
++
++inline Vec LoadVec(uint32_t address) { return {LoadF(address), LoadF(address + 4u), LoadF(address + 8u)}; }
++
++inline void LoadMatrix(uint32_t address, float* m) {
++    for (int i = 0; i < 12; ++i) m[i] = LoadF(address + 4u * static_cast<uint32_t>(i));
++}
++
++// One vertex; false (nothing stored) when it is not for the fast path.
++template <bool Skinned>
++[[gnu::always_inline]] inline bool Vertex(const float* m, const float* rot, uint32_t pos, uint32_t nrm,
++                                          uint32_t out, const Consts& k, Scratch& s) {
++    const Vec p = Normalize(MultVec(m, LoadVec(pos)), k);
++    const Vec n = Skinned ? MultVecSR(m, LoadVec(nrm)) : MultVec(rot, LoadVec(nrm));
++    const float t = Mul(k.two, Add(Mul(p.z, n.z), Add(Mul(p.x, n.x), Mul(p.y, n.y))));
++    const float rx = Sub(p.x, Mul(n.x, t));
++    const float ry = Sub(p.y, Mul(n.y, t));
++    const float rz = Add(k.one, Sub(p.z, Mul(n.z, t)));
++    const float sum = Add(Mul(rz, rz), Add(Mul(rx, rx), Mul(ry, ry)));
++    if (!(sum > 0.0f) || !(sum < INFINITY)) [[unlikely]] return false;
++    float root = SqrtS(sum);
++    if (Widen(k.zero) == Widen(root)) root = k.alt;
++    const float scale = Div(k.half, root);
++    const float u = Mul(k.su, Sub(k.half, Mul(rx, scale)));
++    const float v = Mul(k.sv, Sub(k.half, Mul(ry, scale)));
++    if (std::isnan(u) || std::isnan(v)) [[unlikely]] return false;
++    LoggedStore32(out, Bits(u));
++    LoggedStore32(out + 4u, Bits(v));
++    s.p[0] = p.x; s.p[1] = p.y; s.p[2] = p.z;
++    s.n[0] = n.x; s.n[1] = n.y; s.n[2] = n.z;
++    s.r[0] = rx; s.r[1] = ry; s.r[2] = rz;
++    s.sum = sum;
++    s.pending = true;
++    return true;
++}
++
++// The stack as the last vertex left it, the sqrt native's frame included.
++inline void Flush(uint32_t sp, const Layout& l, Scratch& s) {
++    if (!s.pending) return;
++    for (uint32_t i = 0; i < 3; ++i) {
++        Store32(sp + l.p + 4u * i, Bits(s.p[i]));
++        Store32(sp + l.n + 4u * i, Bits(s.n[i]));
++        Store32(sp + l.r + 4u * i, Bits(s.r[i]));
++    }
++    const double x = Widen(s.sum);
++    const double root = SqrtD(x);
++    uint64_t xBits, rootBits;
++    std::memcpy(&xBits, &x, sizeof xBits);
++    std::memcpy(&rootBits, &root, sizeof rootBits);
++    Store32(sp - 32u, sp);
++    Store64(sp - 24u, xBits);
++    Store32(sp - 16u, static_cast<uint32_t>(rootBits >> 32));
++    Store32(sp - 12u, static_cast<uint32_t>(rootBits));
++    s.pending = false;
++}
++
++// A mesh's arrays: plain, clear of the stack area, the UV buffer clear of the constants, and
++// room in the log for its UV words.
++inline bool MeshFits(const Call& c, uint32_t pos, uint32_t nrm, uint32_t out, uint64_t vertices) {
++    return 2u * vertices <= UndoLog::kCapacity - g_undo.count && Clear(c, pos, 12u * vertices) &&
++           Clear(c, nrm, 12u * vertices) && Clear(c, out, 8u * vertices) &&
++           Disjoint(out, 8u * vertices, c.sdataGuard, 0x8000u);
++}
++
++// ---- the shape descriptor accessors (leaves 0x80059278-0x80059314, inlined); false = rollback ----
++
++struct Mesh { uint32_t pos, nrm, uv, vertices; };
++
++inline bool ReadMesh(const Call& c, uint32_t shape, uint32_t index, Mesh& mesh) {
++    if (!Clear(c, shape + 0x18u, 16u)) return false;
++    const uint32_t buffer = Load32(shape + 0x18u);
++    const uint32_t meshes = Load32(shape + 0x24u);
++    const uint32_t entry = Load32(shape + 0x20u) + (index + buffer * meshes) * 0x1Cu;  // mullw, add, mulli
++    if (!Clear(c, entry, 0x1Cu)) return false;
++    mesh.pos = Load32(entry + 8u);                                                     // 0x800592CC
++    mesh.nrm = Load32(entry + 12u);                                                    // 0x800592F0
++    if (((*Host(entry + 0x18u) >> 3) & 1u) != 0) {                                     // 0x80059290
++        const uint32_t holder = Load32(entry);
++        if (!Clear(c, holder + 0x18u, 4u)) return false;
++        mesh.uv = Load32(holder + 0x18u);
++    } else {
++        mesh.uv = 0;
++    }
++    mesh.vertices = static_cast<uint32_t>((static_cast<uint64_t>(mesh.nrm - mesh.pos) * 0xAAAAAAABull) >> 32) >> 3;
++    return true;                                                                       // 0x80059314
++}
++
++// Undo every write since entry and run the translation from the entry state.
++[[gnu::noinline, gnu::cold]] void Rollback(CpuContext* ctx, const CpuContext& entry, uint32_t stackLow,
++                                           const uint8_t* stack, uint32_t stackLength) {
++    while (g_undo.count != 0) {
++        --g_undo.count;
++        Store32(g_undo.address[g_undo.count], g_undo.old[g_undo.count]);
++    }
++    std::memcpy(Host(stackLow), stack, stackLength);
++    *ctx = entry;
++    func_8000D770(ctx);
++}
++
++}  // namespace mlb_envmap
++
++extern "C" void MLB_EnvMapCoords_8000D770(CpuContext* ctx) {
++    using namespace mlb_envmap;
++    HleTraceCall("MLB_EnvMapCoords_8000D770");
++    const uint32_t r1 = ctx->gpr[1], r2 = ctx->gpr[2], r13 = ctx->gpr[13];
++    const uint32_t model = ctx->gpr[3];
++    const uint32_t sp = r1 + (0u - 400u - (r1 & 15u));
++    // Everything the fast path writes on the stack lies in [sp-64, r1+8): PSMTXConcat's back
++    // chain at sp-64 up to the LR save word at r1+4.
++    const uint32_t stackLow = sp - 64u;
++    const uint32_t stackLength = r1 + 8u - stackLow;
++    if (GuestFlat::RequiresCheckedAccess() || ctx->gqr[0] != 0 || sp < 64u || r2 < 0x8000u ||
++        !Plain(stackLow, stackLength) || !Plain(model + 0x18u, 12u) || !Plain(r13 - 30108u, 4u) ||
++        !Plain(r2 - 0x8000u, 0x8000u)) [[unlikely]] {
++        func_8000D770(ctx);
++        return;
++    }
++    const CpuContext entry = *ctx;
++    uint8_t stack[64 + 400 + 15 + 8];
++    std::memcpy(stack, Host(stackLow), stackLength);
++    g_undo.count = 0;
++    const Call c{ctx, sp, r2, static_cast<uint64_t>(sp) - kStackBelow, static_cast<uint64_t>(r2) - 0x8000u};
++#define MLB_ENVMAP_ROLLBACK() do { Rollback(ctx, entry, stackLow, stack, stackLength); return; } while (false)
++
++    uint32_t r21 = ctx->gpr[21], r22 = ctx->gpr[22], r23 = ctx->gpr[23], r24 = ctx->gpr[24], r25 = ctx->gpr[25];
++    uint32_t r26 = ctx->gpr[26], r27 = ctx->gpr[27], r28 = ctx->gpr[28], r29 = ctx->gpr[29], r30 = ctx->gpr[30];
++    uint32_t r31 = ctx->gpr[31];
++
++    // Prologue: clrlwi/subfic/stwux (a 16-byte aligned frame of 0x190 + (r1 & 15)), LR, f26-f31 as
++    // stfd + psq_st pairs, _savegpr_21.
++    Store32(sp, r1);
++    Store32(r1 + 4u, ctx->lr);
++    for (uint32_t i = 0; i < 6; ++i) {
++        const double saved = ctx->fpr[31 - i].d;
++        MemoryInline::FlatWriteRamFloat64(r1 - 16u - 16u * i, saved);
++        PPC_PsqStStackInline<0u, 0u>(ctx, r1 - 8u - 16u * i, PPC_PsFromScalarInline(saved));
++    }
++    const uint32_t r11 = r1 - 96u;
++    for (uint32_t reg = 21; reg <= 31; ++reg) Store32(r11 - 4u * (32u - reg), ctx->gpr[reg]);
++    ctx->gpr[1] = sp;
++    ctx->xer |= 0x20000000u;  // subfic's carry: 0xFFFFFE70 >= (r1 & 15)
++
++    const uint32_t shape0 = Load32(model + 0x18u);
++    r31 = model;
++    if (shape0 != 0) {
++        if (!Clear(c, shape0 + 24u, 8u)) MLB_ENVMAP_ROLLBACK();
++        // stfs of lfs values: the double the load made (FZ flushes a subnormal there), narrowed back.
++        const double init = Widen(LoadF(r2 - 32660u));
++        for (uint32_t o = 96; o <= 108; o += 4) MemoryInline::FlatWriteRamFloat32(sp + o, init);
++        // 0x80058B98: flip the shape's UV buffer, buffer = buffer + 1 < count ? buffer + 1 : 0.
++        {
++            uint32_t next = Load32(shape0 + 24u) + 1u;
++            const uint32_t buffers = Load32(shape0 + 28u);
++            LoggedStore32(shape0 + 24u, next);
++            if (static_cast<int32_t>(next) >= static_cast<int32_t>(buffers)) next = 0;
++            LoggedStore32(shape0 + 24u, next);
++        }
++        // M = gfx[+0x1F5C] * copy of gfx[+0x1FCC] (0x8005FA84 -> PSMTXConcat), at sp+0xA0.
++        const uint32_t gfx = Load32(r13 - 30108u);
++        if (!Clear(c, gfx + 8028u, 48u) || !Clear(c, gfx + 8140u, 48u) || !Clear(c, gfx + 0x2030u, 12u))
++            MLB_ENVMAP_ROLLBACK();
++        for (uint32_t o = 0; o < 48; o += 8) {
++            const uint32_t a = Load32(gfx + 8140u + o);
++            const uint32_t b = Load32(gfx + 8144u + o);
++            Store32(sp + 212u + o, b);
++            Store32(sp + 208u + o, a);
++        }
++        ctx->gpr[0] = sp + 160u;
++        ctx->gpr[3] = gfx + 8028u;
++        ctx->gpr[4] = sp + 208u;
++        ctx->gpr[5] = sp + 160u;
++        MLB_PSMTXConcat_800A890C(ctx);
++        // R = M without its translation column, at sp+0x70 (r28-r30 keep M's first row).
++        for (uint32_t w = 0; w < 12; ++w) Store32(sp + 0x70u + 4u * w, Load32(sp + 0xA0u + 4u * w));
++        r30 = Load32(sp + 0xA0u);
++        r29 = Load32(sp + 0xA4u);
++        r28 = Load32(sp + 0xA8u);
++        const double column = Widen(LoadF(r2 - 32656u));
++        for (uint32_t o = 0x7Cu; o <= 0x9Cu; o += 0x10u) MemoryInline::FlatWriteRamFloat32(sp + o, column);
++        float m[12], rot[12];
++        LoadMatrix(sp + 0xA0u, m);
++        LoadMatrix(sp + 0x70u, rot);
++        // 0x80046610(gfx, sp+0x10, sp+0x14): the skinning palette and its companion word, or zeros.
++        const uint32_t gfx2 = Load32(r13 - 30108u);
++        if (gfx2 != gfx) MLB_ENVMAP_ROLLBACK();  // only if a stack store hit the pointer: no fast path
++        if (*Host(gfx2 + 0x2030u) != 0) {
++            Store32(sp + 0x14u, Load32(gfx2 + 0x2038u));
++            Store32(sp + 0x10u, Load32(gfx2 + 0x2034u));
++        } else {
++            Store32(sp + 0x14u, 0);
++            Store32(sp + 0x10u, 0);
++        }
++        Consts k;
++        k.two = LoadF(r2 - 32652u);
++        k.one = LoadF(r2 - 32660u);
++        k.zero = LoadF(r2 - 32656u);
++        k.half = LoadF(r2 - 32644u);
++        k.su = LoadF(sp + 96u);
++        k.sv = LoadF(sp + 100u);
++        k.nz = LoadF(r2 - 30824u);
++        k.nh = LoadF(r2 - 30812u);
++        k.n3 = LoadF(r2 - 30808u);
++        k.alt = LoadF(r2 - 32648u);
++        const bool skinned = Load32(sp + 0x10u) != 0;
++        // The model's fields are read again between vertices: not in the stack area.
++        if (!Clear(c, r31 + 0x18u, 12u) || !Clear(c, Load32(r31 + 24u) + 0x24u, 4u)) MLB_ENVMAP_ROLLBACK();
++        const uint32_t meshes = Load32(Load32(r31 + 24u) + 0x24u);  // 0x80059278
++        Scratch s{};
++        if (!skinned) {
++            // Loop 1 (0x8000D918): pos r30, nrm r27, uv r26, i r24 < n r28 over meshes r25 < r29.
++            r29 = meshes;
++            for (r25 = 0; static_cast<int32_t>(r25) < static_cast<int32_t>(r29); ++r25) {
++                Mesh mesh;
++                if (!ReadMesh(c, Load32(r31 + 24u), r25, mesh)) MLB_ENVMAP_ROLLBACK();
++                r30 = mesh.pos; r27 = mesh.nrm; r26 = mesh.uv; r28 = mesh.vertices;
++                r24 = 0;
++                const int32_t count = static_cast<int32_t>(r28);
++                if (count <= 0) continue;
++                if (!MeshFits(c, r30, r27, r26, static_cast<uint64_t>(count))) MLB_ENVMAP_ROLLBACK();
++                for (; static_cast<int32_t>(r24) < count; ++r24, r30 += 12u, r27 += 12u, r26 += 8u)
++                    if (!Vertex<false>(m, rot, r30, r27, r26, k, s)) [[unlikely]] MLB_ENVMAP_ROLLBACK();
++            }
++            Flush(sp, Layout{0x54u, 0x48u, 0x3Cu}, s);
++            ctx->fpr[26].d = Widen(k.sv); ctx->fpr[27].d = Widen(k.su); ctx->fpr[28].d = Widen(k.half);
++            ctx->fpr[29].d = Widen(k.zero); ctx->fpr[30].d = Widen(k.one); ctx->fpr[31].d = Widen(k.two);
++        } else {
++            // Loop 2 (0x8000DA90): M = [sp+0x10] + 48 * byte[r23]; pos r25, nrm r26, uv r27,
++            // i r22 < n r29 over meshes r24 < r28; r30 steps the index stream table, r21 keeps M.
++            const uint32_t palette = Load32(sp + 0x10u);
++            r28 = meshes;
++            r30 = 0;
++            for (r24 = 0; static_cast<int32_t>(r24) < static_cast<int32_t>(r28); ++r24, r30 += 4u) {
++                Mesh mesh;
++                if (!ReadMesh(c, Load32(r31 + 24u), r24, mesh)) MLB_ENVMAP_ROLLBACK();
++                r25 = mesh.pos; r26 = mesh.nrm; r27 = mesh.uv;
++                // 0x80059280 only computes an address nobody reads.
++                const uint32_t streams = Load32(r31 + 32u);
++                if (!Clear(c, streams + r30, 4u)) MLB_ENVMAP_ROLLBACK();
++                r23 = Load32(streams + r30);
++                r29 = mesh.vertices;
++                r22 = 0;
++                const int32_t count = static_cast<int32_t>(r29);
++                if (count <= 0) continue;
++                if (!MeshFits(c, r25, r26, r27, static_cast<uint64_t>(count))) MLB_ENVMAP_ROLLBACK();
++                for (; static_cast<int32_t>(r22) < count; ++r22, ++r23, r25 += 12u, r26 += 12u, r27 += 8u) {
++                    if (!Clear(c, r23, 1u)) [[unlikely]] MLB_ENVMAP_ROLLBACK();
++                    const uint32_t matrix = palette + 48u * *Host(r23);
++                    if (!Clear(c, matrix, 48u)) [[unlikely]] MLB_ENVMAP_ROLLBACK();
++                    float mi[12];
++                    LoadMatrix(matrix, mi);
++                    if (!Vertex<true>(mi, mi, r25, r26, r27, k, s)) [[unlikely]] MLB_ENVMAP_ROLLBACK();
++                    r21 = matrix;
++                }
++            }
++            Flush(sp, Layout{0x30u, 0x24u, 0x18u}, s);
++            ctx->fpr[26].d = Widen(k.zero); ctx->fpr[27].d = Widen(k.half); ctx->fpr[28].d = Widen(k.su);
++            ctx->fpr[29].d = Widen(k.sv); ctx->fpr[30].d = Widen(k.two); ctx->fpr[31].d = Widen(k.one);
++        }
++        g_undo.count = 0;
++        // 0x80059350(shape): flushes the UV buffers (its frame saves r27-r31 and LR), then
++        // GXInvalidateVtxCache. Guest code from here on: no rollback past this point.
++        ctx->gpr[3] = Load32(r31 + 24u);
++        ctx->gpr[21] = r21; ctx->gpr[22] = r22; ctx->gpr[23] = r23; ctx->gpr[24] = r24; ctx->gpr[25] = r25;
++        ctx->gpr[26] = r26; ctx->gpr[27] = r27; ctx->gpr[28] = r28; ctx->gpr[29] = r29; ctx->gpr[30] = r30;
++        ctx->gpr[31] = r31;
++        ctx->lr = 0x8000DC08u;
++        InvokeDirectCpu<0x80059350u>(ctx);
++        InvokeDirectCpu<0x800C48D4u>(ctx);
++    }
++#undef MLB_ENVMAP_ROLLBACK
++
++    // Epilogue: f26-f31 from their stfd slots, _restgpr_21, LR, r1 from the back chain.
++    const uint32_t r10 = MemoryInline::FlatRead32(sp);
++    const uint32_t r11e = r10 - 96u;
++    for (uint32_t i = 0; i < 6; ++i) ctx->fpr[31 - i].d = MemoryInline::FlatReadFloat64(r10 - 16u - 16u * i);
++    for (uint32_t reg = 21; reg <= 31; ++reg) ctx->gpr[reg] = MemoryInline::FlatRead32(r11e - 4u * (32u - reg));
++    const uint32_t lr = MemoryInline::FlatRead32(r10 + 4u);
++    ctx->gpr[0] = lr;
++    ctx->gpr[10] = r10;
++    ctx->gpr[11] = r11e;
++    ctx->lr = lr;
++    ctx->gpr[1] = r10;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8000D770, MLB_EnvMapCoords_8000D770, "EnvMapCoords");
++#endif
 diff --git a/runtime/src/hle/mlb/mix_natives.cpp b/runtime/src/hle/mlb/mix_natives.cpp
 new file mode 100644
 index 0000000..bc0030e
@@ -8544,6 +9938,34 @@ index 280cfd6..876817c 100644
          message = "Informe guardado en UserData/Benchmarks";
          std::fprintf(stderr, "[match-bench] saved %s.txt\n", report.string().c_str());
      };
+diff --git a/runtime/src/memory.cpp b/runtime/src/memory.cpp
+index 88a484e..bd58b19 100644
+--- a/runtime/src/memory.cpp
++++ b/runtime/src/memory.cpp
+@@ -765,7 +765,11 @@ uint8_t* Memory::GetPointer(uint32_t addr) {
+     return GetPointer(addr, 1);
+ }
+ 
++#if defined(__SWITCH__)
++uint8_t* Memory::GetPointerSlow(uint32_t addr, size_t length) {
++#else
+ uint8_t* Memory::GetPointer(uint32_t addr, size_t length) {
++#endif
+     if (auto* ptr = MemoryInline::GetPointerFast(addr, length)) {
+         return ptr;
+     }
+@@ -774,7 +778,11 @@ uint8_t* Memory::GetPointer(uint32_t addr, size_t length) {
+     return region.storagePtr + offset;
+ }
+ 
++#if defined(__SWITCH__)
++bool Memory::ContainsSlow(uint32_t addr, size_t length) {
++#else
+ bool Memory::Contains(uint32_t addr, size_t length) {
++#endif
+     if (MemoryInline::GetPointerFast(addr, length)) {
+         return true;
+     }
 diff --git a/runtime/src/platform/switch/switch_crash.cpp b/runtime/src/platform/switch/switch_crash.cpp
 new file mode 100644
 index 0000000..a133027

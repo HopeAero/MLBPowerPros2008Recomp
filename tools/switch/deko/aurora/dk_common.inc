@@ -102,10 +102,10 @@ static void dk_render(std::vector<RenderPass>& renderPasses, uint32_t stagingSlo
         };
         dk::copy_convert(convReq, !passInfo.resolveNeedsConversion);
         dk::note_pass_copy(passInfo.resolveNeedsConversion ? 1 : 2, passInfo.resolveTarget->size.width,
-                           passInfo.resolveTarget->size.height);
+                           passInfo.resolveTarget->size.height, passInfo.resolveRect);
       } else {
         dk::note_pass_copy(3, static_cast<uint32_t>(passInfo.resolveRect.width),
-                           static_cast<uint32_t>(passInfo.resolveRect.height));
+                           static_cast<uint32_t>(passInfo.resolveRect.height), passInfo.resolveRect);
         dk::copy_texture(passInfo.copySourceTexture.Get(), static_cast<uint32_t>(passInfo.resolveRect.x),
                          static_cast<uint32_t>(passInfo.resolveRect.y), passInfo.resolveTarget->texture.Get(),
                          static_cast<uint32_t>(passInfo.resolveRect.width),
