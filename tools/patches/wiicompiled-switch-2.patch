@@ -1,0 +1,1743 @@
+diff --git a/runtime/src/hle/mlb/reverb_natives.cpp b/runtime/src/hle/mlb/reverb_natives.cpp
+new file mode 100644
+index 0000000..1840a0d
+--- /dev/null
++++ b/runtime/src/hle/mlb/reverb_natives.cpp
+@@ -0,0 +1,423 @@
++// MLB Power Pros 2008 (RL8E54): a native 0x800BC3AC, the AXFX "ReverbHi" processing callback
++// (AXFXReverbHiCallback 0x800BC0E8 is a single branch to it). Run 11 profile: 4.2% of the Switch
++// main thread, the hottest audio function.
++//
++// void Reverb(int32_t** bufs /* r3: L, R, S */, Work* w /* r4 */) runs once per AX aux frame
++// (__AXOutNewFrame 0x800BA0D4, from the audio DMA callback: 96 samples = 3 ms, ~5.6 calls per
++// video frame). If w+0x10C is nonzero it clears bit 1 there and returns. Otherwise, per sample
++// and per channel (L, R, S): x = (float)(in + busIn), a 3-tap early line, an optional predelay
++// line, 3 parallel combs, 2 shared-index all-passes, a one-pole low-pass, a per-channel last
++// all-pass; then a crosstalk mix between the three channels written back in place as integers
++// (fctiwz, times w+0x140) and, with a bus-out descriptor, to the bus (times w+0x144). Every line
++// index steps once per sample and wraps at its length. docs/en/reverse-engineering.md section 4
++// ("MIX mixer and reverb") has the work-area layout.
++//
++// The translation emulates every single-precision op (operand rounded to 25 bits, the double
++// result narrowed through fcvt), turns each stfs into the Gekko narrowing routine plus the MMIO
++// check, keeps every index, pointer and scratch value on the guest stack or in the work area
++// with a reload per channel, and converts each input integer through the 0x43300000 double trick
++// on the stack. Here a sample is the same loads and stores of the sample arrays in the same
++// order, the arithmetic in host single precision, the work-area fields and stack slots in
++// registers, written once at the end.
++//
++// Why host singles give the translation's bits (FPCR.FZ on or off as it is; any rounding mode):
++// every operand is a single (lfs loads, single results, the exact int -> float conversion), so
++// PpcForce25BitInline is the identity, a single product is exact in a double, and a double sum
++// or product of singles narrowed once equals the single op (53 >= 2*24 + 2). FZ flushes subnormal
++// inputs and tiny results alike in both. stfs of a single is its own bits in
++// ConvertPpcDoubleToSingleBits. fctiwz of a single equals FCVTZS (saturating, toward zero) but
++// for NaN (0x80000000), kept. NaNs are where the two could part: an op with two NaN operands
++// returns one of them, and which one depends on the operand order the compiler picked for the
++// translation. Every NaN that arises in a call reaches a stored float (the integer conversions
++// do not depend on payloads), so the fast path checks every float it stores (an fmax chain:
++// fmax propagates NaN), and a call that stores a NaN is undone and run by the translation.
++//
++// Fast path conditions, checked at entry (else the translation runs the whole call): the flat
++// view, w+0x10C zero, the magic double at r2-30248 is 0x4330000080000000, and no access of the
++// call can see the deferred state: the stack frame [r1-112, r1+8), the work area [w, w+0x148)
++// and the constants [r2-30268, r2-30240) must not overlap one another, and every sample array
++// range the call can touch (in/out buffers, bus-in and bus-out buffers, every line from its index
++// over 96 steps, conservatively) must neither overlap them nor wrap nor touch the MMIO window
++// (0xCC000000-0xCDFFFFFF), nor may the buffer descriptors overlap the stack frame. The sample
++// arrays may overlap one another: their loads and stores keep the program order.
++//
++// Rollback: each sample-array store goes through an undo log (the value it replaces, which the
++// lines read just before the store); on a NaN the log is replayed backwards and nothing else has
++// been written yet (stack slots, work-area fields and the context are written after the loop).
++//
++// Kept exactly on the fast path (cross-checked with the translation in qemu-aarch64, see the
++// snippet header local/tmp/cpu/C5-reverb.py): every guest store (frame, saved registers, LR slot,
++// scratch slots, the pointer slots, the conversion double, the lines, the outputs, the work-area
++// indices and low-pass states) and the whole register state the translation leaves (r0-r12,
++// r25-r31, f0-f13, CR, CTR, LR).
++//
++// This file builds like the translated code (-O2 -fno-fast-math -ffp-contract=off, outside the
++// unity build: runtime/CMakeLists.txt); the FP ops are single instructions in asm anyway.
++#if defined(__SWITCH__)
++#include <cstdint>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++
++extern "C" void func_800BC3AC(CpuContext* ctx);  // the translation (kept: _AS registration)
++
++namespace mlb_reverb {
++
++// ---- guest memory, flat view (ranges proven plain before use) ----
++
++[[gnu::always_inline]] inline uint8_t* Host(uint32_t address) { return MKW_FLAT_GUEST_BASE + address; }
++
++[[gnu::always_inline]] inline uint32_t Bits(float value) {
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof bits);
++    return bits;
++}
++
++[[gnu::always_inline]] inline float Float(uint32_t bits) {
++    float value;
++    std::memcpy(&value, &bits, sizeof value);
++    return value;
++}
++
++[[gnu::always_inline]] inline uint32_t Load32(uint32_t address) {
++    uint32_t raw;
++    std::memcpy(&raw, Host(address), sizeof raw);
++    return __builtin_bswap32(raw);
++}
++
++[[gnu::always_inline]] inline uint64_t Load64(uint32_t address) {
++    uint64_t raw;
++    std::memcpy(&raw, Host(address), sizeof raw);
++    return __builtin_bswap64(raw);
++}
++
++[[gnu::always_inline]] inline void Store32(uint32_t address, uint32_t value) {
++    const uint32_t raw = __builtin_bswap32(value);
++    std::memcpy(Host(address), &raw, sizeof raw);
++}
++
++// One instruction each, so nothing can be fused, reassociated or widened.
++[[gnu::always_inline]] inline float Mul(float a, float b) { float r; __asm__("fmul %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++[[gnu::always_inline]] inline float Add(float a, float b) { float r; __asm__("fadd %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++[[gnu::always_inline]] inline float Sub(float a, float b) { float r; __asm__("fsub %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++// fmax returns a NaN when either operand is one: the running "any NaN stored" test.
++[[gnu::always_inline]] inline float Max(float a, float b) { float r; __asm__("fmax %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++[[gnu::always_inline]] inline float FromInt(uint32_t v) { float r; __asm__("scvtf %s0, %w1" : "=w"(r) : "r"(v)); return r; }
++[[gnu::always_inline]] inline double Widen(float a) { double r; __asm__("fcvt %d0, %s1" : "=w"(r) : "w"(a)); return r; }
++// fctiwz of a single: saturating, toward zero, NaN -> 0x80000000 (PpcClampIntegerWordInline).
++[[gnu::always_inline]] inline uint32_t Fctiwz(float a) {
++    uint32_t r;
++    __asm__("fcvtzs %w0, %s1" : "=r"(r) : "w"(a));
++    return a != a ? 0x80000000u : r;
++}
++
++// ---- ranges ----
++
++struct Area { uint64_t lo, hi; };
++
++inline bool Plain(uint64_t lo, uint64_t hi) {
++    return hi <= 0x100000000ull && (hi <= 0xCC000000ull || lo >= 0xCE000000ull);
++}
++inline bool Overlap(uint64_t lo, uint64_t hi, const Area& a) { return lo < a.hi && a.lo < hi; }
++
++struct Guard {
++    Area stack, work, consts;
++    bool ok;
++    void Range(uint64_t lo, uint64_t hi) {
++        if (lo >= hi) return;
++        ok = ok && Plain(lo, hi) && !Overlap(lo, hi, stack) && !Overlap(lo, hi, work) && !Overlap(lo, hi, consts);
++    }
++    // The slots a line indexed by `index` (wrapping at `length`) touches over 96 samples.
++    void Line(uint32_t base, uint32_t index, uint32_t length) {
++        const uint64_t b = base;
++        if (index < length) {
++            if (length - index >= 96u) Range(b + 4ull * index, b + 4ull * index + 384u);
++            else Range(b, b + 4ull * length);
++        } else {  // index, then 0, 1, ... (only 0 when the length is 0)
++            Range(b + 4ull * index, b + 4ull * index + 4u);
++            Range(b, b + 4ull * (length == 0u ? 1u : (length < 96u ? length : 96u)));
++        }
++    }
++};
++
++[[gnu::always_inline]] inline uint32_t Step(uint32_t index, uint32_t length) {
++    const uint32_t next = index + 1u;
++    return next < length ? next : 0u;
++}
++
++// ---- rollback ----
++
++struct UndoEntry { uint32_t address, old; };
++constexpr uint32_t kUndoCapacity = 96u * 30u;  // per sample: 3 x (early, predelay, 3 combs, 3 all-passes) + 6 outputs
++UndoEntry g_undo[kUndoCapacity];
++
++// ---- the call ----
++
++struct Channel {
++    uint32_t early, predelay, comb[3], allpass[2], last;  // line base addresses
++    uint32_t lastIndex, lastLength;
++    float lowpass;
++    uint32_t in, busIn, out;                              // sample pointers
++    float scratch;                                        // [sp+20+4ch]
++};
++
++[[gnu::noinline, gnu::cold]] void Translated(CpuContext& context) { func_800BC3AC(&context); }
++
++// Returns false, with nothing written, when the translation must run the call.
++bool Run(CpuContext& c) {
++    const uint32_t r1 = c.gpr[1], r2 = c.gpr[2], r3 = c.gpr[3], w = c.gpr[4];
++    if (r1 < 112u || r2 < 30268u) return false;
++    const uint32_t sp = r1 - 112u;
++    const uint32_t kc = r2 - 30268u;
++    Guard g{{sp, uint64_t(sp) + 120u}, {w, uint64_t(w) + 0x148u}, {kc, uint64_t(kc) + 28u}, true};
++    if (!Plain(g.stack.lo, g.stack.hi) || !Plain(g.work.lo, g.work.hi) || !Plain(g.consts.lo, g.consts.hi)) return false;
++    if (Overlap(g.stack.lo, g.stack.hi, g.work) || Overlap(g.stack.lo, g.stack.hi, g.consts) ||
++        Overlap(g.work.lo, g.work.hi, g.consts))
++        return false;
++    if (Load32(w + 268u) != 0u) return false;  // the bypass path (clears bit 1): rare, translation
++    if (Load64(kc + 20u) != 0x4330000080000000ull) return false;
++
++    const uint32_t busInDesc = Load32(w + 312u), busOutDesc = Load32(w + 316u);
++    const auto descriptorOk = [&](uint32_t d) {
++        return Plain(d, uint64_t(d) + 12u) && !Overlap(d, uint64_t(d) + 12u, g.stack);
++    };
++    if (!descriptorOk(r3) || (busInDesc != 0u && !descriptorOk(busInDesc)) ||
++        (busOutDesc != 0u && !descriptorOk(busOutDesc)))
++        return false;
++
++    // Work area (struct offsets in the doc).
++    const uint32_t earlyLength = Load32(w + 24u), predelayLength = Load32(w + 60u);
++    const uint32_t combLength[3] = {Load32(w + 116u), Load32(w + 120u), Load32(w + 124u)};
++    const uint32_t allpassLength[2] = {Load32(w + 184u), Load32(w + 188u)};
++    uint32_t e0 = Load32(w + 12u), e1 = Load32(w + 16u), e2 = Load32(w + 20u);
++    uint32_t pp = Load32(w + 56u);
++    uint32_t cj[3] = {Load32(w + 104u), Load32(w + 108u), Load32(w + 112u)};
++    uint32_t ak[2] = {Load32(w + 176u), Load32(w + 180u)};
++    const float earlyCoef[3] = {Float(Load32(w + 32u)), Float(Load32(w + 36u)), Float(Load32(w + 40u))};
++    const float combCoef[3] = {Float(Load32(w + 140u)), Float(Load32(w + 144u)), Float(Load32(w + 148u))};
++    const float allpassCoef = Float(Load32(w + 248u));
++    const float lpf = Float(Load32(w + 264u));
++    const float crosstalk = Float(Load32(w + 300u)), fused = Float(Load32(w + 308u));
++    const float outGain = Float(Load32(w + 320u)), sendGain = Float(Load32(w + 324u));
++    const float kZero = Float(Load32(kc)), kOne = Float(Load32(kc + 4u));
++    const float k06 = Float(Load32(kc + 8u)), k05 = Float(Load32(kc + 12u));
++
++    Channel ch[3];
++    for (uint32_t i = 0; i < 3; ++i) {
++        Channel& h = ch[i];
++        h.early = Load32(w + 4u * i);
++        h.predelay = Load32(w + 44u + 4u * i);
++        for (uint32_t k = 0; k < 3; ++k) h.comb[k] = Load32(w + 68u + 12u * i + 4u * k);
++        for (uint32_t k = 0; k < 2; ++k) h.allpass[k] = Load32(w + 152u + 8u * i + 4u * k);
++        h.last = Load32(w + 200u + 4u * i);
++        h.lastIndex = Load32(w + 212u + 4u * i);
++        h.lastLength = Load32(w + 224u + 4u * i);
++        h.lowpass = Float(Load32(w + 252u + 4u * i));
++        h.in = Load32(r3 + 4u * i);
++        h.busIn = busInDesc != 0u ? Load32(busInDesc + 4u * i) : 0u;
++        h.scratch = 0.0f;
++        g.Line(h.early, e0, earlyLength);
++        g.Line(h.early, e1, earlyLength);
++        g.Line(h.early, e2, earlyLength);
++        if (predelayLength != 0u) g.Line(h.predelay, pp, predelayLength);
++        for (uint32_t k = 0; k < 3; ++k) g.Line(h.comb[k], cj[k], combLength[k]);
++        for (uint32_t k = 0; k < 2; ++k) g.Line(h.allpass[k], ak[k], allpassLength[k]);
++        g.Line(h.last, h.lastIndex, h.lastLength);
++        g.Range(h.in, uint64_t(h.in) + 384u);
++        if (busInDesc != 0u) g.Range(h.busIn, uint64_t(h.busIn) + 384u);
++    }
++    // r3, r5, r6 as the translation leaves them before the loop: the bus-out pointers.
++    uint32_t o3 = r3, o5 = ch[1].in, o6 = ch[0].in;
++    if (busInDesc != 0u) { o5 = ch[0].busIn; o3 = ch[1].busIn; }
++    if (busOutDesc != 0u) {
++        o3 = Load32(busOutDesc); o5 = Load32(busOutDesc + 4u); o6 = Load32(busOutDesc + 8u);
++        g.Range(o3, uint64_t(o3) + 384u); g.Range(o5, uint64_t(o5) + 384u); g.Range(o6, uint64_t(o6) + 384u);
++    }
++    if (!g.ok) return false;
++
++    const float oneMinusLpf = Sub(kOne, lpf);  // f4
++    const float fusedGain = Mul(k06, fused);   // f5
++    const float cross = Mul(k05, crosstalk);   // f6
++
++    UndoEntry* undo = g_undo;
++    const auto logged = [&undo](uint32_t address, uint32_t old, uint32_t value) {
++        *undo++ = UndoEntry{address, old};
++        Store32(address, value);
++    };
++    float nan = 0.0f;  // becomes NaN once any stored float is one
++    uint32_t convWord = 0;
++    float lp = 0.0f, rp = 0.0f, sp2 = 0.0f;  // the crosstalk results (f9, f8, f7) of the last sample
++    uint32_t lastInt = 0, lastK1 = 0;
++
++    for (uint32_t s = 0; s < 96u; ++s) {
++#pragma GCC unroll 3
++        for (uint32_t i = 0; i < 3; ++i) {
++            Channel& h = ch[i];
++            // Input: in (+ bus in), the int32 sum as a float.
++            uint32_t v;
++            if (busInDesc != 0u) {
++                const uint32_t b = Load32(h.busIn);
++                h.busIn += 4u;
++                v = Load32(h.in) + b;
++            } else {
++                v = Load32(h.in);
++            }
++            convWord = v ^ 0x80000000u;
++            const float x = FromInt(v);
++            const uint32_t xb = Bits(x);
++            // Early reflections: three taps, the input written at the third.
++            const uint32_t t0 = Load32(h.early + (e0 << 2)), t1 = Load32(h.early + (e1 << 2));
++            const uint32_t a2 = h.early + (e2 << 2);
++            const uint32_t t2 = Load32(a2);
++            logged(a2, t2, xb);
++            float early = Add(Mul(earlyCoef[0], Float(t0)), Mul(earlyCoef[1], Float(t1)));
++            early = Add(Mul(earlyCoef[2], Float(t2)), early);
++            // Predelay.
++            float d = x;
++            if (predelayLength != 0u) {
++                const uint32_t a = h.predelay + (pp << 2);
++                const uint32_t old = Load32(a);
++                logged(a, old, xb);
++                d = Float(old);
++            }
++            // Three combs in parallel, their outputs summed.
++            float sum = kZero;
++#pragma GCC unroll 3
++            for (uint32_t k = 0; k < 3; ++k) {
++                const uint32_t a = h.comb[k] + (cj[k] << 2);
++                const uint32_t old = Load32(a);
++                const float cv = Float(old);
++                const float fb = Mul(cv, combCoef[k]);
++                sum = Add(sum, cv);
++                const float stored = Add(d, fb);
++                nan = Max(nan, stored);
++                logged(a, old, Bits(stored));
++            }
++            // Two all-passes.
++            float y = sum;
++#pragma GCC unroll 2
++            for (uint32_t k = 0; k < 2; ++k) {
++                const uint32_t a = h.allpass[k] + (ak[k] << 2);
++                const uint32_t old = Load32(a);
++                const float av = Float(old);
++                const float t = Add(y, Mul(av, allpassCoef));
++                nan = Max(nan, t);
++                logged(a, old, Bits(t));
++                y = Sub(av, Mul(t, allpassCoef));
++            }
++            // Low-pass.
++            const float lowpass = Add(Mul(oneMinusLpf, y), Mul(lpf, h.lowpass));
++            nan = Max(nan, lowpass);
++            h.lowpass = lowpass;
++            // The channel's own last all-pass.
++            {
++                const uint32_t a = h.last + (h.lastIndex << 2);
++                const uint32_t old = Load32(a);
++                const float cv = Float(old);
++                const float t = Add(lowpass, Mul(cv, allpassCoef));
++                nan = Max(nan, t);
++                logged(a, old, Bits(t));
++                const float out = Sub(cv, Mul(t, allpassCoef));
++                h.lastIndex = Step(h.lastIndex, h.lastLength);
++                h.scratch = Add(Mul(out, fusedGain), early);
++            }
++        }
++        // Crosstalk between L, R, S; written back in place and to the bus.
++        const float l = ch[0].scratch, r = ch[1].scratch, sv = ch[2].scratch;
++        lp = Add(l, Mul(Add(r, sv), cross));
++        rp = Add(r, Mul(Add(l, sv), cross));
++        sp2 = Add(sv, Mul(Add(l, r), cross));
++        nan = Max(nan, Max(lp, Max(rp, sp2)));
++        logged(ch[0].in, Load32(ch[0].in), Fctiwz(Mul(lp, outGain)));
++        logged(ch[1].in, Load32(ch[1].in), Fctiwz(Mul(rp, outGain)));
++        lastInt = Fctiwz(Mul(sp2, outGain));
++        logged(ch[2].in, Load32(ch[2].in), lastInt);
++        ch[0].in += 4u; ch[1].in += 4u; ch[2].in += 4u;
++        if (busOutDesc != 0u) {
++            logged(o3, Load32(o3), Fctiwz(Mul(lp, sendGain)));
++            logged(o5, Load32(o5), Fctiwz(Mul(rp, sendGain)));
++            lastInt = Fctiwz(Mul(sp2, sendGain));
++            logged(o6, Load32(o6), lastInt);
++            o3 += 4u; o5 += 4u; o6 += 4u;
++        }
++        e0 = Step(e0, earlyLength); e1 = Step(e1, earlyLength); e2 = Step(e2, earlyLength);
++        if (predelayLength != 0u) pp = Step(pp, predelayLength);
++        cj[0] = Step(cj[0], combLength[0]); cj[1] = Step(cj[1], combLength[1]); cj[2] = Step(cj[2], combLength[2]);
++        lastK1 = ak[1];
++        ak[0] = Step(ak[0], allpassLength[0]); ak[1] = Step(ak[1], allpassLength[1]);
++    }
++
++    if (nan != nan) [[unlikely]] {
++        while (undo != g_undo) {
++            --undo;
++            Store32(undo->address, undo->old);
++        }
++        return false;
++    }
++
++    // The stack frame as the translation leaves it.
++    Store32(sp, r1);
++    Store32(sp + 116u, c.lr);
++    for (uint32_t reg = 25; reg <= 31; ++reg) Store32(sp + 84u + 4u * (reg - 25u), c.gpr[reg]);
++    if (busInDesc != 0u) {
++        for (uint32_t i = 0; i < 3; ++i) Store32(sp + 8u + 4u * i, ch[i].busIn);
++        Store32(sp + 56u, 0x43300000u);
++        Store32(sp + 60u, convWord);
++    } else {
++        Store32(sp + 64u, 0x43300000u);
++        Store32(sp + 68u, convWord);
++    }
++    for (uint32_t i = 0; i < 3; ++i) Store32(sp + 20u + 4u * i, Bits(ch[i].scratch));
++    Store32(sp + 32u, Bits(lp));
++    Store32(sp + 36u, Bits(rp));
++    Store32(sp + 40u, Bits(sp2));
++    for (uint32_t i = 0; i < 3; ++i) Store32(sp + 44u + 4u * i, ch[i].in);
++    // The work-area fields it steps.
++    Store32(w + 12u, e0); Store32(w + 16u, e1); Store32(w + 20u, e2);
++    if (predelayLength != 0u) Store32(w + 56u, pp);
++    Store32(w + 104u, cj[0]); Store32(w + 108u, cj[1]); Store32(w + 112u, cj[2]);
++    Store32(w + 176u, ak[0]); Store32(w + 180u, ak[1]);
++    for (uint32_t i = 0; i < 3; ++i) {
++        Store32(w + 212u + 4u * i, ch[i].lastIndex);
++        Store32(w + 252u + 4u * i, Bits(ch[i].lowpass));
++    }
++
++    // Registers.
++    const uint32_t lr = c.lr;
++    c.gpr[0] = lr;
++    c.gpr[3] = o3; c.gpr[5] = o5; c.gpr[6] = o6;
++    c.gpr[7] = allpassLength[1];
++    c.gpr[8] = lastK1 + 1u;
++    c.gpr[9] = w + 8u;
++    c.gpr[10] = ch[1].in - 4u;
++    c.gpr[11] = r1;
++    c.gpr[12] = ch[0].in - 4u;
++    c.ctr = 0u;
++    SetCRResident(c.cr, c.xer, 0, uint32_t(96u), uint32_t(96u));
++    c.fpr[0].raw = 0x4330000080000000ull;
++    c.fpr[1].d = Widen(lpf);
++    c.fpr[2].raw = lastInt;
++    c.fpr[3].d = Widen(allpassCoef);
++    c.fpr[4].d = Widen(oneMinusLpf);
++    c.fpr[5].d = Widen(fusedGain);
++    c.fpr[6].d = Widen(cross);
++    c.fpr[7].d = Widen(sp2);
++    c.fpr[8].d = Widen(rp);
++    c.fpr[9].d = Widen(lp);
++    c.fpr[10].d = Widen(ch[0].scratch);
++    c.fpr[11].d = Widen(ch[2].scratch);
++    c.fpr[12].d = Widen(ch[1].scratch);
++    c.fpr[13].d = Widen(Add(ch[0].scratch, ch[1].scratch));
++    return true;
++}
++
++}  // namespace mlb_reverb
++
++extern "C" void MLB_ReverbHi_800BC3AC(CpuContext* ctx) {
++    if (GuestFlat::RequiresCheckedAccess() || !mlb_reverb::Run(*ctx)) [[unlikely]]
++        mlb_reverb::Translated(*ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x800BC3AC, MLB_ReverbHi_800BC3AC, "AXFXReverbHiProcess");
++#endif
+diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
+index eeedef2..a6fb804 100644
+--- a/runtime/src/hle/mlb/season_cap.cpp
++++ b/runtime/src/hle/mlb/season_cap.cpp
+@@ -15,6 +15,9 @@
+ #include "mods.h"
+ #include "runtime_config.h"
+ 
++// The year atlas may still be read by queued GX draws (WIICOMPILED_GX_FIFO=deferred|thread).
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason); // aurora gx/fifo_async.inc
++
+ namespace season_cap {
+ 
+ namespace {
+@@ -558,6 +561,7 @@ bool PaintYearPicture(CpuContext* ctx, int year) {
+     }
+     if (!PictureTexels(ctx, kFirstPictureYear, texels, u0, v0)) return false;
+     const YearPicture picture = ComposeYearPicture(year, units);
++    aurora_gx_fifo_quiesce(0);
+     for (int y = 0; y < kYearPictureHeight; ++y)
+         for (int x = 0; x < kYearPictureWidth; ++x)
+             Memory::Write8(texels + C8Offset(u0 + x, v0 + y, 512), picture[y * kYearPictureWidth + x]);
+diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
+index 83faaac..15fb008 100644
+--- a/runtime/src/hle/mlb/two_way.cpp
++++ b/runtime/src/hle/mlb/two_way.cpp
+@@ -36,6 +36,10 @@
+ #include "runtime_config.h"
+ #include "season_cap.h"
+ 
++// The atlas below may still be read by queued GX draws (WIICOMPILED_GX_FIFO=deferred|thread):
++// wait for the decoder before writing it. Nothing to wait for in sync mode.
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason); // aurora gx/fifo_async.inc
++
+ namespace two_way {
+ namespace {
+ 
+@@ -305,6 +309,7 @@ void SetTexel(int x, int y, uint8_t v) { Memory::Write8(g_texels + season_cap::C
+ 
+ void Restore() {
+     if (!g_texels) return;
++    aurora_gx_fifo_quiesce(0);
+     for (int y = 0; y < kTitleH; ++y)
+         for (int x = 0; x < kTitleW; ++x) SetTexel(g_titleU + x, g_titleV + y, g_titleBackup[y * kTitleW + x]);
+     for (int y = 0; y < kButtonH; ++y)
+@@ -328,6 +333,7 @@ void Paint(CpuContext* ctx) {
+         !Picture(ctx, kPitcherButton + 3 * 0x48, kButtonW, kButtonH, sourceTexels, su, sv) ||
+         pitcherTexels != texels || sourceTexels != texels || !Memory::Contains(texels, kAtlasWidth * 256 + 512))
+         return;
++    aurora_gx_fifo_quiesce(0);
+     g_texels = texels;
+     g_titleBackup.resize(kTitleW * kTitleH);
+     g_buttonBackup.resize(kButtonW * kButtonH);
+diff --git a/runtime/src/hle/storage/dvd.cpp b/runtime/src/hle/storage/dvd.cpp
+index 8f4c9b4..238a064 100644
+--- a/runtime/src/hle/storage/dvd.cpp
++++ b/runtime/src/hle/storage/dvd.cpp
+@@ -501,10 +501,17 @@ static void ScanDirectory(const fs::path& root, const std::string& virtualPrefix
+             return;
+         }
+ 
++#if defined(__SWITCH__)
++        const fs::path relative = entry.path().lexically_relative(root);
++        if (relative.empty()) {
++            return;
++        }
++#else
+         const fs::path relative = fs::relative(entry.path(), root, entryEc);
+         if (entryEc) {
+             return;
+         }
++#endif
+ 
+         std::string prefix = virtualPrefix.empty() ? "/" : virtualPrefix;
+         if (prefix.back() != '/' && prefix.back() != '\\') {
+diff --git a/runtime/src/hle/vi.cpp b/runtime/src/hle/vi.cpp
+index b1feb54..ee71ab7 100644
+--- a/runtime/src/hle/vi.cpp
++++ b/runtime/src/hle/vi.cpp
+@@ -31,6 +31,10 @@
+ 
+ #include <aurora/aurora.h>
+ 
++// aurora gx/fifo_async.inc: the GX decoder maps viewports with the configured size, so queued GX
++// work (WIICOMPILED_GX_FIFO=deferred|thread) is decoded before VIConfigure changes it.
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason);
++
+ // Forward declaration for OSWakeupThread - used to wake threads on VI retrace queue
+ extern "C" void OSWakeupThread_HLE_801aaaa4(CpuContext* ctx);
+ 
+@@ -752,6 +756,7 @@ extern "C" void VIConfigure_HLE_801b9f6c(CpuContext* ctx)
+             renderMode.xfbHeight != 0 ? renderMode.xfbHeight : renderMode.efbHeight;
+     }
+ 
++    aurora_gx_fifo_quiesce(1);
+     ::VIConfigure(&renderMode);
+ 
+     ViSetR3(ctx, 0);
+diff --git a/runtime/src/host_context.cpp b/runtime/src/host_context.cpp
+index 502f72c..885f8bb 100644
+--- a/runtime/src/host_context.cpp
++++ b/runtime/src/host_context.cpp
+@@ -14,7 +14,7 @@
+ 
+ extern "C" void mkw_co_switch(void** targetSp, void** sourceSp);
+ extern "C" void* mkw_co_init(void* stackTop, void (*entry)(void*), void* argument);
+-#elif defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
++#elif defined(__linux__) || defined(__SWITCH__) || (defined(__APPLE__) && defined(__x86_64__))
+ #include <libco.h>
+ 
+ #include <cstdlib>
+@@ -158,7 +158,7 @@ void Switch(Handle target)
+     g_current = source;
+ }
+ 
+-#elif defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
++#elif defined(__linux__) || defined(__SWITCH__) || (defined(__APPLE__) && defined(__x86_64__))
+ 
+ namespace {
+ struct Context {
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 4eef06f..6e0b7f9 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -47,6 +47,8 @@
+ #if defined(_WIN32)
+ #include <windows.h>
+ #include <shellapi.h>
++#elif defined(__SWITCH__)
++#include <unistd.h>
+ #else
+ #include <signal.h>
+ #include <spawn.h>
+@@ -429,6 +431,12 @@ constexpr const char* kRosterEditorPage =
+ 
+ #if defined(_WIN32)
+ std::wstring Quoted(const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; }
++#elif defined(__SWITCH__)
++// A homebrew title cannot start other programs: desktop tools stay on the PC.
++bool SpawnDetached(const std::vector<std::string>& command) {
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: " << command[0] << " is not available on the Switch" << std::endl;
++    return false;
++}
+ #else
+ // Starts a program without waiting for it; the game keeps running. Steam's overlay preload is
+ // dropped so desktop tools (xdg-open, the file manager) do not inherit it.
+@@ -507,6 +515,8 @@ void OpenRosterEditor() {
+     const fs::path page = data / "abrir.html";
+     std::ofstream(page, std::ios::binary | std::ios::trunc) << kRosterEditorPage;
+     ShellExecuteW(nullptr, L"open", page.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++#elif defined(__SWITCH__)
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: PowerUp+ is not available on the Switch" << std::endl;
+ #else
+     namespace fs = std::filesystem;
+     const auto exeDir = RuntimeConfigFile::ExecutableDirectory();
+@@ -692,6 +702,9 @@ bool Relaunch() {
+     CloseHandle(process.hThread);
+     CloseHandle(process.hProcess);
+     return true;
++#elif defined(__SWITCH__)
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: restarting is not available on the Switch" << std::endl;
++    return false;
+ #else
+     setenv("WIICOMPILED_SKIP_LAUNCHER", "1", 1);
+     std::vector<char*> args(g_argv, g_argv + g_argc);
+diff --git a/runtime/src/launcher_controls.cpp b/runtime/src/launcher_controls.cpp
+index 5f029c0..0b51bbe 100644
+--- a/runtime/src/launcher_controls.cpp
++++ b/runtime/src/launcher_controls.cpp
+@@ -51,7 +51,8 @@ void LoadPromptStyle() {
+     if (loaded) return;
+     loaded = true;
+     int value = 1;
+-    if (std::ifstream(PromptPath()) >> value; value >= 0 && value <= 2) promptStyle = value;
++    std::ifstream prompts(PromptPath());
++    if (prompts >> value && value >= 0 && value <= 2) promptStyle = value;
+ }
+ enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
+ struct Capture {
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 7269747..49093ee 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -429,6 +429,9 @@ std::string ReadInstalledSetupVersion() {
+     return text.substr(open + 1, close - open - 1);
+ }
+ 
++#if defined(__SWITCH__)
++extern "C" bool SwitchStdioToNxlink();  // platform/switch/switch_stdio.cpp
++#endif
+ void InitializeProcessTranscript(int argc, char** argv) {
+     auto& state = GetProcessTranscriptState();
+     if (state.initialized.exchange(true, std::memory_order_acq_rel)) {
+@@ -469,6 +472,19 @@ void InitializeProcessTranscript(int argc, char** argv) {
+         state.file.flush();
+     }
+ 
++#if defined(__SWITCH__)
++    // Horizon has no pipes to tee the standard streams through: they go to nxlink's console on the
++    // PC when it started the game, else straight into this file.
++    state.file.close();
++    state.enabled = false;
++    if (!SwitchStdioToNxlink()) {
++        (void)std::freopen(path.string().c_str(), "a", stdout);
++        (void)std::freopen(path.string().c_str(), "a", stderr);
++    }
++    std::setvbuf(stdout, nullptr, _IONBF, 0);
++    std::setvbuf(stderr, nullptr, _IONBF, 0);
++    return;
++#endif
+     state.savedStdoutFd = DuplicateFileDescriptor(GetFileDescriptor(stdout));
+     state.savedStderrFd = DuplicateFileDescriptor(GetFileDescriptor(stderr));
+ 
+@@ -1133,6 +1149,9 @@ void InstallSehLogger() {
+         SetUnhandledExceptionFilter(UnhandledSehFilter);
+     }
+ }
++#elif defined(__SWITCH__)
++// Horizon delivers no signals: a crash ends in Atmosphère's crash report instead.
++void InstallPosixMemoryFaultHandler() {}
+ #else
+ // POSIX counterpart to SehLogger above. Unlike Windows' AddVectoredExceptionHandler, which lets
+ // GuestFlat and this module each install their own handler and defensively re-check each other,
+@@ -1322,6 +1341,11 @@ static void TerminateHandler() {
+     } else {
+         terminateDetails = "std::terminate() without current exception.";
+     }
++#if defined(__SWITCH__)
++    std::fprintf(stderr, "[terminate] %s\n", terminateDetails.c_str());
++    std::fflush(stderr);
++    __builtin_trap();
++#endif
+     ShowRuntimeFatalPopup("an unhandled C++ exception occurred", terminateDetails);
+     const std::string hostStackSummary = FormatHostStackTrace(1);
+     if (!hostStackSummary.empty()) {
+@@ -1441,6 +1465,10 @@ int RuntimeMain(int argc, char** argv) {
+             {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
+             {"null", BACKEND_NULL},
+         }};
++#elif defined(__SWITCH__)
++        static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
++            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"null", BACKEND_NULL},
++        }};
+ #elif defined(_WIN32)
+         static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
+             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN}, {"d3d11", BACKEND_D3D11},
+@@ -1587,6 +1615,15 @@ int RuntimeMain(int argc, char** argv) {
+ }
+ 
+ int main(int argc, char** argv) {
++#if defined(__SWITCH__)
++    for (int i = 1; i < argc; ++i) {
++        const char* equals = std::strchr(argv[i], '=');
++        if (std::strncmp(argv[i], "WIICOMPILED_", 12) == 0 && equals != nullptr) {
++            setenv(std::string(argv[i], equals - argv[i]).c_str(), equals + 1, 1);
++        }
++    }
++    argc = 1;
++#endif
+     return RuntimeMain(argc, argv);
+ }
+ extern "C" bool g_dynamicAspectRatioEnabled = false;
+diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
+index 280cfd6..6a4e529 100644
+--- a/runtime/src/match_benchmark_overlay.inc
++++ b/runtime/src/match_benchmark_overlay.inc
+@@ -1,4 +1,7 @@
+ // Included inside settings_overlay's private namespace: reuse its live graphics setters.
++#if defined(__SWITCH__)
++extern "C" const char* SwitchClocks();  // platform/switch/switch_profiler.cpp
++#endif
+ // CPU, threads, RAM, GPU and OS, one per line, for the panel and the saved report.
+ std::string BenchmarkDeviceInfo() {
+     char cpu[49] = {};
+@@ -14,7 +17,11 @@ std::string BenchmarkDeviceInfo() {
+     std::string name = cpu;
+     name.erase(name.find_last_not_of(' ') + 1);
+     name.erase(0, name.find_first_not_of(' '));
++#if defined(__SWITCH__)
++    const std::string gpu = SwitchUsesDeko3d() ? std::string("Tegra X1 (deko3d)") : std::string(aurora_get_adapter_name());
++#else
+     const std::string gpu = aurora_get_adapter_name();
++#endif
+     char ram[32];
+     std::snprintf(ram, sizeof(ram), "%.1f GB", SDL_GetSystemRAM() / 1024.0);
+     return "CPU: " + (name.empty() ? std::string("desconocida") : name) + " (" + std::to_string(SDL_GetNumLogicalCPUCores()) +
+@@ -156,6 +163,10 @@ void DrawMatchBenchmark() {
+         std::error_code ec;
+         std::filesystem::create_directories(folder, ec);
+         report = folder / ("match-" + std::to_string(id));
++#if defined(__SWITCH__)
++        static char csvBuffer[4 << 20];  // flush to the SD card at the end, not every few frames (90 s ~ 1 MB)
++        csv.rdbuf()->pubsetbuf(csvBuffer, sizeof csvBuffer);
++#endif
+         csv.open(report.string() + ".csv");
+         if (!csv) { message = "No se pudo crear el informe"; return; }
+         csv << "utc_unix_ms,elapsed_s,frame_ms,draws,scale,force_16_9,backend,shader_queue,gpu_render_ms,gpu_samples,cpu_encode_ms,efb_copies,efb_source_pixels,efb_snapshots,efb_readbacks,efb_readback_wait_ms,presents,process_cpu_pct,gpu_3d_pct,process_ram_mb,vram_mb,system_ram_used_gb\n";
+@@ -163,6 +174,7 @@ void DrawMatchBenchmark() {
+         start = last = now;
+         base = previous = waits;
+         gpuBase = gpuPrevious = gpu;
++        aurora_gx_fifo_stats_mark();
+         intervals.clear();
+         valid = true;
+         recordedScale = g_resolutionScale;
+@@ -172,10 +184,18 @@ void DrawMatchBenchmark() {
+         recording = true;
+         message = "Midiendo";
+         std::fprintf(stderr, "[match-bench] recording %s scale=%.0f force169=%d\n", report.string().c_str(), g_resolutionScale, g_forceAspect169);
++#if defined(__SWITCH__)
++        SwitchProfilerStart();
++#endif
+     };
+     const auto finish = [&] {
+         recording = false;
+         completed = true;
++#if defined(__SWITCH__)
++        // The profile ends with the last recorded frame: the report's files below (the CSV's one
++        // write of ~0.5 MB, the summary) are no frame of the match. The later call does nothing.
++        SwitchProfilerDump();
++#endif
+         csv.close();
+         auto sorted = intervals;
+         std::sort(sorted.begin(), sorted.end());
+@@ -185,6 +205,9 @@ void DrawMatchBenchmark() {
+         std::ofstream summary(report.string() + ".txt");
+         summary << "Yankees vs Colorado; CPU vs CPU; Coors Field; seeded start\n"
+                 << device << '\n'
++#if defined(__SWITCH__)
++                << SwitchClocks() << '\n'
++#endif
+                 << "valid=" << valid << " start_unix_ms=" << report.filename().string().substr(6) << '\n'
+                 << "scale=" << g_resolutionScale << " force_16_9=" << g_forceAspect169 << " backend=" << GraphicsApiDisplayName() << '\n'
+                 << "seconds=" << elapsed << " presented_frames=" << frames << " fps=" << (elapsed > 0 ? frames/elapsed : 0) << '\n'
+@@ -201,9 +224,17 @@ void DrawMatchBenchmark() {
+             if (loadCount[i]) summary << loadNames[i] << "_mean=" << loadSum[i] / loadCount[i] << ' ' << loadNames[i] << "_peak=" << loadPeak[i] << '\n';
+             else summary << loadNames[i] << "=unavailable\n";
+         }
++        {
++            char fifo[2048];
++            if (aurora_gx_fifo_stats_report(fifo, sizeof fifo) > 0) summary << fifo;
++        }
+         summary << "process_cpu_pct is over all logical cores, like Task Manager. GPU/VRAM from Windows GPU counters.\n"
+                 << "GPU markers exclude presenter work and demanded EFB prefixes. CPU autoplay is not a bit-exact replay.\n";
+         summary.close();
++#if defined(__SWITCH__)
++        if (std::ifstream echo(report.string() + ".txt"); echo) std::cerr << echo.rdbuf() << std::flush;
++        SwitchProfilerDump();  // platform/switch/switch_profiler.cpp (step 17)
++#endif
+         message = "Informe guardado en UserData/Benchmarks";
+         std::fprintf(stderr, "[match-bench] saved %s.txt\n", report.string().c_str());
+     };
+@@ -219,6 +250,9 @@ void DrawMatchBenchmark() {
+     if (recording) {
+         const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+         intervals.push_back(ms);
++#if defined(__SWITCH__)
++        SwitchProfilerFrame();
++#endif
+         const uint64_t samples = gpu.samples - gpuPrevious.samples;
+         csv << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ','
+             << std::chrono::duration<double>(now - start).count() << ',' << ms << ',' << stats->drawCallCount << ','
+diff --git a/runtime/src/memory.cpp b/runtime/src/memory.cpp
+index 88a484e..bd58b19 100644
+--- a/runtime/src/memory.cpp
++++ b/runtime/src/memory.cpp
+@@ -765,7 +765,11 @@ uint8_t* Memory::GetPointer(uint32_t addr) {
+     return GetPointer(addr, 1);
+ }
+ 
++#if defined(__SWITCH__)
++uint8_t* Memory::GetPointerSlow(uint32_t addr, size_t length) {
++#else
+ uint8_t* Memory::GetPointer(uint32_t addr, size_t length) {
++#endif
+     if (auto* ptr = MemoryInline::GetPointerFast(addr, length)) {
+         return ptr;
+     }
+@@ -774,7 +778,11 @@ uint8_t* Memory::GetPointer(uint32_t addr, size_t length) {
+     return region.storagePtr + offset;
+ }
+ 
++#if defined(__SWITCH__)
++bool Memory::ContainsSlow(uint32_t addr, size_t length) {
++#else
+ bool Memory::Contains(uint32_t addr, size_t length) {
++#endif
+     if (MemoryInline::GetPointerFast(addr, length)) {
+         return true;
+     }
+diff --git a/runtime/src/platform/switch/switch_crash.cpp b/runtime/src/platform/switch/switch_crash.cpp
+new file mode 100644
+index 0000000..a133027
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_crash.cpp
+@@ -0,0 +1,46 @@
++// A CPU exception on Horizon (data abort, undefined instruction...): libnx calls this handler instead
++// of letting the system close the program with a bare "an error has occurred". It prints the fault
++// to stdout (nxlink's console on the PC, else the log file) and exits. PC and LR are printed against
++// the address of this function, so `nm WiiCompiled.elf` turns them into names.
++#if defined(__SWITCH__)
++#include <cstdio>
++#include <switch.h>
++
++#include "guest_flat_memory.h"
++
++extern "C" {
++alignas(16) u8 __nx_exception_stack[0x4000];
++u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
++u32 __nx_exception_ignoredebug = 1;
++
++void __libnx_exception_handler(ThreadExceptionDump* ctx) {
++    const auto anchor = reinterpret_cast<u64>(&__libnx_exception_handler);
++    std::printf("\n[crash] CPU exception 0x%x esr=0x%x far=0x%lx\n", ctx->error_desc, ctx->esr, ctx->far.x);
++    // In the flat view, far - base is the guest address the translated code touched.
++    if (const auto flat = reinterpret_cast<u64>(GuestFlat::g_flatBase); flat != 0) {
++        std::printf("[crash] far - flat base = 0x%lx%s (flat base 0x%lx)\n", ctx->far.x - flat,
++                    ctx->far.x - flat < GuestFlat::kGuestSpaceSize ? " (guest address)" : "", flat);
++    }
++    std::printf("[crash] pc=0x%lx lr=0x%lx sp=0x%lx fp=0x%lx (__libnx_exception_handler at 0x%lx)\n",
++                ctx->pc.x, ctx->lr.x, ctx->sp.x, ctx->fp.x, anchor);
++    for (int i = 0; i < 29; ++i) {
++        std::printf("[crash] x%-2d=0x%016lx%s", i, ctx->cpu_gprs[i].x, i % 4 == 3 ? "\n" : "  ");
++    }
++    // Return addresses on the stack: words that point into the program's code (within 256 MB of here).
++    // ponytail: a scan, not an unwinder; enough to name the callers.
++    std::printf("\n[crash] stack:");
++    const auto* stack = reinterpret_cast<const u64*>(ctx->sp.x);
++    for (int i = 0, shown = 0; i < 256 && shown < 24; ++i) {
++        const u64 word = stack[i];
++        if (word + 0x10000000 > anchor && word < anchor + 0x10000000) {
++            std::printf(" 0x%lx", word);
++            ++shown;
++        }
++    }
++    std::printf("\n");
++    std::fflush(stdout);
++    svcSleepThread(500'000'000);  // let nxlink's socket send it
++    svcExitProcess();
++}
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_io.cpp b/runtime/src/platform/switch/switch_io.cpp
+new file mode 100644
+index 0000000..0df4632
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_io.cpp
+@@ -0,0 +1,368 @@
++// Two main-thread costs on Horizon, linked in with -Wl,--wrap (PublicProducts.cmake):
++//
++// 1. WIICOMPILED_SWITCH_IO_LOG=1: every SD card operation goes through libnx's fs calls (fsdev's
++//    open/read/write/stat/close, romfs, SQLite, the shader caches). Each is an IPC to the fs
++//    service, a millisecond or more on the SD card. The wrappers count them per thread, time the
++//    main thread's (core 0, the game's fibers) and name their files; every 30 s a thread of its
++//    own prints the totals and the costliest paths to stderr. Off: one load and a getenv a second.
++// 2. SDL's Switch keyboard poll (SDL_switchkeyboard.c) calls SDL_SendKeyboardKey for each of the
++//    231 scancodes on every SDL_PumpEvents, with or without a keyboard. With no key down on the
++//    keyboard and none down in SDL's state, every one of those calls returns without doing anything
++//    (a key-up for a key that is up), so the poll is skipped then. A key down, or one SDL still
++//    holds down, runs it as before: the same events (repeats included) in the same order.
++#if defined(__SWITCH__)
++#include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++#include <SDL3/SDL_keyboard.h>
++#include <switch.h>
++
++namespace {
++enum Op { kOpen, kRead, kWrite, kFlush, kClose, kSize, kStat, kCreate, kDelete, kRename, kDir, kCommit, kOps };
++const char* const kOpNames[kOps] = {"open",   "read",   "write",  "flush", "close", "size",
++                                    "stat",   "create", "delete", "rename", "dir",  "commit"};
++
++struct Totals {
++    u64 count[kOps] = {};
++    u64 ns[kOps] = {};
++    u64 bytes = 0;
++    u64 Count() const { u64 n = 0; for (u64 c : count) n += c; return n; }
++    u64 Ns() const { u64 n = 0; for (u64 t : ns) n += t; return n; }
++};
++struct PathStats {
++    Totals totals;
++    u64 maxNs = 0;
++};
++
++// Never destroyed: threads may still reach the fs calls while the process exits.
++struct Log {
++    std::mutex mutex;
++    std::unordered_map<u64, std::string> names;  // open FsFile / FsDir (session, object id) -> path
++    std::unordered_map<std::string, PathStats> mainPaths;
++    Totals main, other;
++    u64 mainMaxNs = 0;
++    std::string mainMaxWhat;
++    u64 windowStart = 0;
++};
++Log& L() {
++    static Log* log = new Log;
++    return *log;
++}
++
++// 0: before this file's static initialisation (libnx mounts the SD card and romfs earlier), 1: off
++// so far (the variable comes from nxlink's arguments, which main() turns into the environment), 2: on.
++std::atomic<int> g_state{0};
++struct MarkInitialized {
++    MarkInitialized() { g_state.store(1, std::memory_order_release); }
++} g_markInitialized;
++
++void Report() {
++    Totals main, other;
++    std::vector<std::pair<std::string, PathStats>> paths;
++    u64 maxNs = 0;
++    std::string maxWhat;
++    u64 start = 0;
++    const u64 now = armGetSystemTick();
++    {
++        const std::lock_guard<std::mutex> lock(L().mutex);
++        main = std::exchange(L().main, {});
++        other = std::exchange(L().other, {});
++        paths.assign(L().mainPaths.begin(), L().mainPaths.end());
++        L().mainPaths.clear();
++        maxNs = std::exchange(L().mainMaxNs, 0);
++        maxWhat = std::move(L().mainMaxWhat);
++        L().mainMaxWhat.clear();
++        start = std::exchange(L().windowStart, now);
++    }
++    char ops[512];
++    int o = 0;
++    for (int i = 0; i < kOps; ++i) {
++        if (main.count[i] && o < int(sizeof ops)) {
++            o += std::snprintf(ops + o, sizeof ops - size_t(o), "%s%s %llu %.1f ms", o ? ", " : "", kOpNames[i],
++                               (unsigned long long)main.count[i], double(main.ns[i]) / 1e6);
++        }
++    }
++    std::fprintf(stderr,
++                 "[io] %.1f s: main thread %llu file ops, %.1f ms (%s), %.1f KiB; longest %.2f ms%s%s; other "
++                 "threads %llu ops, %.1f ms\n",
++                 double(armTicksToNs(now - start)) / 1e9, (unsigned long long)main.Count(), double(main.Ns()) / 1e6,
++                 o ? ops : "none", double(main.bytes) / 1024.0, double(maxNs) / 1e6, maxWhat.empty() ? "" : " ",
++                 maxWhat.c_str(), (unsigned long long)other.Count(), double(other.Ns()) / 1e6);
++    std::sort(paths.begin(), paths.end(),
++              [](const auto& a, const auto& b) { return a.second.totals.Ns() > b.second.totals.Ns(); });
++    for (size_t p = 0; p < paths.size() && p < 8; ++p) {
++        const Totals& t = paths[p].second.totals;
++        o = 0;
++        for (int i = 0; i < kOps; ++i) {
++            if (t.count[i] && o < int(sizeof ops)) {
++                o += std::snprintf(ops + o, sizeof ops - size_t(o), "%s%s %llu", o ? ", " : "", kOpNames[i],
++                                   (unsigned long long)t.count[i]);
++            }
++        }
++        std::fprintf(stderr, "[io]   main %8.2f ms (max %.2f) %5llu ops (%s) %8.1f KiB  %s\n", double(t.Ns()) / 1e6,
++                     double(paths[p].second.maxNs) / 1e6, (unsigned long long)t.Count(), ops, double(t.bytes) / 1024.0,
++                     paths[p].first.c_str());
++    }
++}
++
++void StartReporter() {
++    {
++        const std::lock_guard<std::mutex> lock(L().mutex);
++        L().windowStart = armGetSystemTick();
++    }
++    std::fprintf(stderr, "[io] WIICOMPILED_SWITCH_IO_LOG=1: SD card operations every 30 s (main thread by file)\n");
++    // a libnx thread: std::thread::detach throws on Horizon (pthread_detach is unsupported) and,
++    // without exceptions, terminated the NRO at the benchmark's start
++    static Thread reporter;
++    const auto loop = [](void*) {
++        for (;;) {
++            svcSleepThread(30'000'000'000LL);
++            Report();  // prints without the lock: its own writes (stderr on the SD card) come back here
++        }
++    };
++    if (R_FAILED(threadCreate(&reporter, loop, nullptr, nullptr, 0x10000, 0x3B, 2)) ||
++        R_FAILED(threadStart(&reporter))) {
++        std::fprintf(stderr, "[io] could not start the reporter thread\n");
++    }
++}
++
++// Turned on by SwitchIoLogStart (the match benchmark's start), never from inside an fs call: starting
++// the reporter (getenv, a thread, stderr) there crashed the NRO at boot.
++bool Enabled() { return g_state.load(std::memory_order_acquire) == 2; }
++} // namespace
++
++extern "C" void SwitchIoLogStart() {
++    const char* value = std::getenv("WIICOMPILED_SWITCH_IO_LOG");
++    if (value == nullptr || std::strcmp(value, "1") != 0) return;
++    int expected = 1;
++    if (g_state.compare_exchange_strong(expected, 2)) StartReporter();
++}
++
++namespace {
++
++u64 Key(const Service& s) { return (u64(s.session) << 32) | s.object_id; }
++
++void Record(Op op, const char* path, u64 key, u64 ticks, u64 bytes) {
++    const u64 ns = armTicksToNs(ticks);
++    const bool main = threadGetCurHandle() == envGetMainThreadHandle();
++    const std::lock_guard<std::mutex> lock(L().mutex);
++    Totals& totals = main ? L().main : L().other;
++    ++totals.count[op];
++    totals.ns[op] += ns;
++    totals.bytes += bytes;
++    if (!main) return;
++    std::string name;
++    if (path != nullptr) {
++        name = path;
++    } else if (const auto it = L().names.find(key); it != L().names.end()) {
++        name = it->second;
++    } else {
++        name = "(opened before the log started)";
++    }
++    PathStats& stats = L().mainPaths[name];
++    ++stats.totals.count[op];
++    stats.totals.ns[op] += ns;
++    stats.totals.bytes += bytes;
++    stats.maxNs = std::max(stats.maxNs, ns);
++    if (ns > L().mainMaxNs) {
++        L().mainMaxNs = ns;
++        L().mainMaxWhat = std::string(kOpNames[op]) + " " + name;
++    }
++}
++
++void Name(u64 key, const char* path) {
++    const std::lock_guard<std::mutex> lock(L().mutex);
++    L().names[key] = path;
++}
++
++void Forget(u64 key) {
++    const std::lock_guard<std::mutex> lock(L().mutex);
++    L().names.erase(key);
++}
++} // namespace
++
++extern "C" {
++Result __real_fsFsOpenFile(FsFileSystem* fs, const char* path, u32 mode, FsFile* out);
++Result __real_fsFileRead(FsFile* f, s64 off, void* buf, u64 read_size, u32 option, u64* bytes_read);
++Result __real_fsFileWrite(FsFile* f, s64 off, const void* buf, u64 write_size, u32 option);
++Result __real_fsFileFlush(FsFile* f);
++void __real_fsFileClose(FsFile* f);
++Result __real_fsFileGetSize(FsFile* f, s64* out);
++Result __real_fsFileSetSize(FsFile* f, s64 sz);
++Result __real_fsFsGetEntryType(FsFileSystem* fs, const char* path, FsDirEntryType* out);
++Result __real_fsFsGetFileTimeStampRaw(FsFileSystem* fs, const char* path, FsTimeStampRaw* out);
++Result __real_fsFsCreateFile(FsFileSystem* fs, const char* path, s64 size, u32 option);
++Result __real_fsFsDeleteFile(FsFileSystem* fs, const char* path);
++Result __real_fsFsRenameFile(FsFileSystem* fs, const char* cur_path, const char* new_path);
++Result __real_fsFsOpenDirectory(FsFileSystem* fs, const char* path, u32 mode, FsDir* out);
++Result __real_fsDirRead(FsDir* d, s64* total_entries, size_t max_entries, FsDirectoryEntry* buf);
++void __real_fsDirClose(FsDir* d);
++Result __real_fsFsCreateDirectory(FsFileSystem* fs, const char* path);
++Result __real_fsFsCommit(FsFileSystem* fs);
++void __real_SWITCH_PollKeyboard(Uint64 timestamp);
++
++Result __wrap_fsFsOpenFile(FsFileSystem* fs, const char* path, u32 mode, FsFile* out) {
++    if (!Enabled()) return __real_fsFsOpenFile(fs, path, mode, out);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsOpenFile(fs, path, mode, out);
++    const u64 ticks = armGetSystemTick() - t0;
++    if (R_SUCCEEDED(rc)) Name(Key(out->s), path);
++    Record(kOpen, path, 0, ticks, 0);
++    return rc;
++}
++
++Result __wrap_fsFileRead(FsFile* f, s64 off, void* buf, u64 read_size, u32 option, u64* bytes_read) {
++    if (!Enabled()) return __real_fsFileRead(f, off, buf, read_size, option, bytes_read);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFileRead(f, off, buf, read_size, option, bytes_read);
++    Record(kRead, nullptr, Key(f->s), armGetSystemTick() - t0, R_SUCCEEDED(rc) && bytes_read ? *bytes_read : 0);
++    return rc;
++}
++
++Result __wrap_fsFileWrite(FsFile* f, s64 off, const void* buf, u64 write_size, u32 option) {
++    if (!Enabled()) return __real_fsFileWrite(f, off, buf, write_size, option);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFileWrite(f, off, buf, write_size, option);
++    Record(kWrite, nullptr, Key(f->s), armGetSystemTick() - t0, write_size);
++    return rc;
++}
++
++Result __wrap_fsFileFlush(FsFile* f) {
++    if (!Enabled()) return __real_fsFileFlush(f);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFileFlush(f);
++    Record(kFlush, nullptr, Key(f->s), armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++void __wrap_fsFileClose(FsFile* f) {
++    if (!Enabled()) return __real_fsFileClose(f);
++    const u64 key = Key(f->s);
++    const u64 t0 = armGetSystemTick();
++    __real_fsFileClose(f);
++    Record(kClose, nullptr, key, armGetSystemTick() - t0, 0);
++    Forget(key);
++}
++
++Result __wrap_fsFileGetSize(FsFile* f, s64* out) {
++    if (!Enabled()) return __real_fsFileGetSize(f, out);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFileGetSize(f, out);
++    Record(kSize, nullptr, Key(f->s), armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFileSetSize(FsFile* f, s64 sz) {
++    if (!Enabled()) return __real_fsFileSetSize(f, sz);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFileSetSize(f, sz);
++    Record(kSize, nullptr, Key(f->s), armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsGetEntryType(FsFileSystem* fs, const char* path, FsDirEntryType* out) {
++    if (!Enabled()) return __real_fsFsGetEntryType(fs, path, out);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsGetEntryType(fs, path, out);
++    Record(kStat, path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsGetFileTimeStampRaw(FsFileSystem* fs, const char* path, FsTimeStampRaw* out) {
++    if (!Enabled()) return __real_fsFsGetFileTimeStampRaw(fs, path, out);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsGetFileTimeStampRaw(fs, path, out);
++    Record(kStat, path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsCreateFile(FsFileSystem* fs, const char* path, s64 size, u32 option) {
++    if (!Enabled()) return __real_fsFsCreateFile(fs, path, size, option);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsCreateFile(fs, path, size, option);
++    Record(kCreate, path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsDeleteFile(FsFileSystem* fs, const char* path) {
++    if (!Enabled()) return __real_fsFsDeleteFile(fs, path);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsDeleteFile(fs, path);
++    Record(kDelete, path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsRenameFile(FsFileSystem* fs, const char* cur_path, const char* new_path) {
++    if (!Enabled()) return __real_fsFsRenameFile(fs, cur_path, new_path);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsRenameFile(fs, cur_path, new_path);
++    Record(kRename, new_path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsOpenDirectory(FsFileSystem* fs, const char* path, u32 mode, FsDir* out) {
++    if (!Enabled()) return __real_fsFsOpenDirectory(fs, path, mode, out);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsOpenDirectory(fs, path, mode, out);
++    const u64 ticks = armGetSystemTick() - t0;
++    if (R_SUCCEEDED(rc)) Name(Key(out->s), path);
++    Record(kDir, path, 0, ticks, 0);
++    return rc;
++}
++
++Result __wrap_fsDirRead(FsDir* d, s64* total_entries, size_t max_entries, FsDirectoryEntry* buf) {
++    if (!Enabled()) return __real_fsDirRead(d, total_entries, max_entries, buf);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsDirRead(d, total_entries, max_entries, buf);
++    Record(kDir, nullptr, Key(d->s), armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++void __wrap_fsDirClose(FsDir* d) {
++    if (!Enabled()) return __real_fsDirClose(d);
++    const u64 key = Key(d->s);
++    const u64 t0 = armGetSystemTick();
++    __real_fsDirClose(d);
++    Record(kDir, nullptr, key, armGetSystemTick() - t0, 0);
++    Forget(key);
++}
++
++Result __wrap_fsFsCreateDirectory(FsFileSystem* fs, const char* path) {
++    if (!Enabled()) return __real_fsFsCreateDirectory(fs, path);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsCreateDirectory(fs, path);
++    Record(kCreate, path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsCommit(FsFileSystem* fs) {
++    if (!Enabled()) return __real_fsFsCommit(fs);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsCommit(fs);
++    Record(kCommit, "(commit)", 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++void __wrap_SWITCH_PollKeyboard(Uint64 timestamp) {
++    // The real poll: if hidGetKeyboardStates gives a state, SDL_SendKeyboardKey(pressed) for every
++    // scancode below HidKeyboardKey_RightGui. A failed read does nothing there either.
++    HidKeyboardState state;
++    if (hidGetKeyboardStates(&state, 1) == 0) return;
++    if ((state.keys[0] | state.keys[1] | state.keys[2] | state.keys[3]) == 0) {
++        int count = 0;
++        const bool* down = SDL_GetKeyboardState(&count);
++        if (down == nullptr || count <= 0 || std::memchr(down, 1, size_t(count)) == nullptr) return;
++    }
++    __real_SWITCH_PollKeyboard(timestamp);
++}
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_mbedtls.cpp b/runtime/src/platform/switch/switch_mbedtls.cpp
+new file mode 100644
+index 0000000..d37b613
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_mbedtls.cpp
+@@ -0,0 +1,21 @@
++// mbed TLS's platform hooks on Horizon (include/mbedtls_switch_config.h): entropy from libnx's CSRNG,
++// milliseconds from the monotonic clock.
++#if defined(__SWITCH__)
++#include <cstddef>
++#include <cstdint>
++#include <ctime>
++
++extern "C" void randomGet(void* buf, size_t len);  // libnx
++
++extern "C" int mbedtls_hardware_poll(void*, unsigned char* output, size_t length, size_t* written) {
++    randomGet(output, length);
++    *written = length;
++    return 0;
++}
++
++extern "C" int64_t mbedtls_ms_time(void) {  // mbedtls_ms_time_t
++    timespec now{};
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return int64_t{now.tv_sec} * 1000 + now.tv_nsec / 1000000;
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_posix.cpp b/runtime/src/platform/switch/switch_posix.cpp
+new file mode 100644
+index 0000000..e01a61b
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_posix.cpp
+@@ -0,0 +1,49 @@
++// POSIX calls Horizon's SD card cannot honour, linked in with -Wl,--wrap (PublicProducts.cmake).
++// FAT32/exFAT keep no Unix permissions, so changing them succeeds with nothing to do; libnx's fsdev
++// answers ENOSYS instead, which made every std::filesystem::copy_file fail.
++//
++// FAT has no hard links either. The runtime links a finished temporary file to its final name to
++// publish it without replacing one already there; Horizon's rename refuses an existing destination,
++// so it gives the same result. POSIX rename does replace (atomic saves rely on it): when Horizon
++// refuses, the old file goes first. ponytail: not atomic, which FAT cannot be anyway.
++#if defined(__SWITCH__)
++#include <cerrno>
++#include <pthread.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++extern "C" {
++int __real_rename(const char* from, const char* to);
++
++int __wrap_chmod(const char*, mode_t) { return 0; }
++int __wrap_fchmod(int, mode_t) { return 0; }
++int __wrap_link(const char* from, const char* to) { return __real_rename(from, to); }
++
++int __wrap_rename(const char* from, const char* to) {
++    if (__real_rename(from, to) == 0) return 0;
++    if (errno != EEXIST || ::unlink(to) != 0) return -1;
++    return __real_rename(from, to);
++}
++
++// A thread that asks for no particular stack (std::thread never does) gets 128 KiB from libnx;
++// Dawn's shader compiler alone needs more (GCC gives tint's AnalyzeUniformity a ~110 KB frame).
++// Desktop systems give 1 MiB (Windows) to 8 MiB (Linux). ponytail: one size for every such thread.
++constexpr size_t kDefaultThreadStack = 2 * 1024 * 1024;
++
++int __real_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg);
++
++int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
++    size_t size = 0;
++    if (attr != nullptr) pthread_attr_getstacksize(attr, &size);
++    if (size != 0) return __real_pthread_create(thread, attr, start, arg);
++    pthread_attr_t sized;
++    if (attr != nullptr) {
++        sized = *attr;
++    } else {
++        pthread_attr_init(&sized);
++    }
++    pthread_attr_setstacksize(&sized, kDefaultThreadStack);
++    return __real_pthread_create(thread, &sized, start, arg);
++}
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_profiler.cpp b/runtime/src/platform/switch/switch_profiler.cpp
+new file mode 100644
+index 0000000..5544d45
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_profiler.cpp
+@@ -0,0 +1,98 @@
++// Sampling profiler on Horizon: svcSetThreadActivity pauses the main thread (which runs the guest
++// fibers), svcGetThreadContext3 reads where it is, and it resumes. Started and dumped by the match
++// benchmark (match_benchmark_overlay.inc) when WIICOMPILED_SWITCH_PROFILE=1.
++#if defined(__SWITCH__)
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <unordered_map>
++#include <switch.h>
++
++namespace {
++std::atomic<bool> g_running{false};
++Thread g_thread;
++std::unordered_map<u64, u32> g_pc, g_lr;
++u64 g_samples = 0, g_failed = 0;
++// samples taken while the host frame in progress is already past 17 ms (SwitchProfilerFrame marks each
++// frame's start): what the main thread does in the frames that miss a vblank
++std::atomic<u64> g_frameStart{0};
++std::unordered_map<u64, u32> g_latePc, g_lateLr;
++u64 g_lateSamples = 0;
++
++void Sample(void*) {
++    const Handle main = envGetMainThreadHandle();
++    while (g_running.load(std::memory_order_relaxed)) {
++        svcSleepThread(1'000'000);
++        if (R_FAILED(svcSetThreadActivity(main, ThreadActivity_Paused))) { ++g_failed; continue; }
++        ThreadContext context{};
++        const bool read = R_SUCCEEDED(svcGetThreadContext3(&context, main));
++        svcSetThreadActivity(main, ThreadActivity_Runnable);
++        if (!read) { ++g_failed; continue; }
++        ++g_pc[context.pc.x];
++        ++g_lr[context.lr];
++        ++g_samples;
++        const u64 start = g_frameStart.load(std::memory_order_relaxed);
++        if (start && armTicksToNs(armGetSystemTick() - start) > 17'000'000) {
++            ++g_latePc[context.pc.x];
++            ++g_lateLr[context.lr];
++            ++g_lateSamples;
++        }
++    }
++}
++} // namespace
++
++// Mode, renderer and clocks right now, so a report says whether it ran docked, handheld or
++// overclocked (sys-clk changes them under the game). Phase 25 puts it in the benchmark summary.
++extern "C" const char* SwitchClocks() {
++    static char text[160];
++    u32 hz[3] = {};
++    const PcvModuleId ids[3] = {PcvModuleId_CpuBus, PcvModuleId_GPU, PcvModuleId_EMC};
++    const bool clkrst = R_SUCCEEDED(clkrstInitialize());
++    for (int i = 0; clkrst && i < 3; ++i) {
++        ClkrstSession session;
++        if (R_SUCCEEDED(clkrstOpenSession(&session, ids[i], 3))) {
++            clkrstGetClockRate(&session, &hz[i]);
++            clkrstCloseSession(&session);
++        }
++    }
++    if (clkrst) clkrstExit();
++    const char* renderer = std::getenv("WIICOMPILED_SWITCH_RENDERER");
++    std::snprintf(text, sizeof text, "switch_mode=%s renderer=%s cpu_mhz=%u gpu_mhz=%u emc_mhz=%u",
++                  appletGetOperationMode() == AppletOperationMode_Console ? "docked" : "handheld",
++                  renderer ? renderer : "deko3d", hz[0] / 1000000, hz[1] / 1000000, hz[2] / 1000000);
++    return text;
++}
++
++extern "C" void SwitchIoLogStart();  // switch_io.cpp: WIICOMPILED_SWITCH_IO_LOG=1
++
++extern "C" void SwitchProfilerStart() {
++    std::fprintf(stderr, "[match-bench] at start: %s\n", SwitchClocks());
++    SwitchIoLogStart();
++    const char* enabled = std::getenv("WIICOMPILED_SWITCH_PROFILE");
++    if (enabled == nullptr || *enabled != '1' || g_running.exchange(true)) return;
++    // Core 2, above the game's priority and the AX mix worker's (0x2B there: equal priority never
++    // preempts, so samples waited for the mix and landed after the game thread's join).
++    if (R_FAILED(threadCreate(&g_thread, Sample, nullptr, nullptr, 0x10000, 0x2A, 2)) ||
++        R_FAILED(threadStart(&g_thread))) {
++        g_running = false;
++        std::fprintf(stderr, "[profile] could not start the sampler\n");
++    }
++}
++
++extern "C" void SwitchProfilerFrame() { g_frameStart.store(armGetSystemTick(), std::memory_order_relaxed); }
++
++extern "C" void SwitchProfilerDump() {
++    if (!g_running.exchange(false)) return;
++    threadWaitForExit(&g_thread);
++    threadClose(&g_thread);
++    std::fprintf(stderr, "[profile] anchor=0x%lx samples=%lu failed=%lu\n",
++                 reinterpret_cast<u64>(&SwitchProfilerStart), g_samples, g_failed);
++    for (const auto& [pc, count] : g_pc) std::fprintf(stderr, "[profile] P %lx %u\n", pc, count);
++    for (const auto& [lr, count] : g_lr) std::fprintf(stderr, "[profile] L %lx %u\n", lr, count);
++    std::fprintf(stderr, "[profile] late samples=%lu (host frame past 17 ms)\n", g_lateSamples);
++    for (const auto& [pc, count] : g_latePc) std::fprintf(stderr, "[profile] Q %lx %u\n", pc, count);
++    for (const auto& [lr, count] : g_lateLr) std::fprintf(stderr, "[profile] R %lx %u\n", lr, count);
++    std::fprintf(stderr, "[profile] end\n");
++    std::fflush(stderr);
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_stdio.cpp b/runtime/src/platform/switch/switch_stdio.cpp
+new file mode 100644
+index 0000000..4eab794
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_stdio.cpp
+@@ -0,0 +1,11 @@
++// Standard output on Horizon (main.cpp's process transcript): over the network to nxlink's console on
++// the PC when nxlink started the game (nxlink -s), else nowhere but the log file.
++#if defined(__SWITCH__)
++#include <arpa/inet.h>  // nxlink.h uses struct in_addr without it
++#include <switch.h>
++
++extern "C" bool SwitchStdioToNxlink() {
++    if (__nxlink_host.s_addr == 0 || R_FAILED(socketInitializeDefault())) return false;
++    return nxlinkStdio() >= 0;
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_thread_placement.cpp b/runtime/src/platform/switch/switch_thread_placement.cpp
+new file mode 100644
+index 0000000..624bd23
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_thread_placement.cpp
+@@ -0,0 +1,173 @@
++// Core 0 belongs to the game's main thread (the guest fibers, priority 0x2C).
++//
++// libnx starts every pthread (std::thread, SDL_CreateThread, Mesa's thrd_create, Dawn's workers)
++// through __syscall_thread_create: threadCreate(prio 0x3B, core -2) and then
++// svcSetThreadCoreMask(handle, -1, <process core mask>), i.e. allowed on cores 0, 1 and 2. Horizon
++// then runs those threads on core 0 whenever the main thread blocks for a moment (a fiber switch
++// wait, a FIFO handoff), and the main thread pays the switch back and the cache they evicted.
++// SwitchWakerHD (Wind Waker HD on Switch) measured 20 -> 28 fps in a CPU-bound scene by giving its
++// main thread a core of its own.
++//
++// Here that one libnx call is rewritten while the new thread is still suspended: its affinity
++// becomes WIICOMPILED_SWITCH_THREAD_MASK (default 0x6: cores 1 and 2; 0 keeps libnx's mask), ideal
++// core the highest core in it. Threads that pin themselves later (SwitchPinCurrentThread: the GX
++// FIFO worker, the frame worker, the presenter, the AX mixer, deko3d's shader worker) still do.
++// Linked with -Wl,--wrap=__syscall_thread_create -Wl,--wrap=svcSetThreadCoreMask
++// (PublicProducts.cmake); only the call made inside __syscall_thread_create is changed.
++//
++// WIICOMPILED_SWITCH_THREADS=1 (nxlink argument; N > 1: every N seconds, else every 60 s) prints
++// every thread created that way plus the main thread: ideal core, affinity mask, priority and CPU
++// time per interval ("[threads] ..." on stderr). entry/run are link-time addresses (nm -n of
++// WiiCompiled.elf): entry is the pthread start routine; for a std::thread, run is its _M_run.
++#if defined(__SWITCH__)
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <switch.h>
++
++extern "C" {
++int __real___syscall_thread_create(void* thread, void* (*func)(void*), void* arg, void* stack_addr,
++                                   size_t stack_size);
++Result __real_svcSetThreadCoreMask(Handle handle, s32 preferred_core, u32 affinity_mask);
++extern char __start__[];      // switch.ld: image start (code)
++extern char __rodata_start[]; // end of code
++extern char __relro_start[];  // .data.rel.ro (vtables) ...
++extern char __data_start[];   // ... ends here
++extern char* fake_heap_start; // libsysbase's heap bounds, set by libnx
++extern char* fake_heap_end;
++}
++
++namespace mlb_switch_threads {
++
++struct Created {
++    Handle handle;
++    u64 tid;
++    u64 entry, arg, run; // link-time addresses (run: std::thread _State's _M_run, else 0)
++    u64 lastTicks;
++    std::atomic<bool> ready;
++};
++
++constexpr int kMaxCreated = 96;
++Created g_created[kMaxCreated];
++std::atomic<int> g_count{0};  // slots handed out (a slot is valid once .ready)
++std::atomic<bool> g_dumperStarted{false};
++Thread g_dumper;
++
++// The pthread being created on this thread, between __syscall_thread_create and its core-mask call.
++thread_local void* (*t_start)(void*) = nullptr;
++thread_local void* t_arg = nullptr;
++
++u32 PlacementMask() {
++    const char* text = std::getenv("WIICOMPILED_SWITCH_THREAD_MASK");
++    return text ? u32(std::strtoul(text, nullptr, 0)) & 0x7u : 0x6u;
++}
++
++u64 LinkAddress(const void* p) {
++    return p ? u64(reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(__start__)) : 0;
++}
++
++// std::thread hands pthread a heap _State* whose vtable (in .data.rel.ro) has _M_run at slot 2.
++u64 StdThreadRun(void* arg) {
++    const auto a = reinterpret_cast<uintptr_t>(arg);
++    if (a % 8 || a < uintptr_t(fake_heap_start) || a + 8 > uintptr_t(fake_heap_end)) return 0;
++    const auto vtable = *reinterpret_cast<const uintptr_t*>(a);
++    if (vtable % 8 || vtable < uintptr_t(__relro_start) || vtable + 24 > uintptr_t(__data_start)) return 0;
++    const auto run = reinterpret_cast<const uintptr_t*>(vtable)[2];
++    if (run < uintptr_t(__start__) || run >= uintptr_t(__rodata_start)) return 0;
++    return u64(run - uintptr_t(__start__));
++}
++
++u64 ThreadTicks(Handle handle) {
++    u64 ticks = 0;
++    if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, handle, u64(-1)))) return u64(-1);
++    return ticks;
++}
++
++void DumpOne(const char* label, Handle handle, u64& lastTicks) {
++    s32 ideal = -9, prio = -1;
++    u64 mask = 0, tid = 0;
++    const Result rm = svcGetThreadCoreMask(&ideal, &mask, handle);
++    svcGetThreadPriority(&prio, handle);
++    svcGetThreadId(&tid, handle);
++    const u64 ticks = ThreadTicks(handle);
++    const u64 delta = (ticks != u64(-1) && lastTicks != 0 && ticks >= lastTicks) ? ticks - lastTicks : 0;
++    if (ticks != u64(-1)) lastTicks = ticks;
++    std::fprintf(stderr, "[threads] %s tid=%lu ideal=%d mask=0x%lx prio=0x%x cpu_ms=%lu interval_ms=%lu%s\n",
++                 label, tid, ideal, mask, unsigned(prio), ticks == u64(-1) ? 0 : armTicksToNs(ticks) / 1000000,
++                 armTicksToNs(delta) / 1000000, R_FAILED(rm) ? " (handle gone)" : "");
++}
++
++void Dump() {
++    static u64 mainLast = 0;
++    const int count = g_count.load(std::memory_order_acquire);
++    std::fprintf(stderr, "[threads] dump: %d pthreads created, placement mask 0x%x, sampled on core %u\n",
++                 count, PlacementMask(), svcGetCurrentProcessorNumber());
++    DumpOne("main", envGetMainThreadHandle(), mainLast);
++    for (int i = 0; i < count && i < kMaxCreated; ++i) {
++        Created& c = g_created[i];
++        if (!c.ready.load(std::memory_order_acquire)) continue;
++        char label[96];
++        std::snprintf(label, sizeof label, "#%d created_tid=%lu entry=0x%lx run=0x%lx", i, c.tid, c.entry, c.run);
++        DumpOne(label, c.handle, c.lastTicks);
++    }
++    std::fflush(stderr);
++}
++
++void DumperMain(void*) {
++    const char* text = std::getenv("WIICOMPILED_SWITCH_THREADS");
++    const long every = text ? std::atol(text) : 0;
++    const u64 period = u64(every > 1 ? every : 60) * 1000000000ull;
++    for (;;) {
++        svcSleepThread(s64(period));
++        Dump();
++    }
++}
++
++void MaybeStartDumper() {
++    if (g_dumperStarted.load(std::memory_order_relaxed)) return;
++    const char* text = std::getenv("WIICOMPILED_SWITCH_THREADS");
++    if (text == nullptr || std::atol(text) <= 0 || g_dumperStarted.exchange(true)) return;
++    // Core 2, libnx's preemptive priority: it sleeps all the time and must stay off core 0.
++    if (R_SUCCEEDED(threadCreate(&g_dumper, DumperMain, nullptr, nullptr, 0x8000, 0x3B, 2)))
++        threadStart(&g_dumper);
++}
++
++} // namespace mlb_switch_threads
++
++extern "C" int __wrap___syscall_thread_create(void* thread, void* (*func)(void*), void* arg,
++                                              void* stack_addr, size_t stack_size) {
++    using namespace mlb_switch_threads;
++    MaybeStartDumper();
++    t_start = func;
++    t_arg = arg;
++    const int rc = __real___syscall_thread_create(thread, func, arg, stack_addr, stack_size);
++    t_start = nullptr;
++    t_arg = nullptr;
++    return rc;
++}
++
++extern "C" Result __wrap_svcSetThreadCoreMask(Handle handle, s32 preferred_core, u32 affinity_mask) {
++    using namespace mlb_switch_threads;
++    if (t_start == nullptr || preferred_core != -1) {
++        return __real_svcSetThreadCoreMask(handle, preferred_core, affinity_mask);
++    }
++    // libnx's own call for the thread __syscall_thread_create just made (not started yet).
++    const int slot = g_count.fetch_add(1, std::memory_order_relaxed);
++    if (slot < kMaxCreated) {
++        Created& c = g_created[slot];
++        c.handle = handle;
++        c.tid = 0;
++        svcGetThreadId(&c.tid, handle);
++        c.entry = LinkAddress(reinterpret_cast<void*>(t_start));
++        c.arg = reinterpret_cast<uintptr_t>(t_arg);
++        c.run = StdThreadRun(t_arg);
++        c.lastTicks = 0;
++        c.ready.store(true, std::memory_order_release);
++    }
++    t_start = nullptr;  // one call per creation
++    const u32 mask = PlacementMask() & affinity_mask;
++    if (mask == 0) return __real_svcSetThreadCoreMask(handle, preferred_core, affinity_mask);
++    const s32 ideal = 31 - __builtin_clz(mask);
++    return __real_svcSetThreadCoreMask(handle, ideal, mask);
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_threads.cpp b/runtime/src/platform/switch/switch_threads.cpp
+new file mode 100644
+index 0000000..e8aa273
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_threads.cpp
+@@ -0,0 +1,11 @@
++// Core and priority for threads that libnx would start at 0x3B on the default core
++// (aurora.cpp's frame worker and presenter, the AX mixer). Lower number = higher priority;
++// the game's main thread runs at 0x2C on core 0.
++#if defined(__SWITCH__)
++#include <switch.h>
++
++extern "C" void SwitchPinCurrentThread(int core, int priority) {
++    svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
++    svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
++}
++#endif
+diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
+index 7a2f7dd..da370c2 100644
+--- a/runtime/src/settings_overlay.cpp
++++ b/runtime/src/settings_overlay.cpp
+@@ -76,10 +76,19 @@ namespace two_way {
+ void OnHostFrame();  // two_way.cpp: the MLB Life drill list's "X Change"
+ }
+ 
++extern "C" void aurora_gx_fifo_stats_mark(void); // aurora gx/fifo_async.inc (match benchmark)
++extern "C" int aurora_gx_fifo_stats_report(char* out, int size);
++#if defined(__SWITCH__)
++extern "C" bool SwitchUsesDeko3d();  // tools/switch/deko/aurora/dk_present.cpp
++#endif
++
+ namespace settings_overlay {
+ namespace {
+ 
+ const char* GraphicsApiDisplayName() {
++#if defined(__SWITCH__)
++    if (SwitchUsesDeko3d()) return "deko3d";
++#endif
+     switch (aurora_get_backend()) {
+     case BACKEND_D3D11: return "Direct3D 11";
+     case BACKEND_D3D12: return "Direct3D 12";
+@@ -1220,6 +1229,11 @@ void DrawGraphicsSettings() {
+ }
+ 
+ // WIICOMPILED_BENCH=<minDraws>,<seconds>[,<maxWaitSeconds>]: event-driven benchmark. Waits until a
++#if defined(__SWITCH__)
++extern "C" void SwitchProfilerStart();  // platform/switch/switch_profiler.cpp
++extern "C" void SwitchProfilerDump();
++extern "C" void SwitchProfilerFrame();
++#endif
+ #include "match_benchmark_overlay.inc"
+ // frame issues at least minDraws draw calls (the scene under test), then records frame-to-frame
+ // times for the given seconds, prints a summary to stderr and exits. Exits with code 3 if the
+@@ -1308,11 +1322,18 @@ void RunBenchmarkFrame() {
+ void DrawFpsOverlay() {
+     DrawMatchBenchmark();
+     RunBenchmarkFrame();
++#if !defined(__SWITCH__)
+     AuroraPresentTiming presentTiming{};
+     aurora_get_present_timing(&presentTiming);
++#endif
+     if (!g_showFps || stadium_viewer::Enabled()) {
+         return;
+     }
++#if defined(__SWITCH__)
++    // Only for the counter it shows: the snapshot locks the presenter's timing ring and walks it.
++    AuroraPresentTiming presentTiming{};
++    aurora_get_present_timing(&presentTiming);
++#endif
+ 
+     const ImGuiIO& io = ImGui::GetIO();
+     constexpr float kMargin = 10.0f;
+diff --git a/runtime/third_party/libco/settings.h b/runtime/third_party/libco/settings.h
+index 418c00a..d61eb79 100644
+--- a/runtime/third_party/libco/settings.h
++++ b/runtime/third_party/libco/settings.h
+@@ -120,6 +120,8 @@
+   #define LIBCO_STRINGIFY(x) #x
+   #define LIBCO_TOSTRING(x) LIBCO_STRINGIFY(x)
+   #define section(name) __pragma(code_seg(LIBCO_TOSTRING("." #name))) __declspec(allocate(LIBCO_TOSTRING("." #name)))
++#elif defined(__SWITCH__)
++  #define section(name) __attribute__((section("." #name ".libco")))
+ #elif defined(__APPLE__)
+   #define section(name) __attribute__((section("__TEXT,__" #name)))
+ #else
+diff --git a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
+index 2201e54..42a7f98 100644
+--- a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
++++ b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
+@@ -22,15 +22,17 @@ internal static class AssemblyBlobWriter
+         var expectedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+         var assembly = new StringBuilder();
+         foreach (var header in headerLines) assembly.AppendLine(header);
+-        // PE/COFF (Windows), Mach-O (macOS), and ELF (Linux) spell a read-only data section
+-        // differently in GNU-as syntax. The build always targets
+-        // whichever platform the translator itself runs on (there is no cross-compilation
+-        // support), so that's what this picks the section syntax from.
+-        assembly.AppendLine(OperatingSystem.IsWindows()
+-            ? ".section .rdata,\"dr\""
+-            : OperatingSystem.IsMacOS()
+-                ? ".section __TEXT,__const"
+-                : ".section .rodata,\"a\",@progbits");
++        // PE/COFF (Windows), Mach-O (macOS), and ELF (Linux, Horizon) spell a read-only data
++        // section differently in GNU-as syntax. The target can differ from the platform the
++        // translator runs on (the Switch build translates on Windows), so the preprocessor that
++        // .S files go through picks it.
++        assembly.AppendLine("#if defined(_WIN32)");
++        assembly.AppendLine(".section .rdata,\"dr\"");
++        assembly.AppendLine("#elif defined(__APPLE__)");
++        assembly.AppendLine(".section __TEXT,__const");
++        assembly.AppendLine("#else");
++        assembly.AppendLine(".section .rodata,\"a\",@progbits");
++        assembly.AppendLine("#endif");
+         assembly.AppendLine();
+ 
+         foreach (var blob in blobs)

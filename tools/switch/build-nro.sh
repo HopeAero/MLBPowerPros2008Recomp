@@ -92,7 +92,8 @@ print('\n'.join(re.findall(r"'([\w-]+)'", block)))
 EOF
 )
     (( ${#patches[@]} > 0 )) || fail "could not read the patch list from tools/wiicompiled-translate.ps1"
-    patches+=(wiicompiled-linux wiicompiled-switch)   # the Switch platform comes last
+    # the Switch platform comes last (two files: the repository's 512 KiB per-file limit)
+    patches+=(wiicompiled-linux wiicompiled-switch wiicompiled-switch-2)
     for patch in "${patches[@]}"; do
         # Some Windows working copies of the patches are CRLF; git apply needs the LF they are committed as.
         tr -d '\r' < "$root/tools/patches/$patch.patch" | git -C "$src" apply || fail "patch $patch does not apply"
