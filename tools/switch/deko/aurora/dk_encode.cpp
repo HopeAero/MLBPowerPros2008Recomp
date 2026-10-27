@@ -44,14 +44,25 @@
 //                                   frame's start, flushed before every barrier and render-target change.
 //   WIICOMPILED_DK_AB=n             the two above in turn every n frames (off, lean, tiled, both), the GPU
 //                                   time per frame of each logged with the 30 s statistics ("A/B").
-//   WIICOMPILED_DK_HW_CLEARS=1      (experiment, off by default) Aurora's partial clear draws (GX copy
+//   WIICOMPILED_DK_HW_CLEARS=0      (default on since H4, 2026-10-27) Aurora's partial clear draws (GX copy
 //                                   clears of a rectangle: a triangle over the target, scissored, the
 //                                   colour as blend constant, the depth from the uniform) as the 3D
-//                                   engine's clears, which deko3d sets up to honour the scissor: no
-//                                   fragment shader, no blending. Same values (the colour converted to
-//                                   RGBA8 from the same floats, the depth clamped to 0..1 as the uniform),
-//                                   but ClearBuffers' handling of the bound write masks is not documented:
-//                                   check with WIICOMPILED_DK_SHOT before making it the default.
+//                                   engine's clears: no fragment shader (whose gl_FragDepth forced late
+//                                   Z), no blending, no destination read. Why the pixels are the same, from
+//                                   deko3d's source (gpu_3d_base.cpp, clear_buffers.mme): ClearColor's
+//                                   mask goes to ClearBuffers' R/G/B/A enables, which are the clear draw's
+//                                   write mask (clear.cpp clear_write_mask); deko3d's init sets
+//                                   ClearBufferFlags to StencilMask | Scissor, so the clear covers scissor 0
+//                                   (set here to the draw's scissor, clamped as before; ScreenScissor is the
+//                                   target) and the draw's viewport, the whole target, clips nothing more;
+//                                   the colour write and depth states are bound all-on first, so whether
+//                                   ClearBuffers also applies them cannot mask anything. Values: the colour
+//                                   is GX's copy clear colour, u8 / 255.f (command_processor.cpp), which the
+//                                   draw's blend (1.0 * constant + 0 * dst) and the clear both turn into the
+//                                   same RGBA8 byte; the depth is clear_depth_value(), already in 0..1, which
+//                                   both store as is into the Depth32Float EFB. A clear after GX draws of the
+//                                   same pass first flushes the tiled cache (Aurora puts them at a pass's
+//                                   start, right after pass_begin's flush, so this does not happen today).
 // GPU timing (diagnostics):
 //   WIICOMPILED_DK_PASS_TIMES=n     timestamps around every pass and clear draw; every n frames (1: 600)
 //                                   the GPU time per pass index (palette conversions, load clears, clear
@@ -122,6 +133,7 @@ struct PassState {
     uint32_t width = 0, height = 0;
     bool requireReady = false;
     Tex* color = nullptr;  // the colour target (diagnostics)
+    bool drawn = false;    // GX or clear draws since pass_begin's tiled cache flush (HW clears flush first)
 } g_pass;
 
 // ---- diagnostics for one console session (off by default):
@@ -363,12 +375,12 @@ void log_pass_times() {
                          ps * 1e-12 * 307e6 * 256.0);
             }
             dklog("    %.3f ms (%.1f%%): %.1f draws/frame, %.0f indices/draw; pipe %016llx module %016llx; depth "
-                  "test %u write %u, blend %s, cull %d; passes %s; raster rect %.1f kpx/draw; textures %.1f (first "
+                  "test %u write %u compare %u, blend %s, cull %d; passes %s; raster rect %.1f kpx/draw; textures %.1f (first "
                   "%ux%u)%s",
                   ms(d.ns), all ? 100.0 * double(d.ns) / double(all) : 0.0, double(d.draws) / n,
                   d.draws ? double(d.indices) / double(d.draws) : 0.0, (unsigned long long)p->ref,
                   (unsigned long long)(p->module ? p->module->key : 0), unsigned(p->depthStencil.depthTestEnable),
-                  unsigned(p->depthStencil.depthWriteEnable), p->color.blendEnableMask ? "on" : "off",
+                  unsigned(p->depthStencil.depthWriteEnable), unsigned(p->depthStencil.depthCompareOp), p->color.blendEnableMask ? "on" : "off",
                   int(p->rasterizer.cullMode), passes, double(d.area) / dr / 1000.0, double(d.texCount) / dr,
                   d.texWH >> 16, d.texWH & 0xFFFF, px);
         }
@@ -523,19 +535,15 @@ void read_marks(uint64_t frame) {
             uint64_t passNs = 0, convNs = 0;
             dpx[0] = 0;
             if (g_opt.pixels) {
-                // samples passed: a 32-bit count in the record's second word; the statistics counters: 64 bits
+                // Every counter report (deko3d: a four-word semaphore release) is {u64 count, u64 timestamp}:
+                // the count in the first 8 bytes for samples passed too. (Until H4 the samples were read as
+                // the 32 bits at +4, the count's high word: 0 kpx and absurd ps/px in run 9.)
                 uint64_t last = 0;
                 for (uint32_t i = 0; i < m.count; i++) {
                     const uint8_t* rec = q.cpu + size_t(kMaxMarks + i) * 16;
                     uint64_t v = 0;
-                    if (g_opt.pixels == 2) {
-                        memcpy(&v, rec, 8);
-                    } else {
-                        uint32_t v32;
-                        memcpy(&v32, rec + 4, 4);
-                        v = v32;
-                    }
-                    if (i) dpx[i] = g_opt.pixels == 2 ? v - last : uint64_t(uint32_t(v - last));
+                    memcpy(&v, rec, 8);
+                    if (i) dpx[i] = v >= last ? v - last : 0;  // (a counter reset between marks: none counted)
                     last = v;
                 }
             } else {
@@ -816,8 +824,9 @@ void batch_begin(uint32_t stagingSlot) {
         g_gpuTimers = swdk::env_flag("WIICOMPILED_DK_GPU_TIMERS", true);
         g_opt.lean = swdk::env_flag("WIICOMPILED_DK_LEAN_BARRIERS", false);
         g_opt.tiled = swdk::env_flag("WIICOMPILED_DK_TILED_CACHE", true);
-        g_opt.hwClears = swdk::env_flag("WIICOMPILED_DK_HW_CLEARS", false);
-        if (g_opt.hwClears) dklog("encoder: partial clears as 3D engine clears (WIICOMPILED_DK_HW_CLEARS, experiment)");
+        g_opt.hwClears = swdk::env_flag("WIICOMPILED_DK_HW_CLEARS", true);
+        dklog("encoder: partial clears %s (WIICOMPILED_DK_HW_CLEARS)",
+              g_opt.hwClears ? "as 3D engine clears" : "as clear draws");
         g_opt.abFrames = uint32_t(std::clamp(swdk::env_long("WIICOMPILED_DK_AB", 0), 0L, 1L << 20));
         const long passTimes = swdk::env_long("WIICOMPILED_DK_PASS_TIMES", 0);
         g_opt.passTimes = passTimes <= 0 ? 0u : passTimes == 1 ? 600u : uint32_t(std::min(passTimes, 1L << 20));
@@ -942,7 +951,7 @@ bool pass_begin(const PassTargets& t) {
     if (colorView->tex->samples > 1) note_unsupported("a multisampled pass (drawn single-sampled; MSAA is workstream C)");
     swdk::tiled_cache_flush();
     dkCmdBufBindRenderTargets(R.cmd, colors, 1, depthPtr);
-    g_pass = {true, t.width, t.height, t.requireReadyPipelines, colorView->tex};
+    g_pass = {true, t.width, t.height, t.requireReadyPipelines, colorView->tex, false};
     if (g_diag.frame && g_diag.drawLog) {
         dklog("diag frame %llu pass %u: colour %ux%u (level %u, format %d, %s) depth %s; load clear colour %d "
               "(%.3f %.3f %.3f %.3f) depth %d (%.3f)",
@@ -1057,6 +1066,7 @@ void draw_gx(const gx::DrawData& d, const Range* uniformOverride) {
     // gl_VertexID / gl_InstanceID are WebGPU's indices
     dkCmdBufDrawIndexed(R.cmd, DkPrimitive_Triangles, d.indexCount, d.instanceCount,
                         d.idxRange.offset / uint32_t(sizeof(uint16_t)), 0, 0);
+    g_pass.drawn = true;
     if (g_diag.frame && g_diag.draws < g_diag.drawLog) log_draw(d, p, uniformRange);
     g_diag.draws++;
     g_stats.draws++;
@@ -1128,7 +1138,9 @@ void draw_clear(const clear::DrawData& d) {
     if (g_opt.passTimes && g_drawsSinceMark) gpu_mark_tag(GpuWork::Efb, g_tag);
     if (g_opt.hwClears && p->clearMask) {
         // WIICOMPILED_DK_HW_CLEARS: the 3D engine's clears in the scissor, with every channel's write and
-        // the depth write on so that no state bound before can mask them
+        // the depth write on so that no state bound before can mask them (after draws of this pass: the
+        // tiled cache flushed first, as before the load clears)
+        if (g_pass.drawn) swdk::tiled_cache_flush();
         dkCmdBufSetScissors(R.cmd, 0, &s, 1);
         g_cache.scValid = false;
         g_curSc = s;
@@ -1174,6 +1186,7 @@ void draw_clear(const clear::DrawData& d) {
     g_curVp = v;
     g_curSc = s;
     dkCmdBufDraw(R.cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+    g_pass.drawn = true;
     g_stats.clears++;
     g_batch.workSinceTransfer = true;
     if (g_opt.passTimes) {

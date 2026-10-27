@@ -472,4 +472,303 @@ uint32_t tev_fast_rewrite(std::string* wgsl) {
     return uint32_t(sites.size());
 }
 
+// ---- tev_unit_rewrite (begin; shader_translate.h. Plain string work, no Tint: H4's host test compiles
+// this part on its own, local/tmp/cpu/h4_unit_rewrite_test.cpp)
+namespace {
+
+// fs_main's lines as gx/shader.cpp writes them (build_shader_source, the TEV stage loop and after it):
+//   var prev: vec4f;  |  var prev = ubuf.tevprev;  |  var tevregN: vec4f;  |  var tevregN = ubuf.tevregN;
+//   let tev_stageN_color_a = <colour arg>;
+//   REG = vec4f(clamp(<op>, vec3f(0.0), vec3f(1.0)), REG.a);          (or the S10 bounds)
+//   REG.a = clamp(<op>, 0.0, 1.0);                                       (or the S10 bounds)
+//   prev = vec4f(tevregN.rgb, prev.a);  |  prev.a = tevregN.a;
+//   prev = tev_overflow_vec4f(prev);
+// A register's channels (rgb, a) are known: 0 nothing, 1 in [0, 1], 2 sat(fl(R) / 255) for an integer R
+// (a clamped regular op, or zero). Any other assignment to a register forgets it.
+struct UnitState {
+    uint8_t rgb[4] = {}, a[4] = {};
+    std::map<std::string, uint8_t> lets;
+    bool textures = false;
+};
+
+std::string ut_trim(const std::string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && isspace(uint8_t(s[a]))) a++;
+    while (b > a && isspace(uint8_t(s[b - 1]))) b--;
+    return s.substr(a, b - a);
+}
+bool ut_ident(char c) { return isalnum(uint8_t(c)) || c == '_'; }
+
+// the ')' matching s[open] == '(' (npos: none)
+size_t ut_close(const std::string& s, size_t open) {
+    int depth = 0;
+    for (size_t i = open; i < s.size(); i++) {
+        if (s[i] == '(') depth++;
+        if (s[i] == ')' && --depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+// the top-level arguments of the call whose '(' is at open and ')' at close: [begin, end) each
+bool ut_args(const std::string& s, size_t open, size_t close, std::vector<std::pair<size_t, size_t>>* out) {
+    out->clear();
+    int depth = 0;
+    size_t start = open + 1;
+    for (size_t i = open + 1; i < close; i++) {
+        if (s[i] == '(') depth++;
+        if (s[i] == ')') depth--;
+        if (depth < 0) return false;
+        if (s[i] == ',' && depth == 0) {
+            out->push_back({start, i});
+            start = i + 1;
+        }
+    }
+    out->push_back({start, close});
+    return depth == 0;
+}
+
+// "name(...)" as the whole of e: the inside, else false
+bool ut_call(const std::string& e, const char* name, std::string* inner) {
+    const size_t n = strlen(name);
+    if (e.size() < n + 2 || e.compare(0, n, name) != 0 || e[n] != '(') return false;
+    if (ut_close(e, n) != e.size() - 1) return false;
+    *inner = e.substr(n + 1, e.size() - n - 2);
+    return true;
+}
+
+int ut_reg(const std::string& name) {
+    if (name == "prev") return 0;
+    if (name == "tevreg0") return 1;
+    if (name == "tevreg1") return 2;
+    if (name == "tevreg2") return 3;
+    return -1;
+}
+
+bool ut_swizzle(const std::string& s) {
+    if (s.empty() || s.size() > 4) return false;
+    for (char c : s)
+        if (c != 'r' && c != 'g' && c != 'b' && c != 'a') return false;
+    return true;
+}
+
+// what is known of an operand expression (0, 1 or 2 as UnitState)
+uint8_t ut_level(const UnitState& st, std::string e) {
+    e = ut_trim(e);
+    std::string inner;
+    if (ut_call(e, "", &inner)) return ut_level(st, inner);  // (x)
+    if (ut_call(e, "vec3f", &inner)) {
+        std::vector<std::pair<size_t, size_t>> args;
+        if (!ut_args(e, 5, e.size() - 1, &args) || args.size() != 1) return 0;  // (splats only)
+        return ut_level(st, inner);
+    }
+    if (auto it = st.lets.find(e); it != st.lets.end()) return it->second;
+    const size_t dot = e.find('.');
+    if (dot == std::string::npos) return 0;
+    const std::string base = e.substr(0, dot), sw = e.substr(dot + 1);
+    if (const int r = ut_reg(base); r >= 0) {
+        if (sw == "rgb") return st.rgb[r];
+        if (sw == "a") return st.a[r];
+        return 0;
+    }
+    // sampledN.<swizzle>
+    if (base.rfind("sampled", 0) == 0 && base.size() > 7 && ut_swizzle(sw)) {
+        for (size_t i = 7; i < base.size(); i++)
+            if (!isdigit(uint8_t(base[i]))) return 0;
+        return st.textures ? 1 : 0;
+    }
+    // ubuf.kcolorN.<swizzle>
+    if (base == "ubuf") {
+        const size_t dot2 = sw.find('.');
+        if (dot2 == std::string::npos) return 0;
+        const std::string field = sw.substr(0, dot2);
+        if (field.size() == 7 && field.compare(0, 6, "kcolor") == 0 && field[6] >= '0' && field[6] <= '3' &&
+            ut_swizzle(sw.substr(dot2 + 1)))
+            return 1;
+    }
+    return 0;
+}
+
+// tev_regular_vec3f / tev_regular_f32 calls in line: an A, B or C operand tev_overflow_*(X) with X
+// known in [0, 1] becomes tev_unit_*(X): X * 255 through a bitcast pair (an opaque value, as the
+// overflow's subtraction) / 255. The byte conversion's * 255 meets the same (T * fl(1/255)) * 255 as
+// before, so whatever the compiler folds there it folds the same way, on T = y instead of m = y: uam
+// folds it (the DKSH is the same as with the bare X: H4's GLSL check); a compiler that does not would
+// compute the same thing from the same value. used[0]/[1]: the vec3f / f32 helper is now used.
+uint32_t ut_operands(const UnitState& st, std::string* line, bool used[2]) {
+    uint32_t n = 0;
+    for (const char* fn : {"tev_regular_vec3f(", "tev_regular_f32("}) {
+        const bool f32 = strcmp(fn, "tev_regular_f32(") == 0;
+        const char* ovf = f32 ? "tev_overflow_f32" : "tev_overflow_vec3f";
+        size_t pos = 0;
+        while ((pos = line->find(fn, pos)) != std::string::npos) {
+            if (pos > 0 && ut_ident((*line)[pos - 1])) {
+                pos++;
+                continue;
+            }
+            const size_t open = pos + strlen(fn) - 1;
+            const size_t close = ut_close(*line, open);
+            std::vector<std::pair<size_t, size_t>> args;
+            if (close == std::string::npos || !ut_args(*line, open, close, &args) || args.size() != 7) {
+                pos = open + 1;
+                continue;
+            }
+            for (int k = 2; k >= 0; k--) {  // (right to left: the earlier ranges stay valid)
+                const std::string arg = line->substr(args[k].first, args[k].second - args[k].first);
+                const std::string t = ut_trim(arg);
+                std::string x;
+                if (!ut_call(t, ovf, &x) || ut_level(st, x) == 0) continue;
+                const size_t lead = arg.find_first_not_of(" \t");
+                line->replace(args[k].first + lead, t.size(), (f32 ? "tev_unit_f32(" : "tev_unit_vec3f(") + x + ")");
+                used[f32 ? 1 : 0] = true;
+                n++;
+            }
+            pos = open + 1;
+        }
+    }
+    return n;
+}
+
+// a clamp(<op>, lo, hi): the level its result gets (lo/hi as the unit bounds of the channel kind)
+uint8_t ut_clamp_level(const std::string& op, const char* lo, const char* hi, const char* regularFn) {
+    std::string inner;
+    if (!ut_call(op, "clamp", &inner)) return 0;
+    std::vector<std::pair<size_t, size_t>> args;
+    if (!ut_args(op, 5, op.size() - 1, &args) || args.size() != 3) return 0;
+    const auto arg = [&](int k) { return ut_trim(op.substr(args[k].first, args[k].second - args[k].first)); };
+    if (arg(1) != lo || arg(2) != hi) return 0;
+    std::string call;
+    return ut_call(arg(0), regularFn, &call) ? 2 : 1;
+}
+
+// any assignment to a register in line t (REG, REG.x, with =, +=, -=, *=, /=): its channels forgotten
+void ut_forget_writes(UnitState* st, const std::string& t) {
+    static const char* const kNames[4] = {"prev", "tevreg0", "tevreg1", "tevreg2"};
+    for (int r = 0; r < 4; r++) {
+        const size_t len = strlen(kNames[r]);
+        size_t pos = 0;
+        while ((pos = t.find(kNames[r], pos)) != std::string::npos) {
+            const size_t start = pos;
+            pos += len;
+            if ((start > 0 && (ut_ident(t[start - 1]) || t[start - 1] == '.')) || (pos < t.size() && ut_ident(t[pos])))
+                continue;
+            size_t j = pos;
+            if (j < t.size() && t[j] == '.') {
+                j++;
+                while (j < t.size() && ut_ident(t[j])) j++;
+            }
+            while (j < t.size() && t[j] == ' ') j++;
+            const bool assign = j < t.size() && ((t[j] == '=' && (j + 1 >= t.size() || t[j + 1] != '=')) ||
+                                                 (strchr("+-*/", t[j]) && j + 1 < t.size() && t[j + 1] == '='));
+            if (assign) st->rgb[r] = st->a[r] = 0;
+        }
+    }
+}
+
+}  // namespace
+
+uint32_t tev_unit_rewrite(std::string* wgsl, bool textures) {
+    const size_t fn = wgsl->find("\nfn fs_main(");
+    if (fn == std::string::npos) return 0;
+    const size_t bodyOpen = wgsl->find('{', fn);
+    if (bodyOpen == std::string::npos) return 0;
+    size_t bodyClose = std::string::npos;
+    {
+        int depth = 0;
+        for (size_t i = bodyOpen; i < wgsl->size(); i++) {
+            if ((*wgsl)[i] == '{') depth++;
+            if ((*wgsl)[i] == '}' && --depth == 0) {
+                bodyClose = i;
+                break;
+            }
+        }
+    }
+    if (bodyClose == std::string::npos) return 0;
+    UnitState st;
+    st.textures = textures;
+    std::string body = wgsl->substr(bodyOpen + 1, bodyClose - bodyOpen - 1), out;
+    out.reserve(body.size());
+    uint32_t n = 0;
+    bool finalUnit = false, used[2] = {false, false};
+    size_t at = 0;
+    while (at <= body.size()) {
+        size_t eol = body.find('\n', at);
+        if (eol == std::string::npos) eol = body.size();
+        std::string line = body.substr(at, eol - at);
+        if (line.find("tev_regular_") != std::string::npos) n += ut_operands(st, &line, used);
+        const std::string t = ut_trim(line);
+        bool handled = true;
+        int r;
+        if (t == "var prev: vec4f;") {
+            st.rgb[0] = st.a[0] = 2;
+        } else if (t.rfind("var tevreg", 0) == 0 && t.size() > 11 && (r = ut_reg(t.substr(4, 7))) > 0 &&
+                   t.compare(11, std::string::npos, ": vec4f;") == 0) {
+            st.rgb[r] = st.a[r] = 2;
+        } else if (t.rfind("let tev_stage", 0) == 0 && t.find(" = ") != std::string::npos && t.back() == ';') {
+            const size_t eq = t.find(" = ");
+            st.lets[t.substr(4, eq - 4)] = ut_level(st, t.substr(eq + 3, t.size() - eq - 4));
+        } else if (t == "prev = tev_overflow_vec4f(prev);") {
+            if (st.rgb[0] == 2 && st.a[0] == 2) {
+                line.replace(line.find("tev_overflow_vec4f"), 18, "tev_unit_vec4f");
+                finalUnit = true;
+                n++;
+            }
+            st.rgb[0] = st.a[0] = 0;
+        } else {
+            handled = false;
+            // REG = vec4f(<op>, REG.a);  /  REG.a = <op>;
+            const size_t eq = t.find(" = ");
+            const int reg = eq == std::string::npos ? -1 : ut_reg(t.substr(0, eq));
+            const int regA = eq != std::string::npos && eq > 2 && t.compare(eq - 2, 2, ".a") == 0
+                                 ? ut_reg(t.substr(0, eq - 2))
+                                 : -1;
+            if (reg >= 0 && t.back() == ';') {
+                const std::string rhs = t.substr(eq + 3, t.size() - eq - 4);
+                const std::string keepA = ", " + t.substr(0, eq) + ".a)";
+                std::string inner;
+                if (ut_call(rhs, "vec4f", &inner) && inner.size() > keepA.size() - 1 &&
+                    rhs.compare(rhs.size() - keepA.size(), keepA.size(), keepA) == 0) {
+                    const std::string op = ut_trim(rhs.substr(6, rhs.size() - 6 - keepA.size()));
+                    uint8_t level = ut_clamp_level(op, "vec3f(0.0)", "vec3f(1.0)", "tev_regular_vec3f");
+                    if (op.size() > 4 && op.compare(op.size() - 4, 4, ".rgb") == 0 &&
+                        ut_reg(op.substr(0, op.size() - 4)) >= 0)
+                        level = st.rgb[ut_reg(op.substr(0, op.size() - 4))];  // (a copy)
+                    // (the operands this line read were checked above, before its write; REG.a is kept)
+                    st.rgb[reg] = level;
+                    handled = true;
+                }
+            } else if (regA >= 0 && t.back() == ';') {
+                const std::string rhs = t.substr(eq + 3, t.size() - eq - 4);
+                uint8_t level = ut_clamp_level(rhs, "0.0", "1.0", "tev_regular_f32");
+                if (rhs.size() > 2 && rhs.compare(rhs.size() - 2, 2, ".a") == 0 && ut_reg(rhs.substr(0, rhs.size() - 2)) >= 0)
+                    level = st.a[ut_reg(rhs.substr(0, rhs.size() - 2))];  // (a copy)
+                st.a[regA] = level;
+                handled = true;
+            }
+        }
+        if (!handled) ut_forget_writes(&st, t);
+        out += line;
+        if (eol < body.size()) out += '\n';
+        at = eol + 1;
+    }
+    if (n == 0) return 0;
+    wgsl->replace(bodyOpen + 1, bodyClose - bodyOpen - 1, out);
+    std::string helpers;
+    if (used[0])
+        helpers += "fn tev_unit_vec3f(in: vec3f) -> vec3f {\n"
+                   "  return bitcast<vec3f>(bitcast<vec3u>(in * 255.0)) / 255.0;\n"
+                   "}\n\n";
+    if (used[1])
+        helpers += "fn tev_unit_f32(in: f32) -> f32 {\n"
+                   "  return bitcast<f32>(bitcast<u32>(in * 255.0)) / 255.0;\n"
+                   "}\n\n";
+    if (finalUnit)
+        helpers += "fn tev_unit_vec4f(in: vec4f) -> vec4f {\n"
+                   "  return max(in * 255.0, vec4f(0.0)) / 255.0;\n"
+                   "}\n\n";
+    const size_t frag = wgsl->find("@fragment\nfn fs_main(");
+    if (frag != std::string::npos) wgsl->insert(frag, helpers);  // (found: fs_main was, above)
+    return n;
+}
+// ---- tev_unit_rewrite (end)
+
 }  // namespace swdk

@@ -278,6 +278,13 @@ bool module_wait(ShaderModule* m);
 // (shader_translate.h: the TEV byte conversions without the conversion unit, same pixels) and keyed
 // by XXH3_64bits_withSeed(wgsl, kTevFastSeed), so the two variants never share a cache record.
 bool tev_fast_enabled();
+// WIICOMPILED_DK_TEV_UNIT (default 2): GX modules are translated with tev_unit_rewrite (shader_translate.h:
+// the TEV overflow left out for operands known in [0, 1], same pixels): 2 registers, konst colours and
+// textures, 1 registers and konst colours only (exact whatever the texture formats), 0 off.
+uint32_t tev_unit_mode();
+// The XXH3 seed of a GX module's key for the translation variant in use (TEV_FAST, TEV_UNIT): each variant
+// has keys of its own, so the SD card's cache never mixes them (0: none, the plain XXH3 of the WGSL).
+uint64_t module_key_seed();
 // WIICOMPILED_DK_DUMP_MODULES=<hex key>[,...] or "all": the module's WGSL and GLSL written next to the
 // cache (mod_<key>.wgsl, mod_<key>_{vs,fs}.glsl) once per session, also for modules the cache already
 // holds (WIICOMPILED_DK_DUMP_GLSL only sees modules translated in the session). Any thread.

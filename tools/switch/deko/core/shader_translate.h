@@ -121,4 +121,37 @@ bool post_pass(std::string* glsl, const std::vector<SamplerSlot>& samplerSlots, 
 // Returns the number of rewritten sites (0: unchanged).
 uint32_t tev_fast_rewrite(std::string* wgsl);
 
+// The TEV overflow emulation left out where its operand is known to lie in [0, 1] (2026-10-27, stream
+// H4; the deko3d NRO applies it by default, WIICOMPILED_DK_TEV_UNIT, core/shaders.cpp). gx/shader.cpp
+// wraps every A/B/C operand of a regular TEV op in tev_overflow_*: y = x * 255, then y - floor(y / 256)
+// * 256 (a quarter-rate F2F.FLOOR, an FMUL and an FFMA per channel), then / 255, which the byte
+// conversion's * 255 cancels (Mesa folds (m * fl(1/255)) * 255 into m * 1.0: uam's TGSI shows the
+// byte taken of m). For x in [-0, 1], y = fl(x * 255) <= 255, floor(y / 256) = 0 and m = y exactly,
+// fused or not (host check, every float in [-0, 1]: local/tmp/cpu/h4_unit_check.c): the byte of x
+// itself is the same integer, so tev_regular_*(tev_overflow_*(X), ...) becomes
+// tev_regular_*(tev_unit_*(X), ...), tev_unit_*(X) = bitcast(bitcast(X * 255)) / 255 (the overflow's
+// structure without the floor: what the compiler folds, it folds alike; uam's DKSH is the same as with
+// a bare X), when X is
+//   - a TEV register (prev, tevreg0-2: .rgb, .a, vec3f(.a)) whose last write in the shader was a
+//     clamped combiner result (clamp(..., 0, 1): MOV_SAT, NaN included, gives [0, 1]) or which starts
+//     zeroed (not loaded from the uniform: the S10 colour registers can be outside [0, 1]);
+//   - a konst colour (ubuf.kcolorN: the BP register's u8 / 255.f, command_processor.cpp);
+//   - a texture sample (sampledN), when `textures`: UNORM formats only give [0, 1]. Every texture the
+//     game's GX path makes is one (Aurora's GX conversions, the EFB copies and palette conversions: R8,
+//     RG8, RGBA8, BC1/3/5/7 UNORM); only a texture replacement pack in an SNORM or float format (BC4/5
+//     SNORM, BC6H) could be outside, hence the switch;
+//   - a `let tev_stageN_color_*` holding one of these.
+// Rasterized colours keep the overflow (interpolation can leave [0, 1] by an ulp, and -tiny wraps to
+// 256), as do the compare ops (their C operand is used as a float, not as a byte).
+// The final `prev = tev_overflow_vec4f(prev)` keeps its two multiplies but loses the floor when both
+// prev.rgb and prev.a were last written by clamped regular ops (or start zeroed): prev = sat(fl(R) /
+// 255) for an integer R, so y >= +0 and m = y again; max(y, 0.0) stands in for the FFMA (it keeps
+// nv50_ir's chained-MUL collapse from turning y * 255 / 255 into y * 1.0, which differs from fl(fl(y) /
+// 255) by an ulp for 126 of the 2^23 R values: the same host check).
+// Returns the number of overflows left out (0: unchanged). The module key's seed says which variant.
+uint32_t tev_unit_rewrite(std::string* wgsl, bool textures);
+// The XXH3 seeds of a GX module's key with tev_unit_rewrite (xor'ed with kTevFastSeed's choice)
+constexpr uint64_t kTevUnitSeed = 0x7465765f756e6974ull;      // "tev_unit" (textures too)
+constexpr uint64_t kTevUnitRegsSeed = 0x7465765f756e7267ull;  // "tev_unrg" (registers and konst only)
+
 }  // namespace swdk

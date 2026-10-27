@@ -143,8 +143,9 @@ void create_gx_pipeline(const gx::PipelineConfig& config) {
     if (find_pipe(ref)) return;
     // the module: by the hash of its WGSL (the cache's key); a new one is compiled in the background
     const std::string wgsl = gx::build_shader_source(config.shaderConfig);
-    // (WIICOMPILED_DK_TEV_FAST: the rewritten translation has keys of its own, dk.h tev_fast_enabled)
-    const uint64_t seed = swdk::tev_fast_enabled() ? swdk::kTevFastSeed : 0;
+    // (WIICOMPILED_DK_TEV_FAST, WIICOMPILED_DK_TEV_UNIT: each rewritten translation has keys of its own,
+    // dk.h module_key_seed)
+    const uint64_t seed = swdk::module_key_seed();
     swdk::ShaderModule* m = swdk::shader_module(XXH3_64bits_withSeed(wgsl.data(), wgsl.size(), seed));
     if (m->state.load(std::memory_order_acquire) == swdk::ModuleState::Unresolved) {
         const gx::ShaderConfig shaderConfig = config.shaderConfig;
@@ -153,9 +154,10 @@ void create_gx_pipeline(const gx::PipelineConfig& config) {
         g_stats.modulesNew++;
     }
     // (WIICOMPILED_DK_DUMP_MODULES: by this key or by the plain XXH3, the key of a session without the
-    // TEV rewrite, e.g. run 6's draw-times lines)
+    // TEV rewrites, e.g. run 6's draw-times lines), or by the key with TEV_FAST alone (runs 7-9's)
     const uint64_t plainKey = seed ? XXH3_64bits(wgsl.data(), wgsl.size()) : m->key;
-    if (swdk::module_dump_wanted(m->key) || swdk::module_dump_wanted(plainKey)) {
+    const uint64_t fastKey = XXH3_64bits_withSeed(wgsl.data(), wgsl.size(), swdk::kTevFastSeed);
+    if (swdk::module_dump_wanted(m->key) || swdk::module_dump_wanted(plainKey) || swdk::module_dump_wanted(fastKey)) {
         if (plainKey != m->key)
             dklog("pipelines: module %016llx (plain XXH3 %016llx) to be dumped", (unsigned long long)m->key,
                   (unsigned long long)plainKey);
@@ -191,6 +193,13 @@ void create_gx_pipeline(const gx::PipelineConfig& config) {
     (void)logged;
     if (noCull) rs.cullMode = DkFace_None;
     if (depthAlways) ds.depthCompareOp = DkCompareOp_Always;
+    // A depth test that compares Always and writes nothing passes every fragment and leaves the depth
+    // buffer as it is (no stencil in the Depth32Float EFB): with the test off the pixels are the same and
+    // the ZROP neither reads nor tests depth (GX draws with z compare off: 2D, UI, overlays). (H4,
+    // WIICOMPILED_DK_DEPTH_SKIP=0 keeps the test on as WebGPU's pipeline has it. With the test off,
+    // WIICOMPILED_DK_DRAW_PIXELS=1's samples-passed counter may not count these draws: use =2.)
+    static const bool depthSkip = swdk::env_flag("WIICOMPILED_DK_DEPTH_SKIP", true);
+    if (depthSkip && ds.depthCompareOp == DkCompareOp_Always && !ds.depthWriteEnable) ds.depthTestEnable = false;
     // Blending off where it computes src * One + dst * Zero for both colour and alpha (GX_BM_NONE,
     // and the logic op Copy): the colour target is RGBA8 Unorm, where the blend unit's result is the
     // clamped source either way, so the ROP need not read the destination

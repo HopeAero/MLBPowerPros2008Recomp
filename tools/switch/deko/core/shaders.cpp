@@ -43,6 +43,8 @@
 #endif
 
 namespace swdk {
+// (defined below with the switches it follows)
+void rewrite_module(std::string* wgsl, uint32_t* fast, uint32_t* unit);
 namespace {
 
 constexpr const char* kCacheDir = MLB_DK_CACHE_DIR;
@@ -210,7 +212,8 @@ void run_dump_job(Job& job) {
     char path[256];
     snprintf(path, sizeof path, "%s/mod_%016llx.wgsl", kCacheDir, (unsigned long long)key);
     write_text(path, wgsl);
-    const uint32_t rewritten = tev_fast_enabled() ? tev_fast_rewrite(&wgsl) : 0;
+    uint32_t rewritten = 0, unitSites = 0;
+    rewrite_module(&wgsl, &rewritten, &unitSites);
     const TranslateResult tv = wgsl_to_glsl(wgsl, "vs_main", ShaderStage::Vertex, BindingScheme::GX);
     const TranslateResult tf = wgsl_to_glsl(wgsl, "fs_main", ShaderStage::Fragment, BindingScheme::GX);
     for (int st = 0; st < 2; st++) {
@@ -219,8 +222,8 @@ void run_dump_job(Job& job) {
         write_text(path, r.ok ? r.glsl : "/* translation failed: " + r.error + " */\n");
     }
     dklog("shaders: module %016llx dumped to %s/mod_%016llx{.wgsl,_vs.glsl,_fs.glsl} (WIICOMPILED_DK_DUMP_MODULES; "
-          "TEV fast rewrite: %u sites; vs %016llx fs %016llx)",
-          (unsigned long long)key, kCacheDir, (unsigned long long)key, rewritten,
+          "TEV fast rewrite: %u sites, TEV unit rewrite: %u overflows left out; vs %016llx fs %016llx)",
+          (unsigned long long)key, kCacheDir, (unsigned long long)key, rewritten, unitSites,
           (unsigned long long)(tv.ok ? glsl_hash(tv.glsl) : 0), (unsigned long long)(tf.ok ? glsl_hash(tf.glsl) : 0));
 }
 
@@ -229,18 +232,26 @@ void run_module_job(Job& job) {
     const uint64_t t0 = now_ns();
     std::string wgsl = job.source ? job.source() : std::string();
     std::string original;  // (the WGSL as generated, when the TEV rewrite changed it)
-    // the TEV byte conversions without the conversion unit (shader_translate.h; same pixels)
-    if (!wgsl.empty() && tev_fast_enabled()) {
+    // the TEV byte conversions without the conversion unit, the TEV overflow left out where its operand
+    // is in [0, 1] (shader_translate.h; same pixels)
+    if (!wgsl.empty() && (tev_fast_enabled() || tev_unit_mode())) {
         original = wgsl;
-        const uint32_t sites = tev_fast_rewrite(&wgsl);
-        if (!sites) original.clear();
-        static uint64_t rewritten = 0, unchanged = 0;
+        uint32_t sites = 0, unitSites = 0;
+        rewrite_module(&wgsl, &sites, &unitSites);
+        if (!sites && !unitSites) original.clear();
+        static uint64_t rewritten = 0, unchanged = 0, unitModules = 0, unitTotal = 0;
         std::lock_guard<std::mutex> lock(g_jobMutex);
         (sites ? rewritten : unchanged)++;
-        if (!sites && unchanged <= 4)
+        if (unitSites) unitModules++, unitTotal += unitSites;
+        if (tev_fast_enabled() && !sites && unchanged <= 4)
             dklog("shaders: module %016llx: the TEV helpers are not as gx/shader.cpp writes them; translated as they "
                   "are (WIICOMPILED_DK_TEV_FAST; %llu rewritten, %llu unchanged so far)",
                   (unsigned long long)m->key, (unsigned long long)rewritten, (unsigned long long)unchanged);
+        if (unitSites && (unitModules <= 8 || unitModules % 64 == 0))
+            dklog("shaders: module %016llx: %u TEV overflows left out (WIICOMPILED_DK_TEV_UNIT; %llu modules, %llu "
+                  "overflows so far)",
+                  (unsigned long long)m->key, unitSites, (unsigned long long)unitModules,
+                  (unsigned long long)unitTotal);
     }
     TranslateResult tv, tf;
     if (!wgsl.empty()) {
@@ -249,7 +260,7 @@ void run_module_job(Job& job) {
     }
     if (!original.empty() && (!tv.ok || !tf.ok)) {
         // (Tint refused the rewritten text: the module as generated, rather than no module)
-        dklog("shaders: module %016llx: Tint refused the TEV rewrite (%s); translated as generated",
+        dklog("shaders: module %016llx: Tint refused the TEV rewrites (%s); translated as generated",
               (unsigned long long)m->key, (!tv.ok ? tv.error : tf.error).substr(0, 300).c_str());
         wgsl = std::move(original);
         tv = wgsl_to_glsl(wgsl, "vs_main", ShaderStage::Vertex, BindingScheme::GX);
@@ -479,6 +490,31 @@ bool tev_fast_enabled() {
         return v;
     }();
     return on;
+}
+
+uint32_t tev_unit_mode() {
+    static const uint32_t mode = [] {
+        const long v = env_long("WIICOMPILED_DK_TEV_UNIT", 2);
+        const uint32_t m = v <= 0 ? 0u : v == 1 ? 1u : 2u;
+        dklog("shaders: TEV overflow %s (WIICOMPILED_DK_TEV_UNIT=%u; same pixels)",
+              m == 2 ? "left out for registers, konst colours and textures known in [0, 1]"
+              : m == 1 ? "left out for registers and konst colours known in [0, 1]"
+                       : "as generated",
+              m);
+        return m;
+    }();
+    return mode;
+}
+
+uint64_t module_key_seed() {
+    const uint32_t unit = tev_unit_mode();
+    return (tev_fast_enabled() ? kTevFastSeed : 0) ^ (unit == 2 ? kTevUnitSeed : unit == 1 ? kTevUnitRegsSeed : 0);
+}
+
+// the WGSL rewrites of the variant in use (tev_fast_rewrite, tev_unit_rewrite): sites rewritten by each
+void rewrite_module(std::string* wgsl, uint32_t* fast, uint32_t* unit) {
+    *fast = tev_fast_enabled() ? tev_fast_rewrite(wgsl) : 0;
+    *unit = tev_unit_mode() ? tev_unit_rewrite(wgsl, tev_unit_mode() == 2) : 0;
 }
 
 bool module_dump_wanted(uint64_t key) {
