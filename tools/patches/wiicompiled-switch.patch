@@ -9870,7 +9870,7 @@ index 7269747..49093ee 100644
  }
  extern "C" bool g_dynamicAspectRatioEnabled = false;
 diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
-index 280cfd6..876817c 100644
+index 280cfd6..683aa4d 100644
 --- a/runtime/src/match_benchmark_overlay.inc
 +++ b/runtime/src/match_benchmark_overlay.inc
 @@ -1,4 +1,7 @@
@@ -9881,7 +9881,19 @@ index 280cfd6..876817c 100644
  // CPU, threads, RAM, GPU and OS, one per line, for the panel and the saved report.
  std::string BenchmarkDeviceInfo() {
      char cpu[49] = {};
-@@ -156,6 +159,10 @@ void DrawMatchBenchmark() {
+@@ -14,7 +17,11 @@ std::string BenchmarkDeviceInfo() {
+     std::string name = cpu;
+     name.erase(name.find_last_not_of(' ') + 1);
+     name.erase(0, name.find_first_not_of(' '));
++#if defined(__SWITCH__)
++    const std::string gpu = SwitchUsesDeko3d() ? std::string("Tegra X1 (deko3d)") : std::string(aurora_get_adapter_name());
++#else
+     const std::string gpu = aurora_get_adapter_name();
++#endif
+     char ram[32];
+     std::snprintf(ram, sizeof(ram), "%.1f GB", SDL_GetSystemRAM() / 1024.0);
+     return "CPU: " + (name.empty() ? std::string("desconocida") : name) + " (" + std::to_string(SDL_GetNumLogicalCPUCores()) +
+@@ -156,6 +163,10 @@ void DrawMatchBenchmark() {
          std::error_code ec;
          std::filesystem::create_directories(folder, ec);
          report = folder / ("match-" + std::to_string(id));
@@ -9892,7 +9904,7 @@ index 280cfd6..876817c 100644
          csv.open(report.string() + ".csv");
          if (!csv) { message = "No se pudo crear el informe"; return; }
          csv << "utc_unix_ms,elapsed_s,frame_ms,draws,scale,force_16_9,backend,shader_queue,gpu_render_ms,gpu_samples,cpu_encode_ms,efb_copies,efb_source_pixels,efb_snapshots,efb_readbacks,efb_readback_wait_ms,presents,process_cpu_pct,gpu_3d_pct,process_ram_mb,vram_mb,system_ram_used_gb\n";
-@@ -163,6 +170,7 @@ void DrawMatchBenchmark() {
+@@ -163,6 +174,7 @@ void DrawMatchBenchmark() {
          start = last = now;
          base = previous = waits;
          gpuBase = gpuPrevious = gpu;
@@ -9900,7 +9912,7 @@ index 280cfd6..876817c 100644
          intervals.clear();
          valid = true;
          recordedScale = g_resolutionScale;
-@@ -172,6 +180,9 @@ void DrawMatchBenchmark() {
+@@ -172,6 +184,9 @@ void DrawMatchBenchmark() {
          recording = true;
          message = "Midiendo";
          std::fprintf(stderr, "[match-bench] recording %s scale=%.0f force169=%d\n", report.string().c_str(), g_resolutionScale, g_forceAspect169);
@@ -9910,7 +9922,7 @@ index 280cfd6..876817c 100644
      };
      const auto finish = [&] {
          recording = false;
-@@ -185,6 +196,9 @@ void DrawMatchBenchmark() {
+@@ -185,6 +200,9 @@ void DrawMatchBenchmark() {
          std::ofstream summary(report.string() + ".txt");
          summary << "Yankees vs Colorado; CPU vs CPU; Coors Field; seeded start\n"
                  << device << '\n'
@@ -9920,7 +9932,7 @@ index 280cfd6..876817c 100644
                  << "valid=" << valid << " start_unix_ms=" << report.filename().string().substr(6) << '\n'
                  << "scale=" << g_resolutionScale << " force_16_9=" << g_forceAspect169 << " backend=" << GraphicsApiDisplayName() << '\n'
                  << "seconds=" << elapsed << " presented_frames=" << frames << " fps=" << (elapsed > 0 ? frames/elapsed : 0) << '\n'
-@@ -201,9 +215,17 @@ void DrawMatchBenchmark() {
+@@ -201,9 +219,17 @@ void DrawMatchBenchmark() {
              if (loadCount[i]) summary << loadNames[i] << "_mean=" << loadSum[i] / loadCount[i] << ' ' << loadNames[i] << "_peak=" << loadPeak[i] << '\n';
              else summary << loadNames[i] << "=unavailable\n";
          }
@@ -10102,7 +10114,7 @@ index 0000000..e01a61b
 +#endif
 diff --git a/runtime/src/platform/switch/switch_profiler.cpp b/runtime/src/platform/switch/switch_profiler.cpp
 new file mode 100644
-index 0000000..1483e95
+index 0000000..be7d145
 --- /dev/null
 +++ b/runtime/src/platform/switch/switch_profiler.cpp
 @@ -0,0 +1,78 @@
@@ -10156,7 +10168,7 @@ index 0000000..1483e95
 +    const char* renderer = std::getenv("WIICOMPILED_SWITCH_RENDERER");
 +    std::snprintf(text, sizeof text, "switch_mode=%s renderer=%s cpu_mhz=%u gpu_mhz=%u emc_mhz=%u",
 +                  appletGetOperationMode() == AppletOperationMode_Console ? "docked" : "handheld",
-+                  renderer ? renderer : "vulkan", hz[0] / 1000000, hz[1] / 1000000, hz[2] / 1000000);
++                  renderer ? renderer : "deko3d", hz[0] / 1000000, hz[1] / 1000000, hz[2] / 1000000);
 +    return text;
 +}
 +
@@ -10398,20 +10410,30 @@ index 0000000..e8aa273
 +}
 +#endif
 diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
-index 7a2f7dd..5265221 100644
+index 7a2f7dd..f2a9540 100644
 --- a/runtime/src/settings_overlay.cpp
 +++ b/runtime/src/settings_overlay.cpp
-@@ -76,6 +76,9 @@ namespace two_way {
+@@ -76,10 +76,19 @@ namespace two_way {
  void OnHostFrame();  // two_way.cpp: the MLB Life drill list's "X Change"
  }
  
 +extern "C" void aurora_gx_fifo_stats_mark(void); // aurora gx/fifo_async.inc (match benchmark)
 +extern "C" int aurora_gx_fifo_stats_report(char* out, int size);
++#if defined(__SWITCH__)
++extern "C" bool SwitchUsesDeko3d();  // tools/switch/deko/aurora/dk_present.cpp
++#endif
 +
  namespace settings_overlay {
  namespace {
  
-@@ -1220,6 +1223,10 @@ void DrawGraphicsSettings() {
+ const char* GraphicsApiDisplayName() {
++#if defined(__SWITCH__)
++    if (SwitchUsesDeko3d()) return "deko3d";
++#endif
+     switch (aurora_get_backend()) {
+     case BACKEND_D3D11: return "Direct3D 11";
+     case BACKEND_D3D12: return "Direct3D 12";
+@@ -1220,6 +1229,10 @@ void DrawGraphicsSettings() {
  }
  
  // WIICOMPILED_BENCH=<minDraws>,<seconds>[,<maxWaitSeconds>]: event-driven benchmark. Waits until a

@@ -175,6 +175,9 @@ struct Times {
 } g_times;
 SubmitStats g_submits;
 uint64_t g_submitsAtStats = 0;
+struct PresentAt {
+    uint64_t frame = 0, ns = 0;
+} g_presentAt[kPresentRing];  // (written by the presenting thread, read by the encoder on the same thread)
 
 void frame_stats(uint64_t presentNs) {
     g_times.presents++;
@@ -397,6 +400,7 @@ PresentTimes frame_present(const ImDrawData* ui, PictureFn picture, void* user, 
     check_queue("the present");
     dkQueuePresentImage(R.queue, g_swapchain, slot);
     const uint64_t t6 = now_ns();
+    g_presentAt[frame % kPresentRing] = {frame, t6};
     R.frame = frame;
     R.frameOpen = false;
     g_submits.frames++;
@@ -418,6 +422,11 @@ PresentTimes frame_present(const ImDrawData* ui, PictureFn picture, void* user, 
     g_times.waitNs += times.waitNs;
     frame_stats(t6 - g_frameOpenNs);
     return times;
+}
+
+uint64_t present_ns(uint64_t frame) {
+    const PresentAt& p = g_presentAt[frame % kPresentRing];
+    return p.frame == frame ? p.ns : 0;
 }
 
 bool env_flag(const char* name, bool def) {

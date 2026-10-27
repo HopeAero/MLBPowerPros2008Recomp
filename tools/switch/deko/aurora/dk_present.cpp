@@ -110,12 +110,20 @@ std::vector<std::string> g_notes;
 }  // namespace
 
 bool enabled() noexcept {
+    // the default since it holds 60 fps at stock clocks; WIICOMPILED_SWITCH_RENDERER=vulkan for Dawn's Vulkan
     static const bool on = [] {
         const char* e = std::getenv("WIICOMPILED_SWITCH_RENDERER");
-        return e != nullptr && std::strcmp(e, "deko3d") == 0;
+        return e == nullptr || std::strcmp(e, "vulkan") != 0;
     }();
     return on;
 }
+
+}  // namespace aurora::gfx::dk
+
+// for the runtime's overlay and benchmark summary, which do not see Aurora's headers
+extern "C" bool SwitchUsesDeko3d() { return aurora::gfx::dk::enabled(); }
+
+namespace aurora::gfx::dk {
 
 void initialize() {
     if (!enabled()) return;

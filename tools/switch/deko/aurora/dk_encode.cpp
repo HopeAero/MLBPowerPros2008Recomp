@@ -456,6 +456,59 @@ struct GpuClock {
     }
 } g_clock;
 
+// ---- late frames: each frame's GPU time beside its present interval (the 30 s statistics). A present
+// more than 18 ms after the previous one missed a vblank; when that frame's GPU time is over 16.0 ms the
+// GPU made it late, else the CPU side (the game thread, the FIFO worker or the recording).
+struct LateFrames {
+    static constexpr uint32_t kBuckets = 160;  // GPU time histogram, 0.25 ms each (40 ms and over: the last)
+    uint64_t frames = 0, late = 0, lateGpu = 0, gpuOver = 0;
+    uint32_t hist[kBuckets] = {};
+    struct Worst {
+        uint64_t frame, intervalNs, gpuNs;
+    } worst[6] = {};
+} g_late;
+
+void note_frame(uint64_t frame, uint64_t gpuNs) {
+    const uint64_t t1 = swdk::present_ns(frame), t0 = swdk::present_ns(frame - 1);
+    if (!t1 || !t0) return;
+    const uint64_t interval = t1 - t0;
+    LateFrames& l = g_late;
+    l.frames++;
+    l.hist[std::min<uint64_t>(gpuNs / 250'000, LateFrames::kBuckets - 1)]++;
+    if (gpuNs > 16'000'000) l.gpuOver++;
+    if (interval > 18'000'000) {
+        l.late++;
+        if (gpuNs > 16'000'000) l.lateGpu++;
+    }
+    auto* w = std::min_element(std::begin(l.worst), std::end(l.worst),
+                               [](const auto& a, const auto& b) { return a.intervalNs < b.intervalNs; });
+    if (interval > w->intervalNs) *w = {frame, interval, gpuNs};
+}
+
+void log_late() {
+    LateFrames& l = g_late;
+    if (!l.frames) return;
+    const auto pct = [&](double p) {
+        uint64_t seen = 0;
+        for (uint32_t i = 0; i < LateFrames::kBuckets; i++)
+            if ((seen += l.hist[i]) >= uint64_t(p * double(l.frames))) return double(i + 1) * 0.25;
+        return 40.0;
+    };
+    std::sort(std::begin(l.worst), std::end(l.worst), [](const auto& a, const auto& b) { return a.intervalNs > b.intervalNs; });
+    char worst[256];
+    int o = 0;
+    for (const auto& w : l.worst)
+        if (w.intervalNs)
+            o += snprintf(worst + o, sizeof worst - size_t(o), "%s#%llu %.1f/%.1f", o ? ", " : "",
+                          (unsigned long long)w.frame, double(w.intervalNs) / 1e6, double(w.gpuNs) / 1e6);
+    dklog("late frames: %llu of %llu presents over 18 ms after the previous, %llu of them with GPU over 16 ms "
+          "(the rest: CPU side); GPU over 16 ms in %llu frames; GPU per frame p50 %.2f p95 %.2f p99 %.2f ms; "
+          "worst (frame interval/GPU ms): %s",
+          (unsigned long long)l.late, (unsigned long long)l.frames, (unsigned long long)l.lateGpu,
+          (unsigned long long)l.gpuOver, pct(.50), pct(.95), pct(.99), o ? worst : "none");
+    l = {};
+}
+
 void read_marks(uint64_t frame) {
     Marks& m = g_marks[frame % swdk::kFrames];
     if (m.count >= 2) {
@@ -497,6 +550,7 @@ void read_marks(uint64_t frame) {
             const uint64_t total = uint64_t(double(dkTimestampToNs(ts[m.count - 1] - ts[0])) * g_clock.factor);
             g_stats.gpuTotalNs += total;
             g_stats.gpuFrames++;
+            note_frame(frame, total);
             const uint8_t c = m.config & 3;
             g_ab.frames[c]++;
             g_ab.totalNs[c] += total;
@@ -571,6 +625,7 @@ void log_stats() {
         }
         dklog("A/B GPU per frame since the start, by turn of %u frames (WIICOMPILED_DK_AB): %s", g_opt.abFrames, line);
     }
+    log_late();
     last = s;
     g_statsStart = now;
 }

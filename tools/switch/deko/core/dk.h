@@ -219,6 +219,10 @@ struct PresentTimes {
 // submit, beforePresent (Aurora's pacing wait; may be null), the present.
 PresentTimes frame_present(const ImDrawData* ui, PictureFn picture, void* user, void (*beforePresent)(void*),
                            void* beforeUser);
+// When that frame's present returned (now_ns), for the last kPresentRing frames, else 0: the encoder
+// pairs it with the frame's GPU time to say which side made a late frame late.
+constexpr uint64_t kPresentRing = 256;
+uint64_t present_ns(uint64_t frame);
 // The frame's end without a present (the window cannot be shown): its fence and a submit, so the
 // frame's memory comes back as usual.
 void frame_close();
