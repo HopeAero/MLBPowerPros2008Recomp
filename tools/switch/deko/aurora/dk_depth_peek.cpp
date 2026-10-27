@@ -105,7 +105,7 @@ void depth_peek_snapshot(WGPUTextureView depthView, uint32_t width, uint32_t hei
     const DkCopyBuf out = {slot->mem.gpu, w * 4, 0};
     dkCmdBufCopyImageToBuffer(R.cmd, &src, &rect, &out, 0);
     // the copy out of the GPU's L2 into memory before the CPU reads it (SwitchWaker's read_texture)
-    dkCmdBufBarrier(R.cmd, DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
+    swdk::barrier(DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
     swdk::fence_record(slot->fence);
     EncodeStats& s = encode_stats();
     s.copies++;

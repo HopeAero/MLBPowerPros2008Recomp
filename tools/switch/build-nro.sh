@@ -142,6 +142,10 @@ step "Configuring for Horizon (graphics: $graphics)"
 # (msys-rules.cmake), past Windows' 32K command line.
 msys=()
 [[ $(uname -o) == Msys ]] && msys=(-DCMAKE_PROJECT_INCLUDE="$root/tools/switch/windows/msys-rules.cmake")
+# Optional A/B knobs (phase 31): MLB_SWITCH_SHARD_FLAGS (the translated shards' extra flags; "" = the
+# plain -O2 build) and MLB_SWITCH_HOT_ORDER (a linker section-ordering file; unset = link order).
+[[ -v MLB_SWITCH_SHARD_FLAGS ]] && msys+=(-DMLB_SWITCH_SHARD_FLAGS="$MLB_SWITCH_SHARD_FLAGS")
+msys+=(-DMLB_SWITCH_HOT_ORDER="${MLB_SWITCH_HOT_ORDER:-}")
 cmake -S "$src/runtime" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release "${msys[@]}" \
     -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON \
     -DCMAKE_UNITY_BUILD_RELOCATABLE=ON \

@@ -170,8 +170,20 @@ struct Renderer {
     uint32_t width = 1280, height = 720;  // the swapchain images (the window)
     bool zcull = false;      // WIICOMPILED_DK_ZCULL=1 (queue flag; off by default)
     bool frameOpen = false;  // between frame_open and the present
+    bool tiledCache = false; // Maxwell's tiled cache (binning) is on (tiled_cache_set; off by default)
 };
 extern Renderer R;
+
+// Every barrier that orders work (mode other than DkBarrier_None) goes through here: with the tiled
+// cache on, the binned primitives are flushed first (deko3d flushes the tiled cache itself only at
+// fences and counter reports). Command buffer owner.
+void barrier(DkBarrier mode, uint32_t invalidate);
+// Maxwell's tiled cache, which deko3d 0.5.0 never enables (TiledCacheEnable is not written when the
+// queue starts): written at a frame's start by the encoder when WIICOMPILED_DK_TILED_CACHE or the A/B
+// cycle asks for it (aurora/dk_encode.cpp); turning it off flushes it first.
+void tiled_cache_set(bool on);
+// before render targets change (a no-op when the tiled cache is off)
+void tiled_cache_flush();
 
 // The conventions, each switchable with an nxlink argument so that the first console session can
 // correct them without a rebuild; all logged at start ("[dk] conventions:"). The defaults are

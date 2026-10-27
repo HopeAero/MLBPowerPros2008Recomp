@@ -37,11 +37,24 @@ Tex* diag_last_pass_target();
 enum class GpuWork : uint8_t { FrameStart, Efb, Copy, Conversion, Present, Imgui, Other, Count };
 void gpu_mark(GpuWork work);
 
+// The end of a conversion's draw into dst (dk_copy_conv.cpp): a Fragments barrier with the texture
+// cache invalidated, or with WIICOMPILED_DK_LEAN_BARRIERS a Fragments barrier alone (the next pass may
+// overwrite what the conversion sampled: write after read) and dst remembered until a barrier that
+// invalidates the texture cache; whatever samples dst before that gets one first (before_sampling,
+// the GX draws' bind groups, flush_pending at the batch's end and at the present).
+void conversion_barrier(Tex* dst);
+// before a draw outside the encoder (a conversion) samples t
+void before_sampling(const Tex* t);
+// every conversion target written since the last image-invalidating barrier made visible
+void flush_pending();
+
 // counters (running totals; logged every 30 s)
 struct EncodeStats {
     uint64_t batches = 0, passes = 0, draws = 0, clears = 0, skippedPipeline = 0, skippedShader = 0, skippedPass = 0;
     uint64_t pipelineBinds = 0, shaderBinds = 0, textureBinds = 0, uniformBinds = 0;
     uint64_t copies = 0, conversions = 0, barriers = 0, submits = 0, uploads = 0;
+    uint64_t leanBarriers = 0, pendingFlushes = 0;  // WIICOMPILED_DK_LEAN_BARRIERS: Fragments-only barriers, and
+                                                     // the image barriers a sampled conversion target needed
     uint64_t encodeNs = 0;
     uint64_t gpuFrames = 0, gpuNs[size_t(GpuWork::Count)] = {}, gpuTotalNs = 0, gpuDropped = 0;
 };

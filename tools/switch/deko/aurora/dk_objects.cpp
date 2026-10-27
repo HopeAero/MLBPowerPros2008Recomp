@@ -51,6 +51,7 @@ std::mutex g_slotMutex;
 std::vector<uint32_t> g_freedSlots;
 
 bool g_compression = false;  // WIICOMPILED_DK_COMPRESSION=1: hardware compression on colour render targets
+bool g_depthCompression = false;  // WIICOMPILED_DK_DEPTH_COMPRESSION=1: and on depth render targets
 std::atomic<bool> g_active{false};
 
 // WriteTexture uploads and new textures to clear, for the next batch (g_uploadMutex)
@@ -163,8 +164,11 @@ void release_bind_group(BindGroup* g) {
 Tex* make_texture(WGPUTexture handle, const WGPUTextureDescriptor& d) {
     static bool once = [] {
         g_compression = swdk::env_flag("WIICOMPILED_DK_COMPRESSION", false);
-        dklog("textures: images in the deko3d image heap; colour render targets %s (WIICOMPILED_DK_COMPRESSION=1)",
-              g_compression ? "with hardware compression" : "without hardware compression");
+        g_depthCompression = swdk::env_flag("WIICOMPILED_DK_DEPTH_COMPRESSION", false);
+        dklog("textures: images in the deko3d image heap; colour render targets %s (WIICOMPILED_DK_COMPRESSION=1), "
+              "depth render targets %s (WIICOMPILED_DK_DEPTH_COMPRESSION=1)",
+              g_compression ? "with hardware compression" : "without hardware compression",
+              g_depthCompression ? "with hardware compression" : "without hardware compression");
         return true;
     }();
     (void)once;
@@ -216,7 +220,9 @@ Tex* make_texture(WGPUTexture handle, const WGPUTextureDescriptor& d) {
     if (render && f.canRender) m.flags |= DkImageFlags_UsageRender;
     t->render = render && f.canRender && d.dimension != WGPUTextureDimension_3D;
     if (f.can2d) m.flags |= DkImageFlags_Usage2DEngine;
-    if (render && g_compression && !f.depth) m.flags |= DkImageFlags_HwCompression;
+    // (compression lives in the image's memory mapping: the 3D engine, the texture units and the copy
+    // engine all read and write it through L2 as plain data; nothing else touches image memory)
+    if (render && f.canRender && (f.depth ? g_depthCompression : g_compression)) m.flags |= DkImageFlags_HwCompression;
     swdk::image_tile_size_fix(m, f.compressed ? (t->height + f.blockH - 1) / f.blockH : t->height);
     DkImageLayout layout;
     dkImageLayoutInitialize(&layout, &m);
@@ -393,6 +399,11 @@ void objects_activate() {
 
 bool objects_active() { return g_active.load(std::memory_order_acquire); }
 
+bool objects_uploads_pending() {
+    std::lock_guard<std::mutex> lock(g_uploadMutex);
+    return !g_clears.empty() || !g_uploads.empty();
+}
+
 uint32_t objects_flush_uploads() {
     std::vector<Tex*> clears;
     std::vector<PendingUpload> uploads;
@@ -410,6 +421,7 @@ uint32_t objects_flush_uploads() {
             DkImageView v = level_view(t, level);
             const uint32_t w = std::max(t->width >> level, 1u), h = std::max(t->height >> level, 1u);
             const DkScissor sc = {0, 0, w, h};
+            swdk::tiled_cache_flush();
             if (t->depth) {
                 dkCmdBufBindRenderTargets(R.cmd, nullptr, 0, &v);
                 dkCmdBufSetScissors(R.cmd, 0, &sc, 1);
@@ -423,7 +435,7 @@ uint32_t objects_flush_uploads() {
         }
         release_tex(t);
     }
-    if (!clears.empty()) dkCmdBufBarrier(R.cmd, DkBarrier_Fragments, DkInvalidateFlags_Image);
+    if (!clears.empty()) swdk::barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
     for (PendingUpload& u : uploads) {
         Tex* t = u.tex;
         const uint32_t blockRows = (u.height + t->blockH - 1) / t->blockH;

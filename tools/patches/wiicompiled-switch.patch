@@ -3983,7 +3983,7 @@ index c73ad5e..08482bd 100644
    TRY(SDL_DisableScreenSaver(), "Error disabling screensaver: {}", SDL_GetError());
    if (g_config.allowJoystickBackgroundEvents) {
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index 0063653..6a6a9c3 100644
+index 0063653..33ec28f 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
 @@ -10,8 +10,9 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
@@ -4060,12 +4060,18 @@ index 0063653..6a6a9c3 100644
      endif()
  endif()
  
-@@ -215,7 +244,15 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
+@@ -215,7 +244,21 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
      COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS}")
  # Match the optimization policy of the translated callers as well as their FP policy.
  set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp" APPEND PROPERTY
 -    COMPILE_OPTIONS -O2 -fno-slp-vectorize)
 +    COMPILE_OPTIONS -O2 ${MKW_NO_SLP_VECTORIZE})
++if(MKW_PLATFORM_SWITCH)
++    # MLB's MIXUpdateSettings native (hle/mlb/mix_natives.cpp) defines file-local macros for its body.
++    set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/hle/mlb/mix_natives.cpp" PROPERTIES
++        SKIP_UNITY_BUILD_INCLUSION ON
++        SKIP_PRECOMPILE_HEADERS ON)
++endif()
 +if(MKW_PLATFORM_SWITCH)
 +    # MLB's paired-single natives (hle/mlb/mtx_natives.cpp) share the translation's psq/ps helpers
 +    # and must compute exactly what they compute there: the translated shards' FP policy and -O2.
@@ -4077,7 +4083,7 @@ index 0063653..6a6a9c3 100644
  
  # ----------------------------------------------------------------------
  # Third-party: aurora-main (provides SDL3 + GPU backends)
-@@ -278,7 +315,44 @@ else()
+@@ -278,7 +321,44 @@ else()
      set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
      # Isolate aurora build products to a subdirectory under the main build dir.
      add_subdirectory(${MKW_AURORA_DIR} ${CMAKE_BINARY_DIR}/aurora-build EXCLUDE_FROM_ALL)
@@ -4123,7 +4129,7 @@ index 0063653..6a6a9c3 100644
  
      # Keep upstream Aurora split: several sources intentionally use file-local
      # names that collide under this repo's aggressive unity build settings.
-@@ -381,7 +455,7 @@ if(MKW_BUILD_PSQ_TESTS)
+@@ -381,7 +461,7 @@ if(MKW_BUILD_PSQ_TESTS)
          "${CMAKE_CURRENT_LIST_DIR}/include")
      target_compile_features(mkw_psq_helpers_tests PRIVATE cxx_std_17)
      target_compile_options(mkw_psq_helpers_tests PRIVATE
@@ -4133,7 +4139,7 @@ index 0063653..6a6a9c3 100644
          target_compile_options(mkw_psq_helpers_tests PRIVATE -march=x86-64-v3)
      endif()
 diff --git a/runtime/cmake/PublicProducts.cmake b/runtime/cmake/PublicProducts.cmake
-index 251c83a..08be853 100644
+index 251c83a..de8c0d5 100644
 --- a/runtime/cmake/PublicProducts.cmake
 +++ b/runtime/cmake/PublicProducts.cmake
 @@ -18,6 +18,9 @@ if(EXISTS "${GUEST_SYMBOL_TABLE_FILE}")
@@ -4155,7 +4161,30 @@ index 251c83a..08be853 100644
  endfunction()
  
  function(mkw_configure_object_target target)
-@@ -89,6 +92,8 @@ elseif(MKW_PLATFORM_LINUX)
+@@ -68,9 +71,22 @@ function(mkw_bound_translated_compiles target)
+     endif()
+ endfunction()
+ 
++if(MKW_PLATFORM_SWITCH)
++    # Appended after the portable shard policy above, so its -O level wins (the last -O counts).
++    # The FP policy stays: -O3 adds no value-changing FP transform under -fno-fast-math and
++    # -ffp-contract=off. -fwrapv only defines signed overflow as the wrap PowerPC performs anyway;
++    # -fomit-frame-pointer frees x29 for the register-hungry translated code (devkitA64 GCC keeps a
++    # frame record in every non-leaf function by default). "" restores the plain -O2 shards.
++    set(MLB_SWITCH_SHARD_FLAGS "-O3;-fwrapv;-fomit-frame-pointer" CACHE STRING
++        "Extra compile options for the translated shards on Switch (A/B: -O2 or empty for the old build)")
++endif()
++
+ function(mkw_configure_translated_target target)
+     mkw_configure_object_target(${target})
+     mkw_apply_translated_compile_options(${target})
++    if(MKW_PLATFORM_SWITCH AND MLB_SWITCH_SHARD_FLAGS)
++        target_compile_options(${target} PRIVATE ${MLB_SWITCH_SHARD_FLAGS})
++    endif()
+     mkw_bound_translated_compiles(${target})
+ endfunction()
+ 
+@@ -89,6 +105,8 @@ elseif(MKW_PLATFORM_LINUX)
      # ${CMAKE_DL_LIBS} for music_attenuation.cpp's dlopen of libdbus-1 (MPRIS
      # media monitoring).
      target_link_libraries(mkw_runtime_common PRIVATE mkw::libco ${CMAKE_DL_LIBS})
@@ -4164,7 +4193,7 @@ index 251c83a..08be853 100644
  endif()
  
  if(MKW_PLATFORM_MACOS)
-@@ -231,6 +236,8 @@ function(mkw_configure_product target)
+@@ -231,6 +249,8 @@ function(mkw_configure_product target)
              dbghelp user32 winmm ws2_32 iphlpapi secur32 crypt32 windowsapp)
  
          set_target_properties(${target} PROPERTIES WIN32_EXECUTABLE TRUE)
@@ -4173,7 +4202,7 @@ index 251c83a..08be853 100644
      elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
          # mkw_runtime_common is an OBJECT library: WiiCompiled/RetroRewind only pull in its .o
          # files via $<TARGET_OBJECTS:>, which does not propagate mkw_runtime_common's own
-@@ -310,6 +317,25 @@ endfunction()
+@@ -310,6 +330,50 @@ endfunction()
  
  add_executable(WiiCompiled "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})
  mkw_configure_product(WiiCompiled)
@@ -4195,6 +4224,31 @@ index 251c83a..08be853 100644
 +    nx_generate_nacp(MLBPowerPros2008.nacp NAME "MLB Power Pros 2008" AUTHOR "HopeAero" VERSION "0.1.0")
 +    nx_create_nro(WiiCompiled OUTPUT MLBPowerPros2008.nro NACP MLBPowerPros2008.nacp
 +        ICON "$ENV{DEVKITPRO}/libnx/default_icon.jpg")
++endif()
++if(MKW_PLATFORM_SWITCH)
++    # Core 0 for the main thread alone: libnx's pthreads get cores 1-2 instead of 0-2
++    # (platform/switch/switch_thread_placement.cpp). Not in a unity group: <switch.h> names
++    # (Thread, Event...) must not meet the rest of the runtime.
++    target_link_options(WiiCompiled PRIVATE
++        "LINKER:--wrap=__syscall_thread_create" "LINKER:--wrap=svcSetThreadCoreMask")
++    set_source_files_properties(
++        "${MKW_RUNTIME_SOURCE_DIR}/src/platform/switch/switch_thread_placement.cpp"
++        PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++    # Hot code together: an ld --section-ordering-file (local/tmp/cpu/F-hot.py makes one from a
++    # WIICOMPILED_SWITCH_PROFILE run) puts the profile's functions, hottest first, at the start
++    # of .text, right after crt0. Empty: the link order as before.
++    set(MLB_SWITCH_HOT_ORDER "" CACHE FILEPATH
++        "ld section-ordering file for the Switch NRO's hot functions (empty: off)")
++    if(MLB_SWITCH_HOT_ORDER)
++        if(NOT EXISTS "${MLB_SWITCH_HOT_ORDER}")
++            message(FATAL_ERROR "MLB_SWITCH_HOT_ORDER: ${MLB_SWITCH_HOT_ORDER} does not exist")
++        endif()
++        # copied next to the link and named relatively: under MSYS2, CMake paths are /d/... and the
++        # native devkitA64 ld reads only Windows paths (the response file skips MSYS's conversion)
++        configure_file("${MLB_SWITCH_HOT_ORDER}" "${CMAKE_BINARY_DIR}/hot-order.ld" COPYONLY)
++        target_link_options(WiiCompiled PRIVATE "LINKER:--section-ordering-file=hot-order.ld")
++        set_property(TARGET WiiCompiled APPEND PROPERTY LINK_DEPENDS "${CMAKE_BINARY_DIR}/hot-order.ld")
++    endif()
 +endif()
  target_precompile_headers(WiiCompiled PRIVATE
      "${MKW_RUNTIME_SOURCE_DIR}/include/mkw_pch.h")
@@ -4605,7 +4659,7 @@ index 7ac535d..3aca2aa 100644
      std::memcpy(&bits, &value, sizeof(bits));
      FlatStore<uint64_t>(address, bits);
 diff --git a/runtime/include/native_cpu_calls.inc b/runtime/include/native_cpu_calls.inc
-index 0856e7b..cd515a6 100644
+index 0856e7b..92f255e 100644
 --- a/runtime/include/native_cpu_calls.inc
 +++ b/runtime/include/native_cpu_calls.inc
 @@ -43,7 +43,15 @@ extern "C" void GX__SetBlendMode_8017277c(uint32_t t, uint32_t s, uint32_t d, ui
@@ -4642,10 +4696,22 @@ index 0856e7b..cd515a6 100644
  #ifdef WIICOMPILED_NO_MKW_NATIVES
  #define MKW_KNOWN_NATIVE_CPU_CALL(addr, fn) static_assert(true)
  #else
-@@ -108,3 +127,18 @@ MKW_KNOWN_NATIVE_CPU_CALL(0x800847C0u, nw4r__lyt__detail__DrawQuad_800847c0);
+@@ -108,3 +127,30 @@ MKW_KNOWN_NATIVE_CPU_CALL(0x800847C0u, nw4r__lyt__detail__DrawQuad_800847c0);
  MKW_KNOWN_NATIVE_CPU_CALL(0x80084D20u, nw4r__lyt__detail__DrawQuad_80084d20);
  
  #undef MKW_KNOWN_NATIVE_CPU_CALL
++
++#if defined(__SWITCH__) && defined(WIICOMPILED_GAME_RL8E54) && !defined(WIICOMPILED_NO_MKW_NATIVES)
++// MLB's MIXUpdateSettings (hle/mlb/mix_natives.cpp), registered with REGISTER_NATIVE_FUNCTION_AS (the
++// translation stays: the native runs it in checked access mode). A leaf in MkwLeafNativeCpuCall's
++// sense: it writes r26-r31 only with the values it reads back from its own frame, as the original.
++// Spelled base + offset: tools/wiicompiled_rebind.py remaps 0x80xxxxxx literals here as MKW addresses.
++extern "C" void MLB_MIXUpdateSettings_800BFB24(CpuContext* ctx);
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xBFB24u> {
++    static constexpr bool kAvailable = true;
++    static void Invoke(CpuContext* cpu) { MLB_MIXUpdateSettings_800BFB24(cpu); }
++};
++#endif
 +
 +#if defined(__SWITCH__) && defined(WIICOMPILED_GAME_RL8E54) && !defined(WIICOMPILED_NO_MKW_NATIVES)
 +// MLB's MSL leaves (hle/mlb/msl_natives.cpp), registered with REGISTER_NATIVE_FUNCTION. Spelled
@@ -6051,6 +6117,1641 @@ index f2a82a5..22a237d 100644
      if(raw){
          float src[9]{};
          float m[12]{};
+diff --git a/runtime/src/hle/mlb/mix_natives.cpp b/runtime/src/hle/mlb/mix_natives.cpp
+new file mode 100644
+index 0000000..bc0030e
+--- /dev/null
++++ b/runtime/src/hle/mlb/mix_natives.cpp
+@@ -0,0 +1,1629 @@
++// MLB Power Pros 2008 (RL8E54): a native MIXUpdateSettings (0x800BFB24, the AX MIX library),
++// 1.8% of the Switch main thread in the stock match profile (run 3), plus the 1.1% of its
++// per-voice callee __MIXRmtUpdateSettings (0x800C1264).
++//
++// Who calls it: the game's sound engine thread (0x80027A54), woken every 5 ms by its ticker
++// thread (0x80027BF8, OSSleepTicks), walks its 55 channels (0x8002D768) and calls
++// MIXUpdateSettings once per channel that starts or fades, after each MIXSetFader; every call
++// walks all AX voices (r13-27104) and calls __MIXRmtUpdateSettings for each one that has a
++// voice. The AX user frame callback (0x80027BF4) is an empty blr. All of it is guest-thread code
++// (fibers on the main thread), as the single Broadway core ran it on the Wii: the per-frame
++// cost is the game's own, not an HLE artefact.
++//
++// The translation spends most of that time on the call boundary: one InvokeDirectCpu with a
++// full register sync, a guest stack frame and the spills around it per voice, and CR0/XER
++// bookkeeping at every compare. This is the same instruction sequence with __MIXRmtUpdateSettings
++// and its __MIXGetVolume calls (0x800BE098) inlined, guest registers as locals, CR0 kept as the
++// last compare's three flags and XER[CA] as one bit.
++//
++// Kept exactly, also for the volatile registers (cross-checked against the translation in
++// qemu-aarch64, see below): every guest load and store in program order (stack frames included,
++// the epilogues read r26-r31, r30/r31 and LR back from the stack as the original does), the
++// MMIO write policy of each store (the translation's one ResolveRangeHost group, the 15 remote
++// speaker halfwords at AXVPB+0x104, is resolved the same way), r0 r1 r3-r9 r11 r26-r31, CR0,
++// XER[CA] and LR as the translation leaves them; r10, r12, CR1-7, CTR and the FPRs untouched.
++// The checked access mode (no flat view) runs the translation itself, which
++// REGISTER_NATIVE_FUNCTION_AS keeps in the build.
++//
++// The body below is the guest code instruction for instruction (each `VOL(x)` is the inlined
++// __MIXGetVolume: x <= -904 -> 0, x >= 60 -> 0xFF64, else the table at 0x802290B0 indexed by x).
++// The registered function reads and writes the CpuContext only through constant indexes; it
++// hands the context to nothing but the checked-mode fallback, which takes it by reference so
++// the translator's contract analysis sees exactly the registers the translation itself uses.
++#if defined(__SWITCH__)
++#include <cstdint>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "memory.h"
++
++extern "C" void func_800BFB24(CpuContext* ctx);  // the translation (kept: _AS registration)
++
++namespace mlb_mix {
++
++struct Regs {
++    uint32_t r0, r1, r3, r4, r5, r6, r7, r8, r9, r11, r13, r26, r27, r28, r29, r30, r31;
++    uint32_t cr, xer, lr;
++};
++
++[[gnu::always_inline]] inline uint32_t Rotl(uint32_t v, unsigned s) { return (v << s) | (v >> ((32u - s) & 31u)); }
++[[gnu::always_inline]] inline uint32_t Mulhw(uint32_t a, uint32_t b) {
++    return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int32_t>(b)) >> 32);
++}
++[[gnu::always_inline]] inline uint32_t SrawiCarry(uint32_t v, unsigned sh) {
++    return (static_cast<int32_t>(v) < 0 && (v & ((1u << sh) - 1u)) != 0) ? 1u : 0u;
++}
++[[gnu::always_inline]] inline uint32_t Load32(uint8_t* base, uint32_t a) {
++    uint32_t v; std::memcpy(&v, base + a, 4); return __builtin_bswap32(v);
++}
++[[gnu::always_inline]] inline uint32_t Load16(uint8_t* base, uint32_t a) {
++    uint16_t v; std::memcpy(&v, base + a, 2); return __builtin_bswap16(v);
++}
++[[gnu::always_inline]] inline void Store32(uint8_t* base, uint32_t a, uint32_t v) {
++    v = __builtin_bswap32(v); std::memcpy(base + a, &v, 4);
++}
++[[gnu::always_inline]] inline void Store16(uint8_t* base, uint32_t a, uint32_t v) {
++    const uint16_t h = __builtin_bswap16(static_cast<uint16_t>(v)); std::memcpy(base + a, &h, 2);
++}
++// MemoryInline::FlatWrite16/32 with the flat view active: the MMIO window takes the slow path.
++[[gnu::always_inline]] inline void Write32(uint8_t* base, uint32_t a, uint32_t v) {
++    if (MemoryInline::FlatWriteNeedsPolicy(a)) [[unlikely]] { MemoryInline::Write32Slow(a, v); return; }
++    Store32(base, a, v);
++}
++[[gnu::always_inline]] inline void Write16(uint8_t* base, uint32_t a, uint32_t v) {
++    if (MemoryInline::FlatWriteNeedsPolicy(a)) [[unlikely]] { MemoryInline::Write16Slow(a, static_cast<uint16_t>(v)); return; }
++    Store16(base, a, v);
++}
++
++// The flat view only (GuestFlat::RequiresCheckedAccess() false).
++[[gnu::noinline]] void UpdateSettingsFlat(Regs& R) {
++    uint8_t* const base = MKW_FLAT_GUEST_BASE;
++    uint32_t r0 = R.r0, r1 = R.r1, r3 = R.r3, r4 = R.r4, r5 = R.r5, r6 = R.r6, r7 = R.r7, r8 = R.r8, r9 = R.r9;
++    uint32_t r11 = R.r11, r13 = R.r13, r26 = R.r26, r27 = R.r27, r28 = R.r28, r29 = R.r29, r30 = R.r30, r31 = R.r31;
++    uint32_t lr = R.lr;
++    uint32_t ca = (R.xer >> 29) & 1u;
++    bool lt = false, gt = false, eq = false;  // CR0 of the last compare (SO is XER[SO], unchanged)
++    uint8_t* g0 = nullptr;
++
++#define LD32(a) Load32(base, (a))
++#define LD16(a) Load16(base, (a))
++#define ST32(a, v) Write32(base, (a), (v))
++#define ST16(a, v) Write16(base, (a), (v))
++#define STRAM32(a, v) Store32(base, (a), (v))
++#define STG16(g, off, a, v) MemoryInline::WriteResolved16((g), (off), (a), static_cast<uint16_t>(v))
++#define CMPS(a, b) do { const int32_t x_ = static_cast<int32_t>(a), y_ = static_cast<int32_t>(b); lt = x_ < y_; gt = x_ > y_; eq = x_ == y_; } while (false)
++#define CMPU(a, b) do { const uint32_t x_ = (a), y_ = (b); lt = x_ < y_; gt = x_ > y_; eq = x_ == y_; } while (false)
++#define LT lt
++#define GT gt
++#define EQ eq
++#define VOL(x) do { CMPS((x), -904); if (!gt) { r0 = 0u; break; } CMPS((x), 60); if (!lt) { r0 = r29 - 156u; break; } \
++        r0 = (x) << 1; r7 = r30 + r0; r0 = LD16(r7 + 0x710u); } while (false)
++    // stwu r1,-32(r1); mflr r0; stw r0,36(r1); addi r11,r1,32; _savegpr_26 (one resolved range, as the translation)
++#define MIX_PROLOGUE() do { \
++        g0 = MemoryInline::ResolveRangeHost(r1 - 32u, 0, 40u, false, true); \
++        MemoryInline::WriteResolved32(g0, 0u, r1 - 32u, r1); \
++        r1 = r1 - 32u; \
++        r0 = lr; \
++        MemoryInline::WriteResolved32(g0, 36u, r1 + 36u, r0); \
++        r11 = r1 + 32u; \
++        if (!MemoryInline::WriteResolvedPair32(g0, 8u, (static_cast<uint64_t>(r26) << 32) | r27)) { \
++            MemoryInline::WriteResolved32(g0, 8u, r11 - 24u, r26); MemoryInline::WriteResolved32(g0, 12u, r11 - 20u, r27); } \
++        if (!MemoryInline::WriteResolvedPair32(g0, 16u, (static_cast<uint64_t>(r28) << 32) | r29)) { \
++            MemoryInline::WriteResolved32(g0, 16u, r11 - 16u, r28); MemoryInline::WriteResolved32(g0, 20u, r11 - 12u, r29); } \
++        if (!MemoryInline::WriteResolvedPair32(g0, 24u, (static_cast<uint64_t>(r30) << 32) | r31)) { \
++            MemoryInline::WriteResolved32(g0, 24u, r11 - 8u, r30); MemoryInline::WriteResolved32(g0, 28u, r11 - 4u, r31); } \
++    } while (false)
++    // addi r11,r1,32; _restgpr_26; lwz r0,36(r1); mtlr r0; addi r1,r1,32; blr
++#define MIX_EPILOGUE_AND_RETURN() do { \
++        r11 = r1 + 32u; \
++        r26 = LD32(r11 - 24u); r27 = LD32(r11 - 20u); r28 = LD32(r11 - 16u); \
++        r29 = LD32(r11 - 12u); r30 = LD32(r11 - 8u); r31 = LD32(r11 - 4u); \
++        r0 = LD32(r1 + 36u); lr = r0; r1 = r1 + 32u; \
++        goto L_ret; \
++    } while (false)
++
++    MIX_PROLOGUE();
++    r0 = LD32((r13 - 27108u));
++    CMPS(r0, 0);
++    if (EQ) goto L_800C119C;
++    r3 = (0x80230000u);
++    r26 = 0x0u;
++    r27 = 0x0u;
++    r29 = (0x10000u);
++    r30 = (r3 - 30304u);
++    r28 = 0x0u;
++    r31 = (0x2aab0000u);
++    goto L_800C1190;
++L_800BFB64:
++    r4 = LD32((r13 - 27112u));
++    r3 = 0x0u;
++    r0 = 0x0u;
++    r5 = r4 + r27;
++    r4 = LD32(r4 + r27);
++    CMPS(r4, 0);
++    if (EQ) goto L_800C1188;
++    r7 = LD32((r5 + 4u));
++    r6 = 0x0u;
++    r7 = r7 & 0x20000000u;
++    CMPS(r7, 0);
++    if (EQ) goto L_800BFBA8;
++    r7 = LD16((r5 + 62u));
++    r3 = 0x1u;
++    ST16((r5 + 60u), r7);
++    r7 = LD32((r5 + 4u));
++    r7 = r7 & 0xdfffffffu;
++    ST32((r5 + 4u), r7);
++L_800BFBA8:
++    r8 = LD32((r5 + 4u));
++    r7 = r8 & 0x10000000u;
++    CMPS(r7, 0);
++    if (EQ) goto L_800BFC0C;
++    r3 = r8 & 0x00000008u;
++    CMPS(r3, 0);
++    if (EQ) goto L_800BFBC4;
++    ST16((r5 + 62u), r28);
++    goto L_800BFBF8;
++L_800BFBC4:
++    r3 = LD32((r5 + 8u));
++    CMPS(r3, -904);
++    if (GT) goto L_800BFBD8;
++    r3 = 0x0u;
++    goto L_800BFBF4;
++L_800BFBD8:
++    CMPS(r3, 60);
++    if (LT) goto L_800BFBE8;
++    r3 = (r29 - 156u);
++    goto L_800BFBF4;
++L_800BFBE8:
++    r3 = Rotl(r3, 1) & 0xfffffffeu;
++    r3 = r30 + r3;
++    r3 = LD16((r3 + 1808u));
++L_800BFBF4:
++    ST16((r5 + 62u), r3);
++L_800BFBF8:
++    r7 = LD32((r5 + 4u));
++    r3 = 0x1u;
++    r7 = r7 & 0xefffffffu;
++    r7 = r7 | 0x20000000u;
++    ST32((r5 + 4u), r7);
++L_800BFC0C:
++    r7 = LD32((r5 + 4u));
++    r7 = r7 & 0x80000000u;
++    CMPS(r7, 0);
++    if (EQ) goto L_800BFC88;
++    r7 = LD16((r5 + 66u));
++    r0 = 0x1u;
++    ST16((r5 + 64u), r7);
++    r7 = LD16((r5 + 70u));
++    ST16((r5 + 68u), r7);
++    r7 = LD16((r5 + 74u));
++    ST16((r5 + 72u), r7);
++    r7 = LD16((r5 + 78u));
++    ST16((r5 + 76u), r7);
++    r7 = LD16((r5 + 82u));
++    ST16((r5 + 80u), r7);
++    r7 = LD16((r5 + 86u));
++    ST16((r5 + 84u), r7);
++    r7 = LD16((r5 + 90u));
++    ST16((r5 + 88u), r7);
++    r7 = LD16((r5 + 94u));
++    ST16((r5 + 92u), r7);
++    r7 = LD16((r5 + 98u));
++    ST16((r5 + 96u), r7);
++    r7 = LD16((r5 + 102u));
++    ST16((r5 + 100u), r7);
++    r7 = LD16((r5 + 106u));
++    ST16((r5 + 104u), r7);
++    r7 = LD16((r5 + 110u));
++    ST16((r5 + 108u), r7);
++    r7 = LD32((r5 + 4u));
++    r7 = r7 & 0x7fffffffu;
++    ST32((r5 + 4u), r7);
++L_800BFC88:
++    r7 = LD32((r5 + 4u));
++    r7 = r7 & 0x40000000u;
++    CMPS(r7, 0);
++    if (EQ) goto L_800C0DF4;
++    r0 = LD32((r13 - 27100u));
++    CMPS(r0, 3);
++    if (EQ) goto L_800C082C;
++    if (!LT) goto L_800C0DE0;
++    CMPS(r0, 0);
++    if (EQ) goto L_800BFCB4;
++    if (!LT) goto L_800C0238;
++    goto L_800C0DE0;
++L_800BFCB4:
++    r7 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 66u), r0);
++    r7 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 70u), r0);
++    r7 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 74u), r0);
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000001u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800BFE34;
++    r7 = LD32((r5 + 12u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r7 = LD32((r5 + 12u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r7 = LD32((r5 + 12u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 86u), r0);
++    goto L_800BFF04;
++L_800BFE34:
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 12u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 12u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 86u), r0);
++L_800BFF04:
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000002u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800BFFCC;
++    r7 = LD32((r5 + 16u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r7 = LD32((r5 + 16u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r7 = LD32((r5 + 16u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 98u), r0);
++    goto L_800C009C;
++L_800BFFCC:
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 16u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 16u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 98u), r0);
++L_800C009C:
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000004u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C0164;
++    r7 = LD32((r5 + 20u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 102u), r0);
++    r7 = LD32((r5 + 20u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++    r7 = LD32((r5 + 20u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 110u), r0);
++    goto L_800C0DE0;
++L_800C0164:
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 20u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 102u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 20u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 20u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 110u), r0);
++    goto L_800C0DE0;
++L_800C0238:
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 66u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 70u), r0);
++    r7 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 74u), r0);
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000001u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C03D8;
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r7 = LD32((r5 + 12u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 86u), r0);
++    goto L_800C04B8;
++L_800C03D8:
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 36u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 40u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 86u), r0);
++L_800C04B8:
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000002u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C0590;
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r7 = LD32((r5 + 16u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 98u), r0);
++    goto L_800C0670;
++L_800C0590:
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 36u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 40u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 98u), r0);
++L_800C0670:
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000004u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C0748;
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 20u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 102u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 20u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++    r7 = LD32((r5 + 20u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 110u), r0);
++    goto L_800C0DE0;
++L_800C0748:
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 36u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 20u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 102u), r0);
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 40u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 20u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 20u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 110u), r0);
++    goto L_800C0DE0;
++L_800C082C:
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 66u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 70u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 52u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 74u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 56u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 102u), r0);
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000001u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C0A5C;
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 52u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 86u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 56u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++    goto L_800C0B8C;
++L_800C0A5C:
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 36u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 40u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r9 = LD32((r5 + 48u));
++    r7 = LD32((r5 + 52u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 86u), r0);
++    r9 = LD32((r5 + 48u));
++    r7 = LD32((r5 + 56u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++L_800C0B8C:
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000002u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C0CAC;
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 52u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 98u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 56u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 110u), r0);
++    goto L_800C0DDC;
++L_800C0CAC:
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 36u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 40u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r9 = LD32((r5 + 48u));
++    r7 = LD32((r5 + 52u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 98u), r0);
++    r9 = LD32((r5 + 48u));
++    r7 = LD32((r5 + 56u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 110u), r0);
++L_800C0DDC:
++    r6 = r6 | 0x80000000u;
++L_800C0DE0:
++    r7 = LD32((r5 + 4u));
++    r0 = 0x1u;
++    r7 = r7 & 0xbfffffffu;
++    r7 = r7 | 0x80000000u;
++    ST32((r5 + 4u), r7);
++L_800C0DF4:
++    CMPS(r3, 0);
++    if (EQ) goto L_800C0E34;
++    r3 = LD16((r5 + 60u));
++    r8 = (r31 - 21845u);
++    ST16((r4 + 146u), r3);
++    r7 = LD16((r5 + 60u));
++    r3 = LD16((r5 + 62u));
++    r3 = r3 - r7;
++    r3 = Mulhw(r8, r3);
++    ca = SrawiCarry(r3, 4); r3 = uint32_t(int32_t(r3) >> 4);
++    r7 = Rotl(r3, 1) & 0x00000001u;
++    r3 = r3 + r7;
++    ST16((r4 + 148u), r3);
++    r3 = LD32((r4 + 28u));
++    r3 = r3 | 0x100u;
++    ST32((r4 + 28u), r3);
++L_800C0E34:
++    CMPS(r0, 0);
++    if (EQ) goto L_800C1180;
++    r0 = LD16((r5 + 64u));
++    r3 = (r4 + 62u);
++    CMPS(r0, 0);
++    ST16((r4 + 60u), r0);
++    if (EQ) goto L_800C0E54;
++    r6 = r6 | 0x1u;
++L_800C0E54:
++    r7 = LD16((r5 + 64u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 66u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 0u), r7);
++    if (EQ) goto L_800C0E84;
++    r6 = r6 | 0x4u;
++L_800C0E84:
++    r0 = LD16((r5 + 68u));
++    CMPS(r0, 0);
++    ST16((r3 + 2u), r0);
++    if (EQ) goto L_800C0E98;
++    r6 = r6 | 0x2u;
++L_800C0E98:
++    r7 = LD16((r5 + 68u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 70u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 4u), r7);
++    if (EQ) goto L_800C0EC8;
++    r6 = r6 | 0x4u;
++L_800C0EC8:
++    r0 = LD16((r5 + 76u));
++    CMPS(r0, 0);
++    ST16((r3 + 6u), r0);
++    if (EQ) goto L_800C0EDC;
++    r6 = r6 | 0x10000u;
++L_800C0EDC:
++    r7 = LD16((r5 + 76u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 78u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 8u), r7);
++    if (EQ) goto L_800C0F0C;
++    r6 = r6 | 0x40000u;
++L_800C0F0C:
++    r0 = LD16((r5 + 80u));
++    CMPS(r0, 0);
++    ST16((r3 + 10u), r0);
++    if (EQ) goto L_800C0F20;
++    r6 = r6 | 0x20000u;
++L_800C0F20:
++    r7 = LD16((r5 + 80u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 82u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 12u), r7);
++    if (EQ) goto L_800C0F50;
++    r6 = r6 | 0x40000u;
++L_800C0F50:
++    r0 = LD16((r5 + 88u));
++    CMPS(r0, 0);
++    ST16((r3 + 14u), r0);
++    if (EQ) goto L_800C0F64;
++    r6 = r6 | 0x200000u;
++L_800C0F64:
++    r7 = LD16((r5 + 88u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 90u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 16u), r7);
++    if (EQ) goto L_800C0F94;
++    r6 = r6 | 0x800000u;
++L_800C0F94:
++    r0 = LD16((r5 + 92u));
++    CMPS(r0, 0);
++    ST16((r3 + 18u), r0);
++    if (EQ) goto L_800C0FA8;
++    r6 = r6 | 0x400000u;
++L_800C0FA8:
++    r7 = LD16((r5 + 92u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 94u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 20u), r7);
++    if (EQ) goto L_800C0FD8;
++    r6 = r6 | 0x800000u;
++L_800C0FD8:
++    r0 = LD16((r5 + 100u));
++    CMPS(r0, 0);
++    ST16((r3 + 22u), r0);
++    if (EQ) goto L_800C0FEC;
++    r6 = r6 | 0x4000000u;
++L_800C0FEC:
++    r7 = LD16((r5 + 100u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 102u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 24u), r7);
++    if (EQ) goto L_800C101C;
++    r6 = r6 | 0x10000000u;
++L_800C101C:
++    r0 = LD16((r5 + 104u));
++    CMPS(r0, 0);
++    ST16((r3 + 26u), r0);
++    if (EQ) goto L_800C1030;
++    r6 = r6 | 0x8000000u;
++L_800C1030:
++    r7 = LD16((r5 + 104u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 106u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 28u), r7);
++    if (EQ) goto L_800C1060;
++    r6 = r6 | 0x10000000u;
++L_800C1060:
++    r0 = LD16((r5 + 72u));
++    CMPS(r0, 0);
++    ST16((r3 + 30u), r0);
++    if (EQ) goto L_800C1074;
++    r6 = r6 | 0x8u;
++L_800C1074:
++    r7 = LD16((r5 + 72u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 74u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 32u), r7);
++    if (EQ) goto L_800C10A4;
++    r6 = r6 | 0x10u;
++L_800C10A4:
++    r0 = LD16((r5 + 84u));
++    CMPS(r0, 0);
++    ST16((r3 + 34u), r0);
++    if (EQ) goto L_800C10B8;
++    r6 = r6 | 0x80000u;
++L_800C10B8:
++    r7 = LD16((r5 + 84u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 86u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 36u), r7);
++    if (EQ) goto L_800C10E8;
++    r6 = r6 | 0x100000u;
++L_800C10E8:
++    r0 = LD16((r5 + 96u));
++    CMPS(r0, 0);
++    ST16((r3 + 38u), r0);
++    if (EQ) goto L_800C10FC;
++    r6 = r6 | 0x1000000u;
++L_800C10FC:
++    r7 = LD16((r5 + 96u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 98u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 40u), r7);
++    if (EQ) goto L_800C112C;
++    r6 = r6 | 0x2000000u;
++L_800C112C:
++    r0 = LD16((r5 + 108u));
++    CMPS(r0, 0);
++    ST16((r3 + 42u), r0);
++    if (EQ) goto L_800C1140;
++    r6 = r6 | 0x20000000u;
++L_800C1140:
++    r7 = LD16((r5 + 108u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 110u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r5 = Rotl(r0, 1) & 0x00000001u;
++    r5 = r0 + r5;
++    r0 = r5 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 44u), r5);
++    if (EQ) goto L_800C1170;
++    r6 = r6 | 0x40000000u;
++L_800C1170:
++    ST32((r4 + 52u), r6);
++    r0 = LD32((r4 + 28u));
++    r0 = r0 | 0x12u;
++    ST32((r4 + 28u), r0);
++L_800C1180:
++    r3 = r26;
++    lr = 0x800c1188u;
++    STRAM32((r1 - 16u), r1); r1 = (r1 - 16u);
++    r0 = lr;
++    STRAM32((r1 + 20u), r0);
++    r0 = r3 * 0x44u;
++    STRAM32((r1 + 12u), r31);
++    STRAM32((r1 + 8u), r30);
++    r30 = r4;
++    r3 = LD32((r13 - 27096u));
++    r31 = r3 + r0;
++    r3 = LD32(r3 + r0);
++    r0 = r3 & 0xc0000000u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C1688;
++    r0 = r3 & 0x80000000u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C12E8;
++    r0 = LD16((r31 + 38u));
++    ST16((r31 + 36u), r0);
++    r0 = LD16((r31 + 42u));
++    ST16((r31 + 40u), r0);
++    r0 = LD16((r31 + 46u));
++    ST16((r31 + 44u), r0);
++    r0 = LD16((r31 + 50u));
++    ST16((r31 + 48u), r0);
++    r0 = LD16((r31 + 54u));
++    ST16((r31 + 52u), r0);
++    r0 = LD16((r31 + 58u));
++    ST16((r31 + 56u), r0);
++    r0 = LD16((r31 + 62u));
++    ST16((r31 + 60u), r0);
++    r0 = LD16((r31 + 66u));
++    ST16((r31 + 64u), r0);
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x7fffffffu;
++    ST32((r31 + 0u), r0);
++L_c1_800C12E8:
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x40000000u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C13F4;
++    r3 = LD32((r31 + 4u));
++    lr = 0x800c12fcu;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c2_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret2;
++L_c1_c2_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c2_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret2;
++L_c1_c2_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret2;
++L_c1_ret2:;
++    ST16((r31 + 38u), r3);
++    r3 = LD32((r31 + 8u));
++    lr = 0x800c1308u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c3_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret3;
++L_c1_c3_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c3_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret3;
++L_c1_c3_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret3;
++L_c1_ret3:;
++    ST16((r31 + 46u), r3);
++    r3 = LD32((r31 + 12u));
++    lr = 0x800c1314u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c4_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret4;
++L_c1_c4_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c4_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret4;
++L_c1_c4_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret4;
++L_c1_ret4:;
++    ST16((r31 + 54u), r3);
++    r3 = LD32((r31 + 16u));
++    lr = 0x800c1320u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c5_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret5;
++L_c1_c5_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c5_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret5;
++L_c1_c5_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret5;
++L_c1_ret5:;
++    ST16((r31 + 62u), r3);
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x00000001u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C1340;
++    r3 = LD32((r31 + 20u));
++    lr = 0x800c1338u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c6_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret6;
++L_c1_c6_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c6_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret6;
++L_c1_c6_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret6;
++L_c1_ret6:;
++    ST16((r31 + 42u), r3);
++    goto L_c1_800C1354;
++L_c1_800C1340:
++    r3 = LD32((r31 + 4u));
++    r0 = LD32((r31 + 20u));
++    r3 = r3 + r0;
++    lr = 0x800c1350u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c7_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret7;
++L_c1_c7_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c7_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret7;
++L_c1_c7_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret7;
++L_c1_ret7:;
++    ST16((r31 + 42u), r3);
++L_c1_800C1354:
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x00000002u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C1370;
++    r3 = LD32((r31 + 24u));
++    lr = 0x800c1368u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c8_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret8;
++L_c1_c8_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c8_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret8;
++L_c1_c8_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret8;
++L_c1_ret8:;
++    ST16((r31 + 50u), r3);
++    goto L_c1_800C1384;
++L_c1_800C1370:
++    r3 = LD32((r31 + 8u));
++    r0 = LD32((r31 + 24u));
++    r3 = r3 + r0;
++    lr = 0x800c1380u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c9_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret9;
++L_c1_c9_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c9_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret9;
++L_c1_c9_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret9;
++L_c1_ret9:;
++    ST16((r31 + 50u), r3);
++L_c1_800C1384:
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x00000004u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C13A0;
++    r3 = LD32((r31 + 28u));
++    lr = 0x800c1398u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c10_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret10;
++L_c1_c10_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c10_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret10;
++L_c1_c10_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret10;
++L_c1_ret10:;
++    ST16((r31 + 58u), r3);
++    goto L_c1_800C13B4;
++L_c1_800C13A0:
++    r3 = LD32((r31 + 12u));
++    r0 = LD32((r31 + 28u));
++    r3 = r3 + r0;
++    lr = 0x800c13b0u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c11_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret11;
++L_c1_c11_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c11_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret11;
++L_c1_c11_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret11;
++L_c1_ret11:;
++    ST16((r31 + 58u), r3);
++L_c1_800C13B4:
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x00000008u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C13D0;
++    r3 = LD32((r31 + 32u));
++    lr = 0x800c13c8u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c12_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret12;
++L_c1_c12_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c12_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret12;
++L_c1_c12_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret12;
++L_c1_ret12:;
++    ST16((r31 + 66u), r3);
++    goto L_c1_800C13E4;
++L_c1_800C13D0:
++    r3 = LD32((r31 + 16u));
++    r0 = LD32((r31 + 32u));
++    r3 = r3 + r0;
++    lr = 0x800c13e0u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c13_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret13;
++L_c1_c13_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c13_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret13;
++L_c1_c13_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret13;
++L_c1_ret13:;
++    ST16((r31 + 66u), r3);
++L_c1_800C13E4:
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0xbfffffffu;
++    r0 = r0 | 0x80000000u;
++    ST32((r31 + 0u), r0);
++L_c1_800C13F4:
++    r4 = LD16((r31 + 36u));
++    r3 = (r30 + 260u);
++    r0 = 0x0u;
++    CMPS(r4, 0);
++    ST16((r30 + 258u), r4);
++    if (EQ) goto L_c1_800C1410;
++    r0 = r0 | 0x1u;
++L_c1_800C1410:
++    r6 = LD16((r31 + 36u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 38u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    g0 = MemoryInline::ResolveRangeHost(r3, 0, 30u, false, true);
++    STG16(g0, 0u, (r3 + 0u), r5);
++    if (EQ) goto L_c1_800C1448;
++    r0 = r0 | 0x2u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1448:
++    r4 = LD16((r31 + 40u));
++    CMPS(r4, 0);
++    STG16(g0, 2u, (r3 + 2u), r4);
++    if (EQ) goto L_c1_800C1460;
++    r0 = r0 | 0x4u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1460:
++    r6 = LD16((r31 + 40u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 42u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 4u, (r3 + 4u), r5);
++    if (EQ) goto L_c1_800C1498;
++    r0 = r0 | 0x8u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1498:
++    r4 = LD16((r31 + 44u));
++    CMPS(r4, 0);
++    STG16(g0, 6u, (r3 + 6u), r4);
++    if (EQ) goto L_c1_800C14B0;
++    r0 = r0 | 0x10u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C14B0:
++    r6 = LD16((r31 + 44u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 46u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 8u, (r3 + 8u), r5);
++    if (EQ) goto L_c1_800C14E8;
++    r0 = r0 | 0x20u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C14E8:
++    r4 = LD16((r31 + 48u));
++    CMPS(r4, 0);
++    STG16(g0, 10u, (r3 + 10u), r4);
++    if (EQ) goto L_c1_800C1500;
++    r0 = r0 | 0x40u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1500:
++    r6 = LD16((r31 + 48u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 50u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 12u, (r3 + 12u), r5);
++    if (EQ) goto L_c1_800C1538;
++    r0 = r0 | 0x80u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1538:
++    r4 = LD16((r31 + 52u));
++    CMPS(r4, 0);
++    STG16(g0, 14u, (r3 + 14u), r4);
++    if (EQ) goto L_c1_800C1550;
++    r0 = r0 | 0x100u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1550:
++    r6 = LD16((r31 + 52u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 54u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 16u, (r3 + 16u), r5);
++    if (EQ) goto L_c1_800C1588;
++    r0 = r0 | 0x200u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1588:
++    r4 = LD16((r31 + 56u));
++    CMPS(r4, 0);
++    STG16(g0, 18u, (r3 + 18u), r4);
++    if (EQ) goto L_c1_800C15A0;
++    r0 = r0 | 0x400u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C15A0:
++    r6 = LD16((r31 + 56u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 58u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 20u, (r3 + 20u), r5);
++    if (EQ) goto L_c1_800C15D8;
++    r0 = r0 | 0x800u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C15D8:
++    r4 = LD16((r31 + 60u));
++    CMPS(r4, 0);
++    STG16(g0, 22u, (r3 + 22u), r4);
++    if (EQ) goto L_c1_800C15F0;
++    r0 = r0 | 0x1000u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C15F0:
++    r6 = LD16((r31 + 60u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 62u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 24u, (r3 + 24u), r5);
++    if (EQ) goto L_c1_800C1628;
++    r0 = r0 | 0x2000u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1628:
++    r4 = LD16((r31 + 64u));
++    CMPS(r4, 0);
++    STG16(g0, 26u, (r3 + 26u), r4);
++    if (EQ) goto L_c1_800C1640;
++    r0 = r0 | 0x4000u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1640:
++    r6 = LD16((r31 + 64u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 66u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 28u, (r3 + 28u), r5);
++    if (EQ) goto L_c1_800C1678;
++    r0 = r0 | 0x8000u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1678:
++    r3 = LD32((r30 + 28u));
++    ST16((r30 + 256u), r0);
++    r0 = r3 | 0x3000000u;
++    ST32((r30 + 28u), r0);
++L_c1_800C1688:
++    r0 = LD32((r1 + 20u));
++    r31 = LD32((r1 + 12u));
++    r30 = LD32((r1 + 8u));
++    lr = r0;
++    r1 = (r1 + 16u);
++    goto L_ret1;
++L_ret1:;
++L_800C1188:
++    r27 = (r27 + 112u);
++    r26 = (r26 + 1u);
++L_800C1190:
++    r0 = LD32((r13 - 27104u));
++    CMPU(r26, r0);
++    if (LT) goto L_800BFB64;
++L_800C119C:
++    MIX_EPILOGUE_AND_RETURN();
++
++L_ret:
++#undef LD32
++#undef LD16
++#undef ST32
++#undef ST16
++#undef STRAM32
++#undef STG16
++#undef CMPS
++#undef CMPU
++#undef LT
++#undef GT
++#undef EQ
++#undef VOL
++#undef MIX_PROLOGUE
++#undef MIX_EPILOGUE_AND_RETURN
++    R.r0 = r0; R.r1 = r1; R.r3 = r3; R.r4 = r4; R.r5 = r5; R.r6 = r6; R.r7 = r7; R.r8 = r8; R.r9 = r9;
++    R.r11 = r11; R.r26 = r26; R.r27 = r27; R.r28 = r28; R.r29 = r29; R.r30 = r30; R.r31 = r31;
++    R.lr = lr;
++    R.cr = (R.cr & 0x0FFFFFFFu) | (lt ? 0x80000000u : 0u) | (gt ? 0x40000000u : 0u) | (eq ? 0x20000000u : 0u) |
++           ((R.xer >> 3) & 0x10000000u);
++    R.xer = (R.xer & ~0x20000000u) | (ca << 29);
++}
++
++[[gnu::noinline, gnu::cold]] void Translated(CpuContext& context) { func_800BFB24(&context); }
++
++}  // namespace mlb_mix
++
++extern "C" void MLB_MIXUpdateSettings_800BFB24(CpuContext* ctx) {
++    if (GuestFlat::RequiresCheckedAccess()) [[unlikely]] {
++        mlb_mix::Translated(*ctx);
++        return;
++    }
++    mlb_mix::Regs regs;
++    regs.r0 = ctx->gpr[0];
++    regs.r1 = ctx->gpr[1];
++    regs.r3 = ctx->gpr[3];
++    regs.r4 = ctx->gpr[4];
++    regs.r5 = ctx->gpr[5];
++    regs.r6 = ctx->gpr[6];
++    regs.r7 = ctx->gpr[7];
++    regs.r8 = ctx->gpr[8];
++    regs.r9 = ctx->gpr[9];
++    regs.r11 = 0;
++    regs.r13 = ctx->gpr[13];
++    regs.r26 = ctx->gpr[26];
++    regs.r27 = ctx->gpr[27];
++    regs.r28 = ctx->gpr[28];
++    regs.r29 = ctx->gpr[29];
++    regs.r30 = ctx->gpr[30];
++    regs.r31 = ctx->gpr[31];
++    regs.cr = ctx->cr;
++    regs.xer = ctx->xer;
++    regs.lr = ctx->lr;
++    mlb_mix::UpdateSettingsFlat(regs);
++    ctx->gpr[0] = regs.r0;
++    ctx->gpr[1] = regs.r1;
++    ctx->gpr[3] = regs.r3;
++    ctx->gpr[4] = regs.r4;
++    ctx->gpr[5] = regs.r5;
++    ctx->gpr[6] = regs.r6;
++    ctx->gpr[7] = regs.r7;
++    ctx->gpr[8] = regs.r8;
++    ctx->gpr[9] = regs.r9;
++    ctx->gpr[11] = regs.r11;
++    ctx->gpr[26] = regs.r26;
++    ctx->gpr[27] = regs.r27;
++    ctx->gpr[28] = regs.r28;
++    ctx->gpr[29] = regs.r29;
++    ctx->gpr[30] = regs.r30;
++    ctx->gpr[31] = regs.r31;
++    ctx->cr = regs.cr;
++    ctx->xer = regs.xer;
++    ctx->lr = regs.lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x800BFB24, MLB_MIXUpdateSettings_800BFB24, "MIXUpdateSettings");
++#endif
 diff --git a/runtime/src/hle/mlb/msl_natives.cpp b/runtime/src/hle/mlb/msl_natives.cpp
 new file mode 100644
 index 0000000..0c55151
@@ -7076,6 +8777,185 @@ index 0000000..4eab794
 +extern "C" bool SwitchStdioToNxlink() {
 +    if (__nxlink_host.s_addr == 0 || R_FAILED(socketInitializeDefault())) return false;
 +    return nxlinkStdio() >= 0;
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_thread_placement.cpp b/runtime/src/platform/switch/switch_thread_placement.cpp
+new file mode 100644
+index 0000000..624bd23
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_thread_placement.cpp
+@@ -0,0 +1,173 @@
++// Core 0 belongs to the game's main thread (the guest fibers, priority 0x2C).
++//
++// libnx starts every pthread (std::thread, SDL_CreateThread, Mesa's thrd_create, Dawn's workers)
++// through __syscall_thread_create: threadCreate(prio 0x3B, core -2) and then
++// svcSetThreadCoreMask(handle, -1, <process core mask>), i.e. allowed on cores 0, 1 and 2. Horizon
++// then runs those threads on core 0 whenever the main thread blocks for a moment (a fiber switch
++// wait, a FIFO handoff), and the main thread pays the switch back and the cache they evicted.
++// SwitchWakerHD (Wind Waker HD on Switch) measured 20 -> 28 fps in a CPU-bound scene by giving its
++// main thread a core of its own.
++//
++// Here that one libnx call is rewritten while the new thread is still suspended: its affinity
++// becomes WIICOMPILED_SWITCH_THREAD_MASK (default 0x6: cores 1 and 2; 0 keeps libnx's mask), ideal
++// core the highest core in it. Threads that pin themselves later (SwitchPinCurrentThread: the GX
++// FIFO worker, the frame worker, the presenter, the AX mixer, deko3d's shader worker) still do.
++// Linked with -Wl,--wrap=__syscall_thread_create -Wl,--wrap=svcSetThreadCoreMask
++// (PublicProducts.cmake); only the call made inside __syscall_thread_create is changed.
++//
++// WIICOMPILED_SWITCH_THREADS=1 (nxlink argument; N > 1: every N seconds, else every 60 s) prints
++// every thread created that way plus the main thread: ideal core, affinity mask, priority and CPU
++// time per interval ("[threads] ..." on stderr). entry/run are link-time addresses (nm -n of
++// WiiCompiled.elf): entry is the pthread start routine; for a std::thread, run is its _M_run.
++#if defined(__SWITCH__)
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <switch.h>
++
++extern "C" {
++int __real___syscall_thread_create(void* thread, void* (*func)(void*), void* arg, void* stack_addr,
++                                   size_t stack_size);
++Result __real_svcSetThreadCoreMask(Handle handle, s32 preferred_core, u32 affinity_mask);
++extern char __start__[];      // switch.ld: image start (code)
++extern char __rodata_start[]; // end of code
++extern char __relro_start[];  // .data.rel.ro (vtables) ...
++extern char __data_start[];   // ... ends here
++extern char* fake_heap_start; // libsysbase's heap bounds, set by libnx
++extern char* fake_heap_end;
++}
++
++namespace mlb_switch_threads {
++
++struct Created {
++    Handle handle;
++    u64 tid;
++    u64 entry, arg, run; // link-time addresses (run: std::thread _State's _M_run, else 0)
++    u64 lastTicks;
++    std::atomic<bool> ready;
++};
++
++constexpr int kMaxCreated = 96;
++Created g_created[kMaxCreated];
++std::atomic<int> g_count{0};  // slots handed out (a slot is valid once .ready)
++std::atomic<bool> g_dumperStarted{false};
++Thread g_dumper;
++
++// The pthread being created on this thread, between __syscall_thread_create and its core-mask call.
++thread_local void* (*t_start)(void*) = nullptr;
++thread_local void* t_arg = nullptr;
++
++u32 PlacementMask() {
++    const char* text = std::getenv("WIICOMPILED_SWITCH_THREAD_MASK");
++    return text ? u32(std::strtoul(text, nullptr, 0)) & 0x7u : 0x6u;
++}
++
++u64 LinkAddress(const void* p) {
++    return p ? u64(reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(__start__)) : 0;
++}
++
++// std::thread hands pthread a heap _State* whose vtable (in .data.rel.ro) has _M_run at slot 2.
++u64 StdThreadRun(void* arg) {
++    const auto a = reinterpret_cast<uintptr_t>(arg);
++    if (a % 8 || a < uintptr_t(fake_heap_start) || a + 8 > uintptr_t(fake_heap_end)) return 0;
++    const auto vtable = *reinterpret_cast<const uintptr_t*>(a);
++    if (vtable % 8 || vtable < uintptr_t(__relro_start) || vtable + 24 > uintptr_t(__data_start)) return 0;
++    const auto run = reinterpret_cast<const uintptr_t*>(vtable)[2];
++    if (run < uintptr_t(__start__) || run >= uintptr_t(__rodata_start)) return 0;
++    return u64(run - uintptr_t(__start__));
++}
++
++u64 ThreadTicks(Handle handle) {
++    u64 ticks = 0;
++    if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, handle, u64(-1)))) return u64(-1);
++    return ticks;
++}
++
++void DumpOne(const char* label, Handle handle, u64& lastTicks) {
++    s32 ideal = -9, prio = -1;
++    u64 mask = 0, tid = 0;
++    const Result rm = svcGetThreadCoreMask(&ideal, &mask, handle);
++    svcGetThreadPriority(&prio, handle);
++    svcGetThreadId(&tid, handle);
++    const u64 ticks = ThreadTicks(handle);
++    const u64 delta = (ticks != u64(-1) && lastTicks != 0 && ticks >= lastTicks) ? ticks - lastTicks : 0;
++    if (ticks != u64(-1)) lastTicks = ticks;
++    std::fprintf(stderr, "[threads] %s tid=%lu ideal=%d mask=0x%lx prio=0x%x cpu_ms=%lu interval_ms=%lu%s\n",
++                 label, tid, ideal, mask, unsigned(prio), ticks == u64(-1) ? 0 : armTicksToNs(ticks) / 1000000,
++                 armTicksToNs(delta) / 1000000, R_FAILED(rm) ? " (handle gone)" : "");
++}
++
++void Dump() {
++    static u64 mainLast = 0;
++    const int count = g_count.load(std::memory_order_acquire);
++    std::fprintf(stderr, "[threads] dump: %d pthreads created, placement mask 0x%x, sampled on core %u\n",
++                 count, PlacementMask(), svcGetCurrentProcessorNumber());
++    DumpOne("main", envGetMainThreadHandle(), mainLast);
++    for (int i = 0; i < count && i < kMaxCreated; ++i) {
++        Created& c = g_created[i];
++        if (!c.ready.load(std::memory_order_acquire)) continue;
++        char label[96];
++        std::snprintf(label, sizeof label, "#%d created_tid=%lu entry=0x%lx run=0x%lx", i, c.tid, c.entry, c.run);
++        DumpOne(label, c.handle, c.lastTicks);
++    }
++    std::fflush(stderr);
++}
++
++void DumperMain(void*) {
++    const char* text = std::getenv("WIICOMPILED_SWITCH_THREADS");
++    const long every = text ? std::atol(text) : 0;
++    const u64 period = u64(every > 1 ? every : 60) * 1000000000ull;
++    for (;;) {
++        svcSleepThread(s64(period));
++        Dump();
++    }
++}
++
++void MaybeStartDumper() {
++    if (g_dumperStarted.load(std::memory_order_relaxed)) return;
++    const char* text = std::getenv("WIICOMPILED_SWITCH_THREADS");
++    if (text == nullptr || std::atol(text) <= 0 || g_dumperStarted.exchange(true)) return;
++    // Core 2, libnx's preemptive priority: it sleeps all the time and must stay off core 0.
++    if (R_SUCCEEDED(threadCreate(&g_dumper, DumperMain, nullptr, nullptr, 0x8000, 0x3B, 2)))
++        threadStart(&g_dumper);
++}
++
++} // namespace mlb_switch_threads
++
++extern "C" int __wrap___syscall_thread_create(void* thread, void* (*func)(void*), void* arg,
++                                              void* stack_addr, size_t stack_size) {
++    using namespace mlb_switch_threads;
++    MaybeStartDumper();
++    t_start = func;
++    t_arg = arg;
++    const int rc = __real___syscall_thread_create(thread, func, arg, stack_addr, stack_size);
++    t_start = nullptr;
++    t_arg = nullptr;
++    return rc;
++}
++
++extern "C" Result __wrap_svcSetThreadCoreMask(Handle handle, s32 preferred_core, u32 affinity_mask) {
++    using namespace mlb_switch_threads;
++    if (t_start == nullptr || preferred_core != -1) {
++        return __real_svcSetThreadCoreMask(handle, preferred_core, affinity_mask);
++    }
++    // libnx's own call for the thread __syscall_thread_create just made (not started yet).
++    const int slot = g_count.fetch_add(1, std::memory_order_relaxed);
++    if (slot < kMaxCreated) {
++        Created& c = g_created[slot];
++        c.handle = handle;
++        c.tid = 0;
++        svcGetThreadId(&c.tid, handle);
++        c.entry = LinkAddress(reinterpret_cast<void*>(t_start));
++        c.arg = reinterpret_cast<uintptr_t>(t_arg);
++        c.run = StdThreadRun(t_arg);
++        c.lastTicks = 0;
++        c.ready.store(true, std::memory_order_release);
++    }
++    t_start = nullptr;  // one call per creation
++    const u32 mask = PlacementMask() & affinity_mask;
++    if (mask == 0) return __real_svcSetThreadCoreMask(handle, preferred_core, affinity_mask);
++    const s32 ideal = 31 - __builtin_clz(mask);
++    return __real_svcSetThreadCoreMask(handle, ideal, mask);
 +}
 +#endif
 diff --git a/runtime/src/platform/switch/switch_threads.cpp b/runtime/src/platform/switch/switch_threads.cpp

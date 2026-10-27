@@ -89,7 +89,7 @@ void overlay_upload_pending() {
         const DkImageRect rect = {0, 0, 0, p.width, p.height, 1};
         dkCmdBufCopyBufferToImage(R.cmd, &src, &view, &rect, 0);
         // the copy done before any draw samples the texture
-        dkCmdBufBarrier(R.cmd, DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_Descriptors);
+        barrier(DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_Descriptors);
     }
 }
 

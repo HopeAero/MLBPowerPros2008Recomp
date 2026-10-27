@@ -18,9 +18,11 @@
 // Passes. Render targets bound from the views' shadows, load-op clears with deko3d's clear commands,
 // then the pass's commands: viewport (reversed Z: depth range 1 - far .. 1 - near, as
 // render_pass_impl), scissor (clamped as render_pass_impl), GX draws, partial-clear draws. Every pass
-// ends with a Fragments barrier that also invalidates the texture cache, and is followed by its EFB
-// copy: the copy engine for an exact copy, workstream C's conversions otherwise. Copy-engine work
-// (uploads, copies) sits between Full barriers.
+// ends with a Fragments barrier that also invalidates the texture cache (its EFB copy samples what it
+// drew), and is followed by its EFB copy: the copy engine for an exact copy, workstream C's
+// conversions otherwise. Copy-engine work (uploads, copies) sits between Full barriers. In the match
+// (2026-10-27) a frame is ~31 passes on the one EFB (939x528), each but the last followed by a
+// conversion: pass, barrier, conversion, barrier, pass... (~64 barriers per frame).
 //
 // State cache. Pipeline state, shaders, viewport, scissor, blend constant, uniform offset, texture
 // handles are bound only when they change within a batch; anything that binds its own state (the
@@ -28,6 +30,27 @@
 //
 // The command list goes to the GPU every WIICOMPILED_DK_SUBMIT_DRAWS draws (default 256, 0 = once
 // per batch), as SwitchWakerHD's, so the GPU starts on a frame while it is still being recorded.
+//
+// GPU cost switches (nxlink arguments, read once; each keeps the pixels as they are):
+//   WIICOMPILED_DK_LEAN_BARRIERS=1  a conversion ends with a Fragments barrier alone (no texture cache
+//                                   invalidation, so no wait for idle): what follows a conversion is the
+//                                   next pass, which overwrites the EFB the conversion sampled (write
+//                                   after read: fragment order is enough). The conversion's target is
+//                                   remembered; a draw or conversion that samples it before the next
+//                                   image barrier (the next pass end) gets one first, as do the batch's
+//                                   end and the present.
+//   WIICOMPILED_DK_TILED_CACHE=1    Maxwell's tiled cache (binning), which deko3d leaves off: on at every
+//                                   frame's start, flushed before every barrier and render-target change.
+//   WIICOMPILED_DK_AB=n             the two above in turn every n frames (off, lean, tiled, both), the GPU
+//                                   time per frame of each logged with the 30 s statistics ("A/B").
+// GPU timing (diagnostics):
+//   WIICOMPILED_DK_PASS_TIMES=n     timestamps around every pass and clear draw; every n frames (1: 600)
+//                                   the GPU time per pass index (palette conversions, load clears, clear
+//                                   draws, draws, its EFB copy) with the pass's target, draws, clears and
+//                                   copy ("pass times"); with WIICOMPILED_DK_AB, of its base turns only.
+//   WIICOMPILED_DK_DRAW_TIMES=1     with PASS_TIMES: a timestamp after every GX draw too, and the GPU time
+//                                   by pipeline (the time between a draw's timestamp and the one before;
+//                                   the GPU overlaps draws, so this is where the time goes, roughly).
 #include "dk_encode.hpp"
 
 #include "dk_gfx.hpp"
@@ -124,17 +147,208 @@ uint32_t g_submitDraws = 256;
 // the pipes this thread already found, by Aurora's PipelineRef (pipes never go away)
 std::unordered_map<uint64_t, const Pipe*> g_pipeCache;
 
+// ---- the GPU cost switches (see the top of the file), read at the first batch
+struct Options {
+    bool lean = false, tiled = false;  // WIICOMPILED_DK_LEAN_BARRIERS, WIICOMPILED_DK_TILED_CACHE
+    uint32_t abFrames = 0;             // WIICOMPILED_DK_AB
+    uint32_t passTimes = 0;            // WIICOMPILED_DK_PASS_TIMES (frames per report; 0: off)
+    bool drawTimes = false;            // WIICOMPILED_DK_DRAW_TIMES
+} g_opt;
+// this frame's configuration (bit 0 lean barriers, bit 1 tiled cache): the switches, or the A/B turn
+uint8_t g_config = 0;
+constexpr const char* kConfigNames[4] = {"base", "lean barriers", "tiled cache", "lean + tiled"};
+// lean barriers: conversion targets written since the last barrier that invalidated the texture cache
+std::vector<const Tex*> g_pending;
+
 // ---- GPU timestamps: every frame, at its first batch, the end of every pass and copy, the present
-// and ImGui; read when the frame's slot comes round again (its fence waited for in frame_open)
+// and ImGui; read when the frame's slot comes round again (its fence waited for in frame_open). With
+// WIICOMPILED_DK_PASS_TIMES each one also says which pass and which part of it it ends.
 constexpr uint32_t kMaxMarks = swdk::kQuerySize / swdk::kFrames / 16;
+constexpr uint32_t kMaxPasses = 64;
+enum Seg : uint8_t { kSegNone, kSegPalette, kSegLoad, kSegClears, kSegDraws, kSegCopy, kSegCount };
+struct Tag {
+    uint8_t seg = kSegNone;
+    uint8_t pass = 0xFF;
+};
+// one pass of a frame as recorded (WIICOMPILED_DK_PASS_TIMES)
+struct PassRec {
+    uint32_t width = 0, height = 0, clearPixels = 0, copyW = 0, copyH = 0;
+    int32_t format = 0;
+    uint16_t gxDraws = 0, clearDraws = 0;
+    bool depth = false, loadColor = false, loadDepth = false;
+    uint8_t copyKind = 0;  // 0 none, 1 conversion, 2 shader-sampled blit, 3 copy engine
+    char label[24] = {};
+};
 struct Marks {
     GpuWork work[kMaxMarks];
+    Tag tag[kMaxMarks];
+    const Pipe* pipe[kMaxMarks];  // the GX draw a mark follows (WIICOMPILED_DK_DRAW_TIMES), else null
+    uint32_t indices[kMaxMarks];  // (and its index count times instances)
     uint32_t count = 0;
     uint64_t cpuNs = 0;  // when the frame was opened
+    uint8_t config = 0;
+    uint32_t passCount = 0;  // the frame's passes so far (index of the next one)
+    PassRec passes[kMaxPasses];
 };
 Marks g_marks[swdk::kFrames];
 bool g_gpuTimers = true;
 uint64_t g_statsStart = 0;
+Tag g_tag;                     // what the next mark without a tag of its own ends
+bool g_passEnded = false;      // a pass ended since the walk's last pass_prologue
+uint32_t g_drawsSinceMark = 0; // GX draws of the open pass since its last mark
+
+Marks& frame_marks() { return g_marks[(R.frame + 1) % swdk::kFrames]; }
+PassRec* open_pass_rec() {
+    Marks& m = frame_marks();
+    return m.passCount && m.passCount <= kMaxPasses ? &m.passes[m.passCount - 1] : nullptr;
+}
+
+void gpu_mark_tag(GpuWork work, Tag tag, const Pipe* pipe = nullptr, uint32_t indices = 0) {
+    if (!g_gpuTimers || !R.frameOpen) return;
+    const uint64_t frame = R.frame + 1;
+    Marks& m = g_marks[frame % swdk::kFrames];
+    if (m.count >= kMaxMarks) {
+        g_stats.gpuDropped++;
+        return;
+    }
+    const swdk::QueryRegion q = swdk::query_region(frame);
+    dkCmdBufReportCounter(R.cmd, DkCounter_Timestamp, q.gpu + uint64_t(m.count) * 16);
+    m.work[m.count] = work;
+    m.tag[m.count] = tag;
+    m.pipe[m.count] = pipe;
+    m.indices[m.count] = indices;
+    m.count++;
+    g_drawsSinceMark = 0;
+}
+
+// ---- the per-pass GPU times (WIICOMPILED_DK_PASS_TIMES) and the A/B turns, summed over frames
+struct PassAgg {
+    uint64_t frames = 0, varied = 0;
+    uint64_t ns[kSegCount] = {};
+    uint64_t gxDraws = 0, clearDraws = 0, clearPixels = 0, loadColor = 0, loadDepth = 0, depth = 0;
+    uint64_t copies[4] = {};
+    uint32_t width = 0, height = 0, copyW = 0, copyH = 0;
+    int32_t format = 0;
+    char label[24] = {};
+};
+struct DrawAgg {
+    uint64_t ns = 0, draws = 0, indices = 0, passMask = 0;
+};
+struct PassTimes {
+    uint64_t frames = 0, totalNs = 0, otherNs = 0, passes = 0;
+    PassAgg agg[kMaxPasses];
+    std::unordered_map<const Pipe*, DrawAgg> draws;
+} g_pt;
+struct AbStats {
+    uint64_t frames[4] = {}, totalNs[4] = {}, passNs[4] = {}, convNs[4] = {};
+} g_ab;
+
+void log_pass_times() {
+    const double n = double(std::max<uint64_t>(g_pt.frames, 1));
+    const auto ms = [&](uint64_t ns) { return double(ns) / n / 1e6; };
+    uint64_t seg[kSegCount] = {};
+    for (const PassAgg& a : g_pt.agg)
+        for (uint32_t s = 0; s < kSegCount; s++) seg[s] += a.ns[s];
+    dklog("pass times over %llu frames (GPU ms per frame; WIICOMPILED_DK_PASS_TIMES%s; config %s): total %.3f = palette "
+          "conversions %.3f + load clears %.3f + clear draws %.3f + draws %.3f + EFB copies %.3f + other %.3f (uploads, "
+          "present, ImGui); %.1f passes per frame",
+          (unsigned long long)g_pt.frames, g_opt.drawTimes ? ", with draw timestamps" : "",
+          g_opt.abFrames ? "the A/B's base turns" : kConfigNames[g_config], ms(g_pt.totalNs), ms(seg[kSegPalette]),
+          ms(seg[kSegLoad]), ms(seg[kSegClears]), ms(seg[kSegDraws]), ms(seg[kSegCopy]),
+          ms(g_pt.otherNs + seg[kSegNone]), double(g_pt.passes) / n);
+    static const char* const kCopy[4] = {"none", "conversion", "blit", "copy engine"};
+    for (uint32_t p = 0; p < kMaxPasses; p++) {
+        const PassAgg& a = g_pt.agg[p];
+        if (!a.frames) continue;
+        const double f = double(a.frames);
+        uint32_t copyKind = 0;
+        for (uint32_t k = 1; k < 4; k++)
+            if (a.copies[k] > a.copies[copyKind]) copyKind = k;
+        uint64_t total = 0;
+        for (uint32_t s = 0; s < kSegCount; s++) total += a.ns[s];
+        char varied[48] = "";
+        if (a.varied) snprintf(varied, sizeof varied, " (another target in %.0f%%)", 100.0 * double(a.varied) / f);
+        dklog("  pass %2u: %ux%u fmt %d '%s'%s%s, in %.0f%% of frames; load clear colour %.0f%% depth %.0f%%; %.1f "
+              "draws, %.1f clear draws (%.0f kpx); then %s %ux%u (%.0f%%) | GPU %.3f ms = palette %.3f + load %.3f + "
+              "clears %.3f + draws %.3f + copy %.3f",
+              p, a.width, a.height, int(a.format), a.label, a.depth ? " +depth" : "", varied, 100.0 * f / n,
+              100.0 * double(a.loadColor) / f, 100.0 * double(a.loadDepth) / f, double(a.gxDraws) / f,
+              double(a.clearDraws) / f, double(a.clearPixels) / f / 1000.0, kCopy[copyKind], a.copyW, a.copyH,
+              100.0 * double(a.copies[copyKind]) / f, ms(total), ms(a.ns[kSegPalette]), ms(a.ns[kSegLoad]),
+              ms(a.ns[kSegClears]), ms(a.ns[kSegDraws]), ms(a.ns[kSegCopy]));
+    }
+    if (g_opt.drawTimes && !g_pt.draws.empty()) {
+        std::vector<std::pair<const Pipe*, DrawAgg>> v(g_pt.draws.begin(), g_pt.draws.end());
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+        uint64_t all = 0;
+        for (const auto& e : v) all += e.second.ns;
+        dklog("  draw times by pipeline (WIICOMPILED_DK_DRAW_TIMES): %zu pipelines, %.3f ms per frame; the top 24:",
+              v.size(), ms(all));
+        for (size_t i = 0; i < v.size() && i < 24; i++) {
+            const Pipe* p = v[i].first;
+            const DrawAgg& d = v[i].second;
+            char passes[96];
+            int o = 0;
+            for (uint32_t b = 0; b < 64 && o < int(sizeof passes) - 8; b++)
+                if (d.passMask >> b & 1) o += snprintf(passes + o, sizeof passes - size_t(o), "%s%u", o ? "," : "", b);
+            if (!o) snprintf(passes, sizeof passes, "-");
+            dklog("    %.3f ms (%.1f%%): %.1f draws/frame, %.0f indices/draw; pipe %016llx module %016llx; depth "
+                  "test %u write %u, blend %s, cull %d; passes %s",
+                  ms(d.ns), all ? 100.0 * double(d.ns) / double(all) : 0.0, double(d.draws) / n,
+                  d.draws ? double(d.indices) / double(d.draws) : 0.0, (unsigned long long)p->ref,
+                  (unsigned long long)(p->module ? p->module->key : 0), unsigned(p->depthStencil.depthTestEnable),
+                  unsigned(p->depthStencil.depthWriteEnable), p->color.blendEnableMask ? "on" : "off",
+                  int(p->rasterizer.cullMode), passes);
+        }
+    }
+    g_pt = PassTimes{};
+}
+
+// a frame's timestamps read: the intervals by pass and part (each interval belongs to the mark that
+// ends it), the pass records
+void add_pass_times(const Marks& m, const uint64_t* dt) {
+    for (uint32_t i = 1; i < m.count; i++) {
+        const Tag t = m.tag[i];
+        if (t.seg != kSegNone && t.pass < m.passCount && t.pass < kMaxPasses) {
+            g_pt.agg[t.pass].ns[t.seg] += dt[i];
+            if (m.pipe[i]) {
+                DrawAgg& d = g_pt.draws[m.pipe[i]];
+                d.ns += dt[i];
+                d.draws++;
+                d.indices += m.indices[i];
+                d.passMask |= uint64_t(1) << t.pass;
+            }
+        } else {
+            g_pt.otherNs += dt[i];
+        }
+    }
+    const uint32_t passes = std::min(m.passCount, kMaxPasses);
+    for (uint32_t p = 0; p < passes; p++) {
+        const PassRec& r = m.passes[p];
+        PassAgg& a = g_pt.agg[p];
+        if (a.frames == 0) {
+            a.width = r.width;
+            a.height = r.height;
+            a.format = r.format;
+            memcpy(a.label, r.label, sizeof a.label);
+        } else if (a.width != r.width || a.height != r.height || a.format != r.format) {
+            a.varied++;
+        }
+        a.frames++;
+        a.gxDraws += r.gxDraws;
+        a.clearDraws += r.clearDraws;
+        a.clearPixels += r.clearPixels;
+        a.loadColor += r.loadColor;
+        a.loadDepth += r.loadDepth;
+        a.depth += r.depth;
+        a.copies[r.copyKind & 3]++;
+        if (r.copyKind) {
+            a.copyW = r.copyW;
+            a.copyH = r.copyH;
+        }
+    }
+    g_pt.passes += m.passCount;
+}
 
 // the GPU's timer against the CPU's (SwitchWakerHD backend.cpp GpuClock): deko3d's dkTimestampToNs
 // assumes 31.25 MHz, the Tegra X1's runs at 19.2 MHz; measured over the session
@@ -164,10 +378,27 @@ void read_marks(uint64_t frame) {
         bool ok = true;
         for (uint32_t i = 1; i < m.count && ok; i++) ok = ts[i] >= ts[i - 1];
         if (ok) {
-            for (uint32_t i = 1; i < m.count; i++)
-                g_stats.gpuNs[size_t(m.work[i])] += uint64_t(double(dkTimestampToNs(ts[i] - ts[i - 1])) * g_clock.factor);
-            g_stats.gpuTotalNs += uint64_t(double(dkTimestampToNs(ts[m.count - 1] - ts[0])) * g_clock.factor);
+            static uint64_t dt[kMaxMarks];
+            uint64_t passNs = 0, convNs = 0;
+            for (uint32_t i = 1; i < m.count; i++) {
+                dt[i] = uint64_t(double(dkTimestampToNs(ts[i] - ts[i - 1])) * g_clock.factor);
+                g_stats.gpuNs[size_t(m.work[i])] += dt[i];
+                if (m.work[i] == GpuWork::Efb) passNs += dt[i];
+                if (m.work[i] == GpuWork::Conversion) convNs += dt[i];
+            }
+            const uint64_t total = uint64_t(double(dkTimestampToNs(ts[m.count - 1] - ts[0])) * g_clock.factor);
+            g_stats.gpuTotalNs += total;
             g_stats.gpuFrames++;
+            const uint8_t c = m.config & 3;
+            g_ab.frames[c]++;
+            g_ab.totalNs[c] += total;
+            g_ab.passNs[c] += passNs;
+            g_ab.convNs[c] += convNs;
+            if (g_opt.passTimes && (!g_opt.abFrames || c == 0)) {  // (with the A/B: its base turns)
+                add_pass_times(m, dt);
+                g_pt.totalNs += total;
+                if (++g_pt.frames >= g_opt.passTimes) log_pass_times();
+            }
         } else {
             g_stats.gpuDropped++;
         }
@@ -212,13 +443,41 @@ void log_stats() {
           (unsigned long long)o.textures, (unsigned long long)(o.imageBytes >> 20), (unsigned long long)o.uploads,
           (unsigned long long)(o.uploadBytes >> 20), (unsigned long long)o.clears, (unsigned long long)p.gx,
           (unsigned long long)p.clear, (unsigned long long)p.modulesNew);
+    if (g_opt.lean || g_opt.abFrames) {
+        dklog("encoder: lean barriers: %llu Fragments-only barriers after conversions, %llu image barriers for a "
+              "conversion target sampled before the next pass end",
+              (unsigned long long)(s.leanBarriers - last.leanBarriers),
+              (unsigned long long)(s.pendingFlushes - last.pendingFlushes));
+    }
+    if (g_opt.abFrames) {
+        // since the session's start: the turns interleave every WIICOMPILED_DK_AB frames, so each one sees the
+        // same scenes
+        char line[512];
+        int o = 0;
+        for (uint32_t c = 0; c < 4; c++) {
+            const double n = double(std::max<uint64_t>(g_ab.frames[c], 1));
+            o += snprintf(line + o, sizeof line - size_t(o), "%s%s %.3f ms (passes %.3f, conversions %.3f; %llu frames)",
+                          c ? "; " : "", kConfigNames[c], double(g_ab.totalNs[c]) / n / 1e6,
+                          double(g_ab.passNs[c]) / n / 1e6, double(g_ab.convNs[c]) / n / 1e6,
+                          (unsigned long long)g_ab.frames[c]);
+        }
+        dklog("A/B GPU per frame since the start, by turn of %u frames (WIICOMPILED_DK_AB): %s", g_opt.abFrames, line);
+    }
     last = s;
     g_statsStart = now;
 }
 
 void barrier(DkBarrier mode, uint32_t invalidate) {
-    dkCmdBufBarrier(R.cmd, mode, invalidate);
+    swdk::barrier(mode, invalidate);
     g_stats.barriers++;
+    // the texture cache now sees every conversion target written before (lean barriers)
+    if (mode != DkBarrier_None && (invalidate & DkInvalidateFlags_Image)) g_pending.clear();
+}
+
+bool is_pending(const Tex* t) {
+    for (const Tex* p : g_pending)
+        if (p == t) return true;
+    return false;
 }
 
 void set_swizzle(bool flip) {
@@ -392,9 +651,23 @@ void batch_begin(uint32_t stagingSlot) {
     static const bool once = [] {
         g_submitDraws = uint32_t(std::max(0L, swdk::env_long("WIICOMPILED_DK_SUBMIT_DRAWS", 256)));
         g_gpuTimers = swdk::env_flag("WIICOMPILED_DK_GPU_TIMERS", true);
+        g_opt.lean = swdk::env_flag("WIICOMPILED_DK_LEAN_BARRIERS", false);
+        g_opt.tiled = swdk::env_flag("WIICOMPILED_DK_TILED_CACHE", false);
+        g_opt.abFrames = uint32_t(std::clamp(swdk::env_long("WIICOMPILED_DK_AB", 0), 0L, 1L << 20));
+        const long passTimes = swdk::env_long("WIICOMPILED_DK_PASS_TIMES", 0);
+        g_opt.passTimes = passTimes <= 0 ? 0u : passTimes == 1 ? 600u : uint32_t(std::min(passTimes, 1L << 20));
+        g_opt.drawTimes = g_opt.passTimes && swdk::env_flag("WIICOMPILED_DK_DRAW_TIMES", false);
+        if (!g_gpuTimers) g_opt.passTimes = 0, g_opt.drawTimes = false;  // (they are GPU timestamps)
         dklog("encoder: Aurora's passes recorded into deko3d; submits every %u draws (WIICOMPILED_DK_SUBMIT_DRAWS), "
               "a barrier at every pass end, GPU timestamps %s (WIICOMPILED_DK_GPU_TIMERS)",
               g_submitDraws, g_gpuTimers ? "on" : "off");
+        char ab[96];
+        snprintf(ab, sizeof ab, "taken in turn every %u frames: off, lean, tiled, both", g_opt.abFrames);
+        dklog("encoder: lean barriers %s (WIICOMPILED_DK_LEAN_BARRIERS), tiled cache %s (WIICOMPILED_DK_TILED_CACHE)%s%s; "
+              "per-pass GPU times %s%u frames (WIICOMPILED_DK_PASS_TIMES), per-draw %s (WIICOMPILED_DK_DRAW_TIMES)",
+              g_opt.lean ? "ON" : "off", g_opt.tiled ? "ON" : "off", g_opt.abFrames ? ", A/B: " : "",
+              g_opt.abFrames ? ab : "", g_opt.passTimes ? "every " : "off; ", g_opt.passTimes,
+              g_opt.drawTimes ? "on" : "off");
         return true;
     }();
     (void)once;
@@ -418,8 +691,15 @@ void batch_begin(uint32_t stagingSlot) {
         g_diag.draws = g_diag.passes = 0;
         g_diag.lastColor = nullptr;
         if (f > swdk::kFrames) read_marks(f - swdk::kFrames);  // that frame's fence was waited for in frame_open
-        g_marks[f % swdk::kFrames].count = 0;
-        g_marks[f % swdk::kFrames].cpuNs = swdk::now_ns();
+        // this frame's configuration: the switches, or the A/B cycle's turn
+        g_config = g_opt.abFrames ? uint8_t((f / g_opt.abFrames) & 3) : uint8_t((g_opt.lean ? 1 : 0) | (g_opt.tiled ? 2 : 0));
+        if (g_opt.tiled || g_opt.abFrames) swdk::tiled_cache_set((g_config & 2) != 0);
+        Marks& m = g_marks[f % swdk::kFrames];
+        m.count = 0;
+        m.cpuNs = swdk::now_ns();
+        m.config = g_config;
+        m.passCount = 0;
+        g_tag = Tag{};
         gpu_mark(GpuWork::FrameStart);
         log_stats();
     }
@@ -435,10 +715,21 @@ void batch_begin(uint32_t stagingSlot) {
     // what was written into textures since the last batch: before any draw samples them. The draws of
     // the previous batch may still sample what this one's uploads overwrite: the copy engine waits for
     // them (the queue orders submissions, not engines).
-    g_batch.workSinceTransfer = true;
-    transfer_begin();
-    const uint32_t uploads = objects_flush_uploads();
-    transfer_end();
+    // Lean barriers: with nothing to upload, the two Full barriers order nothing but what the previous
+    // frame's present (or batch) still samples, which this batch's first pass may overwrite: a Fragments
+    // barrier does that. The 3D work before it is not known to be done, so copy-engine work later in this
+    // batch (efb_ram's readback batches) still gets its Full barrier first.
+    uint32_t uploads = 0;
+    if ((g_config & 1) && !objects_uploads_pending()) {
+        barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
+        g_stats.leanBarriers++;
+        g_batch.workSinceTransfer = true;
+    } else {
+        g_batch.workSinceTransfer = true;
+        transfer_begin();
+        uploads = objects_flush_uploads();
+        transfer_end();
+    }
     if (uploads) {
         g_stats.uploads += uploads;
         gpu_mark(GpuWork::Copy);
@@ -451,6 +742,8 @@ void batch_begin(uint32_t stagingSlot) {
 void batch_end(uint32_t stagingSlot) {
     if (!g_batch.open) return;
     if (g_pass.open) pass_end();
+    flush_pending();  // (lean barriers: the next batch or the present may sample a conversion target)
+    g_tag = Tag{};    // (the present's and ImGui's timestamps belong to no pass)
     const uint64_t t0 = swdk::now_ns();
     swdk::fence_record(g_staging[stagingSlot < kStagingSlots ? stagingSlot : g_batch.slot].fence);
     swdk::submit("batch");
@@ -479,6 +772,7 @@ bool pass_begin(const PassTargets& t) {
         depthPtr = &depth;
     }
     if (colorView->tex->samples > 1) note_unsupported("a multisampled pass (drawn single-sampled; MSAA is workstream C)");
+    swdk::tiled_cache_flush();
     dkCmdBufBindRenderTargets(R.cmd, colors, 1, depthPtr);
     g_pass = {true, t.width, t.height, t.requireReadyPipelines, colorView->tex};
     if (g_diag.frame && g_diag.drawLog) {
@@ -505,6 +799,24 @@ bool pass_begin(const PassTargets& t) {
     g_cache.emptyTextures = false;
     bind_empty_textures();
     g_batch.workSinceTransfer = true;
+    if (g_opt.passTimes) {
+        Marks& m = frame_marks();
+        const uint32_t index = m.passCount++;
+        if (index < kMaxPasses) {
+            PassRec& r = m.passes[index];
+            r = PassRec{};
+            r.width = t.width;
+            r.height = t.height;
+            r.format = int32_t(colorView->tex->format);
+            r.depth = depthPtr != nullptr;
+            r.loadColor = t.clearColor;
+            r.loadDepth = t.clearDepth && depthPtr;
+            snprintf(r.label, sizeof r.label, "%s", colorView->tex->label.c_str());
+        }
+        const uint8_t pass = uint8_t(std::min<uint32_t>(index, 0xFE));
+        gpu_mark_tag(GpuWork::Efb, Tag{kSegLoad, pass});  // (the load clears, and what was before them)
+        g_tag = Tag{kSegDraws, pass};
+    }
     g_stats.encodeNs += swdk::now_ns() - t0;
     return true;
 }
@@ -550,6 +862,17 @@ void draw_gx(const gx::DrawData& d, const Range* uniformOverride) {
     // the WebGPU pass
     if (d.bindGroups.resolvedTextureBindGroup != nullptr && d.bindGroups.resolvedTextureBindGroup != g_cache.textures) {
         if (BindGroup* g = find_bind_group(d.bindGroups.resolvedTextureBindGroup)) {
+            // (lean barriers: a conversion target written since the last image barrier is sampled here; a
+            // group bound before that conversion was rebound since: passes start with the empty textures)
+            if (!g_pending.empty()) {
+                for (const BindGroup::Entry& e : g->entries) {
+                    if (e.view && is_pending(e.view->tex)) {
+                        barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
+                        g_stats.pendingFlushes++;
+                        break;
+                    }
+                }
+            }
             dkCmdBufBindTextures(R.cmd, DkStage_Fragment, 0, gx_handles(g), 8);
             g_stats.textureBinds++;
             g_cache.textures = d.bindGroups.resolvedTextureBindGroup;
@@ -565,6 +888,13 @@ void draw_gx(const gx::DrawData& d, const Range* uniformOverride) {
     if (g_diag.frame && g_diag.draws < g_diag.drawLog) log_draw(d, p, uniformRange);
     g_diag.draws++;
     g_stats.draws++;
+    if (g_opt.passTimes) {
+        if (PassRec* r = open_pass_rec()) r->gxDraws++;
+        g_drawsSinceMark++;
+        // (a reserve of marks kept for the passes' own and the present's)
+        if (g_opt.drawTimes && frame_marks().count + 256 < kMaxMarks)
+            gpu_mark_tag(GpuWork::Efb, g_tag, p, d.indexCount * std::max<uint32_t>(d.instanceCount, 1));
+    }
     g_batch.workSinceTransfer = true;
     g_stats.encodeNs += swdk::now_ns() - t0;
     maybe_submit();
@@ -593,6 +923,8 @@ void draw_clear(const clear::DrawData& d) {
         if (right <= x || bottom <= y) return;
         s = {x, y, right - x, bottom - y};
     }
+    // (pass times: the GX draws before this clear end there, the clear draw at its own mark)
+    if (g_opt.passTimes && g_drawsSinceMark) gpu_mark_tag(GpuWork::Efb, g_tag);
     ensure_globals();
     bind_pipe(p);
     set_blend_const(float(d.color.r), float(d.color.g), float(d.color.b), float(d.color.a));
@@ -605,6 +937,13 @@ void draw_clear(const clear::DrawData& d) {
     dkCmdBufDraw(R.cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
     g_stats.clears++;
     g_batch.workSinceTransfer = true;
+    if (g_opt.passTimes) {
+        if (PassRec* r = open_pass_rec()) {
+            r->clearDraws++;
+            r->clearPixels += s.width * s.height;
+        }
+        gpu_mark_tag(GpuWork::Efb, Tag{kSegClears, g_tag.pass});
+    }
 }
 
 void pass_end() {
@@ -612,6 +951,8 @@ void pass_end() {
     // later passes and copies read what this one wrote
     barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
     gpu_mark(GpuWork::Efb);
+    if (g_opt.passTimes) g_tag = Tag{kSegCopy, g_tag.pass};  // (its EFB copy follows)
+    g_passEnded = true;
     if (g_diag.frame) {
         Tex* c = g_pass.color;
         const bool rgba = c && (c->format == DkImageFormat_RGBA8_Unorm || c->format == DkImageFormat_BGRA8_Unorm);
@@ -676,17 +1017,49 @@ void note_work() { g_batch.workSinceTransfer = true; }
 
 Tex* diag_last_pass_target() { return g_diag.frame && g_diag.shotPasses ? g_diag.lastColor : nullptr; }
 
-void gpu_mark(GpuWork work) {
-    if (!g_gpuTimers || !R.frameOpen) return;
-    const uint64_t frame = R.frame + 1;
-    Marks& m = g_marks[frame % swdk::kFrames];
-    if (m.count >= kMaxMarks) {
-        g_stats.gpuDropped++;
+void gpu_mark(GpuWork work) { gpu_mark_tag(work, g_tag); }
+
+void conversion_barrier(Tex* dst) {
+    if (!(g_config & 1) || !dst) {
+        barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
         return;
     }
-    const swdk::QueryRegion q = swdk::query_region(frame);
-    dkCmdBufReportCounter(R.cmd, DkCounter_Timestamp, q.gpu + uint64_t(m.count) * 16);
-    m.work[m.count++] = work;
+    // the next pass overwrites what the conversion sampled once its fragments are done; whoever samples
+    // dst before the next image barrier gets one first
+    barrier(DkBarrier_Fragments, 0);
+    g_stats.leanBarriers++;
+    if (!is_pending(dst)) g_pending.push_back(dst);
+}
+
+void before_sampling(const Tex* t) {
+    if (t && !g_pending.empty() && is_pending(t)) {
+        barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
+        g_stats.pendingFlushes++;
+    }
+}
+
+void flush_pending() {
+    if (g_pending.empty()) return;
+    barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
+    g_stats.pendingFlushes++;
+}
+
+void pass_prologue() {
+    g_passEnded = false;
+    if (g_opt.passTimes) {
+        // (the palette conversions before the pass the walk is at: the next index)
+        const uint32_t next = frame_marks().passCount;
+        g_tag = Tag{kSegPalette, uint8_t(std::min<uint32_t>(next, 0xFE))};
+    }
+}
+
+void note_pass_copy(uint8_t kind, uint32_t width, uint32_t height) {
+    if (!g_opt.passTimes || !g_passEnded) return;
+    if (PassRec* r = open_pass_rec()) {
+        r->copyKind = kind;
+        r->copyW = width;
+        r->copyH = height;
+    }
 }
 
 EncodeStats& encode_stats() { return g_stats; }

@@ -43,6 +43,7 @@ void picture(void*, int stage) {
     const PresentRequest& req = *g_picture.request;
     if (stage == 0) {
         g_picture.valid = false;
+        flush_pending();  // (a display copy's conversion: WIICOMPILED_DK_LEAN_BARRIERS)
         Tex* src = find_texture(req.source);
         if (!src || !src->valid || req.viewport[2] <= 0.f || req.viewport[3] <= 0.f) {
             note_unsupported(!src            ? "a present whose source texture has no deko3d image (black frame)"

@@ -251,6 +251,18 @@ Investigated in October 2026 to fix the commentator crackle (disassembly, memory
 - AX DSP task at `0x802C12A0`; microcode image at `0x80225E00`.
 - Task callbacks: init `0x800BA3E4`, resume `0x800BA3F0`, done `0x800BA444`, request `0x800BA454`.
 
+### MIX mixer and reverb (CPU cost)
+
+Measured in October 2026 with the Switch profiler (test match) and checked against the translated code, `RL8E54`.
+
+- **The game's AX callback is empty:** `0x80027BF4` is a `blr`, registered at `0x800278EC` with `AXRegisterCallback` (`0x800BA740`). Mixing does not go through it.
+- **The sound thread drives the mixing:** on every 5 ms turn, `0x8002D768` walks the 55 channels and, for each channel that starts or changes volume, calls `MIXSetFader` (`0x800BFAE8`) and `MIXUpdateSettings` (`0x800BFB24`).
+  - `MIXUpdateSettings` walks **every** AX voice and calls `__MIXRmtUpdateSettings` (`0x800C1264`) for each.
+  - `__MIXGetVolume` (`0x800BE098`) turns decibels ×10 into a volume with the table at `0x802290B0`.
+  - The cost grows with fading channels × voices; the Wii paid the same, the recomp does not inflate it.
+- **Reverb:** `AXFXReverbHiCallback` (`0x800BC3AC`) is the aux callback `__AXOutNewFrame` (`0x800BA0D4`) calls from the audio DMA callback (`0x800BA3F0`). Each DMA block is `0x180` bytes = 96 samples = 3 ms, so it runs 333 times a second (about 5.6 per frame).
+- In the Switch port, `MIXUpdateSettings` with its two inner calls is a bit-identical native (`runtime/src/hle/mlb/mix_natives.cpp`, phase 32 of the Switch patch).
+
 ### Commentator streams
 
 - **Table of 4 stream objects** at `0x802A1A78`. `0x80038E50` walks the 4 and calls the handler `0x80038F08` for each valid one.
@@ -980,6 +992,8 @@ Sources: `wiicompiled-season-probe.patch`, `tools/season_save.py`, dumps in `loc
   - About 35 EFB copies per frame in a match; about 17 go to textures already read in the same frame.
 - **Strap screen:** it composes the image, copies it with `GXCopyTex` to `0x90000840` at 512×480 and draws it as a 512×512 texture on a full-screen quad. The hardware does not check the size, so the copy fills the top rows.
 - **TLUT:** the game reinitializes the same TLUT object on every draw, without destroying it.
+- **Environment map on the CPU:** `0x8000D770` computes sphere-map coordinates per vertex: transforms position and normal (two `PSMTXMultVec` without translation), normalizes (`0x800635B4`), reflects (r = p − 2(p·n)n), divides by √(rx² + ry² + (rz+1)²) (square root at `0x80128FD0`) and writes 2 floats per vertex. It is the game function that costs the most CPU in a match (~3.8% of the main thread on the Switch). Measured with the Switch profiler, `RL8E54`.
+- `PSMTXConcat` is at `0x800A890C`; `0x80053174` clears a `0x1E00`-byte table and sets up 64 records.
 - **Masked jumps:** the game uses jump tables bounded with `rlwinm` instead of `cmplwi` (e.g. `0x80031218`).
 
 Sources: `config/wiicompiled/rl8e54-data.csv`, `docs/en/wiicompiled-feasibility.md`, `wiicompiled-aurora-partial-efb-copy.patch`, `wiicompiled-tlut-reinit-cache.patch`.

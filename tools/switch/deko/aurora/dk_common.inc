@@ -20,6 +20,7 @@ static void dk_render(std::vector<RenderPass>& renderPasses, uint32_t stagingSlo
   dk::batch_begin(stagingSlot);
   for (u32 i = 0; i < renderPasses.size(); ++i) {
     const auto& passInfo = renderPasses[i];
+    dk::pass_prologue();  // (WIICOMPILED_DK_PASS_TIMES: the palette conversions belong to this pass)
     if (encodeTextureBakes) {
       for (const auto& conv : passInfo.paletteConvs) {
         dk::palette_convert(conv);
@@ -100,7 +101,11 @@ static void dk_render(std::vector<RenderPass>& renderPasses, uint32_t stagingSlo
             .forceOpaqueAlpha = passInfo.resolveForceOpaqueAlpha,
         };
         dk::copy_convert(convReq, !passInfo.resolveNeedsConversion);
+        dk::note_pass_copy(passInfo.resolveNeedsConversion ? 1 : 2, passInfo.resolveTarget->size.width,
+                           passInfo.resolveTarget->size.height);
       } else {
+        dk::note_pass_copy(3, static_cast<uint32_t>(passInfo.resolveRect.width),
+                           static_cast<uint32_t>(passInfo.resolveRect.height));
         dk::copy_texture(passInfo.copySourceTexture.Get(), static_cast<uint32_t>(passInfo.resolveRect.x),
                          static_cast<uint32_t>(passInfo.resolveRect.y), passInfo.resolveTarget->texture.Get(),
                          static_cast<uint32_t>(passInfo.resolveRect.width),

@@ -104,6 +104,8 @@ void objects_frame_start();
 // zero-initialization gives) and the queued WriteTexture uploads copied into their images. The number
 // of copies recorded.
 uint32_t objects_flush_uploads();
+// whether objects_flush_uploads has anything to do now (any thread; more may come right after)
+bool objects_uploads_pending();
 
 // a DkImageView of one level of a texture (transfers, render targets)
 DkImageView level_view(Tex* t, uint32_t level);

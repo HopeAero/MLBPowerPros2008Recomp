@@ -252,6 +252,18 @@ Investigado en octubre de 2026 para arreglar el petardeo del comentarista (desen
 - Tarea DSP de AX en `0x802C12A0`; imagen del microcódigo en `0x80225E00`.
 - Callbacks de la tarea: init `0x800BA3E4`, resume `0x800BA3F0`, done `0x800BA444`, request `0x800BA454`.
 
+### Mezclador MIX y reverb (coste de CPU)
+
+Medido en octubre de 2026 con el perfilador de la Switch (partido de prueba) y comprobado con el código traducido, `RL8E54`.
+
+- **El callback de AX del juego está vacío:** `0x80027BF4` es un `blr`, registrado en `0x800278EC` con `AXRegisterCallback` (`0x800BA740`). El trabajo de mezcla no va por ahí.
+- **La mezcla la mueve el hilo de sonido:** en cada vuelta de 5 ms, `0x8002D768` recorre los 55 canales y, por cada canal que arranca o cambia de volumen, llama a `MIXSetFader` (`0x800BFAE8`) y a `MIXUpdateSettings` (`0x800BFB24`).
+  - `MIXUpdateSettings` recorre **todas** las voces AX y llama por cada una a `__MIXRmtUpdateSettings` (`0x800C1264`).
+  - `__MIXGetVolume` (`0x800BE098`) pasa decibelios ×10 a volumen con la tabla de `0x802290B0`.
+  - El coste crece con canales en fundido × voces; en la Wii era igual, no lo infla el recomp.
+- **Reverb:** `AXFXReverbHiCallback` (`0x800BC3AC`) es el callback auxiliar que llama `__AXOutNewFrame` (`0x800BA0D4`) desde el callback de DMA de audio (`0x800BA3F0`). Cada bloque de DMA son `0x180` bytes = 96 muestras = 3 ms, así que corre 333 veces por segundo (unas 5,6 por fotograma).
+- En el port de Switch, `MIXUpdateSettings` con sus dos llamadas internas es un nativo idéntico bit a bit (`runtime/src/hle/mlb/mix_natives.cpp`, fase 32 del parche de Switch).
+
 ### Streams del comentarista
 
 - **Tabla de 4 objetos de stream** en `0x802A1A78`. `0x80038E50` recorre los 4 y llama al gestor `0x80038F08` para cada uno válido.
@@ -981,6 +993,8 @@ Fuentes: `wiicompiled-season-probe.patch`, `tools/season_save.py`, volcados en `
   - Unas 35 copias EFB por fotograma en partido; unas 17 van a texturas ya leídas en el mismo fotograma.
 - **Pantalla de la correa:** compone la imagen, la copia con `GXCopyTex` a `0x90000840` en 512×480 y la dibuja como textura de 512×512 sobre un quad de pantalla completa. El hardware no comprueba el tamaño, así que la copia rellena las filas de arriba.
 - **TLUT:** el juego vuelve a inicializar el mismo objeto TLUT en cada dibujo, sin destruirlo.
+- **Mapa de entorno en la CPU:** `0x8000D770` calcula por vértice las coordenadas de un mapa esférico: transforma posición y normal (dos `PSMTXMultVec` sin traslación), normaliza (`0x800635B4`), refleja (r = p − 2(p·n)n), divide por √(rx² + ry² + (rz+1)²) (raíz en `0x80128FD0`) y escribe 2 floats por vértice. Es la función del juego que más CPU gasta en un partido (~3,8 % del hilo principal en la Switch). Medido con el perfilador de la Switch, `RL8E54`.
+- `PSMTXConcat` está en `0x800A890C`; `0x80053174` borra una tabla de `0x1E00` bytes y prepara 64 registros.
 - **Saltos con máscara:** el juego usa tablas de saltos acotadas con `rlwinm` en vez de `cmplwi` (p. ej. `0x80031218`).
 
 Fuentes: `config/wiicompiled/rl8e54-data.csv`, `docs/wiicompiled-feasibility.md`, `wiicompiled-aurora-partial-efb-copy.patch`, `wiicompiled-tlut-reinit-cache.patch`.

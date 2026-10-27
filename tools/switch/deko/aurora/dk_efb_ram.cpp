@@ -115,7 +115,7 @@ bool readback_copy(WGPUTexture texture, uint32_t bytesPerRow, std::shared_ptr<Re
     const DkCopyBuf out = {r.mem.gpu, bytesPerRow, 0};
     dkCmdBufCopyImageToBuffer(R.cmd, &src, &rect, &out, 0);
     // the copy out of the GPU's L2 into memory before the CPU reads it (SwitchWaker's read_texture)
-    dkCmdBufBarrier(R.cmd, DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
+    swdk::barrier(DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
     swdk::fence_record(r.fence);
     EncodeStats& s = encode_stats();
     s.copies++;

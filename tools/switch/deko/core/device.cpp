@@ -232,7 +232,7 @@ void empty_image_init() {
     const DkCopyBuf src = {s.gpu, 0, 0};
     const DkImageRect r = {0, 0, 0, 1, 1, 1};
     dkCmdBufCopyBufferToImage(R.cmd, &src, &view, &r, 0);
-    dkCmdBufBarrier(R.cmd, DkBarrier_Full, DkInvalidateFlags_Image);
+    barrier(DkBarrier_Full, DkInvalidateFlags_Image);
     write_image_descriptor(kEmptyImage, g_empty);
     g_emptyReady = true;
 }
@@ -342,7 +342,7 @@ void shot_record(const DkImage& image, uint32_t width, uint32_t height, const ch
         dklog("shot: %s %ux%u skipped (WIICOMPILED_DK_SHOT_MB full)", tag, width, height);
         return;
     }
-    dkCmdBufBarrier(R.cmd, DkBarrier_Fragments, 0);  // (whatever drew into it has finished)
+    barrier(DkBarrier_Fragments, 0);  // (whatever drew into it has finished)
     DkImageView view;
     dkImageViewDefaults(&view, &image);
     const DkImageRect rect = {0, 0, 0, width, height, 1};
@@ -371,6 +371,7 @@ PresentTimes frame_present(const ImDrawData* ui, PictureFn picture, void* user, 
     dkImageViewDefaults(&color, &g_swapImages[slot]);
     dkImageViewDefaults(&depth, &g_depth);
     const DkImageView* colors[] = {&color};
+    tiled_cache_flush();
     dkCmdBufBindRenderTargets(R.cmd, colors, 1, &depth);
     static const DkViewportSwizzle kIdentity = {DkSwizzle_PositiveX, DkSwizzle_PositiveY, DkSwizzle_PositiveZ,
                                                 DkSwizzle_PositiveW};
@@ -462,6 +463,21 @@ void check_queue(const char* before) {
     if (!dkQueueIsInErrorState(R.queue)) return;
     fatal("the deko3d queue is in an error state (a GPU fault) before %s of frame %llu; deko3d messages %d", before,
           (unsigned long long)R.frame + 1, g_debugMessages);
+}
+
+void barrier(DkBarrier mode, uint32_t invalidate) {
+    if (mode != DkBarrier_None && R.tiledCache) dkCmdBufTiledCacheOp(R.cmd, DkTiledCacheOp_Flush);
+    dkCmdBufBarrier(R.cmd, mode, invalidate);
+}
+
+void tiled_cache_set(bool on) {
+    if (!on && R.tiledCache) dkCmdBufTiledCacheOp(R.cmd, DkTiledCacheOp_Flush);
+    dkCmdBufTiledCacheOp(R.cmd, on ? DkTiledCacheOp_Enable : DkTiledCacheOp_Disable);
+    R.tiledCache = on;
+}
+
+void tiled_cache_flush() {
+    if (R.tiledCache) dkCmdBufTiledCacheOp(R.cmd, DkTiledCacheOp_Flush);
 }
 
 void set_view(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {

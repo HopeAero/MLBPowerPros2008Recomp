@@ -27,7 +27,8 @@
 // State. Dawn's pass for these clears the target and draws one triangle over all of it with no
 // blending, no depth and no culling; the triangle writes every pixel and no shader discards, so the
 // clear is left out. After the draw a Fragments barrier with the texture cache invalidated (later
-// passes and copies sample the result), and the encoder's state cache is reset.
+// passes and copies sample the result; WIICOMPILED_DK_LEAN_BARRIERS: the encoder's conversion_barrier),
+// and the encoder's state cache is reset.
 #include "dk_encode.hpp"
 #include "dk_gfx.hpp"
 
@@ -423,6 +424,7 @@ void conv_draw(View* out, const DkShader* vs, const DkShader* fs, const TexBind*
     if (swdk::code_take_written()) dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Shader);
     const DkImageView target = level_view(t, out->baseMip);
     const DkImageView* targets[] = {&target};
+    swdk::tiled_cache_flush();
     dkCmdBufBindRenderTargets(R.cmd, targets, 1, nullptr);
     const DkViewportSwizzle sw = {DkSwizzle_PositiveX, swdk::C.flipY ? DkSwizzle_NegativeY : DkSwizzle_PositiveY,
                                   DkSwizzle_PositiveZ, DkSwizzle_PositiveW};
@@ -439,11 +441,10 @@ void conv_draw(View* out, const DkShader* vs, const DkShader* fs, const TexBind*
     }
     for (uint32_t i = 0; i < texCount; i++) dkCmdBufBindTexture(R.cmd, DkStage_Fragment, tex[i].binding, tex[i].handle);
     dkCmdBufDraw(R.cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
-    // later passes, conversions and copies read what this wrote
-    dkCmdBufBarrier(R.cmd, DkBarrier_Fragments, DkInvalidateFlags_Image);
+    // later passes, conversions and copies read what this wrote (and may overwrite what it sampled)
+    conversion_barrier(t);
     EncodeStats& s = encode_stats();
     s.conversions++;
-    s.barriers++;
     invalidate_state();
     note_work();
     gpu_mark(GpuWork::Conversion);
@@ -494,6 +495,7 @@ bool copy_convert(const tex_copy_conv::ConvRequest& req, bool shaderSampled) {
     const uint32_t sampler = !depth && req.sampleFilter == tex_copy_conv::SampleFilter::Linear
                                  ? uint32_t(swdk::kSamplerLinearClamp)
                                  : uint32_t(swdk::kSamplerNearestClamp);
+    before_sampling(src->tex);
     const TexBind tex = {0, dkMakeTextureHandle(view_slot(src), sampler)};
     const uint32_t uboSize = std::max<uint32_t>((req.uniformRange.size + 15u) & ~15u, 16u);
     conv_draw(out, vs, fs, &tex, 1, uniform_address(req.uniformRange.offset), uboSize);
@@ -527,6 +529,8 @@ bool palette_convert(const tex_palette_conv::ConvRequest& req) {
         note_unsupported("a palette conversion whose shader did not compile (skipped)");
         return false;
     }
+    before_sampling(src->tex);
+    before_sampling(tlut->tex);
     const TexBind tex[] = {
         {0, dkMakeTextureHandle(view_slot(src), swdk::kSamplerNearestClamp)},
         {1, dkMakeTextureHandle(view_slot(tlut), swdk::kSamplerNearestClamp)},
