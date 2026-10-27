@@ -129,6 +129,12 @@ dotnet "$translator" emit-build-shards "${project[@]}" --base-metadata "$gen/tra
 # host (Docker Desktop's VM, in the image) runs out of memory and drops the build.
 # MLB_SWITCH_JOBS overrides it (when the host is short of memory or swap).
 jobs=${MLB_SWITCH_JOBS:-$(awk -v n="$(nproc)" '/^MemFree:/ { j = int($2 / 2621440); print (j < 1 ? 1 : (j > n ? n : j)) }' /proc/meminfo)}
+# The deko3d renderer's toolchain (patched deko3d, uamlib): no-ops once built.
+step "Building deko3d and uam"
+for part in deko3d uam; do
+    bash "$root/tools/switch/deko/build-$part.sh" > "$logs/build-$part.log" 2>&1 ||
+        { tail -n 20 "$logs/build-$part.log"; fail "$part build failed (local/switch/logs/build-$part.log)"; }
+done
 step "Configuring for Horizon (graphics: $graphics)"
 # Precompiled headers stay off: under MSYS2, devkitA64 (a native Windows compiler) cannot open the
 # absolute MSYS paths the generated PCH header #includes (only command lines get converted), so unity
@@ -141,6 +147,7 @@ cmake -S "$src/runtime" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release "${msys[
     -DCMAKE_UNITY_BUILD_RELOCATABLE=ON \
     -DWIICOMPILED_GAME=RL8E54 -DMKW_TRANSLATED_COMPILE_JOBS="$jobs" \
     -DMKW_SWITCH_GRAPHICS="$graphics" -DMKW_SWITCH_DAWN_DIR="$dawn" \
+    -DMLB_SWITCH_DEKO_DIR="$root/tools/switch/deko" \
     -DAURORA_DAWN_PROVIDER=system -DDawn_DIR="$root/tools/switch/dawn" \
     -DAURORA_SDL3_PROVIDER=system -DAURORA_SDL3_VERSION=3.4.0 \
     > "$logs/configure-$graphics.log" 2>&1 || { tail -n 30 "$logs/configure-$graphics.log"; fail "configure failed (local/switch/logs/configure-$graphics.log)"; }

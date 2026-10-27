@@ -1,0 +1,1095 @@
+uam (https://github.com/devkitPro/uam, zlib; mesa-imported/ MIT) as SwitchWaker vendors it in switch/uam
+(https://github.com/centollOS/SwitchWaker at 56c0758a4651155ca491ef9d6d3be0ae35be726f, from SwitchWakerHD
+df8fbde/61b7c17): the diff of that copy against upstream uam 5a5afc2bae8b55409ab36ba45be63fcb73f68993
+(1.1.0), generated/ left out (build-uam.sh takes it from the same SwitchWaker commit). PATCHES.md (added
+below) explains the 9 patches; every changed upstream line is marked "SwitchWakerHD patch N" /
+"SwitchWaker patch N". Also adds SwitchWaker's CMakeLists.txt (static library uamlib), uam_api.{h,cpp}
+(uam::init / uam::compile), source/uam_log.h, tools/generate.sh and test/uam_dksh_test.cpp.
+Made with: git diff of an upstream checkout after copying SwitchWaker's switch/uam over it (minus generated/).
+
+diff --git a/.gitignore b/.gitignore
+index bbd7e13..7291641 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,3 +9,5 @@ build/
+ *.tgsi
+ *.dksh
+ *.txt
++# SwitchWakerHD: the CMake build of uamlib
++!CMakeLists.txt
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+new file mode 100644
+index 0000000..8c970a2
+--- /dev/null
++++ b/CMakeLists.txt
+@@ -0,0 +1,81 @@
++# uam 1.1.0 (devkitPro's deko3d shader compiler: Mesa's GLSL frontend + nouveau's nv50_ir) without meson:
++# the static library 'uamlib' (compiler core + uam_api.h) for the host tools (native/tools/dksh_cache) and
++# the Switch (devkitPro toolchain: NX_ROOT defined). Vendored from SwitchWakerHD (PATCHES.md).
++# Mirrors meson.build and its subdir()s; the bison/flex/mako outputs are committed in generated/
++# (tools/generate.sh). Our patches: PATCHES.md.
++# Used from another project (add_subdirectory) or on its own (cmake -S switch/uam):
++#   COS_UAM_TEST=ON  also builds uam_dksh_test (compares DKSH bytes with reference .dksh files)
++#   the 'uam' command line tool (target uam_tool) is defined on desktop builds, built only on request
++cmake_minimum_required(VERSION 3.20)
++if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
++  project(uam C CXX)
++  if(NOT CMAKE_BUILD_TYPE)
++    set(CMAKE_BUILD_TYPE Release)
++  endif()
++endif()
++
++set(UAM_DIR ${CMAKE_CURRENT_SOURCE_DIR})
++set(UAM_MESA ${UAM_DIR}/mesa-imported)
++set(UAM_GEN ${UAM_DIR}/generated)
++
++set(UAM_SOURCES
++  ${UAM_DIR}/source/compiler_iface.cpp
++  ${UAM_DIR}/source/glsl_frontend.cpp
++  ${UAM_DIR}/source/mini-os.c
++  ${UAM_DIR}/source/tgsi_support.cpp
++  ${UAM_DIR}/uam_api.cpp
++  # generated (glsl/meson.build, glsl/glcpp/meson.build)
++  ${UAM_GEN}/glsl/glsl_parser.cpp
++  ${UAM_GEN}/glsl/glsl_lexer.cpp
++  ${UAM_GEN}/glsl/glcpp/glcpp-parse.c
++  ${UAM_GEN}/glsl/glcpp/glcpp-lex.c
++  ${UAM_MESA}/glsl/glcpp/pp.c)
++
++# the plain file lists of mesa-imported/*/meson.build
++foreach(sub codegen tgsi util cso_cache glsl compiler program state_tracker main)
++  file(READ ${UAM_MESA}/${sub}/meson.build _mb)
++  string(REGEX MATCHALL "files\\(([^)]*)\\)" _blocks "${_mb}")
++  foreach(_block IN LISTS _blocks)
++    string(REGEX MATCHALL "'[^']+'" _names "${_block}")
++    foreach(_n IN LISTS _names)
++      string(REPLACE "'" "" _n "${_n}")
++      list(APPEND UAM_SOURCES ${UAM_MESA}/${sub}/${_n})
++    endforeach()
++  endforeach()
++  # a source list change upstream must re-run the configure
++  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${UAM_MESA}/${sub}/meson.build)
++endforeach()
++
++add_library(uamlib STATIC ${UAM_SOURCES})
++target_include_directories(uamlib PUBLIC ${UAM_DIR})  # uam_api.h
++target_include_directories(uamlib PRIVATE ${UAM_DIR}/source ${UAM_MESA} ${UAM_GEN} ${UAM_GEN}/glsl ${UAM_GEN}/glsl/glcpp)
++# meson.build's project options: c99 / c++11 (flex output uses 'register', gone in C++17), release asserts
++set_target_properties(uamlib PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF CXX_STANDARD 11 CXX_EXTENSIONS OFF
++                                        POSITION_INDEPENDENT_CODE ON)
++target_compile_definitions(uamlib PRIVATE "PACKAGE_STRING=\"uam 1.1.0\"" DESKTOP _USE_MATH_DEFINES _GNU_SOURCE
++                                          HAVE_POSIX_MEMALIGN
++                                          # always: Mesa's asserts abort, and a Debug game build must not
++                                          NDEBUG)
++target_compile_options(uamlib PRIVATE -ffunction-sections -fdata-sections -w -O2
++                                      $<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>)
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT DEFINED NX_ROOT)
++  find_package(Threads REQUIRED)
++  target_link_libraries(uamlib PUBLIC Threads::Threads)  # c11/threads.h: pthread mutexes
++endif()
++
++if(NOT DEFINED NX_ROOT)
++  # the uam command line tool, as upstream (reference outputs, offline DKSH caches)
++  add_executable(uam_tool EXCLUDE_FROM_ALL ${UAM_DIR}/source/main.cpp)
++  target_include_directories(uam_tool PRIVATE ${UAM_DIR}/source ${UAM_MESA} ${UAM_GEN} ${UAM_GEN}/glsl)
++  target_compile_definitions(uam_tool PRIVATE "PACKAGE_STRING=\"uam 1.1.0\"" DESKTOP NDEBUG)
++  set_target_properties(uam_tool PROPERTIES OUTPUT_NAME uam CXX_STANDARD 11)
++  target_compile_options(uam_tool PRIVATE -w)
++  target_link_libraries(uam_tool PRIVATE uamlib)
++endif()
++
++option(COS_UAM_TEST "build uam_dksh_test (desktop)" OFF)
++if(COS_UAM_TEST AND NOT DEFINED NX_ROOT)
++  add_executable(uam_dksh_test ${UAM_DIR}/test/uam_dksh_test.cpp)
++  set_target_properties(uam_dksh_test PROPERTIES CXX_STANDARD 17)
++  target_link_libraries(uam_dksh_test PRIVATE uamlib)
++endif()
+diff --git a/PATCHES.md b/PATCHES.md
+new file mode 100644
+index 0000000..310552a
+--- /dev/null
++++ b/PATCHES.md
+@@ -0,0 +1,79 @@
++# uam in SwitchWaker
++
++Vendored on 2026-10-08 from SwitchWakerHD
++([github.com/centollOS/SwitchWakerHD](https://github.com/centollOS/SwitchWakerHD),
++`runtime/third_party/uam/` at `df8fbde`) without changes to the compiler: the build option
++`WWHD_UAM_TEST` is `COS_UAM_TEST` here and the comments name this repository's paths. The patch
++markers below stay `SwitchWakerHD patch N` (zlib asks for altered versions to be marked). Users:
++`native/tools/dksh_cache` (host, Debian container); the deko3d NRO later
++(`docs/DEKO3D_MIGRATION_PLAN.md`).
++
++uam 1.1.0, https://github.com/devkitPro/uam at `5a5afc2` (LICENSE: zlib for uam's own files, MIT for
++mesa-imported/). Built by `CMakeLists.txt` (no meson) as the static library `uamlib`; the renderer uses
++it through `uam_api.h` (init / compile, one thread only). `generated/` holds what meson would produce
++with bison, flex and mako: rerun `tools/generate.sh` (bison, flex, python3-mako; e.g. the `uam-host`
++Docker image) after editing a `.yy`, `.ll`, `.y`, `.l` or `ir_expression_operation.py`.
++
++Every change to upstream files is marked `SwitchWakerHD patch N`.
++
++1. **Real mutexes** (`mesa-imported/c11/threads.h`). Upstream's header is a single-threaded stub; it
++   now maps to pthread mutexes. uam is still NOT reentrant (static `gl_context` in
++   `source/glsl_frontend.cpp`; three threads crash even with these mutexes): compile on one thread.
++2. **DKSH in memory**: `DekoCompiler::WriteDksh(std::vector<uint8_t>&)` next to `OutputDksh`, same
++   bytes without a file (`source/compiler_iface.*`).
++3. **Log callback** (`source/uam_log.h`, `source/mini-os.c`): the frontend's and the compiler
++   interface's `fprintf(stderr)`, Mesa's `_mesa_warning` / out-of-memory messages, `os_log_message`
++   and nv50_ir's `ERROR()` (a no-op in release builds before) go to `uam_set_log_callback` (stderr
++   when unset). `uam::compile` collects them in `Result::log`.
++4. **No exit()/abort() from CompileGlsl**: the `exit(1)` in `st_glsl_to_tgsi.cpp`, the `abort()` in
++   `lower_mat_op_to_vec.cpp` and `nv50_ir_from_tgsi.cpp`, nv50_ir's `FATAL()` and flex's
++   `YY_FATAL_ERROR` (both lexers) call `uam_fatal()`, which logs and `longjmp`s back to
++   `DekoCompiler::CompileGlsl`; the compile returns false and what it had allocated is leaked.
++   Mesa's `assert`/`unreachable` stay compiled out (`NDEBUG` is always defined for `uamlib`); the
++   `abort()`s in `ir_validate.cpp` exist only in `DEBUG` builds.
++5. **Resident frontend** (`DekoCompiler::SetFrontendResident`, `uam::init(true)`): Mesa's built-in
++   GLSL function library and type tables are built on the first compile and kept, instead of being
++   rebuilt and freed around every `DekoCompiler` as the uam tool does. Same bytes; about 20 % less
++   compile time on the host.
++6. **Deterministic scheduling data** (`mesa-imported/codegen/nv50_ir.cpp`, `Instruction::init`):
++   `sched` starts at 0x7e0. `SchedDataCalculatorGM107::setDelay` reads the wait mask of the next
++   block's first instruction before that block is visited, i.e. uninitialised heap memory (valgrind:
++   "Conditional jump or move depends on uninitialised value(s)" in `setDelay`). Upstream uam's stall
++   counts therefore depend on what the heap held: compiled in one process after other shaders, 89 of
++   the prototype's 1561 Cemu shaders came out different from the uam tool's files, and a fresh run of
++   the prototype's own uam binary no longer reproduces 5 of the reference files it wrote. 0x7e0 (no
++   barrier, nothing to wait on) is what the scheduler gives every instruction before it runs.
++
++7. **No dual issue** (`mesa-imported/codegen/nv50_ir_emit_gm107.cpp`, `SchedDataCalculatorGM107::setDelay`):
++   uam's Maxwell dual-issue scheduling (README: "enhanced with new experimental findings"; Mesa 20.1,
++   which gfx/gl runs on, never dual-issues) made 4x8-pixel blocks (one 32-thread fragment warp) of
++   sunlit surfaces flicker with wrong lighting on Outset and in Dragon Roost Cavern. Bisected on the
++   console (2026-10-07) with the renderer's load-time patch of the scheduling words: as compiled =
++   specks, no dual issue = clean, same fps. Every instruction now gets its normal stall count instead
++   of a zero-delay pair.
++
++8. **Stall 2 before a new block** (`mesa-imported/codegen/nv50_ir_emit_gm107.cpp`, `SchedDataCalculatorGM107::setDelay`;
++   marked `SwitchWaker patch 8`): Mesa 20.1's rule restored. A dependency barrier becomes active one clock after the
++   instruction that sets it, so Mesa gives an instruction that sets one stall 2 when the next instruction is in
++   another block (whose waits are not known yet). uam asked the next block's entry instead (for its dual-issue
++   experiment), and that entry's "wait on every barrier" is only added when the block is visited: the last
++   instruction of a block got stall 1 and the next block's first one passed the barrier before it was active.
++   Seen on the console (2026-10-08) in the game's light volumes (`dDlst_alphaModel`: torches, lanterns,
++   fireflies): the fragment epilogue's `MOV R0, 1.0` overwrote `IPA.SAT R3 = a[0x8c] * R0` (R0 = 1/w) before the IPA
++   read it, so most 4x8-pixel warps wrote alpha a/w ~ 0 and the halos' alpha mask came out as flickering specks.
++   The deko3d NRO's load-time scheduling patch bisected it (stall 15 on every instruction fixed it, waiting on
++   every barrier did not). Four fragment programs of the cache had a real conflict; every block-ending barrier
++   instruction now gets stall 2, as with Mesa. The DKSH compiler name gains "SwitchWaker patch 8", so every
++   cached DKSH is rebuilt.
++
++9. **Free a compile's memory** (`source/glsl_frontend.cpp`, `glsl_program_free`; `source/compiler_iface.cpp`,
++   `~DekoCompiler`; marked `SwitchWaker patch 9`, from SwitchWakerHD `61b7c17`): uam freed the program but not its
++   linked shaders (each its own ralloc tree: the linked IR), their programs' parameter lists (malloc, not ralloc)
++   or nv50's binary (`m_info.bin.code`, MALLOC). Freed now as Mesa's `_mesa_delete_linked_shader` and
++   `_mesa_delete_program` do. In SwitchWakerHD's first start (~7,800 compiles) this was ~130 MiB that stayed in
++   use; here it is every shader compiled on the console (the ones the bundled DKSH cache lacks). The DKSH bytes do
++   not change, so the compiler name does not either.
++
++Check: `uam_dksh_test` (`-DCOS_UAM_TEST=ON`) compiles a directory of GLSL files in one process and
++compares the DKSH bytes with reference files written by the `uam` tool (target `uam_tool`), one
++process per shader.
+diff --git a/mesa-imported/c11/threads.h b/mesa-imported/c11/threads.h
+index 5a19d76..25be488 100644
+--- a/mesa-imported/c11/threads.h
++++ b/mesa-imported/c11/threads.h
+@@ -1,12 +1,25 @@
+ #pragma once
+ 
+-// This header is fake.
++// Real mutexes (SwitchWakerHD patch 1, see PATCHES.md). uam's own header was a single-threaded stub
++// (every lock a no-op), which let two threads build Mesa's built-in GLSL function library at the
++// same time and damage the ralloc heap. uam stays NOT reentrant (static gl_context in
++// glsl_frontend.cpp): this only keeps Mesa's global tables consistent; compile on one thread.
++#include <pthread.h>
+ 
+-typedef int mtx_t;
++typedef pthread_mutex_t mtx_t;
++enum { mtx_plain = 0, mtx_recursive = 1, mtx_timed = 2 };
+ 
+-#define mtx_init(_m,...) ((void)(_m))
+-#define mtx_destroy(_m,...) ((void)(_m))
+-#define mtx_lock(_m,...) ((void)(_m))
+-#define mtx_unlock(_m,...) ((void)(_m))
++static inline int mtx_init(mtx_t *m, int type)
++{
++	pthread_mutexattr_t a;
++	pthread_mutexattr_init(&a);
++	pthread_mutexattr_settype(&a, (type & mtx_recursive) ? PTHREAD_MUTEX_RECURSIVE : PTHREAD_MUTEX_NORMAL);
++	int r = pthread_mutex_init(m, &a);
++	pthread_mutexattr_destroy(&a);
++	return r;
++}
++static inline void mtx_destroy(mtx_t *m) { pthread_mutex_destroy(m); }
++static inline int mtx_lock(mtx_t *m) { return pthread_mutex_lock(m); }
++static inline int mtx_unlock(mtx_t *m) { return pthread_mutex_unlock(m); }
+ 
+-#define _MTX_INITIALIZER_NP 0
++#define _MTX_INITIALIZER_NP PTHREAD_MUTEX_INITIALIZER
+diff --git a/mesa-imported/codegen/nv50_ir.cpp b/mesa-imported/codegen/nv50_ir.cpp
+index a7adec0..985c29f 100644
+--- a/mesa-imported/codegen/nv50_ir.cpp
++++ b/mesa-imported/codegen/nv50_ir.cpp
+@@ -590,6 +590,12 @@ void Instruction::init()
+    predSrc = -1;
+    flagsDef = -1;
+    flagsSrc = -1;
++
++   // SwitchWakerHD patch 6: SchedDataCalculatorGM107::setDelay reads the wait mask of the next block's
++   // first instruction before that block's visit sets it; uninitialised, the output depended on what
++   // the heap held (stale data from an earlier compile in the same process). 0x7e0 is the value the
++   // scheduler starts every instruction with (no barriers, nothing to wait on).
++   sched = 0x7e0;
+ }
+ 
+ Instruction::Instruction()
+diff --git a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+index 04717c8..763e495 100644
+--- a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
++++ b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+@@ -4119,7 +4119,12 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+    if (delay <= GM107_MIN_ISSUE_DELAY && (wr & rd) != 7) {
+       // Barriers take one additional clock cycle to become active on top of
+       // the clock consumed by the instruction producing it.
+-      if (!next) {
++      // SwitchWaker patch 8: Mesa 20.1's rule restored. uam asked the next block's entry for its waits, but those
++      // are only set when that block is visited, so a barrier set by a block's last instruction got stall 1 and
++      // the next block's first instruction passed the not-yet-active barrier: the light volumes' fragment epilogue
++      // `MOV R0, 1.0` overwrote IPA.SAT's multiplier R0 (1/w) before the IPA read it (alpha a/w ~ 0 in most 4x8
++      // warps, flickering specks). See PATCHES.md.
++      if (!next || insn->bb != next->bb) {
+          delay = 0x2;
+       } else {
+          int wt = getWtDepBar(next);
+@@ -4128,7 +4133,11 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+       }
+    }
+ 
+-   if (lastDualIssued || !next || delay > 1 || !targ->canDualIssue(insn, next)) {
++   // wwhd patch 7: no dual issue. On the console a dual-issued pair in the lit (sunlight) terms of the game's
++   // shaders made whole 32-thread fragment warps (4x8-pixel screen blocks) flicker with wrong lighting;
++   // gfx/gl's Mesa 20.1 never dual-issues. See runtime/third_party/uam/PATCHES.md.
++   static const bool kDualIssue = false;
++   if (!kDualIssue || lastDualIssued || !next || delay > 1 || !targ->canDualIssue(insn, next)) {
+       delay = CLAMP(delay, GM107_MIN_ISSUE_DELAY, GM107_MAX_ISSUE_DELAY);
+       lastDualIssued = false;
+    } else {
+diff --git a/mesa-imported/codegen/nv50_ir_from_tgsi.cpp b/mesa-imported/codegen/nv50_ir_from_tgsi.cpp
+index 7ac4268..9105b8a 100644
+--- a/mesa-imported/codegen/nv50_ir_from_tgsi.cpp
++++ b/mesa-imported/codegen/nv50_ir_from_tgsi.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include "codegen/nv50_ir.h"
+ #include "codegen/nv50_ir_util.h"
++#include "uam_log.h" // SwitchWakerHD patch 4
+ #include "codegen/nv50_ir_build_util.h"
+ 
+ namespace tgsi {
+@@ -3846,8 +3847,8 @@ Converter::handleInstruction(const struct tgsi_full_instruction *insn)
+       break;
+    case TGSI_OPCODE_SWITCH:
+    case TGSI_OPCODE_CASE:
+-      ERROR("switch/case opcode encountered, should have been lowered\n");
+-      abort();
++      // SwitchWakerHD patch 4: fail the compile, not the process
++      uam_fatal("ERROR: switch/case opcode encountered, should have been lowered\n");
+       break;
+    case TGSI_OPCODE_LOAD:
+       handleLOAD(dst0);
+diff --git a/mesa-imported/codegen/nv50_ir_util.h b/mesa-imported/codegen/nv50_ir_util.h
+index d6d5da7..0f9433f 100644
+--- a/mesa-imported/codegen/nv50_ir_util.h
++++ b/mesa-imported/codegen/nv50_ir_util.h
+@@ -28,6 +28,7 @@
+ #include <stdio.h>
+ #include <memory>
+ #include <map>
++#include "uam_log.h" // SwitchWakerHD patch 4
+ 
+ #ifndef NDEBUG
+ # include <typeinfo>
+@@ -36,7 +37,8 @@
+ #include "util/u_inlines.h"
+ #include "util/u_memory.h"
+ 
+-#define ERROR(args...) debug_printf("ERROR: " args)
++// SwitchWakerHD patch 3: errors reach the log callback in release builds too (debug_printf is DEBUG-only)
++#define ERROR(args...) _debug_printf("ERROR: " args)
+ #define WARN(args...) debug_printf("WARNING: " args)
+ #define INFO(args...) debug_printf(args)
+ 
+@@ -46,11 +48,8 @@
+          debug_printf(args);             \
+    } while(0)
+ 
+-#define FATAL(args...)          \
+-   do {                         \
+-      fprintf(stderr, args);    \
+-      abort();                  \
+-   } while(0)
++// SwitchWakerHD patch 4: fail the compile, not the process
++#define FATAL(args...) uam_fatal(args)
+ 
+ 
+ #define NV50_IR_FUNC_ALLOC_OBJ_DEF(obj, f, args...)               \
+diff --git a/mesa-imported/glsl/glcpp/glcpp-lex.l b/mesa-imported/glsl/glcpp/glcpp-lex.l
+index 9838bb4..85f737e 100644
+--- a/mesa-imported/glsl/glcpp/glcpp-lex.l
++++ b/mesa-imported/glsl/glcpp/glcpp-lex.l
+@@ -28,6 +28,8 @@
+ 
+ #include "glsl/glcpp/glcpp.h" // fincs-edit
+ #include "glsl/glcpp/glcpp-parse.h" // fincs-edit
++#include "uam_log.h" // SwitchWakerHD patch 4: flex fails the compile, not the process
++#define YY_FATAL_ERROR(msg) uam_fatal("flex: %s\n", msg)
+ 
+ /* Flex annoyingly generates some functions without making them
+  * static. Let's declare them here. */
+diff --git a/mesa-imported/glsl/glsl_lexer.ll b/mesa-imported/glsl/glsl_lexer.ll
+index 205cc6c..d225b64 100644
+--- a/mesa-imported/glsl/glsl_lexer.ll
++++ b/mesa-imported/glsl/glsl_lexer.ll
+@@ -28,6 +28,8 @@
+ #include "glsl/ast.h" // fincs-edit
+ #include "glsl/glsl_parser_extras.h" // fincs-edit
+ #include "glsl/glsl_parser.h" // fincs-edit
++#include "uam_log.h" // SwitchWakerHD patch 4: flex fails the compile, not the process
++#define YY_FATAL_ERROR(msg) uam_fatal("flex: %s\n", msg)
+ 
+ static int classify_identifier(struct _mesa_glsl_parse_state *, const char *,
+ 			       unsigned name_len, YYSTYPE *output);
+diff --git a/mesa-imported/glsl/linker.cpp b/mesa-imported/glsl/linker.cpp
+index 116f605..531e158 100644
+--- a/mesa-imported/glsl/linker.cpp
++++ b/mesa-imported/glsl/linker.cpp
+@@ -64,6 +64,7 @@
+  * \author Ian Romanick <ian.d.romanick@intel.com>
+  */
+ 
++#include "uam_log.h" // SwitchWakerHD patch 3
+ #include <ctype.h>
+ #include "util/strndup.h"
+ #include "glsl_symbol_table.h"
+@@ -4263,7 +4264,7 @@ is_top_level_shader_storage_block_member(const char* name,
+    int name_length = strlen(interface_name) + 1 + strlen(field_name) + 1;
+    char *full_instanced_name = (char *) calloc(name_length, sizeof(char));
+    if (!full_instanced_name) {
+-      fprintf(stderr, "%s: Cannot allocate space for name\n", __func__);
++      uam_logf("%s: Cannot allocate space for name\n", __func__); // SwitchWakerHD patch 3
+       return false;
+    }
+ 
+diff --git a/mesa-imported/glsl/lower_mat_op_to_vec.cpp b/mesa-imported/glsl/lower_mat_op_to_vec.cpp
+index 88c5d66..b0469e4 100644
+--- a/mesa-imported/glsl/lower_mat_op_to_vec.cpp
++++ b/mesa-imported/glsl/lower_mat_op_to_vec.cpp
+@@ -32,6 +32,7 @@
+  */
+ 
+ #include "ir.h"
++#include "uam_log.h" // SwitchWakerHD patch 4
+ #include "ir_expression_flattening.h"
+ #include "compiler/glsl_types.h"
+ 
+@@ -427,9 +428,9 @@ ir_mat_op_to_vec_visitor::visit_leave(ir_assignment *orig_assign)
+       break;
+ 
+    default:
+-      printf("FINISHME: Handle matrix operation for %s\n",
+-	     ir_expression_operation_strings[orig_expr->operation]);
+-      abort();
++      // SwitchWakerHD patch 4: fail the compile, not the process
++      uam_fatal("FINISHME: Handle matrix operation for %s\n",
++                ir_expression_operation_strings[orig_expr->operation]);
+    }
+    orig_assign->remove();
+    this->made_progress = true;
+diff --git a/mesa-imported/glsl/standalone_scaffolding.cpp b/mesa-imported/glsl/standalone_scaffolding.cpp
+index 8a5c844..a8c7cc6 100644
+--- a/mesa-imported/glsl/standalone_scaffolding.cpp
++++ b/mesa-imported/glsl/standalone_scaffolding.cpp
+@@ -35,6 +35,7 @@
+ #include "util/ralloc.h"
+ #include "util/strtod.h"
+ #include "main/mtypes.h"
++#include "uam_log.h" // SwitchWakerHD patch 3
+ 
+ void
+ _mesa_warning(struct gl_context *ctx, const char *fmt, ...)
+@@ -44,12 +45,10 @@ _mesa_warning(struct gl_context *ctx, const char *fmt, ...)
+ 
+     va_start(vargs, fmt);
+ 
+-    /* This output is not thread-safe, but that's good enough for the
+-     * standalone compiler.
+-     */
+-    fprintf(stderr, "Mesa warning: ");
+-    vfprintf(stderr, fmt, vargs);
+-    fprintf(stderr, "\n");
++    /* SwitchWakerHD patch 3: one message to the log callback */
++    char msg[1024];
++    vsnprintf(msg, sizeof(msg), fmt, vargs);
++    uam_logf("Mesa warning: %s\n", msg);
+ 
+     va_end(vargs);
+ }
+@@ -58,7 +57,7 @@ _mesa_warning(struct gl_context *ctx, const char *fmt, ...)
+ void
+ _mesa_error_no_memory(const char *caller)
+ {
+-    fprintf(stderr, "Mesa error: out of memory in %s\n", caller);
++    uam_logf("Mesa error: out of memory in %s\n", caller); // SwitchWakerHD patch 3
+ }
+ 
+ void
+diff --git a/mesa-imported/state_tracker/st_glsl_to_tgsi.cpp b/mesa-imported/state_tracker/st_glsl_to_tgsi.cpp
+index 8ee1094..bb5ae72 100644
+--- a/mesa-imported/state_tracker/st_glsl_to_tgsi.cpp
++++ b/mesa-imported/state_tracker/st_glsl_to_tgsi.cpp
+@@ -31,6 +31,7 @@
+  */
+ 
+ #include "st_glsl_to_tgsi.h"
++#include "uam_log.h" // SwitchWakerHD patch 4
+ 
+ #include "glsl/glsl_parser_extras.h" // fincs-edit
+ #include "glsl/ir_optimization.h" // fincs-edit
+@@ -1487,10 +1488,9 @@ glsl_to_tgsi_visitor::visit(ir_expression *ir)
+       this->result.file = PROGRAM_UNDEFINED;
+       ir->operands[operand]->accept(this);
+       if (this->result.file == PROGRAM_UNDEFINED) {
+-         printf("Failed to get tree for expression operand:\n");
+-         ir->operands[operand]->print();
+-         printf("\n");
+-         exit(1);
++         // SwitchWakerHD patch 4: fail the compile, not the process
++         uam_fatal("Failed to get tree for expression operand (%s)\n",
++                   ir_expression_operation_strings[ir->operation]);
+       }
+       op[operand] = this->result;
+ 
+@@ -2732,8 +2732,8 @@ glsl_to_tgsi_visitor::visit(ir_dereference_variable *ir)
+       }
+ 
+       if (!entry) {
+-         printf("Failed to make storage for %s\n", var->name);
+-         exit(1);
++         // SwitchWakerHD patch 4: fail the compile, not the process
++         uam_fatal("Failed to make storage for %s\n", var->name);
+       }
+    }
+ 
+diff --git a/source/compiler_iface.cpp b/source/compiler_iface.cpp
+index 7ce5809..5b108ff 100644
+--- a/source/compiler_iface.cpp
++++ b/source/compiler_iface.cpp
+@@ -1,4 +1,6 @@
+ #include "compiler_iface.h"
++#include "uam_log.h"
++#include <stdlib.h>
+ 
+ namespace
+ {
+@@ -26,6 +28,20 @@ namespace
+ 		long pos = ftell(f);
+ 		FileWritePadding(f, Align256(pos) - pos);
+ 	}
++
++	// WriteDksh's counterparts of fwrite and FileAlign256 (padding is zero bytes, as above)
++	void VecWrite(std::vector<uint8_t>& v, const void* p, size_t n)
++	{
++		const uint8_t* b = static_cast<const uint8_t*>(p);
++		v.insert(v.end(), b, b + n);
++	}
++
++	void VecAlign256(std::vector<uint8_t>& v)
++	{
++		v.resize(Align256(v.size()), 0);
++	}
++
++	bool s_frontendResident = false;
+ }
+ 
+ /* NOTE: Using a[0x270] in FP may cause an error even if we're using less than
+@@ -285,11 +301,38 @@ DekoCompiler::~DekoCompiler()
+ {
+ 	if (m_glsl)
+ 		glsl_program_free(m_glsl);
++	// SwitchWaker patch 9 (from SwitchWakerHD): the binary nv50_ir_generate_code MALLOCs and hands over (nouveau frees it with
++	// the program); the DKSH has been written from it by now
++	free(m_info.bin.code);
++
++	if (!s_frontendResident)
++		glsl_frontend_exit();
++}
+ 
+-	glsl_frontend_exit();
++void DekoCompiler::SetFrontendResident(bool resident)
++{
++	s_frontendResident = resident;
+ }
+ 
++// SwitchWakerHD patch 4: a uam_fatal() anywhere below (Mesa, nv50_ir, flex) lands here and fails this
++// compile instead of exiting the process; what the aborted compile had allocated is leaked
+ bool DekoCompiler::CompileGlsl(const char* glsl)
++{
++	jmp_buf fatal;
++	jmp_buf* const outer = uam_fatal_jmp;
++	if (setjmp(fatal))
++	{
++		uam_fatal_jmp = outer;
++		uam_logf("error: compile aborted by the fatal error above\n");
++		return false;
++	}
++	uam_fatal_jmp = &fatal;
++	const bool ok = CompileGlslUnguarded(glsl);
++	uam_fatal_jmp = outer;
++	return ok;
++}
++
++bool DekoCompiler::CompileGlslUnguarded(const char* glsl)
+ {
+ 	m_glsl = glsl_program_create(glsl, m_stage);
+ 	if (!m_glsl) return false;
+@@ -301,14 +344,14 @@ bool DekoCompiler::CompileGlsl(const char* glsl)
+ 	int ret = nv50_ir_generate_code(&m_info);
+ 	if (ret < 0)
+ 	{
+-		fprintf(stderr, "Error compiling program: %d\n", ret);
++		uam_logf("Error compiling program: %d\n", ret);
+ 		return false;
+ 	}
+ 
+ 	if (m_info.io.fp64_rcprsq)
+-		fprintf(stderr, "warning: program uses 64-bit floating point reciprocal/square root, for which only a rough approximation with 20 bits of mantissa is supported by hardware\n");
++		uam_logf("warning: program uses 64-bit floating point reciprocal/square root, for which only a rough approximation with 20 bits of mantissa is supported by hardware\n");
+ 	if (m_info.io.int_divmod)
+-		fprintf(stderr, "warning: program uses non-constant integer division/modulo, which is unsupported by hardware; floating point emulation with resulting loss of precision has been applied\n");
++		uam_logf("warning: program uses non-constant integer division/modulo, which is unsupported by hardware; floating point emulation with resulting loss of precision has been applied\n");
+ 
+ 	m_data = glsl_program_get_constant_buffer(m_glsl, m_dataSize);
+ 	RetrieveAndPadCode();
+@@ -659,6 +702,39 @@ void DekoCompiler::OutputDksh(const char* dkshFile)
+ 	}
+ }
+ 
++void DekoCompiler::WriteDksh(std::vector<uint8_t>& out) const
++{
++	DkshHeader hdr = {};
++	hdr.magic        = DKSH_MAGIC;
++	hdr.header_sz    = sizeof(DkshHeader);
++	hdr.control_sz   = Align256(sizeof(DkshHeader) + sizeof(DkshProgramHeader));
++	hdr.code_sz      = Align256((m_stage != pipeline_stage_compute ? 0x80 : 0x00) + m_codeSize) + Align256(m_dataSize);
++	hdr.programs_off = sizeof(DkshHeader);
++	hdr.num_programs = 1;
++
++	out.clear();
++	out.reserve(hdr.control_sz + hdr.code_sz);
++	VecWrite(out, &hdr, sizeof(hdr));
++	VecWrite(out, &m_dkph, sizeof(m_dkph));
++	VecAlign256(out);
++
++	if (m_stage != pipeline_stage_compute)
++	{
++		static const char s_padding[s_shaderStartOffset] = "lol nvidia why did you make us waste space here";
++		VecWrite(out, s_padding, sizeof(s_padding));
++		VecWrite(out, &m_nvsh, sizeof(m_nvsh));
++	}
++
++	VecWrite(out, m_code, m_codeSize);
++	VecAlign256(out);
++
++	if (m_dataSize)
++	{
++		VecWrite(out, m_data, m_dataSize);
++		VecAlign256(out);
++	}
++}
++
+ void DekoCompiler::OutputRawCode(const char* rawFile)
+ {
+ 	FILE* f = fopen(rawFile, "wb");
+diff --git a/source/compiler_iface.h b/source/compiler_iface.h
+index 63e1042..9d3bb61 100644
+--- a/source/compiler_iface.h
++++ b/source/compiler_iface.h
+@@ -3,6 +3,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <vector>
+ 
+ #include "tgsi/tgsi_text.h"
+ #include "tgsi/tgsi_dump.h"
+@@ -32,6 +33,7 @@ class DekoCompiler
+ 
+ 	void RetrieveAndPadCode();
+ 	void GenerateHeaders();
++	bool CompileGlslUnguarded(const char* glsl);
+ 
+ public:
+ 	DekoCompiler(pipeline_stage stage, int optLevel = 3);
+@@ -39,6 +41,11 @@ public:
+ 
+ 	bool CompileGlsl(const char* glsl);
+ 	void OutputDksh(const char* dkshFile);
++	void WriteDksh(std::vector<uint8_t>& out) const; // SwitchWakerHD patch 2: OutputDksh's bytes, in memory
++
++	// SwitchWakerHD patch 5: true keeps Mesa's built-in functions and type tables between compilers
++	// (built once, on the first compile) instead of releasing them in every destructor
++	static void SetFrontendResident(bool resident);
+ 	void OutputRawCode(const char* rawFile);
+ 	void OutputTgsi(const char* tgsiFile);
+ };
+diff --git a/source/glsl_frontend.cpp b/source/glsl_frontend.cpp
+index 5e940ca..187db58 100644
+--- a/source/glsl_frontend.cpp
++++ b/source/glsl_frontend.cpp
+@@ -16,6 +16,7 @@
+ #include "glsl/opt_add_neg_to_sub.h"
+ #include "main/mtypes.h"
+ #include "program/program.h"
++#include "program/prog_parameter.h"
+ #include "state_tracker/st_glsl_to_tgsi.h"
+ #include "tgsi/tgsi_from_mesa.h"
+ #include "glsl/ir_uniform.h"
+@@ -27,6 +28,7 @@ extern "C"
+ }
+ 
+ #include "glsl_frontend.h"
++#include "uam_log.h"
+ 
+ class dead_variable_visitor : public ir_hierarchical_visitor {
+ public:
+@@ -143,7 +145,7 @@ new_program(UNUSED struct gl_context *ctx, GLenum target,
+ 		return prog;
+ 	}
+ 	default:
+-		printf("bad target in new_program\n");
++		uam_logf("bad target in new_program\n");
+ 		return NULL;
+ 	}
+ }
+@@ -403,9 +405,9 @@ glsl_program glsl_program_create(const char* source, pipeline_stage stage)
+ 	_mesa_glsl_compile_shader(&gl_ctx, shader, false, false, true);
+ 	if (shader->CompileStatus != COMPILE_SUCCESS)
+ 	{
+-		fprintf(stderr, "Shader failed to compile.\n");
++		uam_logf("Shader failed to compile.\n");
+ 		if (shader->InfoLog && shader->InfoLog[0])
+-			fprintf(stderr, "%s\n", shader->InfoLog);
++			uam_logf("%s\n", shader->InfoLog);
+ 		goto _fail;
+ 	}
+ 	_mesa_clear_shader_program_data(&gl_ctx, prg);
+@@ -414,9 +416,9 @@ glsl_program glsl_program_create(const char* source, pipeline_stage stage)
+ 	link_shaders(&gl_ctx, prg);
+ 	if (prg->data->LinkStatus != LINKING_SUCCESS)
+ 	{
+-		fprintf(stderr, "Shader failed to link.\n");
++		uam_logf("Shader failed to link.\n");
+ 		if (prg->data->InfoLog && prg->data->InfoLog[0])
+-			fprintf(stderr, "%s\n", prg->data->InfoLog);
++			uam_logf("%s\n", prg->data->InfoLog);
+ 		goto _fail;
+ 	}
+ 	else
+@@ -437,18 +439,18 @@ glsl_program glsl_program_create(const char* source, pipeline_stage stage)
+ 		// Do the TGSI conversion
+ 		if (!st_link_shader(&gl_ctx, prg))
+ 		{
+-			fprintf(stderr, "st_link_shader failed\n");
++			uam_logf("st_link_shader failed\n");
+ 			goto _fail;
+ 		}
+ 
+ 		// Force OriginUpperLeft
+ 		if (linked_shader->Program->OriginUpperLeft)
+-			fprintf(stderr, "warning: origin_upper_left has no effect\n");
++			uam_logf("warning: origin_upper_left has no effect\n");
+ 		linked_shader->Program->OriginUpperLeft = GL_TRUE;
+ 
+ 		// Check for PixelCenterInteger (unsupported)
+ 		if (linked_shader->Program->PixelCenterInteger == GL_TRUE) {
+-			fprintf(stderr, "error: pixel_center_integer is not supported\n");
++			uam_logf("error: pixel_center_integer is not supported\n");
+ 			goto _fail;
+ 		}
+ 
+@@ -476,13 +478,13 @@ glsl_program glsl_program_create(const char* source, pipeline_stage stage)
+ 				rc = tgsi_translate_compute(&gl_ctx, linked_shader->Program);
+ 				break;
+ 			default:
+-				fprintf(stderr, "Unsupported stage\n");
++				uam_logf("Unsupported stage\n");
+ 				goto _fail;
+ 		}
+ 
+ 		if (!rc)
+ 		{
+-			fprintf(stderr, "Translation failed\n");
++			uam_logf("Translation failed\n");
+ 			goto _fail;
+ 		}
+ 
+@@ -501,7 +503,7 @@ glsl_program glsl_program_create(const char* source, pipeline_stage stage)
+ 			if (location != last_location)
+ 			{
+ 				last_location = location;
+-				fprintf(stderr, "error: uniform '%s' in driver constbuf (c[0x1][0x%03x]) not supported\n",
++				uam_logf("error: uniform '%s' in driver constbuf (c[0x1][0x%03x]) not supported\n",
+ 					p->Name,
+ 					// "(type=%d dim=%ux%u size=%u)"
+ 					//storage->type->base_type,
+@@ -578,9 +580,22 @@ unsigned glsl_program_compute_get_shared_size(glsl_program prg)
+ 
+ void glsl_program_free(glsl_program prg)
+ {
++	// SwitchWaker patch 9 (from SwitchWakerHD): as Mesa's _mesa_delete_program and _mesa_delete_linked_shader, the program's
++	// parameter list (malloc, not ralloc) and the linked shader itself (its own ralloc tree: the linked IR)
++	// are freed too; uam freed only the program (~15 KB a compile kept, ~130 MiB over a first start's ~7,800)
+ 	for (unsigned i = 0; i < MESA_SHADER_STAGES; i++) {
+-		if (prg->_LinkedShaders[i])
+-			ralloc_free(prg->_LinkedShaders[i]->Program);
++		struct gl_linked_shader *linked = prg->_LinkedShaders[i];
++		if (!linked)
++			continue;
++		if (linked->Program) {
++			if (linked->Program->Parameters) {
++				_mesa_free_parameter_list(linked->Program->Parameters);
++				linked->Program->Parameters = NULL;
++			}
++			ralloc_free(linked->Program);
++		}
++		ralloc_free(linked);
++		prg->_LinkedShaders[i] = NULL;
+ 	}
+ 
+ 	delete prg->AttributeBindings;
+diff --git a/source/mini-os.c b/source/mini-os.c
+index b5293f8..7196cbb 100644
+--- a/source/mini-os.c
++++ b/source/mini-os.c
+@@ -1,10 +1,51 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include "util/os_misc.h"
++#include "uam_log.h"
++
++// SwitchWakerHD patches 3 and 4: the log callback and the fatal-error jump (see uam_log.h)
++static uam_log_fn s_log_fn;
++static void* s_log_user;
++jmp_buf* uam_fatal_jmp;
++
++void uam_set_log_callback(uam_log_fn fn, void* user)
++{
++	s_log_fn = fn;
++	s_log_user = user;
++}
++
++void uam_vlogf(const char* fmt, va_list ap)
++{
++	char buf[4096];
++	vsnprintf(buf, sizeof(buf), fmt, ap);
++	if (s_log_fn)
++		s_log_fn(buf, s_log_user);
++	else
++		fputs(buf, stderr);
++}
++
++void uam_logf(const char* fmt, ...)
++{
++	va_list ap;
++	va_start(ap, fmt);
++	uam_vlogf(fmt, ap);
++	va_end(ap);
++}
++
++void uam_fatal(const char* fmt, ...)
++{
++	va_list ap;
++	va_start(ap, fmt);
++	uam_vlogf(fmt, ap);
++	va_end(ap);
++	if (uam_fatal_jmp)
++		longjmp(*uam_fatal_jmp, 1);
++	abort();
++}
+ 
+ void os_log_message(const char *message)
+ {
+-	fputs(message, stderr);
++	uam_logf("%s", message);
+ }
+ 
+ const char* os_get_option(const char *name)
+diff --git a/source/uam_log.h b/source/uam_log.h
+new file mode 100644
+index 0000000..fdce5dc
+--- /dev/null
++++ b/source/uam_log.h
+@@ -0,0 +1,33 @@
++#pragma once
++// SwitchWakerHD patches 3 and 4 (see PATCHES.md): uam's diagnostics go through one settable callback
++// instead of stderr, and fatal errors reachable from DekoCompiler::CompileGlsl fail the compile
++// (longjmp back to it) instead of calling exit() or abort().
++#include <stdarg.h>
++#include <setjmp.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// receives whole messages (usually newline terminated); NULL restores the default (stderr)
++typedef void (*uam_log_fn)(const char* msg, void* user);
++void uam_set_log_callback(uam_log_fn fn, void* user);
++
++void uam_logf(const char* fmt, ...)
++#if defined(__GNUC__)
++	__attribute__((format(printf, 1, 2)))
++#endif
++	;
++void uam_vlogf(const char* fmt, va_list ap);
++
++// set by CompileGlsl while it runs (NULL otherwise); uam_fatal() logs and jumps there, or aborts
++// when nothing is armed (uam used outside CompileGlsl)
++extern jmp_buf* uam_fatal_jmp;
++#if defined(__GNUC__)
++__attribute__((noreturn, format(printf, 1, 2)))
++#endif
++void uam_fatal(const char* fmt, ...);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/test/uam_dksh_test.cpp b/test/uam_dksh_test.cpp
+new file mode 100644
+index 0000000..9e987e4
+--- /dev/null
++++ b/test/uam_dksh_test.cpp
+@@ -0,0 +1,104 @@
++// uam_dksh_test: compiles GLSL files with uamlib (uam_api.h) and checks the DKSH bytes against reference
++// .dksh files written by the uam command line tool for the same inputs (name_vs.glsl -> vertex, else
++// fragment; <ref>/<name>.dksh). Also checks that a broken shader fails with a log and leaves the
++// compiler usable. Exit status 0 only if everything matched.
++//   uam_dksh_test <glsl dir> <reference dksh dir> [--every N] [--transient]
++//   --every N    only every Nth file (by name), plus the 10 largest
++//   --transient  init(false): rebuild Mesa's built-ins around every compile, as the uam tool does
++#include "uam_api.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <string>
++#include <vector>
++
++namespace fs = std::filesystem;
++
++static std::vector<uint8_t> read_file(const fs::path& p) {
++    std::ifstream f(p, std::ios::binary);
++    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++}
++
++int main(int argc, char** argv) {
++    if (argc < 3) {
++        fprintf(stderr, "usage: %s <glsl dir> <reference dksh dir> [--every N] [--transient]\n", argv[0]);
++        return 2;
++    }
++    const fs::path glsl_dir = argv[1], ref_dir = argv[2];
++    size_t every = 1;
++    bool resident = true;
++    for (int i = 3; i < argc; i++) {
++        if (!strcmp(argv[i], "--every") && i + 1 < argc) every = std::max(1, atoi(argv[++i]));
++        else if (!strcmp(argv[i], "--transient")) resident = false;
++    }
++
++    std::vector<fs::path> all;
++    for (auto& e : fs::directory_iterator(glsl_dir))
++        if (e.path().extension() == ".glsl" && e.path().filename().string()[0] != '.') all.push_back(e.path());
++    std::sort(all.begin(), all.end());
++    std::vector<fs::path> files;
++    for (size_t i = 0; i < all.size(); i += every) files.push_back(all[i]);
++    if (every > 1) {
++        std::vector<fs::path> by_size = all;
++        std::sort(by_size.begin(), by_size.end(),
++                  [](const fs::path& a, const fs::path& b) { return fs::file_size(a) > fs::file_size(b); });
++        for (size_t i = 0; i < std::min<size_t>(10, by_size.size()); i++)
++            if (std::find(files.begin(), files.end(), by_size[i]) == files.end()) files.push_back(by_size[i]);
++    }
++
++    uam::init(resident);
++    size_t same = 0, differ = 0, failed = 0, no_ref = 0, logged = 0, bytes = 0;
++    double total_ms = 0, max_ms = 0;
++    for (const fs::path& p : files) {
++        const std::string name = p.stem().string();
++        const bool vs = name.size() > 3 && name.compare(name.size() - 3, 3, "_vs") == 0;
++        std::vector<uint8_t> src = read_file(p);
++        src.push_back(0);
++        const auto t0 = std::chrono::steady_clock::now();
++        uam::Result r = uam::compile(vs ? uam::Stage::Vertex : uam::Stage::Fragment, (const char*)src.data());
++        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        total_ms += ms;
++        max_ms = std::max(max_ms, ms);
++        if (!r.log.empty()) logged++;
++        if (!r.ok) {
++            failed++;
++            printf("FAIL %s: %s\n", name.c_str(), r.log.c_str());
++            continue;
++        }
++        bytes += r.dksh.size();
++        const fs::path ref = ref_dir / (name + ".dksh");
++        if (!fs::exists(ref)) {
++            no_ref++;
++            printf("NOREF %s\n", name.c_str());
++            continue;
++        }
++        if (read_file(ref) == r.dksh) {
++            same++;
++        } else {
++            differ++;
++            printf("DIFF %s (%zu bytes, reference %zu)\n", name.c_str(), r.dksh.size(), (size_t)fs::file_size(ref));
++        }
++    }
++
++    // the error path: a compile error is reported in the log, and the next compile still works
++    uam::Result bad = uam::compile(uam::Stage::Fragment, "#version 460\nvoid main() { undefined_thing = 1; }\n");
++    const bool bad_ok = !bad.ok && bad.dksh.empty() && bad.log.find("undefined_thing") != std::string::npos;
++    uam::Result good = uam::compile(uam::Stage::Fragment,
++                                    "#version 460\nlayout(location=0) out vec4 c;\nvoid main() { c = vec4(1.0); }\n");
++    const bool recover_ok = good.ok && !good.dksh.empty();
++    printf("error path: %s (log: %s)", bad_ok ? "ok" : "WRONG", bad.log.c_str());
++    printf("compile after the error: %s\n", recover_ok ? "ok" : "WRONG");
++    uam::shutdown();
++
++    printf("%zu shaders (%s frontend): %zu identical, %zu differ, %zu failed, %zu without reference, "
++           "%zu with log output; %zu DKSH bytes; compile %.0f ms total, mean %.1f ms, max %.1f ms\n",
++           files.size(), resident ? "resident" : "transient", same, differ, failed, no_ref, logged, bytes,
++           total_ms, files.empty() ? 0.0 : total_ms / files.size(), max_ms);
++    return (differ || failed || no_ref || !bad_ok || !recover_ok || files.empty()) ? 1 : 0;
++}
+diff --git a/tools/generate.sh b/tools/generate.sh
+new file mode 100644
+index 0000000..9b882d9
+--- /dev/null
++++ b/tools/generate.sh
+@@ -0,0 +1,14 @@
++#!/bin/bash
++# regenerates uam's bison/flex/mako outputs into generated/ (run from switch/uam)
++set -e
++G=generated
++mkdir -p $G/glsl/glcpp
++bison -o $G/glsl/glsl_parser.cpp -p _mesa_glsl_ --defines=$G/glsl/glsl_parser.h mesa-imported/glsl/glsl_parser.yy
++flex -o $G/glsl/glsl_lexer.cpp mesa-imported/glsl/glsl_lexer.ll
++for m in enum constant strings; do
++  case $m in enum) o=ir_expression_operation.h;; constant) o=ir_expression_operation_constant.h;; strings) o=ir_expression_operation_strings.h;; esac
++  python3 mesa-imported/glsl/ir_expression_operation.py $m > $G/glsl/$o
++done
++bison -o $G/glsl/glcpp/glcpp-parse.c -p glcpp_parser_ --defines=$G/glsl/glcpp/glcpp-parse.h mesa-imported/glsl/glcpp/glcpp-parse.y
++flex -o $G/glsl/glcpp/glcpp-lex.c mesa-imported/glsl/glcpp/glcpp-lex.l
++bison --version | head -1; flex --version
+diff --git a/uam_api.cpp b/uam_api.cpp
+new file mode 100644
+index 0000000..68363a5
+--- /dev/null
++++ b/uam_api.cpp
+@@ -0,0 +1,54 @@
++// uam_api.h on top of uam's DekoCompiler (one thread only, see the header)
++#include "uam_api.h"
++
++#include "compiler_iface.h"
++#include "uam_log.h"
++
++namespace uam {
++namespace {
++
++void append_log(const char* msg, void* user) {
++    static_cast<std::string*>(user)->append(msg);
++}
++
++pipeline_stage to_pipeline_stage(Stage s) {
++    switch (s) {
++        case Stage::Vertex: return pipeline_stage_vertex;
++        case Stage::TessCtrl: return pipeline_stage_tess_ctrl;
++        case Stage::TessEval: return pipeline_stage_tess_eval;
++        case Stage::Geometry: return pipeline_stage_geometry;
++        case Stage::Fragment: return pipeline_stage_fragment;
++        case Stage::Compute: return pipeline_stage_compute;
++    }
++    return pipeline_stage_fragment;
++}
++
++bool g_resident = false;
++
++}  // namespace
++
++void init(bool resident_frontend) {
++    glsl_frontend_init();
++    g_resident = resident_frontend;
++    DekoCompiler::SetFrontendResident(resident_frontend);
++}
++
++void shutdown() {
++    if (g_resident) glsl_frontend_exit();
++    g_resident = false;
++    DekoCompiler::SetFrontendResident(false);
++}
++
++Result compile(Stage stage, const char* glsl) {
++    Result r;
++    uam_set_log_callback(append_log, &r.log);
++    {
++        DekoCompiler c(to_pipeline_stage(stage), 3);
++        r.ok = glsl && c.CompileGlsl(glsl);
++        if (r.ok) c.WriteDksh(r.dksh);
++    }
++    uam_set_log_callback(nullptr, nullptr);
++    return r;
++}
++
++}  // namespace uam
+diff --git a/uam_api.h b/uam_api.h
+new file mode 100644
+index 0000000..943e5b4
+--- /dev/null
++++ b/uam_api.h
+@@ -0,0 +1,34 @@
++#pragma once
++// The renderer's view of uam (devkitPro's deko3d shader compiler, vendored here with the patches in
++// PATCHES.md): GLSL source in, DKSH bytes out (the same bytes the uam command line tool writes).
++//
++// NOT thread-safe and NOT reentrant: Mesa's GLSL frontend inside uam keeps one static gl_context and
++// global tables, so init() and every compile() must run on ONE thread (the renderer's compile worker).
++// That thread needs a large stack (Mesa's parser and nv50_ir recurse deeply: 8 MB on the Switch).
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace uam {
++
++enum class Stage { Vertex, TessCtrl, TessEval, Geometry, Fragment, Compute };
++
++struct Result {
++    bool ok = false;
++    std::vector<uint8_t> dksh;  // a whole .dksh file (header, program header, code, constants); empty on failure
++    std::string log;            // everything uam reported for this shader (errors, warnings); may be set when ok
++};
++
++// once, before the first compile(). resident_frontend keeps Mesa's built-in GLSL function library and
++// type tables alive between compiles (built on the first compile, a few MB); false rebuilds and frees
++// them around every compile, as the uam tool does.
++void init(bool resident_frontend = true);
++// frees what init() and the compiles kept; compile() works again after another init()
++void shutdown();
++
++// compiles one stage of a separable program (uam has no linking; every binding must be explicit).
++// A compile error, and any fatal error inside Mesa or nv50_ir, returns ok = false with the reason in
++// log; it never exits the process.
++Result compile(Stage stage, const char* glsl);
++
++}  // namespace uam

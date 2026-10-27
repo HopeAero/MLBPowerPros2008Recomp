@@ -53,10 +53,21 @@ index a71eb74..c6538d9 100644
  #else
  void GXSetArray(GXAttr attr, const void* data, u8 stride);
 diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
-index bc80c3c..95b39c7 100644
+index bc80c3c..86d61b7 100644
 --- a/aurora-main/lib/aurora.cpp
 +++ b/aurora-main/lib/aurora.cpp
-@@ -311,7 +311,14 @@ bool frame_worker_requested() noexcept {
+@@ -10,6 +10,10 @@
+ #include "webgpu/gpu_timing.hpp"
+ #include "webgpu/metalfx.hpp"
+ #include "webgpu/fsr.hpp"
++#ifdef AURORA_SWITCH_DEKO3D
++#include <imgui.h>
++#include "dk_gfx.hpp"  // the deko3d renderer (tools/switch/deko)
++#endif
+ #include <webgpu/webgpu_cpp.h>
+ #endif
+ 
+@@ -311,7 +315,14 @@ bool frame_worker_requested() noexcept {
  bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept;
  #endif
  
@@ -71,7 +82,7 @@ index bc80c3c..95b39c7 100644
    {
      std::lock_guard lock(g_frameWorker.mutex);
      g_frameWorker.threadId = std::this_thread::get_id();
-@@ -407,6 +414,13 @@ bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::micr
+@@ -407,6 +418,13 @@ bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::micr
    lock.unlock();
    // Both phases service the guest's alarm/retrace pump identically; the
    // producer must keep its own timing alive however long it waits.
@@ -85,7 +96,36 @@ index bc80c3c..95b39c7 100644
    if (const auto callback = g_frameWorkerWaitCallback.load(std::memory_order_acquire)) {
      callback();
    }
-@@ -1164,7 +1178,12 @@ PresenterState g_presenter;
+@@ -493,6 +511,16 @@ using webgpu::g_device;
+ using webgpu::g_instance;
+ using webgpu::g_queue;
+ using webgpu::g_surface;
++// Whether a WebGPU surface is still owed: the deko3d renderer presents to the NWindow itself and never
++// has one.
++bool surface_missing() noexcept {
++#ifdef AURORA_SWITCH_DEKO3D
++  if (gfx::dk::enabled()) {
++    return false;
++  }
++#endif
++  return !g_surface;
++}
+ std::recursive_mutex g_rendererGpuMutex;
+ std::mutex g_queueSubmitMutex;
+ // Surface ownership, held apart from the renderer mutex: a presentation slot touches the surface,
+@@ -766,7 +794,11 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
+   }
+ 
+   // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
++#ifdef AURORA_SWITCH_DEKO3D
++  if (webgpu::g_backendType == wgpu::BackendType::Null && !gfx::dk::enabled()) {  // (deko3d draws ImGui)
++#else
+   if (webgpu::g_backendType == wgpu::BackendType::Null) {
++#endif
+     ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
+   }
+ #else
+@@ -1164,7 +1196,12 @@ PresenterState g_presenter;
  std::atomic<bool> g_presenterStarted{false};
  
  void presenter_main() noexcept {
@@ -98,7 +138,132 @@ index bc80c3c..95b39c7 100644
      Log.warn("Could not raise the asynchronous presenter thread priority: {}", SDL_GetError());
    }
    for (;;) {
-@@ -1916,7 +1935,7 @@ void end_frame_impl(bool pumpEvents, bool drainFifo) {
+@@ -1487,7 +1524,7 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
+   const bool surfaceReconfigurePending =
+       g_surfaceReconfigurePending.load(std::memory_order_acquire);
+   const bool surfaceMutationRequired =
+-      surfaceReconfigurePending || !window::is_presentable() || !g_surface ||
++      surfaceReconfigurePending || !window::is_presentable() || surface_missing() ||
+       window::native_resize_pending() ||
+       !window::native_window_size_matches(
+           webgpu::g_graphicsConfig.surfaceConfiguration.width,
+@@ -1512,12 +1549,12 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
+         g_surfaceReconfigurePending.exchange(false, std::memory_order_acq_rel);
+     const bool consumeSurfaceRecreate =
+         g_surfaceRecreatePending.exchange(false, std::memory_order_acq_rel);
+-    if (!g_surface || consumeSurfaceReconfigure) {
++    if (surface_missing() || consumeSurfaceReconfigure) {
+       // Reconfigure in place unless the surface was actually lost. See
+       // g_surfaceRecreatePending for why destroying a live surface here is fatal
+       // while a capture overlay is attached.
+       webgpu::refresh_surface(consumeSurfaceRecreate);
+-      if (!g_surface) {
++      if (surface_missing()) {
+         return false;
+       }
+     }
+@@ -1616,10 +1653,88 @@ void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
+   gfx::expire_bind_group_cache();
+ }
+ 
++#ifdef AURORA_SWITCH_DEKO3D
++// Phase 2 with the deko3d renderer (tools/switch/deko): the sealed frame recorded into deko3d's command
++// buffer and presented here, on the frame worker, so one thread owns the deko3d queue (the presenter
++// thread gets no jobs). The present waits for the native slot's deadline as present_presentation_job
++// does. Frame interpolation, MetalFX/FSR and the frame capture are not done (logged once).
++std::vector<PresentationJob> encode_sealed_frame_deko3d(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
++  ZoneScopedN("Encode sealed frame (deko3d)");
++  if (ctx.interpolationActive) {
++    gfx::dk::note_unsupported("frame interpolation (the native frame is presented once; workstream C)");
++  }
++  if (ctx.metalfxEnabled || g_fsrRequested.load(std::memory_order_relaxed)) {
++    gfx::dk::note_unsupported("MetalFX / FSR upscaling at the present");
++  }
++  const auto started = PresentClock::now();
++  {
++    const gfx::ScopedWaitTimer encodeTimer{gfx::g_frameWaits.encodeNs, &gfx::g_frameWaits.encodedFrames};
++    gfx::render(sealedFrame, ctx.encoder, -1, true);
++    // the copy targets hold this frame's resolves: their probe readbacks (dk_efb_ram.cpp), as Dawn's
++    gfx::efb_ram::encode_async_downloads(ctx.encoder);
++  }
++  const auto encodeDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() - started);
++  uint32_t width = 0;
++  uint32_t height = 0;
++  gfx::dk::swapchain_size(width, height);
++  auto viewport = webgpu::calculate_present_viewport(width, height, ctx.presentSource.size.width,
++                                                     ctx.presentSource.size.height);
++  float presentAspect = 0.f;
++  if (window::get_present_aspect_ratio(presentAspect)) {
++    viewport = webgpu::calculate_present_viewport_for_aspect(width, height, presentAspect);
++  }
++  // encode_sealed_frame's deadline for the native slot (interpolation off)
++  PresentClock::time_point presentAt{};
++  if (ctx.scheduleBaseNanos != 0 && ctx.scheduleIntervalNanos != 0) {
++    constexpr uint64_t kNativePresentOffsetNanos = 6'500'000;
++    presentAt = PresentClock::time_point{
++        std::chrono::nanoseconds{ctx.scheduleBaseNanos - ctx.scheduleIntervalNanos + kNativePresentOffsetNanos}};
++  }
++  gfx::dk::PresentRequest request;
++  request.source = ctx.presentSource.texture.Get();
++  request.sourceWidth = ctx.presentSource.size.width;
++  request.sourceHeight = ctx.presentSource.size.height;
++  request.viewport[0] = viewport.left;
++  request.viewport[1] = viewport.top;
++  request.viewport[2] = viewport.width;
++  request.viewport[3] = viewport.height;
++  request.ui = ImGui::GetDrawData();
++  if (presentAt != PresentClock::time_point{}) {
++    request.beforePresent = [](void* user) { wait_until_precise(*static_cast<PresentClock::time_point*>(user)); };
++    request.user = &presentAt;
++  }
++  request.presentable = window::is_presentable();
++  const gfx::dk::PresentResult result = gfx::dk::present(request);
++  if (result.presented) {
++    auto& waits = gfx::g_frameWaits;
++    waits.acquireNs.fetch_add(result.acquireNs, std::memory_order_relaxed);
++    waits.submitNs.fetch_add(result.submitNs, std::memory_order_relaxed);
++    waits.submits.fetch_add(1, std::memory_order_relaxed);
++    waits.scheduleWaitNs.fetch_add(result.waitNs, std::memory_order_relaxed);
++    waits.presentNs.fetch_add(result.presentNs, std::memory_order_relaxed);
++    waits.presents.fetch_add(1, std::memory_order_relaxed);
++    record_successful_present(false, ctx.logicalFrame, std::chrono::nanoseconds{result.acquireNs}, encodeDuration,
++                              std::chrono::nanoseconds{}, std::chrono::nanoseconds{result.submitNs},
++                              std::chrono::nanoseconds{result.presentNs},
++                              std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() - started),
++                              false, 0, std::chrono::nanoseconds{});
++  }
++  gfx::after_submit();
++  gfx::g_stats.presentedFrameCount = result.presented ? 1 : 0;
++  gfx::g_stats.interpolatedFrameCount = 0;
++  return {};
++}
++#endif
++
+ // Phase 2: encode every presentation slot. Reads only `ctx` and the sealed passes, so it runs
+ // without the renderer GPU mutex while the producer records the next frame.
+ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
+   ZoneScopedN("Encode sealed frame");
++#ifdef AURORA_SWITCH_DEKO3D
++  if (gfx::dk::enabled()) {
++    return encode_sealed_frame_deko3d(sealedFrame, ctx);
++  }
++#endif
+   const gfx::ScopedWaitTimer encodeTimer{gfx::g_frameWaits.encodeNs, &gfx::g_frameWaits.encodedFrames};
+   auto encoder = std::move(ctx.encoder);
+   const int gpuTimingSlot = webgpu::timing::begin(encoder);
+@@ -1769,6 +1884,11 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame,
+ 
+ // Phase 3: hand the encoded group to whoever owns presentation.
+ void publish_presentations(std::vector<PresentationJob>&& presentationJobs, bool interpolationActive) {
++#ifdef AURORA_SWITCH_DEKO3D
++  if (presentationJobs.empty()) {
++    return;  // (deko3d presented on the frame worker)
++  }
++#endif
+ #if defined(__APPLE__)
+   (void)interpolationActive;
+   // Presenting reaches SDL/AppKit, whose window operations must stay on the
+@@ -1916,7 +2036,7 @@ void end_frame_impl(bool pumpEvents, bool drainFifo) {
    gfx::SealedFrame sealedFrame;
    SealedFrameContext ctx;
    std::vector<PresentationJob> presentationJobs;
@@ -107,7 +272,16 @@ index bc80c3c..95b39c7 100644
    {
      std::lock_guard gpuLock(g_rendererGpuMutex);
      seal_frame_locked(sealedFrame, ctx);
-@@ -2011,7 +2030,7 @@ void end_frame() {
+@@ -1949,7 +2069,7 @@ bool begin_frame() noexcept {
+   // A surface mutation can legitimately fail preparation, and optimistic success would let GX/ImGui
+   // record into a frame that was never begun, so join this path and return its real result.
+   waitForSurfacePreparation =
+-      !window::is_presentable() || !g_surface ||
++      !window::is_presentable() || surface_missing() ||
+       window::native_resize_pending() || window::is_paused() ||
+       !window::native_window_size_matches(
+           webgpu::g_graphicsConfig.surfaceConfiguration.width,
+@@ -2011,7 +2131,7 @@ void end_frame() {
  
    // Seal all current GX work on the CPU while the renderer is known ready.
    // Later FIFO writes belong exclusively to the next frame.
@@ -116,7 +290,7 @@ index bc80c3c..95b39c7 100644
    {
      std::lock_guard lock(g_frameWorker.mutex);
      g_frameWorker.framePrepared = false;
-@@ -2053,6 +2072,10 @@ bool aurora_begin_frame() { return aurora::begin_frame(); }
+@@ -2053,6 +2173,10 @@ bool aurora_begin_frame() { return aurora::begin_frame(); }
  void aurora_end_frame() { aurora::end_frame(); }
  void aurora_set_frame_worker_wait_callback(AuroraFrameWorkerWaitCallback callback) {
    aurora::g_frameWorkerWaitCallback.store(callback, std::memory_order_release);
@@ -127,7 +301,7 @@ index bc80c3c..95b39c7 100644
  }
  void aurora_wait_for_frame_worker() { aurora::wait_for_frame_worker(); }
  bool aurora_wait_for_frame_worker_for(uint32_t timeoutMicros) {
-@@ -2108,8 +2131,14 @@ bool aurora_flush_efb_copies_to_ram() {
+@@ -2108,8 +2232,14 @@ bool aurora_flush_efb_copies_to_ram() {
    aurora::wait_for_frame_worker();
    // The renderer is about to submit a prefix of the active frame. Its resumed
    // suffix cannot safely be replayed against the same mutable EFB resources.
@@ -144,7 +318,7 @@ index bc80c3c..95b39c7 100644
    if (!aurora::gfx::efb_ram::prepare_downloads()) return false;
    const wgpu::CommandEncoderDescriptor encoderDescriptor{
        .label = "GX CPU-visible EFB copy encoder",
-@@ -2145,8 +2174,14 @@ bool aurora_flush_efb_copy_to_ram(void* dest) {
+@@ -2145,8 +2275,14 @@ bool aurora_flush_efb_copy_to_ram(void* dest) {
    aurora::wait_for_frame_worker();
    // Preserve the requested output cadence by duplicating the completed native
    // image instead of replaying this split frame.
@@ -555,10 +729,51 @@ index dfa305b..f77455d 100644
      *left = g_gxState.boundingBox[0];
    }
 diff --git a/aurora-main/lib/dolphin/gx/GXGeometry.cpp b/aurora-main/lib/dolphin/gx/GXGeometry.cpp
-index 2e54e10..a2564b8 100644
+index 2e54e10..2ad5ad4 100644
 --- a/aurora-main/lib/dolphin/gx/GXGeometry.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXGeometry.cpp
-@@ -153,7 +153,18 @@ static inline void SETVAT(u32* va, u32* vb, u32* vc, GXAttr attr, GXCompCnt cnt,
+@@ -3,6 +3,32 @@
+ #include "dolphin/gd/GDGeometry.h"
+ #include "../../gx/fifo.hpp"
+ 
++#if defined(__SWITCH__)
++// The switch below as a table (no indirect branch; GXSetVtxDesc runs thousands of times a frame in a
++// match, profile-stock1). Same stores, unmasked values included: SET_REG_FIELD does not mask `val`.
++// Checked against the switch for every attr/type (local/tmp/cpu/D-gxstate-test.py).
++static inline void SETVCDATTR(GXAttr attr, GXAttrType type) {
++  // GX_VA_PNMTXIDX..GX_VA_TEX7: field shift; vcdHi from GX_VA_TEX0; 1 bit up to GX_VA_TEX7MTXIDX.
++  static constexpr u8 kShift[GX_VA_TEX7 + 1] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 13, 15, 0, 2, 4, 6, 8, 10, 12, 14};
++  const u32 a = static_cast<u32>(attr);
++  if (a <= GX_VA_TEX7 && a != GX_VA_NRM) LIKELY {
++    const u32 shift = kShift[a];
++    const u32 mask = (a <= GX_VA_TEX7MTXIDX ? 1u : 3u) << shift;
++    u32& reg = a >= GX_VA_TEX0 ? __gx->vcdHi : __gx->vcdLo;
++    reg = (reg & ~mask) | (static_cast<u32>(type) << shift);
++  } else if (a == GX_VA_NRM) {
++    __gx->hasNrms = (type != 0);
++    if (type != GX_NONE) {
++      __gx->nrmType = type;
++    }
++  } else if (a == GX_VA_NBT) {
++    __gx->hasBiNrms = (type != 0);
++    if (type != GX_NONE) {
++      __gx->nrmType = type;
++    }
++  }
++}
++#else
+ static inline void SETVCDATTR(GXAttr attr, GXAttrType type) {
+   switch (attr) {
+   case GX_VA_PNMTXIDX:
+@@ -81,6 +107,7 @@ static inline void SETVCDATTR(GXAttr attr, GXAttrType type) {
+     break;
+   }
+ }
++#endif
+ 
+ static inline void SETVAT(u32* va, u32* vb, u32* vc, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
+   switch (attr) {
+@@ -153,7 +180,18 @@ static inline void SETVAT(u32* va, u32* vb, u32* vc, GXAttr attr, GXCompCnt cnt,
    }
  }
  
@@ -577,7 +792,7 @@ index 2e54e10..a2564b8 100644
    return attr >= GX_VA_PNMTXIDX && attr < GX_VA_MAX_ATTR && g_gxState.vtxDesc[attr] != type;
  }
  
-@@ -161,10 +172,27 @@ static inline bool AuroraVtxAttrFmtDiffers(GXVtxFmt vtxfmt, GXAttr attr, GXCompC
+@@ -161,10 +199,27 @@ static inline bool AuroraVtxAttrFmtDiffers(GXVtxFmt vtxfmt, GXAttr attr, GXCompC
    if (vtxfmt < GX_VTXFMT0 || vtxfmt >= GX_MAX_VTXFMT || attr < GX_VA_POS || attr >= GX_VA_MAX_ATTR) {
      return true;
    }
@@ -605,7 +820,7 @@ index 2e54e10..a2564b8 100644
  extern "C" {
  
  void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
-@@ -190,7 +218,8 @@ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
+@@ -190,7 +245,8 @@ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
  
  void GXSetSourceVtxDesc(GXAttr attr, GXAttrType type) {
    if (attr >= GX_VA_PNMTXIDX && attr < GX_VA_MAX_ATTR) {
@@ -615,7 +830,30 @@ index 2e54e10..a2564b8 100644
    }
  }
  
-@@ -290,6 +319,7 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
+@@ -282,6 +338,22 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
+ 
+   assert((cpIdx & ~0xF) == 0);
+ 
++#if defined(__SWITCH__)
++  // The same bytes in one write (__gx.h, gx_fifo_packet).
++  if (!gx_fifo_packet::direct()) LIKELY {
++    u8 pBytes[22];
++    gx_fifo_packet::Writer p{pBytes};
++    p.u8_(GX_LOAD_AURORA);
++    p.u16_(static_cast<u16>(GX_LOAD_AURORA_ARRAYBASE | cpIdx));
++    p.u64_(reinterpret_cast<u64>(data));
++    p.u32_(size);
++    p.u8_(le ? 1 : 0);
++    p.cp_reg(GX_LOAD_CP_REG, static_cast<u8>(CP_REG_ARRAYSTRIDE_ID | cpIdx), stride);
++    p.send(pBytes);
++    aurora::gx::fifo::note_array(cpAttr, data, size); // WIICOMPILED_GX_FIFO_CHECK only
++    return;
++  }
++#endif
+   // Write array base
+   GX_WRITE_AURORA(GX_LOAD_AURORA_ARRAYBASE | cpIdx);
+   GX_WRITE_U64(reinterpret_cast<u64>(data));
+@@ -290,6 +362,7 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
  
    // Write array stride
    GX_WRITE_CP_REG(CP_REG_ARRAYSTRIDE_ID | cpIdx, stride);
@@ -623,8 +861,39 @@ index 2e54e10..a2564b8 100644
  }
  
  void GXSetTexCoordGen2(GXTexCoordID dst, GXTexGenType type, GXTexGenSrc src, u32 mtx, GXBool normalize, u32 postMtx) {
+diff --git a/aurora-main/lib/dolphin/gx/GXGet.cpp b/aurora-main/lib/dolphin/gx/GXGet.cpp
+index ccefbbc..3bb6193 100644
+--- a/aurora-main/lib/dolphin/gx/GXGet.cpp
++++ b/aurora-main/lib/dolphin/gx/GXGet.cpp
+@@ -19,6 +19,26 @@ static inline u8 GetFracForNrm(GXCompType type) {
+ 
+ void GXGetVtxDesc(GXAttr attr, GXAttrType* type) {
+   CHECK(type != nullptr, "null vtx desc output");
++#if defined(__SWITCH__)
++  // The switch below as a table (gx_dl.cpp's ApplyAuroraVtxDesc asks for 21 attributes per display
++  // list, ~11000 calls a frame in a match). Checked against the switch (local/tmp/cpu/D-gxstate-test.py).
++  {
++    static constexpr u8 kShift[GX_VA_TEX7 + 1] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 14};
++    const u32 a = static_cast<u32>(attr);
++    u32 cpType = 0;
++    if (a <= GX_VA_TEX7) LIKELY {
++      const u32 reg = a >= GX_VA_TEX0 ? __gx->vcdHi : __gx->vcdLo;
++      cpType = (reg >> kShift[a]) & (a <= GX_VA_TEX7MTXIDX ? 1u : 3u);
++      if (a == GX_VA_NRM && !__gx->hasNrms) {
++        cpType = GX_NONE;
++      }
++    } else if (a == GX_VA_NBT) {
++      cpType = __gx->hasBiNrms ? GET_REG_FIELD(__gx->vcdLo, 2, 11) : GX_NONE;
++    }
++    *type = static_cast<GXAttrType>(cpType);
++    return;
++  }
++#endif
+ 
+   u32 cpType = 0;
+   switch (attr) {
 diff --git a/aurora-main/lib/dolphin/gx/GXLighting.cpp b/aurora-main/lib/dolphin/gx/GXLighting.cpp
-index f7331c6..3d029b6 100644
+index f7331c6..ccc1ea1 100644
 --- a/aurora-main/lib/dolphin/gx/GXLighting.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXLighting.cpp
 @@ -131,7 +131,11 @@ void GXInitLightColor(GXLightObj* light_, GXColor col) {
@@ -639,6 +908,87 @@ index f7331c6..3d029b6 100644
    auto* light = reinterpret_cast<const GXLightObj_*>(light_);
  
    // XF bulk write: 16 values at light base address
+@@ -143,6 +147,33 @@ void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
+   u32 colorPacked = (static_cast<u32>(light->color.r) << 24) | (static_cast<u32>(light->color.g) << 16) |
+                     (static_cast<u32>(light->color.b) << 8) | static_cast<u32>(light->color.a);
+ 
++#if defined(__SWITCH__)
++  // The same bytes in one write (__gx.h, gx_fifo_packet).
++  if (!gx_fifo_packet::direct()) LIKELY {
++    u8 pBytes[69];
++    gx_fifo_packet::Writer p{pBytes};
++    p.u8_(0x10);
++    p.u32_(reg);
++    p.u32_(0);
++    p.u32_(0);
++    p.u32_(0);
++    p.u32_(colorPacked);
++    p.f32_(light->a0);
++    p.f32_(light->a1);
++    p.f32_(light->a2);
++    p.f32_(light->k0);
++    p.f32_(light->k1);
++    p.f32_(light->k2);
++    p.f32_(light->px);
++    p.f32_(light->py);
++    p.f32_(light->pz);
++    p.f32_(light->nx);
++    p.f32_(light->ny);
++    p.f32_(light->nz);
++    p.send(pBytes);
++    return;
++  }
++#endif
+   GX_WRITE_U8(0x10);
+   GX_WRITE_U32(reg);
+   // Padding (3 u32s)
+@@ -169,6 +200,46 @@ void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
+   GX_WRITE_F32(light->nz);
+ }
+ 
++#if defined(__SWITCH__)
++// The runtime's GXLoadLightObjImm (gx_lighting.cpp) builds a host light from the guest GXLightObj,
++// whose words 3-15 are the 13 XF light words in big-endian order (color, a0-a2, k0-k2, position,
++// direction): the color repacks to the same word, the floats are copied (the direction is negated
++// twice, a sign-bit flip each time). So the command is those words as they are. Same bytes as
++// GXLoadLightObjImm; inside an Aurora display list it is that function.
++void GXLoadLightObjImmBE(const void* xfWordsBe, GXLightID id) {
++  if (gx_fifo_packet::direct()) UNLIKELY {
++    const auto* b = static_cast<const u8*>(xfWordsBe);
++    u32 w[13];
++    for (u32 i = 0; i < 13; ++i) {
++      std::memcpy(&w[i], b + i * 4, 4);
++      w[i] = __builtin_bswap32(w[i]);
++    }
++    GXLightObj host{};
++    auto* light = reinterpret_cast<GXLightObj_*>(&host);
++    light->color = GXColor{static_cast<u8>(w[0] >> 24), static_cast<u8>(w[0] >> 16), static_cast<u8>(w[0] >> 8),
++                           static_cast<u8>(w[0])};
++    f32* dst[12] = {&light->a0, &light->a1, &light->a2, &light->k0, &light->k1, &light->k2,
++                    &light->px, &light->py, &light->pz, &light->nx, &light->ny, &light->nz};
++    for (u32 i = 0; i < 12; ++i) {
++      std::memcpy(dst[i], &w[i + 1], 4);
++    }
++    GXLoadLightObjImm(&host, id);
++    return;
++  }
++  const u32 idx = static_cast<u32>(__builtin_ctz(static_cast<u32>(id))); // as GXLoadLightObjImm
++  const u32 reg = (0x600 + idx * 0x10) | (0xF << 16);
++  u8 pBytes[69];
++  gx_fifo_packet::Writer p{pBytes};
++  p.u8_(0x10);
++  p.u32_(reg);
++  p.u32_(0);
++  p.u32_(0);
++  p.u32_(0);
++  p.be_words(xfWordsBe, 13);
++  p.send(pBytes);
++}
++#endif
++
+ void GXSetChanAmbColor(GXChannelID id, GXColor color) {
+   if (id == GX_COLOR0A0) {
+     GXSetChanAmbColor(GX_COLOR0, color);
 diff --git a/aurora-main/lib/dolphin/gx/GXManage.cpp b/aurora-main/lib/dolphin/gx/GXManage.cpp
 index 80b3b92..789dc44 100644
 --- a/aurora-main/lib/dolphin/gx/GXManage.cpp
@@ -707,8 +1057,110 @@ index 80b3b92..789dc44 100644
    }
    __gx->dirtyState = 0;
  }
+diff --git a/aurora-main/lib/dolphin/gx/GXTexture.cpp b/aurora-main/lib/dolphin/gx/GXTexture.cpp
+index 684ba79..ac15ce6 100644
+--- a/aurora-main/lib/dolphin/gx/GXTexture.cpp
++++ b/aurora-main/lib/dolphin/gx/GXTexture.cpp
+@@ -174,6 +174,34 @@ void emit_loaded_tlut_metadata(const GXTlutObj_& obj, u32 idx) {
+   GX_WRITE_U32(obj.tlutObjId);
+   GX_WRITE_U32(obj.tlutDataVersion);
+ }
++
++#if defined(__SWITCH__)
++// The same bytes as the two functions above, into a packet (__gx.h).
++void put_loaded_texobj_metadata(gx_fifo_packet::Writer& p, const GXTexObj_& obj, GXTexMapID id) {
++  p.u8_(GX_LOAD_AURORA);
++  p.u16_(GX_LOAD_AURORA_TEXOBJ);
++  p.u8_(static_cast<u8>(id));
++  p.u64_(reinterpret_cast<u64>(obj.data));
++  p.u32_(obj.width());
++  p.u32_(obj.height());
++  p.u32_(obj.format());
++  p.u32_(static_cast<u32>(obj.tlut));
++  p.u8_(static_cast<u8>(obj.has_mips()));
++  p.u32_(obj.texObjId);
++  p.u32_(obj.texDataVersion);
++}
++
++void put_loaded_tlut_metadata(gx_fifo_packet::Writer& p, const GXTlutObj_& obj, u32 idx) {
++  p.u8_(GX_LOAD_AURORA);
++  p.u16_(GX_LOAD_AURORA_TLUT);
++  p.u8_(static_cast<u8>(idx));
++  p.u64_(reinterpret_cast<u64>(obj.data));
++  p.u32_(static_cast<u32>(obj.format));
++  p.u16_(obj.numEntries);
++  p.u32_(obj.tlutObjId);
++  p.u32_(obj.tlutDataVersion);
++}
++#endif
+ } // namespace
+ 
+ extern "C" {
+@@ -290,6 +318,32 @@ void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
+   SET_REG_FIELD(0, image2, 8, 24, GXTexImage2Ids[id]);
+   SET_REG_FIELD(0, obj->image3, 8, 24, GXTexImage3Ids[id]);
+ 
++#if defined(__SWITCH__)
++  // Every byte below in one write (__gx.h, gx_fifo_packet): ~1000 loads a frame in a match.
++  if (!gx_fifo_packet::direct()) LIKELY {
++    u8 pBytes[72];
++    gx_fifo_packet::Writer p{pBytes};
++    p.ras_reg(obj->mode0);
++    p.ras_reg(obj->mode1);
++    p.ras_reg(obj->image0);
++    p.ras_reg(image1);
++    p.ras_reg(image2);
++    p.ras_reg(obj->image3);
++    if ((obj->flags & 2) == 0) {
++      u32 tlut = 0;
++      SET_REG_FIELD(0, tlut, 10, 0, static_cast<u32>(obj->tlut));
++      SET_REG_FIELD(0, tlut, 8, 24, GXTexTlutIds[id]);
++      p.ras_reg(tlut);
++    }
++    put_loaded_texobj_metadata(p, *obj, id);
++    p.send(pBytes);
++    __gx->tImage0[id] = obj->image0;
++    __gx->tMode0[id] = obj->mode0;
++    __gx->dirtyState |= 1;
++    __gx->bpSent = 1;
++    return;
++  }
++#endif
+   GX_WRITE_RAS_REG(obj->mode0);
+   GX_WRITE_RAS_REG(obj->mode1);
+   GX_WRITE_RAS_REG(obj->image0);
+@@ -419,6 +473,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
+ 
+ void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
+   auto* obj = reinterpret_cast<const GXTlutObj_*>(obj_);
++#if defined(__SWITCH__)
++  // The same bytes in two writes (__gx.h, gx_fifo_packet), on either side of load_tlut as before.
++  if (!gx_fifo_packet::direct()) LIKELY {
++    u8 regsBytes[20];
++    gx_fifo_packet::Writer regs{regsBytes};
++    regs.ras_reg(__gx->bpMask);
++    regs.ras_reg(obj->loadTlut0);
++    u32 loadTlut1 = 0;
++    SET_REG_FIELD(0, loadTlut1, 10, 0, idx);
++    SET_REG_FIELD(0, loadTlut1, 10, 10, obj->numEntries - 1);
++    SET_REG_FIELD(0, loadTlut1, 8, 24, 0x65);
++    regs.ras_reg(loadTlut1);
++    regs.ras_reg(__gx->bpMask);
++    regs.send(regsBytes);
++    __gx->bpSent = 1;
++    aurora::gfx::texture_replacement::load_tlut(obj_, idx);
++    u8 metaBytes[26];
++    gx_fifo_packet::Writer meta{metaBytes};
++    put_loaded_tlut_metadata(meta, *obj, idx);
++    meta.send(metaBytes);
++    return;
++  }
++#endif
+   __GXFlushTextureState();
+   GX_WRITE_RAS_REG(obj->loadTlut0);
+ 
 diff --git a/aurora-main/lib/dolphin/gx/GXTransform.cpp b/aurora-main/lib/dolphin/gx/GXTransform.cpp
-index b881d38..bb8a159 100644
+index b881d38..1b5dca9 100644
 --- a/aurora-main/lib/dolphin/gx/GXTransform.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXTransform.cpp
 @@ -2,6 +2,26 @@
@@ -738,7 +1190,161 @@ index b881d38..bb8a159 100644
  static inline void CacheProjectionVector(const f32* ptr, GXProjectionType type) {
    __gx->projType = type;
    for (int i = 0; i < 6; ++i) {
-@@ -189,8 +209,7 @@ void GXProject(f32 x, f32 y, f32 z, const f32 mtx[3][4], const f32* pm, const f3
+@@ -24,6 +44,22 @@ void GXSetProjection(const void* mtx_, GXProjectionType type) {
+   };
+   CacheProjectionVector(projVec, type);
+ 
++#if defined(__SWITCH__)
++  // The same bytes in one write (__gx.h, gx_fifo_packet).
++  if (!gx_fifo_packet::direct()) LIKELY {
++    u8 pBytes[33];
++    gx_fifo_packet::Writer p{pBytes};
++    p.u8_(0x10);
++    p.u32_(0x00061020);
++    for (int i = 0; i < 6; ++i) {
++      p.f32_(__gx->projMtx[i]);
++    }
++    p.u32_(__gx->projType);
++    p.send(pBytes);
++    __gx->bpSent = 0;
++    return;
++  }
++#endif
+   // XF bulk write: 6 params + projection type at 0x1020-0x1026
+   GX_WRITE_U8(0x10);
+   GX_WRITE_U32(0x00061020);
+@@ -57,6 +93,20 @@ void GXLoadPosMtxImm(const void* mtx_, u32 id) {
+   CHECK(id >= GX_PNMTX0 && id <= GX_PNMTX9, "invalid pn mtx {}", static_cast<int>(id));
+   const auto* mtx = reinterpret_cast<const f32*>(mtx_);
+ 
++#if defined(__SWITCH__)
++  // The same bytes in one write (__gx.h, gx_fifo_packet).
++  if (!gx_fifo_packet::direct()) LIKELY {
++    u8 pBytes[53];
++    gx_fifo_packet::Writer p{pBytes};
++    p.u8_(0x10);
++    p.u32_((id * 4) | 0xB0000);
++    for (int i = 0; i < 12; i++) {
++      p.f32_(mtx[i]);
++    }
++    p.send(pBytes);
++    return;
++  }
++#endif
+   GX_WRITE_U8(0x10);
+   GX_WRITE_U32((id * 4) | 0xB0000);
+   for (int i = 0; i < 12; i++) {
+@@ -64,10 +114,83 @@ void GXLoadPosMtxImm(const void* mtx_, u32 id) {
+   }
+ }
+ 
++#if defined(__SWITCH__)
++// The runtime's GXLoadPosMtxImm/GXLoadNrmMtxImm/GXLoadTexMtxImm (gx_transform.cpp) read a guest
++// matrix whose words are already the big-endian XF words these commands carry: their float pass
++// (byte-swap to a host float, store, load, byte-swap back) is a bitwise copy, so these take the
++// guest words as they are. Same bytes as the functions above; inside an Aurora display list they
++// are those functions.
++static void be_words_to_f32(const void* be, f32* out, u32 n) {
++  const auto* bytes = static_cast<const u8*>(be);
++  for (u32 i = 0; i < n; ++i) {
++    u32 w;
++    std::memcpy(&w, bytes + i * 4, 4);
++    w = __builtin_bswap32(w);
++    std::memcpy(&out[i], &w, 4);
++  }
++}
++
++void GXLoadPosMtxImmBE(const void* mtxBe, u32 id) {
++  if (gx_fifo_packet::direct()) UNLIKELY {
++    f32 m[12];
++    be_words_to_f32(mtxBe, m, 12);
++    GXLoadPosMtxImm(m, id);
++    return;
++  }
++  CHECK(id >= GX_PNMTX0 && id <= GX_PNMTX9, "invalid pn mtx {}", static_cast<int>(id));
++  u8 pBytes[53];
++  gx_fifo_packet::Writer p{pBytes};
++  p.u8_(0x10);
++  p.u32_((id * 4) | 0xB0000);
++  p.be_words(mtxBe, 12);
++  p.send(pBytes);
++}
++
++// `rowStride` 4: the 3x3 of a 3x4 matrix (words 0-2, 4-6, 8-10); 3: a packed 3x3.
++void GXLoadNrmMtxImmBE(const void* mtxBe, u32 id, u32 rowStride) {
++  if (gx_fifo_packet::direct()) UNLIKELY {
++    f32 src[12];
++    be_words_to_f32(mtxBe, src, rowStride * 3);
++    f32 m[12]{};
++    for (u32 row = 0; row < 3; ++row) {
++      for (u32 col = 0; col < 3; ++col) {
++        m[row * 4 + col] = src[row * rowStride + col];
++      }
++    }
++    GXLoadNrmMtxImm(m, id);
++    return;
++  }
++  CHECK(id >= GX_PNMTX0 && id <= GX_PNMTX9, "invalid pn mtx {}", static_cast<int>(id));
++  const auto* words = static_cast<const u8*>(mtxBe);
++  u8 pBytes[41];
++  gx_fifo_packet::Writer p{pBytes};
++  p.u8_(0x10);
++  p.u32_((id * 3 + 0x400) | 0x80000);
++  for (u32 row = 0; row < 3; ++row) {
++    p.be_words(words + row * rowStride * 4, 3);
++  }
++  p.send(pBytes);
++}
++#endif
++
+ void GXLoadNrmMtxImm(const void* mtx_, u32 id) {
+   CHECK(id >= GX_PNMTX0 && id <= GX_PNMTX9, "invalid pn mtx {}", static_cast<int>(id));
+   const auto* mtx = reinterpret_cast<const f32*>(mtx_);
+ 
++#if defined(__SWITCH__)
++  // The same bytes in one write (__gx.h, gx_fifo_packet).
++  if (!gx_fifo_packet::direct()) LIKELY {
++    u8 pBytes[41];
++    gx_fifo_packet::Writer p{pBytes};
++    p.u8_(0x10);
++    p.u32_((id * 3 + 0x400) | 0x80000);
++    for (int i : {0, 1, 2, 4, 5, 6, 8, 9, 10}) {
++      p.f32_(mtx[i]);
++    }
++    p.send(pBytes);
++    return;
++  }
++#endif
+   GX_WRITE_U8(0x10);
+   GX_WRITE_U32((id * 3 + 0x400) | 0x80000);
+   // Write 3x3 from 3x4 matrix (skip translation column)
+@@ -103,10 +226,24 @@ void GXLoadTexMtxImm(const void* mtx_, u32 id, GXTexMtxType type) {
+   u32 count = (type == GX_MTX2x4) ? 8 : 12;
+   u32 reg = addr | ((count - 1) << 16);
+ 
++  const auto* mtx = reinterpret_cast<const f32*>(mtx_);
++#if defined(__SWITCH__)
++  // The same bytes in one write (__gx.h, gx_fifo_packet).
++  if (!gx_fifo_packet::direct()) LIKELY {
++    u8 pBytes[53];
++    gx_fifo_packet::Writer p{pBytes};
++    p.u8_(0x10);
++    p.u32_(reg);
++    for (u32 i = 0; i < count; i++) {
++      p.f32_(mtx[i]);
++    }
++    p.send(pBytes);
++    return;
++  }
++#endif
+   GX_WRITE_U8(0x10);
+   GX_WRITE_U32(reg);
+ 
+-  const auto* mtx = reinterpret_cast<const f32*>(mtx_);
+   for (u32 i = 0; i < count; i++) {
+     GX_WRITE_F32(mtx[i]);
+   }
+@@ -189,8 +326,7 @@ void GXProject(f32 x, f32 y, f32 z, const f32 mtx[3][4], const f32* pm, const f3
  // TODO GXLoadNrmMtxIndx3x3
  // TODO GXLoadTexMtxIndx
  void GXSetZScaleOffset(f32 scale, f32 offset) {
@@ -748,7 +1354,7 @@ index b881d38..bb8a159 100644
    constexpr f32 z24Scale = 16777215.0f;
    const f32 sz = z24Scale * offset;
    const f32 oz = 1.0f + z24Scale * scale;
-@@ -205,8 +224,7 @@ void GXSetZScaleOffset(f32 scale, f32 offset) {
+@@ -205,8 +341,7 @@ void GXSetZScaleOffset(f32 scale, f32 offset) {
  }
  
  void GXSetScissorBoxOffset(s32 x_off, s32 y_off) {
@@ -771,11 +1377,649 @@ index 6f71945..0ca5c7d 100644
    }
  }
  
+diff --git a/aurora-main/lib/dolphin/gx/__gx.h b/aurora-main/lib/dolphin/gx/__gx.h
+index 460791e..aa518c9 100644
+--- a/aurora-main/lib/dolphin/gx/__gx.h
++++ b/aurora-main/lib/dolphin/gx/__gx.h
+@@ -83,6 +83,159 @@
+   GX_WRITE_U32(value);                \
+   } while (0)
+ 
++#if defined(__SWITCH__)
++// Each fifo::write_* reloads the FIFO globals through the GOT and checks room, and its byte stores
++// may alias them, so a register write made of two or three of them cost ~60 instructions (most
++// of the main-thread time of the one-register setters, profile-stock1). A command is now built on
++// the stack and appended with one fifo::write_data: outside an Aurora display list the same bytes
++// land in the same order (a full buffer grows in write_data_grow either way). Inside one, write_data
++// checks room per call, so there the pieces keep their own calls and a list that overflows keeps
++// exactly what it kept before (MLB never records one: gx_dl.cpp records lists itself).
++namespace gx_fifo_packet {
++inline bool direct() noexcept { return aurora::gx::fifo::detail::sInDisplayList; }
++
++inline void put_be16(u8* p, u16 v) noexcept {
++  v = __builtin_bswap16(v);
++  std::memcpy(p, &v, 2);
++}
++inline void put_be32(u8* p, u32 v) noexcept {
++  v = __builtin_bswap32(v);
++  std::memcpy(p, &v, 4);
++}
++inline void put_be64(u8* p, u64 v) noexcept {
++  v = __builtin_bswap64(v);
++  std::memcpy(p, &v, 8);
++}
++inline u32 f32_bits(f32 v) noexcept {
++  u32 bits;
++  std::memcpy(&bits, &v, 4);
++  return bits;
++}
++
++// Writes one run of commands into a caller's stack buffer; send() appends it. Callers check
++// direct() first. The cursor lives in a register only if the Writer stays a separate local
++// (`u8 buf[N]; Writer p{buf};`): next to the bytes it would be reloaded after every byte store.
++struct Writer {
++  u8* cur;
++  void u8_(u8 v) noexcept { *cur++ = v; }
++  void u16_(u16 v) noexcept {
++    put_be16(cur, v);
++    cur += 2;
++  }
++  void u32_(u32 v) noexcept {
++    put_be32(cur, v);
++    cur += 4;
++  }
++  void u64_(u64 v) noexcept {
++    put_be64(cur, v);
++    cur += 8;
++  }
++  void f32_(f32 v) noexcept { u32_(f32_bits(v)); }
++  // `n` 32-bit words already in big-endian order (guest memory).
++  void be_words(const void* src, u32 n) noexcept {
++    std::memcpy(cur, src, n * 4);
++    cur += n * 4;
++  }
++  void ras_reg(u32 value) noexcept {
++    u8_(0x61);
++    u32_(value);
++  }
++  void cp_reg(u8 a, u8 b, u32 value) noexcept {
++    u8_(a);
++    u8_(b);
++    u32_(value);
++  }
++  void send(const u8* begin) const noexcept {
++    aurora::gx::fifo::write_data(begin, static_cast<u32>(cur - begin));
++  }
++};
++
++static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the commands below are composed little-endian");
++
++[[gnu::cold, gnu::noinline]] inline void xf_reg_direct(u32 addr, u32 value) {
++  aurora::gx::fifo::write_u8(0x10);
++  aurora::gx::fifo::write_u32(addr);
++  aurora::gx::fifo::write_u32(value);
++}
++// 0x10, addr, value: the first 8 bytes are composed in a register.
++inline void xf_reg(u32 addr, u32 value) {
++  if (direct()) UNLIKELY {
++    xf_reg_direct(addr, value);
++    return;
++  }
++  const u64 head = 0x10u | static_cast<u64>(__builtin_bswap32(addr)) << 8 |
++                   static_cast<u64>(__builtin_bswap32(value)) << 40;
++  u8 b[9];
++  std::memcpy(b, &head, 8);
++  b[8] = static_cast<u8>(value);
++  aurora::gx::fifo::write_data(b, 9);
++}
++[[gnu::cold, gnu::noinline]] inline void reg5_direct(u8 op, u32 value) {
++  aurora::gx::fifo::write_u8(op);
++  aurora::gx::fifo::write_u32(value);
++}
++inline void reg5(u8 op, u32 value) {
++  if (direct()) UNLIKELY {
++    reg5_direct(op, value);
++    return;
++  }
++  const u64 head = op | static_cast<u64>(__builtin_bswap32(value)) << 8;
++  u8 b[5];
++  std::memcpy(b, &head, 5);
++  aurora::gx::fifo::write_data(b, 5);
++}
++[[gnu::cold, gnu::noinline]] inline void reg6_direct(u8 a, u8 c, u32 value) {
++  aurora::gx::fifo::write_u8(a);
++  aurora::gx::fifo::write_u8(c);
++  aurora::gx::fifo::write_u32(value);
++}
++inline void reg6(u8 a, u8 c, u32 value) {
++  if (direct()) UNLIKELY {
++    reg6_direct(a, c, value);
++    return;
++  }
++  const u64 head = a | static_cast<u64>(c) << 8 | static_cast<u64>(__builtin_bswap32(value)) << 16;
++  u8 b[6];
++  std::memcpy(b, &head, 6);
++  aurora::gx::fifo::write_data(b, 6);
++}
++[[gnu::cold, gnu::noinline]] inline void aurora3_direct(u16 cmd) {
++  aurora::gx::fifo::write_u8(GX_LOAD_AURORA);
++  aurora::gx::fifo::write_u16(cmd);
++}
++inline void aurora3(u16 cmd) {
++  if (direct()) UNLIKELY {
++    aurora3_direct(cmd);
++    return;
++  }
++  const u32 head = GX_LOAD_AURORA | static_cast<u32>(__builtin_bswap16(cmd)) << 8;
++  u8 b[3];
++  std::memcpy(b, &head, 3);
++  aurora::gx::fifo::write_data(b, 3);
++}
++} // namespace gx_fifo_packet
++
++#undef GX_WRITE_XF_REG
++#define GX_WRITE_XF_REG(addr, value)                                                                                   \
++  gx_fifo_packet::xf_reg(static_cast<uint32_t>(0x1000 + (addr)), static_cast<uint32_t>(value))
++#undef GX_WRITE_RAS_REG
++#define GX_WRITE_RAS_REG(value) gx_fifo_packet::reg5(0x61, static_cast<uint32_t>(value))
++#undef GX_WRITE_SOME_REG2
++#define GX_WRITE_SOME_REG2(a, b, c, addr)                                                                              \
++  gx_fifo_packet::reg6(static_cast<uint8_t>(a), static_cast<uint8_t>(b), static_cast<uint32_t>(c))
++#undef GX_WRITE_SOME_REG3
++#define GX_WRITE_SOME_REG3(a, b, c, addr)                                                                              \
++  gx_fifo_packet::reg6(static_cast<uint8_t>(a), static_cast<uint8_t>(b), static_cast<uint32_t>(c))
++#undef GX_WRITE_SOME_REG4
++#define GX_WRITE_SOME_REG4(a, b, c, addr)                                                                              \
++  gx_fifo_packet::reg6(static_cast<uint8_t>(a), static_cast<uint8_t>(b), static_cast<uint32_t>(c))
++#undef GX_WRITE_CP_REG
++#define GX_WRITE_CP_REG(addr, value)                                                                                   \
++  gx_fifo_packet::reg6(static_cast<uint8_t>(GX_LOAD_CP_REG), static_cast<uint8_t>(addr), static_cast<uint32_t>(value))
++#undef GX_WRITE_AURORA
++#define GX_WRITE_AURORA(cmd) gx_fifo_packet::aurora3(static_cast<uint16_t>(cmd))
++#endif
++
+ // This shadow register struct contains the GX state Aurora needs on PC.
+ struct __GXData_struct {
+   u16 vNum;         // vertex count for flush prim
+diff --git a/aurora-main/lib/gfx/clear.cpp b/aurora-main/lib/gfx/clear.cpp
+index f5964f9..2e5b013 100644
+--- a/aurora-main/lib/gfx/clear.cpp
++++ b/aurora-main/lib/gfx/clear.cpp
+@@ -2,6 +2,9 @@
+ 
+ #include "../webgpu/gpu.hpp"
+ #include "tracy/Tracy.hpp"
++#ifdef AURORA_SWITCH_DEKO3D
++#include "dk_gfx.hpp"  // the deko3d renderer (tools/switch/deko)
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -26,6 +29,12 @@ using webgpu::g_graphicsConfig;
+ 
+ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+   ZoneScoped;
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    dk::create_clear_pipeline(config);
++    return {};
++  }
++#endif
+   wgpu::ShaderSourceWGSL sourceDescriptor{};
+   sourceDescriptor.code = R"""(
+ struct VertexOutput {
+diff --git a/aurora-main/lib/gfx/common.cpp b/aurora-main/lib/gfx/common.cpp
+index d22b37a..c305ded 100644
+--- a/aurora-main/lib/gfx/common.cpp
++++ b/aurora-main/lib/gfx/common.cpp
+@@ -16,6 +16,9 @@
+ #include "texture_replacement.hpp"
+ #include "texture.hpp"
+ #include "../window.hpp"
++#ifdef AURORA_SWITCH_DEKO3D
++#include "dk_gfx.hpp"  // the deko3d renderer (tools/switch/deko)
++#endif
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -134,6 +137,11 @@ constexpr size_t FrameSlotCount = 3;
+ static std::array<wgpu::Buffer, FrameSlotCount> g_stagingBuffers;
+ static size_t currentStagingBuffer = 0;
+ static StagingMapState s_mappingState;
++#ifdef AURORA_SWITCH_DEKO3D
++// deko3d: the staging slots are deko3d memory the GPU reads in place (tools/switch/deko)
++static std::array<dk::StagingMemory, FrameSlotCount> g_dkStaging;
++static uint32_t g_dkBatchSlot = 0;  // the slot the last end_batch closed: the next render reads it
++#endif
+ static wgpu::Limits g_cachedLimits;
+ // Advanced once per logical frame in the seal prologue, under the renderer GPU mutex and with the
+ // producer blocked, so every later reader sees a value that no longer moves.
+@@ -234,6 +242,9 @@ static void recycle_render_passes(std::vector<RenderPass>& passes) noexcept {
+ }
+ 
+ struct SealedFrameData {
++#ifdef AURORA_SWITCH_DEKO3D
++  uint32_t dkStagingSlot = 0;  // deko3d: the staging slot the frame's draws read
++#endif
+   depth_peek::FrameMapping depthMapping;
+   DebugFrameData debug;
+   std::vector<RenderPass> passes;
+@@ -885,6 +896,13 @@ void initialize() {
+     if (size <= 0) {
+       return;
+     }
++#ifdef AURORA_SWITCH_DEKO3D
++    // deko3d: Dawn's Null buffers only back the Null device's bind groups (no 21 MiB host copies); the
++    // uniform buffer keeps its size (tex_copy_conv's and efb_ram's Null bind groups use its offsets)
++    if (dk::enabled() && !(usage & wgpu::BufferUsage::Uniform)) {
++      size = std::min<uint64_t>(size, 64 * 1024);
++    }
++#endif
+     const wgpu::BufferDescriptor descriptor{
+         .label = label,
+         .usage = usage,
+@@ -905,6 +923,13 @@ void initialize() {
+     createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
+                  label.c_str());
+   }
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    for (size_t i = 0; i < g_dkStaging.size(); ++i) {
++      g_dkStaging[i] = dk::staging_create(i, StagingBufferSize);
++    }
++  }
++#endif
+   currentStagingBuffer = 0;
+   s_mappingState.reset();
+   map_staging_buffer();
+@@ -1035,6 +1060,11 @@ void shutdown() {
+ }
+ 
+ void map_staging_buffer() {
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    return;  // deko3d memory is always mapped; begin_frame waits for the slot's fence instead
++  }
++#endif
+   const auto generation = s_mappingState.request();
+   if (generation == 0) {
+     return;
+@@ -1059,6 +1089,14 @@ FrameWaitCounters g_frameWaits;
+ 
+ static bool begin_frame_impl(bool clearEfb, bool capacityResume = false) {
+   ZoneScoped;
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    // deko3d: the GPU has finished the last batch that read the slot
++    ZoneScopedN("Wait for staging fence");
++    const ScopedWaitTimer mapWait{g_frameWaits.stagingMapWaitNs, nullptr};
++    dk::staging_wait(currentStagingBuffer);
++  } else
++#endif
+   {
+     ZoneScopedN("Wait for buffer map");
+     const ScopedWaitTimer mapWait{g_frameWaits.stagingMapWaitNs, nullptr};
+@@ -1092,6 +1130,11 @@ static bool begin_frame_impl(bool clearEfb, bool capacityResume = false) {
+     if (size <= 0) {
+       return;
+     }
++#ifdef AURORA_SWITCH_DEKO3D
++    if (dk::enabled()) {
++      buf = ByteBuffer{g_dkStaging[currentStagingBuffer].cpu + bufferOffset, static_cast<size_t>(size)};
++    } else
++#endif
+     buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
+     bufferOffset += size;
+   };
+@@ -1195,12 +1238,19 @@ static void end_batch_impl(const wgpu::CommandEncoder& cmd, bool advanceFrame) {
+   const auto writeBuffer = [&](ByteBuffer& buf, wgpu::Buffer& out, uint64_t size, std::string_view label) {
+     const auto writeSize = buf.size(); // Only need to copy this many bytes
+     if (writeSize > 0) {
++#ifdef AURORA_SWITCH_DEKO3D
++      if (!dk::enabled())  // (deko3d reads the staging slot in place)
++#endif
+       cmd.CopyBufferToBuffer(g_stagingBuffers[currentStagingBuffer], bufferOffset, out, 0, AURORA_ALIGN(writeSize, 4));
+       buf.release();
+     }
+     bufferOffset += size;
+     return writeSize;
+   };
++#ifdef AURORA_SWITCH_DEKO3D
++  g_dkBatchSlot = static_cast<uint32_t>(currentStagingBuffer);  // the batch render reads this slot in place
++  if (!dk::enabled())
++#endif
+   g_stagingBuffers[currentStagingBuffer].Unmap();
+   s_mappingState.reset();
+   g_stats.drawCallCount = g_drawCallCount;
+@@ -1509,8 +1559,15 @@ static void render_impl(std::vector<RenderPass>& renderPasses, wgpu::CommandEnco
+ #endif
+ }
+ 
++#ifdef AURORA_SWITCH_DEKO3D
++#include "dk_common.inc"  // dk_render: render_impl's walk into deko3d (tools/switch/deko/aurora)
++#endif
++
+ void seal_frame(SealedFrame& out) noexcept {
+   out.data().depthMapping = depth_peek::capture_frame_mapping();
++#ifdef AURORA_SWITCH_DEKO3D
++  out.data().dkStagingSlot = g_dkBatchSlot;
++#endif
+   ZoneScoped;
+   // The encode that could still have been holding these has completed: the
+   // producer joins the worker's DONE phase before it seals another frame.
+@@ -1533,10 +1590,23 @@ void seal_frame(SealedFrame& out) noexcept {
+ }
+ 
+ void render(SealedFrame& frame, wgpu::CommandEncoder& cmd, int32_t interpolatedFrame, bool finalize) {
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    dk_render(frame.data().passes, frame.data().dkStagingSlot, interpolatedFrame, finalize, frame.data().debug,
++              frame.data().depthMapping);
++    return;
++  }
++#endif
+   render_impl(frame.data().passes, cmd, interpolatedFrame, finalize, frame.data().debug, frame.data().depthMapping);
+ }
+ 
+ void render(wgpu::CommandEncoder& cmd, int32_t interpolatedFrame, bool finalize) {
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    dk_render(g_renderPasses, g_dkBatchSlot, interpolatedFrame, finalize, g_debugFrame,
++              depth_peek::capture_frame_mapping());
++  } else
++#endif
+   render_impl(g_renderPasses, cmd, interpolatedFrame, finalize, g_debugFrame, depth_peek::capture_frame_mapping());
+   if (finalize) {
+     g_currentRenderPass = UINT32_MAX;
+diff --git a/aurora-main/lib/gfx/depth_peek.cpp b/aurora-main/lib/gfx/depth_peek.cpp
+index 1cd357b..aa33a6d 100644
+--- a/aurora-main/lib/gfx/depth_peek.cpp
++++ b/aurora-main/lib/gfx/depth_peek.cpp
+@@ -12,6 +12,9 @@
+ 
+ #include <magic_enum.hpp>
+ #include <tracy/Tracy.hpp>
++#ifdef AURORA_SWITCH_DEKO3D
++#include "dk_gfx.hpp"  // the deko3d renderer's snapshots (tools/switch/deko/aurora/dk_depth_peek.cpp)
++#endif
+ 
+ namespace aurora::gfx::depth_peek {
+ namespace {
+@@ -324,6 +327,11 @@ void request_snapshot() noexcept {
+ }
+ 
+ bool read_latest(uint16_t x, uint16_t y, uint32_t& z) noexcept {
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    return dk::depth_peek_read(x, y, z);
++  }
++#endif
+   std::lock_guard lock{g_mutex};
+   if (x >= g_latest.width || y >= g_latest.height || g_latest.data.empty()) {
+     return false;
+@@ -420,6 +428,37 @@ void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureV
+   cmd.CopyBufferToBuffer(storageBuffer, 0, readbackBuffer, 0, byteSize);
+ }
+ 
++#ifdef AURORA_SWITCH_DEKO3D
++bool take_snapshot_request(wgpu::Extent3D sourceSize, const FrameMapping& mapping, SnapshotParams& out) noexcept {
++  // encode_frame_snapshot's request, limit and checks
++  const auto now = Clock::now();
++  {
++    std::lock_guard lock{g_mutex};
++    if (!g_snapshotRequested || now < g_nextSnapshotTime) {
++      return false;
++    }
++    g_snapshotRequested = false;
++    g_nextSnapshotTime = now + SnapshotInterval;
++  }
++  const auto dstSize = mapping.logicalSize;
++  if (dstSize.x == 0 || dstSize.y == 0 || sourceSize.width == 0 || sourceSize.height == 0) {
++    return false;
++  }
++  const Params params = make_params(sourceSize, mapping);
++  out = {
++      .dstWidth = params.dstWidth,
++      .dstHeight = params.dstHeight,
++      .srcWidth = params.srcWidth,
++      .srcHeight = params.srcHeight,
++      .offsetX = params.offsetX,
++      .offsetY = params.offsetY,
++      .scaleX = params.scaleX,
++      .scaleY = params.scaleY,
++  };
++  return true;
++}
++#endif
++
+ void after_submit() noexcept {
+   std::vector<PendingMap> pendingMaps;
+   {
+diff --git a/aurora-main/lib/gfx/depth_peek.hpp b/aurora-main/lib/gfx/depth_peek.hpp
+index 246afd8..3952eee 100644
+--- a/aurora-main/lib/gfx/depth_peek.hpp
++++ b/aurora-main/lib/gfx/depth_peek.hpp
+@@ -25,6 +25,25 @@ void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureV
+                            wgpu::Extent3D sourceSize, uint32_t msaaSamples, const FrameMapping& mapping) noexcept;
+ void after_submit() noexcept;
+ 
++#ifdef AURORA_SWITCH_DEKO3D
++// The deko3d renderer (tools/switch/deko/aurora/dk_depth_peek.cpp): no compute pass. After the frame's last
++// pass the encoder takes the pending request here (encode_frame_snapshot's 30 Hz limit and checks; false:
++// no snapshot) with the compute shader's Params, copies the depth image itself, and read_latest reads that
++// copy (dk::depth_peek_read): logical pixel (x, y) is depth pixel
++// clamp(floor(offset + (x + 0.5, y + 0.5) * scale), 0, srcSize - 1).
++struct SnapshotParams {
++  uint32_t dstWidth = 0;
++  uint32_t dstHeight = 0;
++  uint32_t srcWidth = 0;
++  uint32_t srcHeight = 0;
++  float offsetX = 0.f;
++  float offsetY = 0.f;
++  float scaleX = 1.f;
++  float scaleY = 1.f;
++};
++bool take_snapshot_request(wgpu::Extent3D sourceSize, const FrameMapping& mapping, SnapshotParams& params) noexcept;
++#endif
++
+ namespace testing {
+ void reset() noexcept;
+ bool snapshot_requested() noexcept;
 diff --git a/aurora-main/lib/gfx/efb_ram_copy.cpp b/aurora-main/lib/gfx/efb_ram_copy.cpp
-index aabd5ca..8fa4ae3 100644
+index aabd5ca..eeb70ce 100644
 --- a/aurora-main/lib/gfx/efb_ram_copy.cpp
 +++ b/aurora-main/lib/gfx/efb_ram_copy.cpp
-@@ -227,6 +227,11 @@ void schedule(void* dest, uint32_t width, uint32_t height, GXTexFmt format, Text
+@@ -5,6 +5,9 @@
+ #include "tex_copy_conv.hpp"
+ #include "../internal.hpp"
+ #include "../webgpu/gpu.hpp"
++#ifdef AURORA_SWITCH_DEKO3D
++#include "dk_gfx.hpp"  // the deko3d renderer's readbacks (tools/switch/deko/aurora/dk_efb_ram.cpp)
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -48,6 +51,9 @@ struct Download {
+   wgpu::Buffer buffer;
+   uint32_t bytesPerRow = 0;
+   uint64_t bufferSize = 0;
++#ifdef AURORA_SWITCH_DEKO3D
++  std::shared_ptr<dk::Readback> dkReadback;  // deko3d: the copy in place of the buffer
++#endif
+ };
+ 
+ enum class AsyncState : uint8_t {
+@@ -72,6 +78,9 @@ struct AsyncSlot {
+   uint32_t hostHeight = 0;
+   HostPixelOrder order = HostPixelOrder::RGBA;
+   AsyncState state = AsyncState::Idle;
++#ifdef AURORA_SWITCH_DEKO3D
++  std::shared_ptr<dk::Readback> dkReadback;  // deko3d: the slot's copy in place of its buffer
++#endif
+ };
+ 
+ std::vector<PendingCopy> g_pending;
+@@ -125,6 +134,12 @@ void encode_native_blit(const wgpu::CommandEncoder& encoder, const PendingCopy&
+                           ? tex_copy_conv::SampleFilter::Nearest
+                           : tex_copy_conv::SampleFilter::Linear,
+   };
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    dk::copy_convert(blitRequest, true);  // (inside the readback batch: the uniform is in its slot)
++    return;
++  }
++#endif
+   tex_copy_conv::blit(encoder, blitRequest);
+ }
+ 
+@@ -179,6 +194,146 @@ void drain_async_events() noexcept {
+   }
+ }
+ 
++#ifdef AURORA_SWITCH_DEKO3D
++// The deko3d renderer (tools/switch/deko/aurora/dk_efb_ram.cpp): encode_downloads, complete_downloads,
++// encode_async_downloads and after_submit below with the copy engine and a fence (dk::readback_*) in place
++// of CopyTextureToBuffer and the buffer maps; the requests, slots, states and call points are Dawn's.
++// The readbacks of one call are a batch of their own on the staging slot the last batch read, where
++// prepare_downloads / seal_async_downloads pushed the native blit uniforms.
++void dk_encode_downloads(void* dest) noexcept {
++  for (auto it = g_pending.begin(); it != g_pending.end();) {
++    if (dest != nullptr && it->dest != dest) {
++      ++it;
++      continue;
++    }
++    PendingCopy pending = std::move(*it);
++    it = g_pending.erase(it);
++    dk::readback_begin();
++    if (pending.nativeTexture) {
++      encode_native_blit(wgpu::CommandEncoder{}, pending);
++    }
++    const auto& texture = pending.nativeTexture ? pending.nativeTexture : pending.texture;
++    const uint32_t bytesPerRow = align_to(texture->size.width * 4, 256);
++    const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * texture->size.height;
++    std::shared_ptr<dk::Readback> readback;
++    if (!dk::readback_copy(texture->texture.Get(), bytesPerRow, readback)) {
++      readback.reset();  // (complete_downloads reports it as a failed readback)
++    }
++    g_downloads.push_back({
++        .copy = std::move(pending),
++        .bytesPerRow = bytesPerRow,
++        .bufferSize = bufferSize,
++        .dkReadback = std::move(readback),
++    });
++  }
++  dk::readback_end();
++}
++
++// complete_downloads' loop body: waits for the copy (5 s at most, as WaitAny) and encodes guest RAM
++bool dk_complete_download(Download& download) noexcept {
++  const uint8_t* pixels = nullptr;
++  {
++    const ScopedWaitTimer readbackWait{g_frameWaits.efbReadbackWaitNs, &g_frameWaits.efbReadbacks};
++    pixels = dk::readback_wait(download.dkReadback.get());
++  }
++  if (pixels == nullptr) {
++    Log.error("EFB RAM readback failed (deko3d) format=0x{:x} size={}x{}", static_cast<unsigned>(download.copy.format),
++              download.copy.width, download.copy.height);
++    return false;
++  }
++  bool success = true;
++  const auto& readbackTexture = download.copy.nativeTexture ? download.copy.nativeTexture : download.copy.texture;
++  const auto order = texture_pixel_order(readbackTexture);
++  const size_t outputSize = encoded_size(download.copy.format, download.copy.width, download.copy.height);
++  if (!encode(download.copy.dest, outputSize, download.copy.format, download.copy.width, download.copy.height, pixels,
++              readbackTexture->size.width, readbackTexture->size.height, download.bytesPerRow, order)) {
++    Log.error("Failed to encode EFB RAM copy format=0x{:x} size={}x{}", static_cast<unsigned>(download.copy.format),
++              download.copy.width, download.copy.height);
++    success = false;
++  }
++  notify_guest_write(download.copy.dest, outputSize);
++  return success;
++}
++
++// drain_async_events + complete_async_slot: the mapped slots whose copy the GPU has finished (no wait)
++void dk_drain_async() noexcept {
++  std::lock_guard lock{g_asyncMutex};
++  if (g_asyncMapsInFlight == 0) {
++    return;
++  }
++  for (auto& [dest, slot] : g_asyncSlots) {
++    if (slot.state != AsyncState::MapPending) {
++      continue;
++    }
++    const uint8_t* pixels = dk::readback_poll(slot.dkReadback.get());
++    if (pixels == nullptr) {
++      continue;  // (not written yet)
++    }
++    if (g_asyncMapsInFlight > 0) --g_asyncMapsInFlight;
++    // Writes guest RAM from the frame worker while the guest may be reading it (see complete_async_slot).
++    const size_t outputSize = encoded_size(slot.format, slot.width, slot.height);
++    if (!encode(slot.dest, outputSize, slot.format, slot.width, slot.height, pixels, slot.hostWidth, slot.hostHeight,
++                slot.bytesPerRow, slot.order)) {
++      Log.error("Failed to encode async EFB RAM copy format=0x{:x} size={}x{}", static_cast<unsigned>(slot.format),
++                slot.width, slot.height);
++    }
++    notify_guest_write(slot.dest, outputSize);
++    slot.state = AsyncState::Idle;
++  }
++}
++
++void dk_encode_async_downloads() noexcept {
++  dk_drain_async();
++  std::lock_guard lock{g_asyncMutex};
++  for (auto& pending : g_asyncSealed) {
++    const auto it = g_asyncSlots.find(pending.dest);
++    if (it == g_asyncSlots.end()) {
++      continue;
++    }
++    auto& slot = it->second;
++    if (slot.state != AsyncState::Idle) {
++      continue;
++    }
++    dk::readback_begin();
++    if (pending.nativeTexture) {
++      encode_native_blit(wgpu::CommandEncoder{}, pending);
++    }
++    const auto& texture = pending.nativeTexture ? pending.nativeTexture : pending.texture;
++    const uint32_t bytesPerRow = align_to(texture->size.width * 4, 256);
++    const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * texture->size.height;
++    if (!dk::readback_copy(texture->texture.Get(), bytesPerRow, slot.dkReadback)) {
++      continue;
++    }
++    slot.bufferSize = bufferSize;
++    slot.bytesPerRow = bytesPerRow;
++    slot.dest = pending.dest;
++    slot.format = pending.format;
++    slot.width = pending.width;
++    slot.height = pending.height;
++    slot.hostWidth = texture->size.width;
++    slot.hostHeight = texture->size.height;
++    slot.order = texture_pixel_order(texture);
++    slot.state = AsyncState::CopySubmitted;
++  }
++  dk::readback_end();
++  g_asyncSealed.clear();
++}
++
++void dk_after_submit() noexcept {
++  {
++    std::lock_guard lock{g_asyncMutex};
++    for (auto& [dest, slot] : g_asyncSlots) {
++      if (slot.state != AsyncState::CopySubmitted) {
++        continue;
++      }
++      slot.state = AsyncState::MapPending;
++      ++g_asyncMapsInFlight;
++    }
++  }
++  dk_drain_async();
++}
++#endif
++
+ } // namespace
+ 
+ void schedule(void* dest, uint32_t width, uint32_t height, GXTexFmt format, TextureHandle texture) noexcept {
+@@ -227,6 +382,11 @@ void schedule(void* dest, uint32_t width, uint32_t height, GXTexFmt format, Text
    }
  }
  
@@ -787,6 +2031,58 @@ index aabd5ca..8fa4ae3 100644
  bool has_pending(void* dest) noexcept {
    if (dest == nullptr) return !g_pending.empty() || !g_downloads.empty();
    return std::any_of(g_pending.begin(), g_pending.end(),
+@@ -256,6 +416,12 @@ void encode_downloads(const wgpu::CommandEncoder& encoder, void* dest) noexcept
+   if (!g_downloads.empty()) {
+     Log.fatal("Attempted to encode new EFB RAM downloads before completing the previous batch");
+   }
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    dk_encode_downloads(dest);
++    return;
++  }
++#endif
+ 
+   g_downloads.reserve(g_pending.size());
+   for (auto it = g_pending.begin(); it != g_pending.end();) {
+@@ -305,6 +471,12 @@ void encode_downloads(const wgpu::CommandEncoder& encoder, void* dest) noexcept
+ bool complete_downloads() noexcept {
+   bool success = true;
+   for (auto& download : g_downloads) {
++#ifdef AURORA_SWITCH_DEKO3D
++    if (dk::enabled()) {
++      success = dk_complete_download(download) && success;
++      continue;
++    }
++#endif
+     // WaitAny may time out before Dawn delivers cancellation. The callback must
+     // own its result rather than retaining references to this stack frame.
+     struct MapResult {
+@@ -384,6 +556,12 @@ void encode_async_downloads(const wgpu::CommandEncoder& encoder) noexcept {
+   if (g_asyncSealed.empty()) {
+     return;
+   }
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    dk_encode_async_downloads();
++    return;
++  }
++#endif
+   // Retire the previous frame's map first so its slot is free here, otherwise a single-slot
+   // destination could only be sampled every other frame.
+   drain_async_events();
+@@ -447,6 +625,12 @@ void encode_async_downloads(const wgpu::CommandEncoder& encoder) noexcept {
+ }
+ 
+ void after_submit() noexcept {
++#ifdef AURORA_SWITCH_DEKO3D
++  if (dk::enabled()) {
++    dk_after_submit();
++    return;
++  }
++#endif
+   struct PendingMap {
+     void* dest;
+     wgpu::Buffer buffer;
 diff --git a/aurora-main/lib/gfx/efb_ram_copy.hpp b/aurora-main/lib/gfx/efb_ram_copy.hpp
 index 3828d3c..9c595d7 100644
 --- a/aurora-main/lib/gfx/efb_ram_copy.hpp
@@ -1047,7 +2343,7 @@ index a9443c6..2aefcbe 100644
  
    else {
 diff --git a/aurora-main/lib/gx/fifo.cpp b/aurora-main/lib/gx/fifo.cpp
-index 9818084..319df6f 100644
+index 9818084..bd1b21a 100644
 --- a/aurora-main/lib/gx/fifo.cpp
 +++ b/aurora-main/lib/gx/fifo.cpp
 @@ -23,7 +23,21 @@ uint32_t sDlSize = 0;
@@ -1090,7 +2386,15 @@ index 9818084..319df6f 100644
    uint32_t needed = detail::sBufferSize + length;
    uint32_t newCap = std::max(detail::sBufferCapacity * 2, needed);
    detail::sBufferData = static_cast<uint8_t*>(realloc(detail::sBufferData, newCap));
-@@ -73,7 +95,32 @@ static void note_drain_wait(uint64_t nanos) noexcept {
+@@ -65,15 +87,38 @@ uint32_t end_display_list() {
+   return padded;
+ }
+ 
+-bool in_display_list() { return detail::sInDisplayList; }
+-
+ // How much of the producer's frame is spent blocked before it may decode the next batch of GX commands.
+ static void note_drain_wait(uint64_t nanos) noexcept {
+   ZoneScopedN("FIFO drain wait");
    TracyPlot("aurora: fifoDrainWaitUs", static_cast<int64_t>(nanos / 1000));
  }
  
@@ -1124,7 +2428,7 @@ index 9818084..319df6f 100644
    // SEALED, not DONE.
    const auto waited = aurora::wait_for_frame_worker_sealed();
    if (waited.count() > 0) UNLIKELY {
-@@ -82,6 +129,7 @@ void drain() {
+@@ -82,6 +127,7 @@ void drain() {
    if (detail::sBufferSize == 0) {
      return;
    }
@@ -1132,7 +2436,7 @@ index 9818084..319df6f 100644
    uint32_t consumed = 0;
    bool retried = false;
    while (consumed < detail::sBufferSize) {
-@@ -92,15 +140,19 @@ void drain() {
+@@ -92,15 +138,19 @@ void drain() {
      if (consumed == detail::sBufferSize) break;
      // process returned with its renderer lock released. No recursive drain.
      gfx::split_staging_batch();
@@ -1154,7 +2458,7 @@ index 9818084..319df6f 100644
 +
 +#include "fifo_async.inc"
 diff --git a/aurora-main/lib/gx/fifo.hpp b/aurora-main/lib/gx/fifo.hpp
-index b01ea45..5cd0a23 100644
+index b01ea45..e07a35d 100644
 --- a/aurora-main/lib/gx/fifo.hpp
 +++ b/aurora-main/lib/gx/fifo.hpp
 @@ -16,6 +16,18 @@ extern uint32_t sDlSize;
@@ -1176,7 +2480,14 @@ index b01ea45..5cd0a23 100644
  void init();
  
  // Out-of-line slow path: grows internal buffer then appends data
-@@ -81,6 +93,92 @@ bool in_display_list();
+@@ -76,11 +88,98 @@ inline void write_f32(const float val) {
+ // Display list recording
+ void begin_display_list(uint8_t* buf, uint32_t size);
+ uint32_t end_display_list();
+-bool in_display_list();
++// Inline: GXSetVtxDesc/GXSetVtxAttrFmt ask twice per call, thousands of times a frame.
++inline bool in_display_list() { return detail::sInDisplayList; }
+ 
  // Drain the internal FIFO buffer through the command processor
  void drain();
  
@@ -1271,10 +2582,10 @@ index b01ea45..5cd0a23 100644
  uint32_t get_buffer_size();
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 new file mode 100644
-index 0000000..8532dd9
+index 0000000..f1b5000
 --- /dev/null
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -0,0 +1,1003 @@
+@@ -0,0 +1,1041 @@
 +// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
 +// at the end of fifo.cpp.
 +//
@@ -1330,8 +2641,16 @@ index 0000000..8532dd9
 +
 +Mode resolve_mode() noexcept {
 +  const char* env = std::getenv("WIICOMPILED_GX_FIFO");
++#if defined(__SWITCH__)
++  // Measured on the console: same frames, 43.8 -> 58 fps in the match benchmark.
++  Mode mode = Mode::Thread;
++  if (env != nullptr && std::strcmp(env, "sync") == 0) {
++    mode = Mode::Sync;
++  } else if (env != nullptr && std::strcmp(env, "deferred") == 0) {
++#else
 +  Mode mode = Mode::Sync;
 +  if (env != nullptr && std::strcmp(env, "deferred") == 0) {
++#endif
 +    mode = Mode::Deferred;
 +  } else if (env != nullptr && std::strcmp(env, "thread") == 0) {
 +    mode = Mode::Thread;
@@ -1479,15 +2798,18 @@ index 0000000..8532dd9
 +constexpr uint32_t kProbeSlots = 64;
 +
 +// Shared with the worker; never destroyed, since the worker may still sleep on it at exit.
++// One cache line per writer: `pushed` (producer, read by the spinning worker) and `processed`
++// (worker, after every segment) used to share a line with each other and with the sleep flags, so
++// each producer publish and each kick missed on a line the worker had just written.
 +struct Shared {
-+  std::mutex mutex;
++  alignas(64) std::atomic<uint64_t> pushed{0};
++  alignas(64) std::atomic<uint64_t> processed{0};
++  alignas(64) std::atomic<bool> workerSleeping{false};
++  alignas(64) std::atomic<bool> mainWaiting{false};
++  alignas(64) std::mutex mutex;
 +  std::condition_variable workerCv;
 +  std::condition_variable mainCv;
-+  std::atomic<uint64_t> pushed{0};
-+  std::atomic<uint64_t> processed{0};
-+  std::atomic<bool> workerSleeping{false};
-+  std::atomic<bool> mainWaiting{false};
-+  Segment ring[kRingSize];
++  alignas(64) Segment ring[kRingSize];
 +};
 +
 +constexpr uint32_t kMainCapacity = 8u << 20;
@@ -1513,7 +2835,9 @@ index 0000000..8532dd9
 +uint32_t sSideOpen = 0;             // [sSideOpen, sSideSize): records not in a segment yet
 +uint32_t sLastRecord = UINT32_MAX;  // the newest open record, which a like record may extend
 +uint32_t sMainPublished = 0;        // detail::sBufferData[0, sMainPublished) is in segments
-+uint64_t sPushed = 0;               // the producer's copy of Shared::pushed
++uint64_t sPushed = 0;               // segments in the ring; Shared::pushed lags until publish_pushed
++uint64_t sPublished = 0;            // the last value stored to Shared::pushed
++uint64_t sProcessedSeen = 0;        // a Shared::processed value read earlier (never ahead of it)
 +uint32_t sKickDraws = 0;
 +uint32_t sKickBytes = 0;
 +uint32_t sVtxProbes = 0;            // bit 8: VCD probed; bits 0-7: VAT formats probed (since the last flush)
@@ -1794,12 +3118,31 @@ index 0000000..8532dd9
 +
 +// ---- Producer --------------------------------------------------------------------------------------
 +
++// Hands the segments pushed so far to the worker: one release store per producer call (a draw, a
++// display list...) instead of one per segment. Every path that pushes ends in kick() or waits.
++void publish_pushed() {
++  if (sPublished != sPushed) {
++    sPublished = sPushed;
++    sShared->pushed.store(sPushed, std::memory_order_release);
++  }
++}
++
 +void kick(bool urgent) {
 +  if (mode() != Mode::Thread) {
 +    return;
 +  }
++  publish_pushed();
 +  Shared& shared = *sShared;
-+  if (!shared.workerSleeping.load(std::memory_order_seq_cst)) {
++  if (urgent) {
++    // The worker stores workerSleeping, then loads pushed (both seq_cst, under the mutex). With
++    // this fence between our pushed store and workerSleeping load, either we see it asleep and
++    // wake it, or it sees the new segments and does not sleep.
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++  }
++  // Not urgent: a plain load. Missing a worker that is falling asleep right now only delays its
++  // wake to a later kick, as the draw/byte thresholds below already do on purpose; every wait
++  // (drain, quiesce, full ring) kicks urgently.
++  if (!shared.workerSleeping.load(std::memory_order_relaxed)) {
 +    // Awake (spinning or decoding): it will see the new segments on its own.
 +    sKickDraws = 0;
 +    sKickBytes = 0;
@@ -1839,6 +3182,7 @@ index 0000000..8532dd9
 +    run_inline_until(target);
 +    return;
 +  }
++  // (Unpublished segments are never processed, so a target among them falls through to kick.)
 +  if (shared.processed.load(std::memory_order_acquire) >= target) {
 +    return;
 +  }
@@ -1875,12 +3219,17 @@ index 0000000..8532dd9
 +
 +void push_segment(uint32_t begin, uint32_t end, uint8_t source) {
 +  Shared& shared = *sShared;
-+  if (sPushed - shared.processed.load(std::memory_order_acquire) >= kRingSize) UNLIKELY {
-+    wait_processed(sPushed - kRingSize + 1);
++  // Slot sPushed is free once segment sPushed - kRingSize is processed. sProcessedSeen trails the
++  // worker, so this reads its cache line only when the ring may be full, not once per segment.
++  if (sPushed - sProcessedSeen >= kRingSize) UNLIKELY {
++    sProcessedSeen = shared.processed.load(std::memory_order_acquire);
++    if (sPushed - sProcessedSeen >= kRingSize) {
++      wait_processed(sPushed - kRingSize + 1);
++      sProcessedSeen = shared.processed.load(std::memory_order_acquire);
++    }
 +  }
 +  shared.ring[sPushed % kRingSize] = Segment{begin, end, source};
-+  ++sPushed;
-+  shared.pushed.store(sPushed, std::memory_order_seq_cst);
++  ++sPushed; // published by publish_pushed (kick, or the wait of whoever pushed)
 +  ++sStats.segments;
 +  sStats.bytes += end - begin;
 +  sKickBytes += end - begin;
@@ -2278,8 +3627,326 @@ index 0000000..8532dd9
 +      delta(now.copiesInline, base.copiesInline) / frames);
 +  return n < 0 ? 0 : std::min(n, size - 1);
 +}
+diff --git a/aurora-main/lib/gx/gx.cpp b/aurora-main/lib/gx/gx.cpp
+index 563fd06..619aa25 100644
+--- a/aurora-main/lib/gx/gx.cpp
++++ b/aurora-main/lib/gx/gx.cpp
+@@ -1659,6 +1659,23 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
+   return g_device.CreateRenderPipeline(&descriptor);
+ }
+ 
++#ifdef AURORA_SWITCH_DEKO3D
++PipelineStateDesc pipeline_state_desc(const PipelineConfig& config) noexcept {
++  // build_pipeline's values, as it hands them to Dawn
++  PipelineStateDesc desc;
++  desc.depthStencil = wgpu::DepthStencilState{
++      .format = g_graphicsConfig.depthFormat,
++      .depthWriteEnabled = config.depthUpdate,
++      .depthCompare = config.depthCompare ? to_compare_function(config.depthFunc) : wgpu::CompareFunction::Always,
++  };
++  desc.blend = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
++                              config.pixelFmt, config.dstAlpha);
++  desc.writeMask = to_write_mask(config.colorUpdate, config.alphaUpdate);
++  desc.primitive = to_primitive_state(config.cullMode);
++  return desc;
++}
++#endif
++
+ u8 comp_type_size(GXAttr attr, GXCompType type) noexcept {
+   switch (attr) {
+   case GX_VA_PNMTXIDX:
+diff --git a/aurora-main/lib/gx/pipeline.cpp b/aurora-main/lib/gx/pipeline.cpp
+index 9b1571e..cb97b88 100644
+--- a/aurora-main/lib/gx/pipeline.cpp
++++ b/aurora-main/lib/gx/pipeline.cpp
+@@ -4,6 +4,9 @@
+ #include "gx_fmt.hpp"
+ #include "shader_info.hpp"
+ #include "tracy/Tracy.hpp"
++#ifdef AURORA_SWITCH_DEKO3D
++#include "dk_gfx.hpp"  // the deko3d renderer (tools/switch/deko)
++#endif
+ 
+ #include <condition_variable>
+ #include <memory>
+@@ -56,6 +59,12 @@ wgpu::ShaderModule cached_shader_module(const ShaderConfig& config) {
+ 
+ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+   ZoneScoped;
++#ifdef AURORA_SWITCH_DEKO3D
++  if (gfx::dk::enabled()) {
++    gfx::dk::create_gx_pipeline(config);  // (no Dawn pipeline: the deko3d one is found by its PipelineRef)
++    return {};
++  }
++#endif
+   const auto shader = cached_shader_module(config.shaderConfig);
+   return build_pipeline(config, {}, shader, "GX Pipeline");
+ }
+diff --git a/aurora-main/lib/gx/pipeline.hpp b/aurora-main/lib/gx/pipeline.hpp
+index a6752b8..aaf93b1 100644
+--- a/aurora-main/lib/gx/pipeline.hpp
++++ b/aurora-main/lib/gx/pipeline.hpp
+@@ -62,6 +62,18 @@ inline bool valid_pipeline_config(const PipelineConfig& config) noexcept {
+ }
+ 
+ wgpu::RenderPipeline create_pipeline([[maybe_unused]] const PipelineConfig& config);
++#ifdef AURORA_SWITCH_DEKO3D
++// The deko3d renderer (tools/switch/deko): build_pipeline's fixed state for a config, the values it gives
++// Dawn, without a WebGPU pipeline (gx.cpp), and a module's WGSL without a WebGPU module (shader.cpp).
++struct PipelineStateDesc {
++  wgpu::DepthStencilState depthStencil;
++  wgpu::BlendState blend;
++  wgpu::ColorWriteMask writeMask = wgpu::ColorWriteMask::All;
++  wgpu::PrimitiveState primitive;
++};
++PipelineStateDesc pipeline_state_desc(const PipelineConfig& config) noexcept;
++std::string build_shader_source(const ShaderConfig& config) noexcept;
++#endif
+ void clear_shader_module_cache();
+ 
+ // Per-pass encoder state carried across the draws of one render pass, so the replay loop can elide Dawn calls that would re-bind what is already bound.
+diff --git a/aurora-main/lib/gx/shader.cpp b/aurora-main/lib/gx/shader.cpp
+index 5bbdc4d..01751c6 100644
+--- a/aurora-main/lib/gx/shader.cpp
++++ b/aurora-main/lib/gx/shader.cpp
+@@ -892,9 +892,15 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8
+                      outputValue);
+ }
+ 
++#ifdef AURORA_SWITCH_DEKO3D
++// The WGSL alone: the deko3d renderer's shader cache key and Tint's input (tools/switch/deko)
++std::string build_shader_source(const ShaderConfig& config) noexcept {
++  ZoneScoped;
++#else
+ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
+   ZoneScoped;
+   const auto hash = xxh3_hash(config);
++#endif
+   const auto info = build_shader_info(config);
+ 
+   std::string uniformPre;
+@@ -2081,6 +2087,15 @@ fn fs_main(in: VertexOutput) -> {9} {{{6}{5}
+                                         uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
+                                         fragmentFnPre, vtxXfrAttrsPre, uniformPre, fragmentReturnType,
+                                         fragmentReturn);
++#ifdef AURORA_SWITCH_DEKO3D
++  return shaderSource;
++}
++
++wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
++  ZoneScoped;
++  const auto hash = xxh3_hash(config);
++  const auto shaderSource = build_shader_source(config);
++#endif
+   wgpu::ShaderSourceWGSL wgslDescriptor{};
+   wgslDescriptor.code = shaderSource.c_str();
+   const auto label = fmt::format("GX Shader {:x}", hash);
+diff --git a/aurora-main/lib/imgui.cpp b/aurora-main/lib/imgui.cpp
+index d1bbead..0416fc8 100644
+--- a/aurora-main/lib/imgui.cpp
++++ b/aurora-main/lib/imgui.cpp
+@@ -16,6 +16,9 @@
+ #include "window.hpp"
+ 
+ #define IMGUI_IMPL_WEBGPU_BACKEND_DAWN
++#ifdef AURORA_SWITCH_DEKO3D
++#include "dk_gfx.hpp"  // the deko3d renderer draws ImGui (tools/switch/deko/core/overlay.cpp)
++#endif
+ #include "backends/imgui_impl_sdl3.h"
+ #include "backends/imgui_impl_sdlrenderer3.h"
+ #include "backends/imgui_impl_wgpu.h"
+@@ -66,6 +69,14 @@ void initialize() noexcept {
+   if (g_useSdlRenderer) {
+     ImGui_ImplSDLRenderer3_Init(renderer);
+   } else {
++#ifdef AURORA_SWITCH_DEKO3D
++    if (gfx::dk::enabled()) {
++      ImGuiIO& io = ImGui::GetIO();
++      io.BackendRendererName = "aurora_deko3d";
++      io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
++      return;
++    }
++#endif
+     ImGui_ImplWGPU_InitInfo info;
+     info.Device = webgpu::g_device.Get();
+     info.RenderTargetFormat = static_cast<WGPUTextureFormat>(webgpu::g_graphicsConfig.surfaceConfiguration.format);
+@@ -167,6 +178,21 @@ void new_frame(const AuroraWindowSize& size) noexcept {
+     ImGui_ImplSDLRenderer3_NewFrame();
+     g_scale = size.scale;
+   } else {
++#ifdef AURORA_SWITCH_DEKO3D
++    if (gfx::dk::enabled()) {
++      // the font atlas (again after a scale change) as one RGBA8 texture for deko3d
++      ImFontAtlas* fonts = ImGui::GetIO().Fonts;
++      if (g_scale != size.scale || !fonts->IsBuilt() || fonts->TexID == ImTextureID{}) {
++        g_scale = size.scale;
++        unsigned char* pixels = nullptr;
++        int width = 0;
++        int height = 0;
++        fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
++        fonts->SetTexID(static_cast<ImTextureID>(
++            gfx::dk::imgui_texture(static_cast<uint32_t>(width), static_cast<uint32_t>(height), pixels)));
++      }
++    } else {
++#endif
+     if (g_scale != size.scale) {
+       if (g_scale > 0.f) {
+         ImGui_ImplWGPU_CreateDeviceObjects();
+@@ -177,6 +203,9 @@ void new_frame(const AuroraWindowSize& size) noexcept {
+       ImGui_ImplWGPU_CreateDeviceObjects();
+     }
+     ImGui_ImplWGPU_NewFrame();
++#ifdef AURORA_SWITCH_DEKO3D
++    }
++#endif
+   }
+   ImGui_ImplSDL3_NewFrame();
+ 
+@@ -216,6 +245,11 @@ void render(const wgpu::RenderPassEncoder& pass) noexcept {
+ }
+ 
+ ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) noexcept {
++#ifdef AURORA_SWITCH_DEKO3D
++  if (gfx::dk::enabled()) {
++    return static_cast<ImTextureID>(gfx::dk::imgui_texture(width, height, data));
++  }
++#endif
+   if (SDL_Renderer* renderer = window::get_sdl_renderer()) {
+     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, width, height);
+     SDL_UpdateTexture(texture, nullptr, data, width * 4);
+diff --git a/aurora-main/lib/webgpu/gpu.cpp b/aurora-main/lib/webgpu/gpu.cpp
+index e050749..b2fe473 100644
+--- a/aurora-main/lib/webgpu/gpu.cpp
++++ b/aurora-main/lib/webgpu/gpu.cpp
+@@ -22,6 +22,9 @@
+ #include "../internal.hpp"
+ #include "../window.hpp"
+ #include "../dolphin/vi/vi_internal.hpp"
++#ifdef AURORA_SWITCH_DEKO3D
++#include "dk_gfx.hpp"  // the deko3d renderer (tools/switch/deko)
++#endif
+ 
+ #if defined(WEBGPU_DAWN) && !defined(__MINGW32__)
+ #include "../dawn/BackendBinding.hpp"
+@@ -498,6 +501,11 @@ static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
+ }
+ 
+ static bool create_surface(wgpu::BackendType backend) {
++#ifdef AURORA_SWITCH_DEKO3D
++  if (gfx::dk::enabled()) {
++    return true;  // no WebGPU surface: deko3d presents to the default NWindow
++  }
++#endif
+   SDL_Window* window = window::get_sdl_window();
+   if (window == nullptr) {
+     Log.error("Failed to create surface: no window");
+@@ -545,7 +553,13 @@ bool initialize(AuroraBackend auroraBackend) {
+       return false;
+     }
+   }
++#ifdef AURORA_SWITCH_DEKO3D
++  // deko3d draws; Dawn's Null device keeps Aurora's object model without GPU work
++  const wgpu::BackendType backend =
++      gfx::dk::enabled() ? wgpu::BackendType::Null : to_wgpu_backend(auroraBackend);
++#else
+   const wgpu::BackendType backend = to_wgpu_backend(auroraBackend);
++#endif
+   Log.info("Attempting to initialize {}", magic_enum::enum_name(backend));
+   // One call is one backend attempt. aurora::initialize() retries without calling shutdown(), so a
+   // leftover adapter would pass the `if (!g_adapter)` guard and mismatch adapter with device.
+@@ -629,8 +643,14 @@ bool initialize(AuroraBackend auroraBackend) {
+         .maxStorageBuffersPerShaderStage = supportedLimits.maxStorageBuffersPerShaderStage == 0
+                                                ? WGPU_LIMIT_U32_UNDEFINED
+                                                : supportedLimits.maxStorageBuffersPerShaderStage,
++#ifdef AURORA_SWITCH_DEKO3D
++        // deko3d binds uniform buffers at 256-byte addresses (DK_UNIFORM_BUF_ALIGNMENT)
++        .minUniformBufferOffsetAlignment = std::max<uint32_t>(supportedLimits.minUniformBufferOffsetAlignment,
++                                                              gfx::dk::enabled() ? 256u : 64u),
++#else
+         .minUniformBufferOffsetAlignment =
+             supportedLimits.minUniformBufferOffsetAlignment < 64 ? 64 : supportedLimits.minUniformBufferOffsetAlignment,
++#endif
+         .minStorageBufferOffsetAlignment =
+             supportedLimits.minStorageBufferOffsetAlignment < 16 ? 16 : supportedLimits.minStorageBufferOffsetAlignment,
+     };
+@@ -822,6 +842,13 @@ bool initialize(AuroraBackend auroraBackend) {
+   }
+   g_queue = g_device.GetQueue();
+ 
++#ifdef AURORA_SWITCH_DEKO3D
++  auto surfaceFormat = wgpu::TextureFormat::RGBA8Unorm;  // deko3d's swapchain images
++  auto presentMode = wgpu::PresentMode::Fifo;
++  if (gfx::dk::enabled()) {
++    gfx::dk::initialize();  // before the first texture: every Dawn object gets its deko3d shadow
++  } else {
++#endif
+   const wgpu::Status status = g_surface.GetCapabilities(g_adapter, &g_surfaceCapabilities);
+   if (status != wgpu::Status::Success) {
+     Log.error("Failed to get surface capabilities: {}", magic_enum::enum_name(status));
+@@ -835,8 +862,14 @@ bool initialize(AuroraBackend auroraBackend) {
+     Log.error("Surface has no present modes");
+     return false;
+   }
++#ifdef AURORA_SWITCH_DEKO3D
++  surfaceFormat = best_surface_format();
++  presentMode = best_present_mode();
++  }
++#else
+   auto surfaceFormat = best_surface_format();
+   auto presentMode = best_present_mode();
++#endif
+   Log.info("Using surface format {}, present mode {}", magic_enum::enum_name(surfaceFormat),
+            magic_enum::enum_name(presentMode));
+   const auto size = window::get_window_size();
+@@ -851,7 +884,11 @@ bool initialize(AuroraBackend auroraBackend) {
+               .presentMode = presentMode,
+           },
+       .depthFormat = wgpu::TextureFormat::Depth32Float,
++#ifdef AURORA_SWITCH_DEKO3D
++      .msaaSamples = gfx::dk::enabled() ? 1u : g_config.msaa,  // (deko3d: MSAA is workstream C's)
++#else
+       .msaaSamples = g_config.msaa,
++#endif
+       .textureAnisotropy = g_config.maxTextureAnisotropy,
+       .maxTextureDimension2D = maxTextureDimension2D,
+   };
+@@ -905,6 +942,9 @@ void serialize_pipeline_caches() noexcept {
+ }
+ 
+ void shutdown() {
++#ifdef AURORA_SWITCH_DEKO3D
++  gfx::dk::shutdown();
++#endif
+   serialize_pipeline_caches();
+   g_initialized.store(false, std::memory_order_release);
+   g_CopyBindGroupLayout = {};
+@@ -964,7 +1004,12 @@ bool refresh_surface(bool recreate) {
+ }
+ 
+ void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height, bool force) {
+-  if (!g_surface || !g_device || width == 0 || height == 0 || native_height == 0 || native_width == 0) {
++#ifdef AURORA_SWITCH_DEKO3D
++  const bool dkSurface = gfx::dk::enabled();  // (deko3d's swapchain: no WebGPU surface to configure)
++#else
++  constexpr bool dkSurface = false;
++#endif
++  if ((!g_surface && !dkSurface) || !g_device || width == 0 || height == 0 || native_height == 0 || native_width == 0) {
+     return;
+   }
+ 
+@@ -1004,7 +1049,9 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, ui
+   g_graphicsConfig.surfaceConfiguration.height = native_height;
+   auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
+   surfaceConfiguration.device = g_device;
+-  g_surface.Configure(&surfaceConfiguration);
++  if (!dkSurface) {
++    g_surface.Configure(&surfaceConfiguration);
++  }
+   if (!sizeChanged) {
+     // Forced reconfigure at an unchanged size (present-mode change or recreated surface). The
+     // offscreen targets are not swapchain images, so reallocating them would only stall the frame.
 diff --git a/aurora-main/lib/window.cpp b/aurora-main/lib/window.cpp
-index c73ad5e..a531866 100644
+index c73ad5e..08482bd 100644
 --- a/aurora-main/lib/window.cpp
 +++ b/aurora-main/lib/window.cpp
 @@ -376,7 +376,7 @@ bool create_window(AuroraBackend backend) {
@@ -2302,8 +3969,21 @@ index c73ad5e..a531866 100644
  
    const Sint32 posX = g_config.hasWindowPosition ? g_config.windowPosX : SDL_WINDOWPOS_CENTERED;
    const Sint32 posY = g_config.hasWindowPosition ? g_config.windowPosY : SDL_WINDOWPOS_CENTERED;
+@@ -492,6 +496,12 @@ bool initialize() {
+       SDL_HINT_SCREENSAVER_INHIBIT_ACTIVITY_NAME, SDL_GetError());
+   TRY(SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE_RUMBLE_BRAKE, "1"), "Error setting {}: {}",
+       SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE_RUMBLE_BRAKE, SDL_GetError());
++#if defined(__SWITCH__)
++  // SDL validates every object handle through a hash table under an rwlock, and newlib's rwlock unlock
++  // broadcasts its condvar (a kernel call) every time: ~3.4% of the main thread in a match from the
++  // gamepad polling. "1" keeps only the NULL checks (aurora drops closed controllers from its map).
++  SDL_SetHint(SDL_HINT_INVALID_PARAM_CHECKS, "1");
++#endif
+ 
+   TRY(SDL_DisableScreenSaver(), "Error disabling screensaver: {}", SDL_GetError());
+   if (g_config.allowJoystickBackgroundEvents) {
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index 0063653..021a6a4 100644
+index 0063653..6a6a9c3 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
 @@ -10,8 +10,9 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
@@ -2380,16 +4060,24 @@ index 0063653..021a6a4 100644
      endif()
  endif()
  
-@@ -215,7 +244,7 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
+@@ -215,7 +244,15 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
      COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS}")
  # Match the optimization policy of the translated callers as well as their FP policy.
  set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp" APPEND PROPERTY
 -    COMPILE_OPTIONS -O2 -fno-slp-vectorize)
 +    COMPILE_OPTIONS -O2 ${MKW_NO_SLP_VECTORIZE})
++if(MKW_PLATFORM_SWITCH)
++    # MLB's paired-single natives (hle/mlb/mtx_natives.cpp) share the translation's psq/ps helpers
++    # and must compute exactly what they compute there: the translated shards' FP policy and -O2.
++    set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/hle/mlb/mtx_natives.cpp" PROPERTIES
++        SKIP_UNITY_BUILD_INCLUSION ON
++        SKIP_PRECOMPILE_HEADERS ON
++        COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS};-O2")
++endif()
  
  # ----------------------------------------------------------------------
  # Third-party: aurora-main (provides SDL3 + GPU backends)
-@@ -278,7 +307,10 @@ else()
+@@ -278,7 +315,44 @@ else()
      set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
      # Isolate aurora build products to a subdirectory under the main build dir.
      add_subdirectory(${MKW_AURORA_DIR} ${CMAKE_BINARY_DIR}/aurora-build EXCLUDE_FROM_ALL)
@@ -2398,10 +4086,44 @@ index 0063653..021a6a4 100644
 +    if(MKW_PLATFORM_SWITCH)
 +        target_compile_definitions(imgui PRIVATE IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
 +    endif()
++    # The deko3d renderer (tools/switch/deko), built when tools/switch/build-nro.sh passes its directory;
++    # mlb::deko (deko3d, uamlib and Tint's GLSL writer: DekoConfig.cmake there) is workstream A's.
++    set(MLB_SWITCH_DEKO_DIR "" CACHE PATH "tools/switch/deko: the Switch deko3d renderer (empty: not built)")
++    if(MKW_PLATFORM_SWITCH AND MLB_SWITCH_DEKO_DIR)
++        set(_dk "${MLB_SWITCH_DEKO_DIR}")
++        if(NOT TARGET mlb::deko)
++            include("${_dk}/DekoConfig.cmake")
++        endif()
++        add_library(aurora_switch_deko STATIC
++            "${_dk}/core/device.cpp" "${_dk}/core/memory.cpp" "${_dk}/core/descriptors.cpp"
++            "${_dk}/core/dksh_file.cpp" "${_dk}/core/shaders.cpp" "${_dk}/core/shader_translate.cpp"
++            "${_dk}/core/fixed_shaders.cpp" "${_dk}/core/overlay.cpp"
++            "${_dk}/aurora/dk_objects.cpp" "${_dk}/aurora/dk_pipeline.cpp" "${_dk}/aurora/dk_encode.cpp"
++            "${_dk}/aurora/dk_present.cpp" "${_dk}/aurora/dk_copy_conv.cpp" "${_dk}/aurora/dk_depth_peek.cpp"
++            "${_dk}/aurora/dk_efb_ram.cpp")
++        set_target_properties(aurora_switch_deko PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON UNITY_BUILD OFF)
++        target_include_directories(aurora_switch_deko PRIVATE "${_dk}/core" "${_dk}/aurora" "${MKW_AURORA_DIR}/lib")
++        target_compile_definitions(aurora_switch_deko PRIVATE NOMINMAX AURORA_SWITCH_DEKO3D=1)
++        target_compile_options(aurora_switch_deko PRIVATE -O2 -pipe)
++        # (static libraries in a cycle: CMake repeats them on the link line)
++        target_link_libraries(aurora_switch_deko PRIVATE aurora::gx aurora::core dawn::webgpu_dawn
++            absl::flat_hash_map absl::btree TracyClient mlb::deko)
++        foreach(_fn wgpuDeviceCreateTexture wgpuTextureAddRef wgpuTextureRelease wgpuTextureCreateView
++                wgpuTextureViewAddRef wgpuTextureViewRelease wgpuDeviceCreateSampler wgpuSamplerAddRef
++                wgpuSamplerRelease wgpuDeviceCreateBindGroup wgpuBindGroupAddRef wgpuBindGroupRelease
++                wgpuQueueWriteTexture)
++            target_link_options(aurora_switch_deko INTERFACE "LINKER:--wrap=${_fn}")
++        endforeach()
++        target_link_libraries(aurora_core PUBLIC aurora_switch_deko)
++        foreach(_t aurora_core aurora_gx)
++            target_compile_definitions(${_t} PRIVATE AURORA_SWITCH_DEKO3D=1)
++            target_include_directories(${_t} PRIVATE "${_dk}/aurora")
++        endforeach()
++    endif()
  
      # Keep upstream Aurora split: several sources intentionally use file-local
      # names that collide under this repo's aggressive unity build settings.
-@@ -381,7 +413,7 @@ if(MKW_BUILD_PSQ_TESTS)
+@@ -381,7 +455,7 @@ if(MKW_BUILD_PSQ_TESTS)
          "${CMAKE_CURRENT_LIST_DIR}/include")
      target_compile_features(mkw_psq_helpers_tests PRIVATE cxx_std_17)
      target_compile_options(mkw_psq_helpers_tests PRIVATE
@@ -2478,10 +4200,22 @@ index 251c83a..08be853 100644
      "${MKW_RUNTIME_SOURCE_DIR}/include/mkw_pch.h")
  if(TARGET mkw_base_sensitive)
 diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
-index 6b76fa6..1b2520b 100644
+index 6b76fa6..4de26b3 100644
 --- a/runtime/include/abi_bridge.h
 +++ b/runtime/include/abi_bridge.h
-@@ -297,6 +297,17 @@ struct KnownTypedNativeCpuCall {
+@@ -18,7 +18,11 @@
+ #include <tuple>
+ #include <type_traits>
+ 
++#if defined(__SWITCH__)
++__attribute__((noinline)) inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx);
++#else
+ inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx);
++#endif
+ 
+ // Some game-facing runtime options alter arguments at well-defined ABI
+ // boundaries. Keep this independent of the dispatch mechanism: generated
+@@ -297,6 +301,17 @@ struct KnownTypedNativeCpuCall {
      static constexpr bool kAvailable = false;
  };
  
@@ -2499,7 +4233,73 @@ index 6b76fa6..1b2520b 100644
  #include "native_cpu_calls.inc"
  
  // Direct-mapped thread-local memo in front of the sorted registry lookup every bctrl performs;
-@@ -545,6 +556,12 @@ inline void InvokeDirectCpu(CpuContext* ctx) {
+@@ -312,16 +327,36 @@ struct IndirectResolvedDispatchMemoEntry {
+     uint32_t address;
+     const TranslatedFunctionInfo* info;
+ };
++#if defined(__SWITCH__)
++// Same thread_locals, reached without the __aarch64_read_tp call (ppc_isa_context.h); defined
++// in abi_bridge.cpp.
++extern thread_local IndirectResolvedDispatchMemoEntry
++    g_indirectResolvedDispatchMemo[kIndirectDispatchCacheEntries];
++MKW_SWITCH_TLS_ADDRESS_FN(MkwIndirectResolvedDispatchMemo, IndirectResolvedDispatchMemoEntry,
++                          g_indirectResolvedDispatchMemo)
++#else
+ inline thread_local IndirectResolvedDispatchMemoEntry
+     g_indirectResolvedDispatchMemo[kIndirectDispatchCacheEntries]{};
++#endif
+ 
+ struct IndirectRawDispatchMemoEntry {
+     bool valid;
+     uint32_t address;
+     const RawDispatchRecord* record;
+ };
++#if defined(__SWITCH__)
++extern thread_local IndirectRawDispatchMemoEntry
++    g_indirectRawDispatchMemo[kIndirectDispatchCacheEntries];
++MKW_SWITCH_TLS_ADDRESS_FN(MkwIndirectRawDispatchMemo, IndirectRawDispatchMemoEntry,
++                          g_indirectRawDispatchMemo)
++#define MKW_INDIRECT_RESOLVED_DISPATCH_MEMO (MkwIndirectResolvedDispatchMemo())
++#define MKW_INDIRECT_RAW_DISPATCH_MEMO (MkwIndirectRawDispatchMemo())
++#else
+ inline thread_local IndirectRawDispatchMemoEntry
+     g_indirectRawDispatchMemo[kIndirectDispatchCacheEntries]{};
++#define MKW_INDIRECT_RESOLVED_DISPATCH_MEMO g_indirectResolvedDispatchMemo
++#define MKW_INDIRECT_RAW_DISPATCH_MEMO g_indirectRawDispatchMemo
++#endif
+ 
+ class TranslatedFunctionRegistry {
+ public:
+@@ -336,7 +371,7 @@ public:
+             return FindByAddressPtrSlow(address);
+         }
+ 
+-        auto& cached = g_indirectResolvedDispatchMemo[
++        auto& cached = MKW_INDIRECT_RESOLVED_DISPATCH_MEMO[
+             ((address >> 2) * 2654435761u) & (kIndirectDispatchCacheEntries - 1)];
+         if (cached.valid && cached.address == address) {
+             return cached.info;
+@@ -356,7 +391,7 @@ public:
+             return nullptr;
+         }
+ 
+-        auto& cached = g_indirectRawDispatchMemo[
++        auto& cached = MKW_INDIRECT_RAW_DISPATCH_MEMO[
+             ((address >> 2) * 2654435761u) & (kIndirectDispatchCacheEntries - 1)];
+         if (cached.valid && cached.address == address) {
+             return cached.record;
+@@ -367,6 +402,10 @@ public:
+     // Look up a registered function by host (native) address.
+     // This enables stack trace symbolication for translated functions.
+     static std::optional<TranslatedFunctionInfo> FindByHostAddress(uintptr_t hostAddr);
++#if defined(__SWITCH__)
++    // What FindRawByAddressPtr returns, without the memo (WIICOMPILED_DISPATCH_CHECK).
++    static const RawDispatchRecord* FindRawByAddressPtrUncached(uint32_t address);
++#endif
+ 
+ private:
+     // Memo miss: resolve against the header-inline generated table first; only dynamically
+@@ -545,6 +584,12 @@ inline void InvokeDirectCpu(CpuContext* ctx) {
      static_assert(Target != 0, "InvokeDirectCpu cannot target address 0");
      CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
      ApplyRuntimeCallOptions(Target, cpu);
@@ -2512,6 +4312,65 @@ index 6b76fa6..1b2520b 100644
      if constexpr (KnownNativeCpuCall<Target>::kAvailable) {
          const auto invokeKnownNative = [&]() {
              PpcNonvolatileGprGuard gprGuard(cpu);
+@@ -636,6 +681,50 @@ inline void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
+     std::exit(EXIT_FAILURE);
+ }
+ 
++#if defined(__SWITCH__)
++// WIICOMPILED_DISPATCH_CHECK=1 (read by TranslatedFunctionRegistry::Finalize): every fast-path
++// indirect call below also resolves its target through the uncached lookup and reads the
++// current context through the compiler's own TLS access, and logs any difference
++// (abi_bridge.cpp).
++inline bool g_switchDispatchCheck = false;
++void SwitchDispatchCheck(uint32_t target, const RawDispatchRecord* record, const CpuContext* cpu) noexcept;
++
++// Everything InvokeIndirectCpu does after ApplyRuntimeCallOptions, unchanged.
++inline MKW_PPC_NO_INLINE void InvokeIndirectCpuGeneral(uint32_t target, CpuContext* cpu) {
++    if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {
++        return;
++    }
++    if (TryDispatchResolvedCpuTarget(TranslatedFunctionRegistry::FindByAddressPtr(target), cpu)) {
++        return;
++    }
++    ReportMissingCpuTarget(target, cpu);
++}
++
++// Every bctrl of the translated code lands here. 97% of the generated indirect targets write no
++// nonvolatile FPR (mask 0) and none preserves GPRs, and the caller already runs in this context:
++// for those TryDispatchRawCpuTarget's guards do nothing and the context scope is not taken, so
++// the call is made straight, in a small frame. Anything else (a native, a guarded mask, another
++// context, a registry miss, before Finalize) takes the unchanged path, whose repeated memo lookup
++// returns the same record.
++inline MKW_PPC_NO_INLINE void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
++    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
++    if (target == 0) {
++        ReportMissingCpuTarget(target, cpu);
++    }
++    ApplyRuntimeCallOptions(target, cpu);
++    const RawDispatchRecord* record = TranslatedFunctionRegistry::FindRawByAddressPtr(target);
++    if (record != nullptr && record->entry != nullptr && record->nonvolatileFprWriteMask == 0 &&
++        !record->preserveNonvolatileGprs && TryGetCpuContext() == cpu) [[likely]] {
++        if (g_switchDispatchCheck) [[unlikely]] {
++            SwitchDispatchCheck(target, record, cpu);
++        }
++        RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
++        record->entry(cpu);
++        return;
++    }
++    InvokeIndirectCpuGeneral(target, cpu);
++}
++#else
+ inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
+     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+     if (target == 0) {
+@@ -650,6 +739,7 @@ inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
+     }
+     ReportMissingCpuTarget(target, cpu);
+ }
++#endif
+ 
+ template <typename Signature>
+ class AbiTrampoline;
 diff --git a/runtime/include/guest_flat_memory.h b/runtime/include/guest_flat_memory.h
 index 2514913..c7cd6fd 100644
 --- a/runtime/include/guest_flat_memory.h
@@ -2571,6 +4430,68 @@ index b062184..ac26a07 100644
 +    const uint64_t& operator[](size_t index) const { return index == 0 ? lo : hi; }
 +};
 +#endif
+diff --git a/runtime/include/isa/ppc_isa_context.h b/runtime/include/isa/ppc_isa_context.h
+index 227987e..f9bab9f 100644
+--- a/runtime/include/isa/ppc_isa_context.h
++++ b/runtime/include/isa/ppc_isa_context.h
+@@ -53,14 +53,37 @@ struct CpuContext {
+     uint32_t msr;       // Machine State Register
+ };
+ 
++#if defined(__SWITCH__)
++// Horizon builds with -mtp=soft: every thread_local access calls libnx's __aarch64_read_tp
++// (mrs tpidrro_el0; ldr x0, [x0, #0x1f8]; ret). The dispatch path's thread_locals are reached
++// with that sequence inline plus the local-exec offset relocations GCC itself emits under
++// -ftls-model=local-exec: the same per-thread address, without the call. abi_bridge.cpp
++// defines the variables (only this asm names them elsewhere, so no TLS wrapper is involved)
++// and checks at Finalize that both ways give the same address.
++#define MKW_SWITCH_TLS_ADDRESS_FN(Name, Type, Symbol)                                      \
++    __attribute__((always_inline)) inline Type* Name() noexcept {                          \
++        Type* address;                                                                     \
++        __asm__("mrs %0, tpidrro_el0\n\t"                                                  \
++                "ldr %0, [%0, #0x1f8]\n\t"                                                 \
++                "add %0, %0, #:tprel_hi12:" #Symbol ", lsl #12\n\t"                        \
++                "add %0, %0, #:tprel_lo12_nc:" #Symbol                                     \
++                : "=r"(address));                                                          \
++        return address;                                                                    \
++    }
++extern thread_local CpuContext* g_currentCpuContext;  // abi_bridge.cpp
++MKW_SWITCH_TLS_ADDRESS_FN(MkwCurrentCpuContextSlot, CpuContext*, g_currentCpuContext)
++#define MKW_CURRENT_CPU_CONTEXT (*MkwCurrentCpuContextSlot())
++#else
+ inline thread_local CpuContext* g_currentCpuContext = nullptr;
++#define MKW_CURRENT_CPU_CONTEXT g_currentCpuContext
++#endif
+ 
+ class CpuContextScope {
+ public:
+     explicit CpuContextScope(CpuContext* ctx)
+-        : previous_(g_currentCpuContext)
++        : previous_(MKW_CURRENT_CPU_CONTEXT)
+     {
+-        g_currentCpuContext = ctx;
++        MKW_CURRENT_CPU_CONTEXT = ctx;
+ 
+         savedMxcsr_ = MkwGetHostFpControl();
+         if (ctx != nullptr)
+@@ -69,7 +92,7 @@ public:
+ 
+     ~CpuContextScope()
+     {
+-        g_currentCpuContext = previous_;
++        MKW_CURRENT_CPU_CONTEXT = previous_;
+         if (previous_ != nullptr)
+             MkwApplyHostNiMode(previous_->fpscr);
+         else
+@@ -86,7 +109,7 @@ private:
+ 
+ inline CpuContext* TryGetCpuContext() noexcept
+ {
+-    return g_currentCpuContext;
++    return MKW_CURRENT_CPU_CONTEXT;
+ }
+ 
+ inline CpuContext* CurrentCpuContext()
 diff --git a/runtime/include/isa/ppc_isa_float.h b/runtime/include/isa/ppc_isa_float.h
 index 592098a..99b5135 100644
 --- a/runtime/include/isa/ppc_isa_float.h
@@ -2684,7 +4605,7 @@ index 7ac535d..3aca2aa 100644
      std::memcpy(&bits, &value, sizeof(bits));
      FlatStore<uint64_t>(address, bits);
 diff --git a/runtime/include/native_cpu_calls.inc b/runtime/include/native_cpu_calls.inc
-index 0856e7b..3c931e9 100644
+index 0856e7b..cd515a6 100644
 --- a/runtime/include/native_cpu_calls.inc
 +++ b/runtime/include/native_cpu_calls.inc
 @@ -43,7 +43,15 @@ extern "C" void GX__SetBlendMode_8017277c(uint32_t t, uint32_t s, uint32_t d, ui
@@ -2703,7 +4624,25 @@ index 0856e7b..3c931e9 100644
  #define MKW_KNOWN_TYPED_UNBOUND(addr, fn, ...) static_assert(true)
  #define MKW_KNOWN_NATIVE_CPU_UNBOUND(addr, fn) static_assert(true)
  #ifdef WIICOMPILED_NO_MKW_NATIVES
-@@ -108,3 +116,18 @@ MKW_KNOWN_NATIVE_CPU_CALL(0x800847C0u, nw4r__lyt__detail__DrawQuad_800847c0);
+@@ -93,6 +101,17 @@ MKW_KNOWN_TYPED_NATIVE(0x80173214u, GX__SetCurrentMtx_80173214, cpu->gpr[3]);
+ 
+ #undef MKW_KNOWN_TYPED_NATIVE
+ 
++#if defined(__SWITCH__) && defined(WIICOMPILED_GAME_RL8E54) && !defined(WIICOMPILED_NO_MKW_NATIVES)
++// MLB's PSMTXConcat (hle/mlb/mtx_natives.cpp), registered with REGISTER_NATIVE_FUNCTION; a leaf in
++// MkwLeafNativeCpuCall's sense. Spelled base + offset: tools/wiicompiled_rebind.py remaps
++// 0x80xxxxxx literals here as MKW addresses.
++extern "C" void MLB_PSMTXConcat_800A890C(CpuContext* ctx);
++template <> struct MkwLeafNativeCpuCall<0x80000000u + 0xA890Cu> {
++    static constexpr bool kAvailable = true;
++    static void Invoke(CpuContext* cpu) { MLB_PSMTXConcat_800A890C(cpu); }
++};
++#endif
++
+ #ifdef WIICOMPILED_NO_MKW_NATIVES
+ #define MKW_KNOWN_NATIVE_CPU_CALL(addr, fn) static_assert(true)
+ #else
+@@ -108,3 +127,18 @@ MKW_KNOWN_NATIVE_CPU_CALL(0x800847C0u, nw4r__lyt__detail__DrawQuad_800847c0);
  MKW_KNOWN_NATIVE_CPU_CALL(0x80084D20u, nw4r__lyt__detail__DrawQuad_80084d20);
  
  #undef MKW_KNOWN_NATIVE_CPU_CALL
@@ -2857,6 +4796,109 @@ index 0c515b5..82ce075 100644
      EcSignature signature{};
      const size_t written = signer.SignMessage(random, data, size, signature.data());
      if (written != signature.size()) {
+diff --git a/runtime/src/abi_bridge.cpp b/runtime/src/abi_bridge.cpp
+index 4ef3b2b..239d784 100644
+--- a/runtime/src/abi_bridge.cpp
++++ b/runtime/src/abi_bridge.cpp
+@@ -4,6 +4,11 @@
+ #include <array>
+ #include <atomic>
+ #include <cstddef>
++#if defined(__SWITCH__)
++#include <cinttypes>
++#include <cstdio>
++#include <cstdlib>
++#endif
+ #include <iomanip>
+ #include <iostream>
+ #include <mutex>
+@@ -32,6 +37,52 @@ static_assert(offsetof(CpuContext, srr1) == 456);
+ static_assert(offsetof(CpuContext, msr) == 460);
+ static_assert(sizeof(CpuContext) == 464);
+ 
++#if defined(__SWITCH__)
++// The dispatch path's thread_locals (ppc_isa_context.h, abi_bridge.h): the headers reach them
++// through MKW_SWITCH_TLS_ADDRESS_FN, without __aarch64_read_tp.
++thread_local CpuContext* g_currentCpuContext = nullptr;
++thread_local IndirectResolvedDispatchMemoEntry g_indirectResolvedDispatchMemo[kIndirectDispatchCacheEntries]{};
++thread_local IndirectRawDispatchMemoEntry g_indirectRawDispatchMemo[kIndirectDispatchCacheEntries]{};
++
++namespace {
++// The inline sequence and the compiler's own TLS access (a __aarch64_read_tp call) must give the
++// same address on this thread; a different libnx thread-pointer layout would stop here.
++void CheckSwitchTlsAccess() {
++    if (MkwCurrentCpuContextSlot() == &g_currentCpuContext &&
++        MkwIndirectResolvedDispatchMemo() == &g_indirectResolvedDispatchMemo[0] &&
++        MkwIndirectRawDispatchMemo() == &g_indirectRawDispatchMemo[0]) {
++        return;
++    }
++    std::fprintf(stderr, "[runtime] inline TLS access disagrees with the compiler's (%p/%p)\n",
++                 static_cast<void*>(MkwCurrentCpuContextSlot()), static_cast<void*>(&g_currentCpuContext));
++    ShowRuntimeFatalPopup("translated dispatch initialization failed",
++                          "The inline thread-local access of the dispatch path does not match the compiler's.");
++    std::abort();
++}
++
++uint64_t g_switchDispatchCheckCalls = 0;
++uint64_t g_switchDispatchCheckMismatches = 0;
++}  // namespace
++
++void SwitchDispatchCheck(uint32_t target, const RawDispatchRecord* record, const CpuContext* cpu) noexcept {
++    const RawDispatchRecord* reference = TranslatedFunctionRegistry::FindRawByAddressPtrUncached(target);
++    const CpuContext* current = g_currentCpuContext;  // the compiler's TLS access
++    ++g_switchDispatchCheckCalls;
++    if (reference != record || current != cpu) {
++        if (++g_switchDispatchCheckMismatches <= 32) {
++            std::fprintf(stderr,
++                         "[dispatch-check] MISMATCH target=0x%08X memo=%p uncached=%p ctx=%p current=%p\n",
++                         target, static_cast<const void*>(record), static_cast<const void*>(reference),
++                         static_cast<const void*>(cpu), static_cast<const void*>(current));
++        }
++    }
++    if ((g_switchDispatchCheckCalls & ((1u << 22) - 1u)) == 0) {
++        std::fprintf(stderr, "[dispatch-check] calls=%" PRIu64 " mismatches=%" PRIu64 "\n",
++                     g_switchDispatchCheckCalls, g_switchDispatchCheckMismatches);
++    }
++}
++#endif
++
+ namespace {
+ std::vector<TranslatedFunctionInfo>& Registry() {
+     static std::vector<TranslatedFunctionInfo> entries;
+@@ -338,6 +389,13 @@ void TranslatedFunctionRegistry::Register(TranslatedFunctionInfo info) {
+ }
+ 
+ void TranslatedFunctionRegistry::Finalize() {
++#if defined(__SWITCH__)
++    CheckSwitchTlsAccess();
++    if (const char* check = std::getenv("WIICOMPILED_DISPATCH_CHECK"); check != nullptr && check[0] == '1') {
++        g_switchDispatchCheck = true;
++        std::fprintf(stderr, "[dispatch-check] comparing every fast-path indirect call with the uncached lookup\n");
++    }
++#endif
+     if (const size_t overrides = PriorityOverrideCount(); overrides != 0) {
+         RT_LOG(RT_TAG_RUNTIME) << overrides
+                   << " registration(s) took over an address by priority" << std::endl;
+@@ -403,6 +461,19 @@ const RawDispatchRecord* TranslatedFunctionRegistry::FindRawByAddressPtrSlow(uin
+     return it != entries.end() && it->address == address ? &*it : nullptr;
+ }
+ 
++#if defined(__SWITCH__)
++const RawDispatchRecord* TranslatedFunctionRegistry::FindRawByAddressPtrUncached(uint32_t address) {
++    if (!lookupPublished_.load(std::memory_order_acquire)) {
++        return nullptr;
++    }
++    const RawDispatchRecord* record = nullptr;
++    if (const auto* table = g_publishedStaticIndirectDispatchTable.load(std::memory_order_acquire)) {
++        record = FindStaticIndirectDispatchEntry(table, address);
++    }
++    return record != nullptr ? record : FindRawByAddressPtrSlow(address);
++}
++#endif
++
+ std::optional<TranslatedFunctionInfo> TranslatedFunctionRegistry::FindByHostAddress(uintptr_t hostAddr) {
+     const bool frozen = RegistryFrozen().load(std::memory_order_acquire);
+     if (!frozen) {
 diff --git a/runtime/src/discord_presence.cpp b/runtime/src/discord_presence.cpp
 index a7b9caa..1e4343a 100644
 --- a/runtime/src/discord_presence.cpp
@@ -3299,10 +5341,10 @@ index eaf6809..f9821a8 100644
      const uint16_t rawSrcTop = g_texCopyState.srcTop;
      const uint16_t rawSrcWidth = g_texCopyState.srcWidth;
 diff --git a/runtime/src/hle/gx/gx_dl.cpp b/runtime/src/hle/gx/gx_dl.cpp
-index 818478d..e31183b 100644
+index 818478d..d187550 100644
 --- a/runtime/src/hle/gx/gx_dl.cpp
 +++ b/runtime/src/hle/gx/gx_dl.cpp
-@@ -10,6 +10,11 @@
+@@ -10,8 +10,12 @@
  // bytes with a 64-bit XXH3 digest (see GxDisplayListScanCache::CanReuse).
  #include <xxhash.h>
  
@@ -3312,9 +5354,123 @@ index 818478d..e31183b 100644
 +extern "C" uint64_t aurora_gx_fifo_frame_epoch(void);
 +
  namespace aurora::gx::fifo {
- bool in_display_list();
+-bool in_display_list();
  bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
-@@ -1206,6 +1211,44 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
+                      uint32_t vertexBytes);
+ }
+@@ -330,10 +334,13 @@ static void ApplyAuroraVtxStateForDlBegin(GXVtxFmt fmt) {
+ }
+ 
+ 
++// Raw bytes, not VtxAttrFmt/VtxArray (whose member initialisers made every declaration of a
++// snapshot write ~2.7 KB of defaults, once per display-list call): the snapshot is only ever filled
++// and read back with memcpy, row by row as the has* flags say.
+ struct HleGxVertexStateSnapshot {
+     GXAttrType vtxDesc[26];
+-    VtxAttrFmt vtxAttrFmt[8][26];
+-    HleGxState::VtxArray vtxArray[26];
++    alignas(VtxAttrFmt) unsigned char vtxAttrFmt[8][sizeof(VtxAttrFmt) * 26];
++    alignas(HleGxState::VtxArray) unsigned char vtxArray[sizeof(HleGxState::VtxArray) * 26];
+     GXVtxFmt currentVtxFmt;
+     uint64_t vtxLayoutHash;
+     bool vtxLayoutHashDirty;
+@@ -345,6 +352,10 @@ struct HleGxVertexStateSnapshot {
+ };
+ 
+ constexpr uint32_t kAllVtxAttrFmtRows = 0xFFu;
++static_assert(std::is_trivially_default_constructible_v<HleGxVertexStateSnapshot>);
++static_assert(sizeof(HleGxVertexStateSnapshot::vtxAttrFmt) == sizeof(HleGxState::vtxAttrFmt));
++static_assert(sizeof(HleGxVertexStateSnapshot::vtxAttrFmt[0]) == sizeof(HleGxState::vtxAttrFmt[0]));
++static_assert(sizeof(HleGxVertexStateSnapshot::vtxArray) == sizeof(HleGxState::vtxArray));
+ 
+ static HleGxVertexStateSnapshot CaptureGxVertexState() {
+     HleGxVertexStateSnapshot snapshot;
+@@ -495,22 +506,25 @@ static uint64_t HashScanLayoutState() {
+     if (!g_hleGxState.vtxLayoutHashDirty) {
+         return g_hleGxState.vtxLayoutHash;
+     }
+-    uint64_t hash = 1469598103934665603ull;
+-    auto mix = [&hash](uint32_t value) {
+-        hash ^= static_cast<uint64_t>(value);
+-        hash *= 1099511628211ull;
+-    };
++    // The same 650 values the byte-serial FNV-1a chain used to mix (one dependent 64-bit
++    // multiply each, ~4k cycles on the Switch's A57 and run whenever the game changed its vertex
++    // layout between lists), packed as 32-bit words and hashed with XXH3 instead. Padding bytes of
++    // VtxAttrFmt are never read.
++    static_assert(sizeof(g_hleGxState.vtxDesc[0]) == sizeof(uint32_t));
++    uint32_t words[26 + 8 * 26 * 3];
+     for (int attr = 0; attr < 26; ++attr) {
+-        mix(static_cast<uint32_t>(g_hleGxState.vtxDesc[attr]));
++        words[attr] = static_cast<uint32_t>(g_hleGxState.vtxDesc[attr]);
+     }
++    uint32_t* out = words + 26;
+     for (int fmt = 0; fmt < 8; ++fmt) {
+-        for (int attr = 0; attr < 26; ++attr) {
++        for (int attr = 0; attr < 26; ++attr, out += 3) {
+             const auto& f = g_hleGxState.vtxAttrFmt[fmt][attr];
+-            mix(static_cast<uint32_t>(f.cnt));
+-            mix(static_cast<uint32_t>(f.type));
+-            mix(static_cast<uint32_t>(f.frac));
++            out[0] = static_cast<uint32_t>(f.cnt);
++            out[1] = static_cast<uint32_t>(f.type);
++            out[2] = static_cast<uint32_t>(f.frac);
+         }
+     }
++    const uint64_t hash = static_cast<uint64_t>(XXH3_64bits(words, sizeof(words)));
+     g_hleGxState.vtxLayoutHash = hash;
+     g_hleGxState.vtxLayoutHashDirty = false;
+     return g_hleGxState.vtxLayoutHash;
+@@ -1121,6 +1135,16 @@ static void ApplyAuroraVtxDesc() {
+     if (!hadValidState) {
+         s_appliedVtxStateMatchesHle = false;
+     }
++    // Aurora's live descriptors for GX_VA_PNMTXIDX..GX_VA_TEX7 in one call (GXGetVtxDescv is
++    // GXGetVtxDesc unrolled over them) instead of one GXGetVtxDesc call per attribute. They stay
++    // the live values until this loop changes aurora's state; from then on it reads them one by
++    // one again, exactly as before.
++    GXVtxDescList live[GX_VA_TEX7 + 3];
++    bool liveValid = false;
++    if (hadValidState) {
++        GXGetVtxDescv(live);
++        liveValid = true;
++    }
+     for (int attr = 0; attr < 26; ++attr) {
+         if (attr == GX_VA_NBT) continue;
+         const GXAttr gxAttr = static_cast<GXAttr>(attr);
+@@ -1134,15 +1158,17 @@ static void ApplyAuroraVtxDesc() {
+         // (MLB skinned models) makes aurora mis-size each vertex and decode the rest of
+         // the list as XF loads.
+         if (!needsPublish && gxAttr <= GX_VA_TEX7) {
+-            needsPublish = !AuroraVtxDescMatchesLive(gxAttr, type);
++            needsPublish = liveValid ? live[attr].type != type : !AuroraVtxDescMatchesLive(gxAttr, type);
+         }
+         if (needsPublish) {
+             GXSetVtxDesc(gxAttr, type);
+             s_appliedVtxDesc[attr] = type;
++            liveValid = false;
+         }
+         if (!hadValidState || s_appliedSourceVtxDesc[attr] != type) {
+             GXSetSourceVtxDesc(gxAttr, type);
+             s_appliedSourceVtxDesc[attr] = type;
++            liveValid = false;
+         }
+     }
+     s_appliedVtxDescValid = true;
+@@ -1185,6 +1211,12 @@ static void ApplyAuroraVtxAttrFmtAll() {
+ }
+ 
+ static void ApplyAuroraVtxAttrFmtForDisplayList(GXVtxFmt fmt, bool mixed) {
++    // The mirror is a verbatim copy of the HLE state (the invariant SyncAppliedVtxStateFromHleReal
++    // relies on): every row compares equal, so the loops below would publish nothing.
++    if (s_appliedVtxAttrFmtValid && s_appliedVtxStateMatchesHle &&
++        s_appliedVtxStateGeneration == g_hleGxState.vtxStateGeneration) {
++        return;
++    }
+     if (!mixed && fmt < GX_MAX_VTXFMT) {
+         ApplyAuroraVtxAttrFmt(fmt);
+         return;
+@@ -1206,6 +1238,44 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
      SyncAppliedVtxStateFromHleReal();
  }
  
@@ -3359,7 +5515,7 @@ index 818478d..e31183b 100644
  static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX_ATTR>& maxIdx,
                                              const std::array<bool, GX_VA_MAX_ATTR>& sawIdx,
                                              GXVtxFmt vtxfmt,
-@@ -1252,7 +1295,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
+@@ -1252,7 +1322,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
              ok = false;
              continue;
          }
@@ -3372,6 +5528,529 @@ index 818478d..e31183b 100644
      }
      return ok;
  }
+diff --git a/runtime/src/hle/gx/gx_internal.h b/runtime/src/hle/gx/gx_internal.h
+index 8656dba..3351ce7 100644
+--- a/runtime/src/hle/gx/gx_internal.h
++++ b/runtime/src/hle/gx/gx_internal.h
+@@ -343,6 +343,15 @@ TexObjMeta& GetTexObjMeta(uint32_t addr);
+ TexObjMeta ExtractTexObjMetaFromGuest(uint32_t addr);
+ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta);
+ TlutObjMeta& GetTlutObjMeta(uint32_t addr);
++#if defined(__SWITCH__)
++// gx_objects.cpp: GXInitTlutObj's metadata write (GetTlutObjMeta plus the field stores), keeping the
++// DCStoreRange TLUT bounds without a full recompute when the palette stays inside them; and the
++// g_TlutObjMeta lookup behind a small address cache.
++TlutObjMeta& SetTlutObjMeta(uint32_t addr, uint32_t dataAddr, uint32_t format, uint16_t entries);
++TlutObjMeta* FindTlutObjMeta(uint32_t addr);
++// The g_TexObjMeta slot of `addr`, as g_TexObjMeta.find (nullptr when absent).
++TexObjSlot* FindTexObjSlotForLoad(uint32_t addr);
++#endif
+ GXTexObj* GetHostTexObj(uint32_t addr);
+ GXTexObj* TryGetHostTexObj(uint32_t addr);
+ GXTexObj* CreateHostTexObj(uint32_t addr);
+@@ -386,8 +395,29 @@ extern bool g_alphaCompareValid;
+ extern std::array<BoundTexInfo, 8> g_boundTexMaps;
+ extern TexCopyState g_texCopyState;
+ 
+-extern std::mutex g_texObjMutex;
+-extern std::mutex g_tlutObjMutex;
++#if defined(__SWITCH__)
++// g_texObjMutex/g_tlutObjMutex guard maps that only guest code touches: the HLE GX calls and the
++// DC-range/DMA notifications all run on the main thread's fibers. std::mutex went through newlib's
++// pthread layer to libnx's mutexLock/mutexUnlock on every GXLoadTexObj/GXInitTlutObj/GXLoadTlut
++// (~1% of the main thread, profile-stock1). A test-and-set lock keeps the exclusion, should another
++// thread ever take one, for an uncontended exchange and a release store.
++struct GxObjMutex {
++    std::atomic<bool> held{false};
++    void lock() noexcept {
++        while (held.exchange(true, std::memory_order_acquire)) {
++            while (held.load(std::memory_order_relaxed)) {
++                std::this_thread::sleep_for(std::chrono::microseconds(1));
++            }
++        }
++    }
++    bool try_lock() noexcept { return !held.exchange(true, std::memory_order_acquire); }
++    void unlock() noexcept { held.store(false, std::memory_order_release); }
++};
++#else
++using GxObjMutex = std::mutex;
++#endif
++extern GxObjMutex g_texObjMutex;
++extern GxObjMutex g_tlutObjMutex;
+ // Guest GXTexObj address -> decoded metadata + host object. std::unordered_map
+ // rather than absl::flat_hash_map because the runtime target does not link
+ // absl, and because callers (gx_texture.cpp) hold an iterator across an insert
+diff --git a/runtime/src/hle/gx/gx_lighting.cpp b/runtime/src/hle/gx/gx_lighting.cpp
+index 1b1d392..8a03ec3 100644
+--- a/runtime/src/hle/gx/gx_lighting.cpp
++++ b/runtime/src/hle/gx/gx_lighting.cpp
+@@ -62,8 +62,20 @@ void InitializeHostLightFromGuest(GXLightObj& host, uint32_t guestAddr) {
+ // Light Object Load
+ // ============================================================================
+ 
++#if defined(__SWITCH__)
++// aurora GXLighting.cpp: the 13 XF light words at kColorOffset as they are (InitializeHostLightFromGuest
++// is a bitwise copy of them: the color repacks to its word, the direction is negated twice).
++extern "C" void GXLoadLightObjImmBE(const void* xfWordsBe, GXLightID id);
++#endif
++
+ extern "C" void GX__LoadLightObjImm_80170320(uint32_t la, uint32_t lid) {
+     if (!ValidateGuestLightObj(la, "GXLoadLightObjImm")) return;
++#if defined(__SWITCH__)
++    if (const void* words = GuestToHostPtr(la + kColorOffset, kLightObjSize - kColorOffset)) {
++        GXLoadLightObjImmBE(words, static_cast<GXLightID>(lid));
++        return;
++    }
++#endif
+     GXLightObj host{};
+     InitializeHostLightFromGuest(host, la);
+     GXLoadLightObjImm(&host, static_cast<GXLightID>(lid));
+diff --git a/runtime/src/hle/gx/gx_objects.cpp b/runtime/src/hle/gx/gx_objects.cpp
+index ec98605..7b76e63 100644
+--- a/runtime/src/hle/gx/gx_objects.cpp
++++ b/runtime/src/hle/gx/gx_objects.cpp
+@@ -66,9 +66,9 @@ struct HleTlutObj {
+     }
+ };
+ 
+-std::mutex g_texObjMutex;
++GxObjMutex g_texObjMutex;
+ std::map<uint32_t, std::unique_ptr<HleTlutObj>> g_HostTlutObjMap;
+-std::mutex g_tlutObjMutex;
++GxObjMutex g_tlutObjMutex;
+ 
+ // The texobj table. One slot per guest GXTexObj address holds both the decoded
+ // metadata and the Aurora object, so GXLoadTexObj resolves everything it needs
+@@ -85,6 +85,23 @@ namespace {
+ uint32_t g_texObjSlotMemoAddr = 0;
+ TexObjSlot* g_texObjSlotMemo = nullptr;
+ 
++#if defined(__SWITCH__)
++// Behind the memo, a direct-mapped cache of slot pointers: a match binds a few hundred texobjs a
++// frame, and g_TexObjMeta.find costs a 64-bit modulo and a node walk (FindTexObjSlot, 0.33% of the
++// main thread, profile-stock1). Same safety argument as the memo: slots are never erased and keep
++// their address across rehashes. Also the TLUT maps (std::map, never erased either) for
++// GXInitTlutObj/GXLoadTlut, which MLB calls per draw.
++constexpr uint32_t kGxObjCacheBits = 8;
++inline uint32_t GxObjCacheIndex(uint32_t addr) noexcept {
++    return (addr * 0x9E3779B1u) >> (32 - kGxObjCacheBits);
++}
++struct TexObjSlotCacheEntry {
++    uint32_t addr = 0;
++    TexObjSlot* slot = nullptr;
++};
++std::array<TexObjSlotCacheEntry, 1u << kGxObjCacheBits> g_texObjSlotCache{};
++#endif
++
+ constexpr size_t kTexObjTableReserve = 1024;
+ 
+ } // namespace
+@@ -237,12 +254,23 @@ TexObjSlot* FindTexObjSlot(uint32_t addr) {
+     if (g_texObjSlotMemo != nullptr && g_texObjSlotMemoAddr == addr) {
+         return g_texObjSlotMemo;
+     }
++#if defined(__SWITCH__)
++    TexObjSlotCacheEntry& cached = g_texObjSlotCache[GxObjCacheIndex(addr)];
++    if (cached.slot != nullptr && cached.addr == addr) {
++        g_texObjSlotMemoAddr = addr;
++        g_texObjSlotMemo = cached.slot;
++        return cached.slot;
++    }
++#endif
+     const auto it = g_TexObjMeta.find(addr);
+     if (it == g_TexObjMeta.end()) {
+         return nullptr;
+     }
+     g_texObjSlotMemoAddr = addr;
+     g_texObjSlotMemo = &it->second;
++#if defined(__SWITCH__)
++    cached = TexObjSlotCacheEntry{addr, &it->second};
++#endif
+     return g_texObjSlotMemo;
+ }
+ 
+@@ -419,6 +447,49 @@ void EnsureTlutObjBoundsLocked() {
+     g_tlutObjBoundsDirty = false;
+ }
+ 
++#if defined(__SWITCH__)
++struct TlutObjCacheEntry {
++    uint32_t addr = 0;
++    std::unique_ptr<HleTlutObj>* host = nullptr; // g_HostTlutObjMap[addr], once it exists
++    TlutObjMeta* meta = nullptr;                 // g_TlutObjMeta[addr], once it exists
++};
++std::array<TlutObjCacheEntry, 1u << kGxObjCacheBits> g_tlutObjCache{};
++
++TlutObjCacheEntry& TlutObjCacheFor(uint32_t addr) noexcept {
++    TlutObjCacheEntry& entry = g_tlutObjCache[GxObjCacheIndex(addr)];
++    if (entry.addr != addr) {
++        entry = TlutObjCacheEntry{addr, nullptr, nullptr};
++    }
++    return entry;
++}
++
++// g_HostTlutObjMap[addr] / .find(addr) and g_TlutObjMeta[addr], through the cache.
++std::unique_ptr<HleTlutObj>& HostTlutObjSlot(uint32_t addr) {
++    TlutObjCacheEntry& entry = TlutObjCacheFor(addr);
++    if (entry.host == nullptr) {
++        entry.host = &g_HostTlutObjMap[addr];
++    }
++    return *entry.host;
++}
++std::unique_ptr<HleTlutObj>* FindHostTlutObjSlot(uint32_t addr) {
++    TlutObjCacheEntry& entry = TlutObjCacheFor(addr);
++    if (entry.host == nullptr) {
++        const auto it = g_HostTlutObjMap.find(addr);
++        if (it != g_HostTlutObjMap.end()) {
++            entry.host = &it->second;
++        }
++    }
++    return entry.host;
++}
++TlutObjMeta& TlutObjMetaSlot(uint32_t addr) {
++    TlutObjCacheEntry& entry = TlutObjCacheFor(addr);
++    if (entry.meta == nullptr) {
++        entry.meta = &g_TlutObjMeta[addr];
++    }
++    return *entry.meta;
++}
++#endif
++
+ bool TexObjBackingDiffers(const TexObjMeta& lhs, const TexObjMeta& rhs) {
+     return CanonicalizeGxMainRamAddress(lhs.dataAddr) != CanonicalizeGxMainRamAddress(rhs.dataAddr) ||
+            lhs.width != rhs.width ||
+@@ -548,9 +619,49 @@ TexObjMeta& GetTexObjMeta(uint32_t addr) {
+ // the cached TLUT address bounds have to be recomputed before the next flush.
+ TlutObjMeta& GetTlutObjMeta(uint32_t addr) {
+     g_tlutObjBoundsDirty = true;
++#if defined(__SWITCH__)
++    return TlutObjMetaSlot(addr);
++#else
+     return g_TlutObjMeta[addr];
++#endif
++}
++
++#if defined(__SWITCH__)
++// GXInitTlutObj's write. The bounds only filter MarkTlutObjsDirtyForRange: a range outside them
++// skips the walk, so any superset of the valid palettes' ranges marks exactly what the exact bounds
++// mark. A palette that lands inside them (MLB re-inits the same ones per draw) keeps them one;
++// otherwise they are recomputed, as GetTlutObjMeta has them.
++TlutObjMeta& SetTlutObjMeta(uint32_t addr, uint32_t dataAddr, uint32_t format, uint16_t entries) {
++    TlutObjMeta& meta = TlutObjMetaSlot(addr);
++    meta.dataAddr = dataAddr;
++    meta.format = format;
++    meta.entries = entries;
++    meta.dirty = false;
++    if (!g_tlutObjBoundsDirty && meta.dataAddr != 0 && meta.entries != 0 && IsKnownTlutFormat(meta.format)) {
++        const uint64_t tlutStart = CanonicalizeGxMainRamAddress(meta.dataAddr);
++        const uint64_t tlutEnd = tlutStart + static_cast<uint64_t>(meta.entries) * 2u;
++        if (g_tlutObjBoundsStart >= g_tlutObjBoundsEnd || tlutStart < g_tlutObjBoundsStart ||
++            tlutEnd > g_tlutObjBoundsEnd) {
++            g_tlutObjBoundsDirty = true;
++        }
++    }
++    return meta;
++}
++
++TlutObjMeta* FindTlutObjMeta(uint32_t addr) {
++    TlutObjCacheEntry& entry = TlutObjCacheFor(addr);
++    if (entry.meta == nullptr) {
++        const auto it = g_TlutObjMeta.find(addr);
++        if (it != g_TlutObjMeta.end()) {
++            entry.meta = &it->second;
++        }
++    }
++    return entry.meta;
+ }
+ 
++TexObjSlot* FindTexObjSlotForLoad(uint32_t addr) { return FindTexObjSlot(addr); }
++#endif
++
+ GXTexObj* GetHostTexObj(uint32_t addr) {
+     TexObjSlot* slot = FindTexObjSlot(addr);
+     if (slot == nullptr || !slot->host || !slot->host->constructed) {
+@@ -610,7 +721,7 @@ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size) {
+ 
+     const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
+     const uint64_t dirtyEnd = dirtyStart + size;
+-    std::lock_guard<std::mutex> guard(g_texObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
+ 
+     EnsureTexObjIntervalsLocked();
+     const auto lower = std::lower_bound(
+@@ -660,7 +771,11 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size) {
+ }
+ 
+ GXTlutObj* CreateHostTlutObj(uint32_t addr) {
++#if defined(__SWITCH__)
++    auto& slot = HostTlutObjSlot(addr);
++#else
+     auto& slot = g_HostTlutObjMap[addr];
++#endif
+     if (!slot) {
+         slot = std::make_unique<HleTlutObj>();
+     } else {
+@@ -671,6 +786,12 @@ GXTlutObj* CreateHostTlutObj(uint32_t addr) {
+ }
+ 
+ void MarkHostTlutObjConstructed(uint32_t addr) {
++#if defined(__SWITCH__)
++    if (std::unique_ptr<HleTlutObj>* slot = FindHostTlutObjSlot(addr); slot != nullptr && *slot) {
++        (*slot)->constructed = true;
++    }
++    return;
++#endif
+     auto it = g_HostTlutObjMap.find(addr);
+     if (it != g_HostTlutObjMap.end() && it->second) {
+         it->second->constructed = true;
+@@ -678,6 +799,12 @@ void MarkHostTlutObjConstructed(uint32_t addr) {
+ }
+ 
+ GXTlutObj* GetHostTlutObj(uint32_t addr) {
++#if defined(__SWITCH__)
++    if (std::unique_ptr<HleTlutObj>* slot = FindHostTlutObjSlot(addr);
++        slot != nullptr && *slot && (*slot)->constructed) {
++        return (*slot)->PublicPtr();
++    }
++#endif
+     auto it = g_HostTlutObjMap.find(addr);
+     if (it == g_HostTlutObjMap.end() || !it->second || !it->second->constructed) {
+         const CpuContext* cpu = TryGetCpuContext();
+@@ -699,7 +826,7 @@ void MarkTlutObjsDirtyForRange(uint32_t addr, uint32_t size) {
+ 
+     const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
+     const uint64_t dirtyEnd = dirtyStart + size;
+-    std::lock_guard<std::mutex> guard(g_tlutObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_tlutObjMutex);
+     EnsureTlutObjBoundsLocked();
+     // Most DCStoreRange calls flush small material/vertex buffers that live
+     // nowhere near a palette, so reject them without walking the map.
+diff --git a/runtime/src/hle/gx/gx_texture.cpp b/runtime/src/hle/gx/gx_texture.cpp
+index b5ebedd..0bd096e 100644
+--- a/runtime/src/hle/gx/gx_texture.cpp
++++ b/runtime/src/hle/gx/gx_texture.cpp
+@@ -250,7 +250,7 @@ extern "C" void GX__InitTexObj_801707f8(uint32_t oa, uint32_t da, uint32_t w, ui
+                 oa, da, w, h, f, ws, wt, m, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
+     }
+     const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
+-    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
+     meta.dataAddr=canonicalDataAddr; meta.width=(u16)w; meta.height=(u16)h; meta.format=f; meta.wrapS=ws; meta.wrapT=wt; meta.mipmap=(m!=0); meta.userData=0; meta.needsUpload=true;
+     GXInitTexObj(obj, GuestToHostPtr(da), (u16)w, (u16)h, (GXTexFmt)f, (GXTexWrapMode)ws, (GXTexWrapMode)wt, (GXBool)m); MarkHostTexObjConstructed(oa);
+     // Also write to guest memory so reads work
+@@ -291,7 +291,7 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
+                 oa, da, w, h, f, ws, wt, m, tl, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
+     }
+     const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
+-    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
+     meta.dataAddr=canonicalDataAddr; meta.width=(u16)w; meta.height=(u16)h; meta.format=f; meta.wrapS=ws; meta.wrapT=wt; meta.mipmap=(m!=0); meta.tlut=tl; meta.userData=0; meta.needsUpload=true;
+     GXInitTexObjCI(obj, GuestToHostPtr(da), (u16)w, (u16)h, (GXCITexFmt)f, (GXTexWrapMode)ws, (GXTexWrapMode)wt, (GXBool)m, tl); MarkHostTexObjConstructed(oa);
+     // Also write to guest memory so reads work
+@@ -306,7 +306,7 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
+ PPC_NATIVE_OVERRIDE_VOID(80170a04, GX__InitTexObjCI_80170a04, (uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m, uint32_t tl), (oa, da, w, h, f, ws, wt, m, tl));
+ 
+ extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma) {
+-    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = GetHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex); GXTexObj* obj = GetHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
+     float fmal = std::isfinite(mal) && mal >= 0.f ? mal : 0.f, fmil = std::isfinite(mil) && mil >= 0.f ? std::min(mil, fmal) : 0.f;
+     meta.minFilter=mif; meta.magFilter=maf; meta.minLod=fmil; meta.maxLod=fmal; meta.lodBias=lb; meta.biasClamp=(bc!=0); meta.edgeLod=(el!=0); meta.maxAniso=ma;
+     GXInitTexObjLOD(obj, (GXTexFilter)mif, (GXTexFilter)maf, fmil, fmal, lb, (GXBool)bc, (GXBool)el, (GXAnisotropy)ma);
+@@ -316,7 +316,7 @@ extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t m
+ PPC_NATIVE_OVERRIDE_VOID(80170a4c, GX__InitTexObjLOD_80170a4c, (uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma), (oa, mif, maf, mil, mal, lb, bc, el, ma));
+ 
+ extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32_t wt) {
+-    std::lock_guard<std::mutex> guard(g_texObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
+     GXTexObj* obj = GetHostTexObj(oa);
+     TexObjMeta& meta = GetTexObjMeta(oa);
+     meta.wrapS = ws;
+@@ -332,7 +332,7 @@ extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32
+ PPC_NATIVE_OVERRIDE_VOID(80170b50, GX__InitTexObjWrapMode_80170b50, (uint32_t oa, uint32_t ws, uint32_t wt), (oa, ws, wt));
+ 
+ extern "C" void GX__InitTexObjTlut_80170b64(uint32_t oa, uint32_t tl) {
+-    std::lock_guard<std::mutex> guard(g_texObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
+     GXTexObj* obj = GetHostTexObj(oa);
+     TexObjMeta& meta = GetTexObjMeta(oa);
+     meta.tlut = tl;
+@@ -347,7 +347,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b64, GX__InitTexObjTlut_80170b64, (uint32_t oa, ui
+ 
+ // GXInitTexObjFilter - sets mag/min filter modes
+ extern "C" void GX__InitTexObjFilter_80170b6c(uint32_t oa, uint32_t minFilter, uint32_t magFilter) {
+-    std::lock_guard<std::mutex> guard(g_texObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
+     TexObjMeta& meta = GetTexObjMeta(oa);
+     meta.minFilter = minFilter;
+     meta.magFilter = magFilter;
+@@ -375,7 +375,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b6c, GX__InitTexObjFilter_80170b6c, (uint32_t oa,
+ 
+ // GXInitTexObjLODBias - sets LOD bias value
+ extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
+-    std::lock_guard<std::mutex> guard(g_texObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
+     TexObjMeta& meta = GetTexObjMeta(oa);
+     
+     // Clamp bias to [-4.0, 3.99...] range as per SDK
+@@ -404,7 +404,7 @@ extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
+ PPC_NATIVE_OVERRIDE_VOID(80170b94, GX__InitTexObjLODBias_80170b94, (uint32_t oa, float bias), (oa, bias));
+ 
+ extern "C" void GX__InitTexObjUserData_80170be8(uint32_t oa, uint32_t userData) {
+-    std::lock_guard<std::mutex> guard(g_texObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
+     TexObjMeta& meta = GetTexObjMeta(oa);
+     meta.userData = userData;
+ 
+@@ -454,7 +454,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+     static uint32_t s_metaLookupLogCount = 0;
+     static uint32_t s_unknownFormatLogCount = 0;
+     static uint32_t s_invalidDataLogCount = 0;
+-    std::lock_guard<std::mutex> guard(g_texObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
+ 
+     if (tid >= g_boundTexMaps.size()) {
+         if (s_invalidTidLogCount < 128) {
+@@ -548,9 +548,14 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+     GXTexObj* obj = TryGetHostTexObj(oa);
+     const bool isPalette = IsPaletteTexFormat(meta.format);
+     bool needsInit = (obj == nullptr);
++#if defined(__SWITCH__)
++    TexObjSlot* const metaSlot = FindTexObjSlotForLoad(oa); // g_TexObjMeta.find, through the slot cache
++#else
+     const auto metaIt = g_TexObjMeta.find(oa);
+-    if (!needsInit && metaIt != g_TexObjMeta.end()) {
+-        const TexObjMeta& cached = metaIt->second;
++    TexObjSlot* const metaSlot = metaIt != g_TexObjMeta.end() ? &metaIt->second : nullptr;
++#endif
++    if (!needsInit && metaSlot != nullptr) {
++        const TexObjMeta& cached = *metaSlot;
+         if (cached.width != meta.width || cached.height != meta.height || cached.format != meta.format ||
+             cached.wrapS != meta.wrapS || cached.wrapT != meta.wrapT || cached.mipmap != meta.mipmap ||
+             cached.minFilter != meta.minFilter || cached.magFilter != meta.magFilter ||
+@@ -586,7 +591,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+             // Write through GetTexObjMeta so the DCStoreRange interval index is
+             // told this entry's backing may have moved.
+             GetTexObjMeta(oa) = meta;
+-        } else if (isPalette && metaIt != g_TexObjMeta.end() && metaIt->second.tlut != meta.tlut) {
++        } else if (isPalette && metaSlot != nullptr && metaSlot->tlut != meta.tlut) {
+             GXInitTexObjTlut(obj, meta.tlut);
+             GetTexObjMeta(oa).tlut = meta.tlut;
+             tlutChanged = true;
+@@ -643,7 +648,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170dc8, GX__LoadTexObjPreLoaded_80170dc8, (uint32_t o
+ // ============================================================================
+ 
+ extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp) {
+-    std::lock_guard<std::mutex> guard(g_texObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
+     TexObjMeta meta;
+     if (!TryGetOrExtractTexObjMeta(oa, meta)) {
+         RT_LOGF(RT_TAG_GX, "GXGetTexObjAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
+@@ -657,7 +662,7 @@ extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp,
+ PPC_NATIVE_OVERRIDE_VOID(80170bf8, GX__GetTexObjAll_80170bf8, (uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp), (oa, dp, wp, hp, fp, wsp, wtp, mp));
+ 
+ extern "C" void GX__GetTexObjLODAll_80170cbc(uint32_t oa, uint32_t mifp, uint32_t mafp, uint32_t milp, uint32_t malp, uint32_t lbp, uint32_t bcp, uint32_t elp, uint32_t map) {
+-    std::lock_guard<std::mutex> guard(g_texObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
+     TexObjMeta meta;
+     if (!TryGetOrExtractTexObjMeta(oa, meta)) {
+         RT_LOGF(RT_TAG_GX, "GXGetTexObjLODAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
+@@ -676,8 +681,13 @@ PPC_NATIVE_OVERRIDE_VOID(80170cbc, GX__GetTexObjLODAll_80170cbc, (uint32_t oa, u
+ // ============================================================================
+ 
+ extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, uint32_t e) {
++#if defined(__SWITCH__)
++    std::lock_guard<GxObjMutex> guard(g_tlutObjMutex); GXTlutObj* obj = CreateHostTlutObj(oa);
++    TlutObjMeta& meta = SetTlutObjMeta(oa, CanonicalizeGxMainRamAddress(da), f, (u16)e);
++#else
+     std::lock_guard<std::mutex> guard(g_tlutObjMutex); GXTlutObj* obj = CreateHostTlutObj(oa); TlutObjMeta& meta = GetTlutObjMeta(oa);
+     meta.dataAddr=CanonicalizeGxMainRamAddress(da); meta.format=f; meta.entries=(u16)e; meta.dirty=false;
++#endif
+     // Leave the object unconstructed on a bad descriptor. A later GXLoadTlut
+     // then takes GetHostTlutObj's soft-fail path and gets a fresh empty object
+     // instead of aurora reading entries*2 bytes off an unvalidated pointer.
+@@ -686,7 +696,26 @@ extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, u
+ }
+ PPC_NATIVE_OVERRIDE_VOID(80170f80, GX__InitTlutObj_80170f80, (uint32_t oa, uint32_t da, uint32_t f, uint32_t e), (oa, da, f, e));
+ 
++#if defined(__SWITCH__)
++// As below, with the g_TlutObjMeta lookup through gx_objects.cpp's address cache.
++extern "C" void GX__LoadTlut_80170fa8(uint32_t oa, uint32_t tl) {
++    std::lock_guard<GxObjMutex> guard(g_tlutObjMutex);
++    if (tl >= kMaxTluts) { RT_LOGF(RT_TAG_GX, "GXLoadTlut: invalid TLUT index %u (oa=0x%08X)\n", tl, oa); return; }
++    if (TlutObjMeta* tlutMeta = FindTlutObjMeta(oa); tlutMeta != nullptr && tlutMeta->dirty) {
++        if (ValidateTlutData(oa, *tlutMeta)) {
++            GXTlutObj* rebuild = CreateHostTlutObj(oa);
++            GXInitTlutObj(rebuild, GuestToHostPtr(tlutMeta->dataAddr), (GXTlutFmt)tlutMeta->format, tlutMeta->entries);
++            MarkHostTlutObjConstructed(oa);
++        }
++        tlutMeta->dirty = false;
++    }
++    GXTlutObj* obj = GetHostTlutObj(oa);
++    GXLoadTlut(obj, (GXTlut)tl);
++    try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) Memory::Write16(gd + 2, 0); } catch (...) {}
++}
++#else
+ extern "C" void GX__LoadTlut_80170fa8(uint32_t oa, uint32_t tl) { std::lock_guard<std::mutex> guard(g_tlutObjMutex); if (tl >= kMaxTluts) { RT_LOGF(RT_TAG_GX, "GXLoadTlut: invalid TLUT index %u (oa=0x%08X)\n", tl, oa); return; } auto metaIt = g_TlutObjMeta.find(oa); if (metaIt != g_TlutObjMeta.end() && metaIt->second.dirty) { if (ValidateTlutData(oa, metaIt->second)) { GXTlutObj* rebuild = CreateHostTlutObj(oa); GXInitTlutObj(rebuild, GuestToHostPtr(metaIt->second.dataAddr), (GXTlutFmt)metaIt->second.format, metaIt->second.entries); MarkHostTlutObjConstructed(oa); } metaIt->second.dirty = false; } GXTlutObj* obj = GetHostTlutObj(oa); GXLoadTlut(obj, (GXTlut)tl); try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) Memory::Write16(gd + 2, 0); } catch (...) {} }
++#endif
+ PPC_NATIVE_OVERRIDE_VOID(80170fa8, GX__LoadTlut_80170fa8, (uint32_t oa, uint32_t tl), (oa, tl));
+ 
+ // ============================================================================
+diff --git a/runtime/src/hle/gx/gx_transform.cpp b/runtime/src/hle/gx/gx_transform.cpp
+index f2a82a5..22a237d 100644
+--- a/runtime/src/hle/gx/gx_transform.cpp
++++ b/runtime/src/hle/gx/gx_transform.cpp
+@@ -143,8 +143,19 @@ PPC_NATIVE_OVERRIDE_VOID(801730cc, GX__GetProjectionv_801730cc, (uint32_t pa), (
+ // Matrix Loading
+ // ============================================================================
+ 
++#if defined(__SWITCH__)
++// aurora GXTransform.cpp: the guest matrix words as they are (their float round trip below is a
++// bitwise copy), one FIFO write.
++extern "C" void GXLoadPosMtxImmBE(const void* mtxBe, u32 id);
++extern "C" void GXLoadNrmMtxImmBE(const void* mtxBe, u32 id, u32 rowStride);
++#endif
++
+ extern "C" void GX__LoadPosMtxImm_8017310c(uint32_t ma, uint32_t id) {
+-    const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma); float m[12];
++    const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma);
++#if defined(__SWITCH__)
++    if (raw) { GXLoadPosMtxImmBE(raw, id); return; }
++#endif
++    float m[12];
+     SwapBeF32ArrayToHost(raw, m, 12);
+     GXLoadPosMtxImm((float(*)[4])m, id);
+ }
+@@ -154,12 +165,19 @@ extern "C" void GX__LoadPosMtxIndx_8017315c(uint32_t mi, uint32_t id) {
+     const auto& arr=g_hleGxState.vtxArray[GX_POS_MTX_ARRAY];
+     if(arr.base==0||arr.stride==0) return;
+     const uint32_t* raw=(const uint32_t*)GuestToHostPtr(arr.base+mi*arr.stride, 48);
++#if defined(__SWITCH__)
++    if(raw){ GXLoadPosMtxImmBE(raw, id); return; }
++#endif
+     if(raw){ float m[12]; SwapBeF32ArrayToHost(raw,m,12); GXLoadPosMtxImm((float(*)[4])m,id); }
+ }
+ PPC_NATIVE_OVERRIDE_VOID(8017315c, GX__LoadPosMtxIndx_8017315c, (uint32_t mi, uint32_t id), (mi, id));
+ 
+ extern "C" void GX__LoadNrmMtxImm_80173188(uint32_t ma, uint32_t id) {
+-    const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma, 48); float m[12];
++    const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma, 48);
++#if defined(__SWITCH__)
++    if (raw) { GXLoadNrmMtxImmBE(raw, id, 4); return; }
++#endif
++    float m[12];
+     SwapBeF32ArrayToHost(raw, m, 12); GXLoadNrmMtxImm((float(*)[4])m, id);
+ }
+ PPC_NATIVE_OVERRIDE_VOID(80173188, GX__LoadNrmMtxImm_80173188, (uint32_t ma, uint32_t id), (ma, id));
+@@ -168,6 +186,9 @@ extern "C" void GX__LoadNrmMtxIndx3x3_801731e0(uint32_t mi, uint32_t id) {
+     const auto& arr=g_hleGxState.vtxArray[GX_NRM_MTX_ARRAY];
+     if(arr.base==0||arr.stride==0) return;
+     const uint32_t* raw=(const uint32_t*)GuestToHostPtr(arr.base+mi*arr.stride, 36);
++#if defined(__SWITCH__)
++    if(raw){ GXLoadNrmMtxImmBE(raw, id, 3); return; }
++#endif
+     if(raw){
+         float src[9]{};
+         float m[12]{};
 diff --git a/runtime/src/hle/mlb/msl_natives.cpp b/runtime/src/hle/mlb/msl_natives.cpp
 new file mode 100644
 index 0000000..0c55151
@@ -3586,6 +6265,252 @@ index 0000000..0c55151
 +    if (!mlb_msl::FillPlainRam(dst, value, count)) mlb_msl::FillStores(dst, value, count);
 +}
 +REGISTER_NATIVE_FUNCTION(0x80006508, MLB_FillMem_80006508);
++#endif
+diff --git a/runtime/src/hle/mlb/mtx_natives.cpp b/runtime/src/hle/mlb/mtx_natives.cpp
+new file mode 100644
+index 0000000..f12eddc
+--- /dev/null
++++ b/runtime/src/hle/mlb/mtx_natives.cpp
+@@ -0,0 +1,240 @@
++// MLB Power Pros 2008 (RL8E54): a native leaf for PSMTXConcat (0x800A890C), 1.6% of the Switch
++// main thread in the stock match profile (42 translated call sites, bone and model matrices).
++//
++// void PSMTXConcat(const Mtx a, const Mtx b, Mtx ab): ab = a * b for 3x4 single matrices, 18
++// paired-single multiplies / fused multiply-adds over 13 psq_l pairs (a, b and the {0, 1} pair at
++// 0x8031A608) and 6 psq_st pairs, all with GQR0.
++//
++// The translation computes each pair with one NEON fmul/fmla (ppc_isa_float.h) and resolves NaN
++// lanes afterwards; loads quiet NaN lanes, stores flush single subnormals to their sign and quiet
++// NaN lanes. Every loaded lane flows into some stored lane, and a NaN lane propagates through
++// every later fmla of its chain, so a result with no NaN lane means no NaN was loaded or produced:
++// the resolver never acted and the load quieting changed nothing. The fast path below does the same
++// 18 instructions on that premise and, when any stored lane is NaN, discards its work (nothing was
++// stored yet) and runs the exact sequence of the translation (Exact), whose helpers it shares.
++// Exact also covers what the fast path does not: the checked access mode (no flat view), a GQR0
++// other than 0 (quantized psq), a destination range that touches the MMIO window or wraps, and
++// source ranges that wrap the 32-bit space.
++//
++// Kept exactly: every guest store (the back chain at r1-64, the 48 bytes of ab), r6 (the address
++// of the {0, 1} pair) and f0-f13 as the translation leaves them; f14, f15 and f31 are restored by
++// the original. r1 is unchanged. No CR, XER, LR or CTR access.
++//
++// This file builds like the translated code (-O2 -fno-fast-math -ffp-contract=off, outside the
++// unity build: runtime/CMakeLists.txt, next to MKW_PPC_SEMANTIC_RUNTIME_SOURCES): the helpers it
++// shares with the translation must compile to the same arithmetic, and -ffinite-math-only would
++// fold the NaN tests away.
++//
++// One call with ordinary matrices (qemu-aarch64 trace, the shard's flags): 742 instructions
++// translated (6 of its out-of-line PpcStorePairPsqFloatFastInline calls included), 152 here.
++#if defined(__SWITCH__)
++#include <arm_neon.h>
++#include <cstdint>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++
++namespace mlb_mtx {
++
++constexpr uint32_t kUnit01 = 0x8031A608u;  // r6 = 0x80320000 - 23032: {0.0f, 1.0f}
++
++// One pair as the translation holds it: packed double, low word ps1, high word ps0.
++inline uint64_t Raw(double value) {
++    uint64_t raw;
++    std::memcpy(&raw, &value, sizeof raw);
++    return raw;
++}
++
++struct Outputs {
++    uint64_t f[14];  // f0-f13 as the translation leaves them
++};
++
++// The translation's sequence, helper for helper and in its order (loads, stores and the MMIO
++// policy of each store included).
++[[gnu::noinline, gnu::cold]] void Exact(uint32_t gqr, uint32_t a, uint32_t b, uint32_t ab, Outputs& out) {
++    double f0 = PPC_PsqLGqrInline<0u, 0u>(gqr, a);
++    const double f6 = PPC_PsqLGqrInline<0u, 0u>(gqr, b);
++    const double f7 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 8u);
++    const double f8 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 16u);
++    double f12 = PPC_PsMuls0Inline(f6, f0);
++    double f2 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 16u);
++    double f13 = PPC_PsMuls0Inline(f7, f0);
++    const double f31 = PPC_PsqLGqrInline<0u, 0u>(gqr, kUnit01);
++    double f14 = PPC_PsMuls0Inline(f6, f2);
++    const double f9 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 24u);
++    double f15 = PPC_PsMuls0Inline(f7, f2);
++    const double f1 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 8u);
++    f12 = PPC_PsMadds1Inline(f8, f0, f12);
++    const double f3 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 24u);
++    f14 = PPC_PsMadds1Inline(f8, f2, f14);
++    const double f10 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 32u);
++    f13 = PPC_PsMadds1Inline(f9, f0, f13);
++    const double f11 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 40u);
++    f15 = PPC_PsMadds1Inline(f9, f2, f15);
++    const double f4 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 32u);
++    const double f5 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 40u);
++    f12 = PPC_PsMadds0Inline(f10, f1, f12);
++    f13 = PPC_PsMadds0Inline(f11, f1, f13);
++    f14 = PPC_PsMadds0Inline(f10, f3, f14);
++    f15 = PPC_PsMadds0Inline(f11, f3, f15);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab, f12);
++    f2 = PPC_PsMuls0Inline(f6, f4);
++    f13 = PPC_PsMadds1Inline(f31, f1, f13);
++    f0 = PPC_PsMuls0Inline(f7, f4);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 16u, f14);
++    f15 = PPC_PsMadds1Inline(f31, f3, f15);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 8u, f13);
++    f2 = PPC_PsMadds1Inline(f8, f4, f2);
++    f0 = PPC_PsMadds1Inline(f9, f4, f0);
++    f2 = PPC_PsMadds0Inline(f10, f5, f2);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 24u, f15);
++    f0 = PPC_PsMadds0Inline(f11, f5, f0);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 32u, f2);
++    f0 = PPC_PsMadds1Inline(f31, f5, f0);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 40u, f0);
++    const double regs[14] = {f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13};
++    for (int i = 0; i < 14; ++i) out.f[i] = Raw(regs[i]);
++}
++
++inline uint64_t Raw(float32x2_t pair) { return vget_lane_u64(vreinterpret_u64_f32(pair), 0); }
++
++// 16 guest bytes as two pairs in the packed layout: each 8-byte half byte-reversed, so the low
++// word of a pair is its second (ps1) float, exactly PpcLoadPairPsqFloatFromHostInline's bswap64.
++inline float32x4_t LoadPairs(const uint8_t* host) {
++    return vreinterpretq_f32_u8(vrev64q_u8(vld1q_u8(host)));
++}
++
++// psq_st's single narrowing of two pairs (PpcStorePsqFloatBitsInline per lane, NaN lanes excluded
++// by the caller): a subnormal or zero keeps only its sign. Then back to guest byte order.
++inline void StorePairs(uint8_t* host, float32x4_t pairs) {
++    const uint32x4_t bits = vreinterpretq_u32_f32(pairs);
++    const uint32x4_t tiny = vcltq_u32(vandq_u32(bits, vdupq_n_u32(0x7FFFFFFFu)), vdupq_n_u32(0x00800000u));
++    const uint32x4_t stored = vbslq_u32(tiny, vandq_u32(bits, vdupq_n_u32(0x80000000u)), bits);
++    vst1q_u8(host, vrev64q_u8(vreinterpretq_u8_u32(stored)));
++}
++
++inline bool Wraps(uint32_t address, uint32_t length) { return address > UINT32_MAX - (length - 1u); }
++
++// No store of ab[0..47] takes MemoryInline's policy path (each psq_st checks its first and last
++// byte against 0xCC000000-0xCDFFFFFF; the range test implies all twelve).
++inline bool PlainDestination(uint32_t ab) {
++    return !Wraps(ab, 48u) && (ab + 47u < 0xCC000000u || ab >= 0xCE000000u);
++}
++
++// False when a stored lane would be NaN: nothing is stored then and Exact runs instead.
++[[gnu::always_inline]] inline bool Fast(uint32_t a, uint32_t b, uint32_t ab, Outputs& out) {
++    uint8_t* const base = MKW_FLAT_GUEST_BASE;
++    const float32x4_t a01 = LoadPairs(base + a), a23 = LoadPairs(base + a + 16u),
++                      a45 = LoadPairs(base + a + 32u);
++    const float32x4_t b01 = LoadPairs(base + b), b23 = LoadPairs(base + b + 16u),
++                      b45 = LoadPairs(base + b + 32u);
++    uint64_t unitRaw;
++    std::memcpy(&unitRaw, base + kUnit01, sizeof unitRaw);
++    const float32x2_t f31 = vreinterpret_f32_u64(vdup_n_u64(__builtin_bswap64(unitRaw)));
++    const float32x2_t f0 = vget_low_f32(a01), f1 = vget_high_f32(a01), f2 = vget_low_f32(a23),
++                      f3 = vget_high_f32(a23), f4 = vget_low_f32(a45), f5 = vget_high_f32(a45);
++    const float32x2_t f6 = vget_low_f32(b01), f7 = vget_high_f32(b01), f8 = vget_low_f32(b23),
++                      f9 = vget_high_f32(b23), f10 = vget_low_f32(b45), f11 = vget_high_f32(b45);
++    // ps0 is lane 1, ps1 lane 0. ps_muls0 d,a,c = a * c.ps0; ps_madds1 d,a,c,b = fma(a, c.ps1, b).
++    float32x2_t r0 = vmul_lane_f32(f6, f0, 1);    // f12: ab row 0, columns 0-1
++    float32x2_t r1 = vmul_lane_f32(f7, f0, 1);    // f13: row 0, columns 2-3
++    float32x2_t r2 = vmul_lane_f32(f6, f2, 1);    // f14: row 1, columns 0-1
++    float32x2_t r3 = vmul_lane_f32(f7, f2, 1);    // f15: row 1, columns 2-3
++    float32x2_t r4 = vmul_lane_f32(f6, f4, 1);    // f2:  row 2, columns 0-1
++    float32x2_t r5 = vmul_lane_f32(f7, f4, 1);    // f0:  row 2, columns 2-3
++    r0 = vfma_lane_f32(r0, f8, f0, 0);
++    r1 = vfma_lane_f32(r1, f9, f0, 0);
++    r2 = vfma_lane_f32(r2, f8, f2, 0);
++    r3 = vfma_lane_f32(r3, f9, f2, 0);
++    r4 = vfma_lane_f32(r4, f8, f4, 0);
++    r5 = vfma_lane_f32(r5, f9, f4, 0);
++    r0 = vfma_lane_f32(r0, f10, f1, 1);
++    r1 = vfma_lane_f32(r1, f11, f1, 1);
++    r2 = vfma_lane_f32(r2, f10, f3, 1);
++    r3 = vfma_lane_f32(r3, f11, f3, 1);
++    r4 = vfma_lane_f32(r4, f10, f5, 1);
++    r5 = vfma_lane_f32(r5, f11, f5, 1);
++    r1 = vfma_lane_f32(r1, f31, f1, 0);
++    r3 = vfma_lane_f32(r3, f31, f3, 0);
++    r5 = vfma_lane_f32(r5, f31, f5, 0);
++    const float32x4_t row0 = vcombine_f32(r0, r1), row1 = vcombine_f32(r2, r3), row2 = vcombine_f32(r4, r5);
++    const uint32x4_t ordered = vandq_u32(vandq_u32(vceqq_f32(row0, row0), vceqq_f32(row1, row1)),
++                                         vceqq_f32(row2, row2));
++    if (vminvq_u32(ordered) == 0) [[unlikely]] return false;
++    StorePairs(base + ab, row0);
++    StorePairs(base + ab + 16u, row1);
++    StorePairs(base + ab + 32u, row2);
++    out.f[0] = Raw(r5);
++    out.f[1] = Raw(f1);
++    out.f[2] = Raw(r4);
++    out.f[3] = Raw(f3);
++    out.f[4] = Raw(f4);
++    out.f[5] = Raw(f5);
++    out.f[6] = Raw(f6);
++    out.f[7] = Raw(f7);
++    out.f[8] = Raw(f8);
++    out.f[9] = Raw(f9);
++    out.f[10] = Raw(f10);
++    out.f[11] = Raw(f11);
++    out.f[12] = Raw(r0);
++    out.f[13] = Raw(r1);
++    return true;
++}
++
++}  // namespace mlb_mtx
++
++// GQR0 is read as (*ctx).gqr: the translator's contract analysis knows gpr/fpr/cr/xer/ctr/lr only
++// and would make any other member a complete-context boundary, but no translated function holds a
++// GQR across a call (mtspr stores to ctx->gqr, every function reloads its copy after each call),
++// so this read needs no register sync.
++extern "C" void MLB_PSMTXConcat_800A890C(CpuContext* ctx) {
++    HleTraceCall("MLB_PSMTXConcat_800A890C");
++    const uint32_t sp = ctx->gpr[1];
++    const uint32_t a = ctx->gpr[3], b = ctx->gpr[4], ab = ctx->gpr[5];
++    const uint32_t gqr = (*ctx).gqr[0];
++    MemoryInline::FlatWriteRam32(sp - 64u, sp);  // stwu r1, -64(r1)
++    ctx->gpr[6] = mlb_mtx::kUnit01;
++    // Two blocks writing the same registers: the fast one's results stay in vector registers,
++    // which a single Outputs passed to the out-of-line Exact as well would not allow.
++    if (!GuestFlat::RequiresCheckedAccess() && gqr == 0 && !mlb_mtx::Wraps(a, 48u) && !mlb_mtx::Wraps(b, 48u) &&
++        mlb_mtx::PlainDestination(ab)) [[likely]] {
++        mlb_mtx::Outputs out;
++        if (mlb_mtx::Fast(a, b, ab, out)) [[likely]] {
++            ctx->fpr[0].raw = out.f[0];
++            ctx->fpr[1].raw = out.f[1];
++            ctx->fpr[2].raw = out.f[2];
++            ctx->fpr[3].raw = out.f[3];
++            ctx->fpr[4].raw = out.f[4];
++            ctx->fpr[5].raw = out.f[5];
++            ctx->fpr[6].raw = out.f[6];
++            ctx->fpr[7].raw = out.f[7];
++            ctx->fpr[8].raw = out.f[8];
++            ctx->fpr[9].raw = out.f[9];
++            ctx->fpr[10].raw = out.f[10];
++            ctx->fpr[11].raw = out.f[11];
++            ctx->fpr[12].raw = out.f[12];
++            ctx->fpr[13].raw = out.f[13];
++            return;
++        }
++    }
++    mlb_mtx::Outputs out;
++    mlb_mtx::Exact(gqr, a, b, ab, out);
++    ctx->fpr[0].raw = out.f[0];
++    ctx->fpr[1].raw = out.f[1];
++    ctx->fpr[2].raw = out.f[2];
++    ctx->fpr[3].raw = out.f[3];
++    ctx->fpr[4].raw = out.f[4];
++    ctx->fpr[5].raw = out.f[5];
++    ctx->fpr[6].raw = out.f[6];
++    ctx->fpr[7].raw = out.f[7];
++    ctx->fpr[8].raw = out.f[8];
++    ctx->fpr[9].raw = out.f[9];
++    ctx->fpr[10].raw = out.f[10];
++    ctx->fpr[11].raw = out.f[11];
++    ctx->fpr[12].raw = out.f[12];
++    ctx->fpr[13].raw = out.f[13];
++}
++REGISTER_NATIVE_FUNCTION(0x800A890C, MLB_PSMTXConcat_800A890C);
 +#endif
 diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
 index eeedef2..a6fb804 100644
@@ -3850,10 +6775,18 @@ index 7269747..49093ee 100644
  }
  extern "C" bool g_dynamicAspectRatioEnabled = false;
 diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
-index 280cfd6..b936f49 100644
+index 280cfd6..876817c 100644
 --- a/runtime/src/match_benchmark_overlay.inc
 +++ b/runtime/src/match_benchmark_overlay.inc
-@@ -156,6 +156,10 @@ void DrawMatchBenchmark() {
+@@ -1,4 +1,7 @@
+ // Included inside settings_overlay's private namespace: reuse its live graphics setters.
++#if defined(__SWITCH__)
++extern "C" const char* SwitchClocks();  // platform/switch/switch_profiler.cpp
++#endif
+ // CPU, threads, RAM, GPU and OS, one per line, for the panel and the saved report.
+ std::string BenchmarkDeviceInfo() {
+     char cpu[49] = {};
+@@ -156,6 +159,10 @@ void DrawMatchBenchmark() {
          std::error_code ec;
          std::filesystem::create_directories(folder, ec);
          report = folder / ("match-" + std::to_string(id));
@@ -3864,7 +6797,7 @@ index 280cfd6..b936f49 100644
          csv.open(report.string() + ".csv");
          if (!csv) { message = "No se pudo crear el informe"; return; }
          csv << "utc_unix_ms,elapsed_s,frame_ms,draws,scale,force_16_9,backend,shader_queue,gpu_render_ms,gpu_samples,cpu_encode_ms,efb_copies,efb_source_pixels,efb_snapshots,efb_readbacks,efb_readback_wait_ms,presents,process_cpu_pct,gpu_3d_pct,process_ram_mb,vram_mb,system_ram_used_gb\n";
-@@ -163,6 +167,7 @@ void DrawMatchBenchmark() {
+@@ -163,6 +170,7 @@ void DrawMatchBenchmark() {
          start = last = now;
          base = previous = waits;
          gpuBase = gpuPrevious = gpu;
@@ -3872,7 +6805,7 @@ index 280cfd6..b936f49 100644
          intervals.clear();
          valid = true;
          recordedScale = g_resolutionScale;
-@@ -172,6 +177,9 @@ void DrawMatchBenchmark() {
+@@ -172,6 +180,9 @@ void DrawMatchBenchmark() {
          recording = true;
          message = "Midiendo";
          std::fprintf(stderr, "[match-bench] recording %s scale=%.0f force169=%d\n", report.string().c_str(), g_resolutionScale, g_forceAspect169);
@@ -3882,7 +6815,17 @@ index 280cfd6..b936f49 100644
      };
      const auto finish = [&] {
          recording = false;
-@@ -201,9 +209,17 @@ void DrawMatchBenchmark() {
+@@ -185,6 +196,9 @@ void DrawMatchBenchmark() {
+         std::ofstream summary(report.string() + ".txt");
+         summary << "Yankees vs Colorado; CPU vs CPU; Coors Field; seeded start\n"
+                 << device << '\n'
++#if defined(__SWITCH__)
++                << SwitchClocks() << '\n'
++#endif
+                 << "valid=" << valid << " start_unix_ms=" << report.filename().string().substr(6) << '\n'
+                 << "scale=" << g_resolutionScale << " force_16_9=" << g_forceAspect169 << " backend=" << GraphicsApiDisplayName() << '\n'
+                 << "seconds=" << elapsed << " presented_frames=" << frames << " fps=" << (elapsed > 0 ? frames/elapsed : 0) << '\n'
+@@ -201,9 +215,17 @@ void DrawMatchBenchmark() {
              if (loadCount[i]) summary << loadNames[i] << "_mean=" << loadSum[i] / loadCount[i] << ' ' << loadNames[i] << "_peak=" << loadPeak[i] << '\n';
              else summary << loadNames[i] << "=unavailable\n";
          }
@@ -4036,10 +6979,10 @@ index 0000000..e01a61b
 +#endif
 diff --git a/runtime/src/platform/switch/switch_profiler.cpp b/runtime/src/platform/switch/switch_profiler.cpp
 new file mode 100644
-index 0000000..024642c
+index 0000000..1483e95
 --- /dev/null
 +++ b/runtime/src/platform/switch/switch_profiler.cpp
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,78 @@
 +// Sampling profiler on Horizon: svcSetThreadActivity pauses the main thread (which runs the guest
 +// fibers), svcGetThreadContext3 reads where it is, and it resumes. Started and dumped by the match
 +// benchmark (match_benchmark_overlay.inc) when WIICOMPILED_SWITCH_PROFILE=1.
@@ -4072,7 +7015,30 @@ index 0000000..024642c
 +}
 +} // namespace
 +
++// Mode, renderer and clocks right now, so a report says whether it ran docked, handheld or
++// overclocked (sys-clk changes them under the game). Phase 25 puts it in the benchmark summary.
++extern "C" const char* SwitchClocks() {
++    static char text[160];
++    u32 hz[3] = {};
++    const PcvModuleId ids[3] = {PcvModuleId_CpuBus, PcvModuleId_GPU, PcvModuleId_EMC};
++    const bool clkrst = R_SUCCEEDED(clkrstInitialize());
++    for (int i = 0; clkrst && i < 3; ++i) {
++        ClkrstSession session;
++        if (R_SUCCEEDED(clkrstOpenSession(&session, ids[i], 3))) {
++            clkrstGetClockRate(&session, &hz[i]);
++            clkrstCloseSession(&session);
++        }
++    }
++    if (clkrst) clkrstExit();
++    const char* renderer = std::getenv("WIICOMPILED_SWITCH_RENDERER");
++    std::snprintf(text, sizeof text, "switch_mode=%s renderer=%s cpu_mhz=%u gpu_mhz=%u emc_mhz=%u",
++                  appletGetOperationMode() == AppletOperationMode_Console ? "docked" : "handheld",
++                  renderer ? renderer : "vulkan", hz[0] / 1000000, hz[1] / 1000000, hz[2] / 1000000);
++    return text;
++}
++
 +extern "C" void SwitchProfilerStart() {
++    std::fprintf(stderr, "[match-bench] at start: %s\n", SwitchClocks());
 +    const char* enabled = std::getenv("WIICOMPILED_SWITCH_PROFILE");
 +    if (enabled == nullptr || *enabled != '1' || g_running.exchange(true)) return;
 +    // Core 2, above the game's priority, so a sample does not wait for the main thread to yield.
