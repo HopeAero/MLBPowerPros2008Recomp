@@ -261,8 +261,40 @@ Medido en octubre de 2026 con el perfilador de la Switch (partido de prueba) y c
   - `MIXUpdateSettings` recorre **todas** las voces AX y llama por cada una a `__MIXRmtUpdateSettings` (`0x800C1264`).
   - `__MIXGetVolume` (`0x800BE098`) pasa decibelios ×10 a volumen con la tabla de `0x802290B0`.
   - El coste crece con canales en fundido × voces; en la Wii era igual, no lo infla el recomp.
-- **Reverb:** `AXFXReverbHiCallback` (`0x800BC3AC`) es el callback auxiliar que llama `__AXOutNewFrame` (`0x800BA0D4`) desde el callback de DMA de audio (`0x800BA3F0`). Cada bloque de DMA son `0x180` bytes = 96 muestras = 3 ms, así que corre 333 veces por segundo (unas 5,6 por fotograma).
+- **Reverb:** `0x800BC3AC` es el proceso de la reverb AXFX ReverbHi. `AXFXReverbHiCallback` (`0x800BC0E8`) es un solo salto a ella. La llama `__AXOutNewFrame` (`0x800BA0D4`) desde el callback de DMA de audio (`0x800BA3F0`). Cada bloque de DMA son `0x180` bytes = 96 muestras = 3 ms, así que corre 333 veces por segundo (unas 5,6 por fotograma).
+  - El juego registra `0x800BC0E8` con `0x800B958C` (guarda callback y contexto del bus auxiliar) en `0x8002C260` y `0x8002DD54` (contexto `r31+0x6508`) y en `0x80069500` (contexto `r30+0x634`, tras iniciarlo con `0x800BBFFC`).
+  - Entrada: `r3` apunta a 3 punteros a búferes `int32` de 96 muestras (L, R, S), que reescribe en el sitio; `r4` es el área de trabajo. Es una hoja: no llama a nada. Marco de pila de 112 bytes (`r25`-`r31` en `+84`).
+  - Si `+0x10C` no es 0, borra su bit 1 y vuelve sin procesar.
+  - Por muestra y canal: `x = (float)(entrada + bus de entrada)` (suma `int32`, convertida con el double `0x4330000080000000` de `r2-30248`). Luego 3 tomas tempranas, predelay opcional, 3 peines en paralelo, 2 all-pass, un paso bajo de un polo y un all-pass final propio del canal.
+  - Tras los 3 canales: mezcla cruzada `L' = L + (R+S)·k` (igual para R y S), `fctiwz(· × +0x140)` a la salida y, si hay bus de salida, `fctiwz(· × +0x144)` al bus.
+  - Constantes en `r2-30268`..`r2-30256`: `0,0`, `1,0`, `0,6` (por `+0x134`) y `0,5` (por `+0x12C`, da `k`).
+  - Cada índice avanza 1 por muestra y vuelve a 0 al llegar a su longitud (comparación sin signo).
+
+| Desplazamiento | Contenido del área de trabajo de la reverb |
+|---|---|
+| `+0x00` | 3 punteros: línea temprana de cada canal |
+| `+0x0C` | 3 índices de la línea temprana: lee en los tres y escribe `x` en el tercero |
+| `+0x18` | longitud de la línea temprana |
+| `+0x20` | 3 coeficientes de las tomas tempranas |
+| `+0x2C` | 3 punteros: línea de predelay de cada canal |
+| `+0x38` / `+0x3C` | índice / longitud del predelay (longitud 0 = sin predelay) |
+| `+0x44` | 9 punteros: peines, 12 bytes por canal (canal × peine) |
+| `+0x68` / `+0x74` | 3 índices / 3 longitudes de los peines |
+| `+0x8C` | 3 coeficientes de realimentación de los peines |
+| `+0x98` | 6 punteros: all-pass, 8 bytes por canal (canal × etapa) |
+| `+0xB0` / `+0xB8` | 2 índices / 2 longitudes de los all-pass |
+| `+0xC8` / `+0xD4` / `+0xE0` | 3 punteros / 3 índices / 3 longitudes del all-pass final de cada canal |
+| `+0xF8` | coeficiente de los all-pass |
+| `+0xFC` | 3 estados del paso bajo |
+| `+0x108` | coeficiente del paso bajo |
+| `+0x10C` | palabra de bypass (ver arriba) |
+| `+0x12C` | mezcla cruzada |
+| `+0x134` | ganancia de la cola reverberante |
+| `+0x138` / `+0x13C` | descriptor del bus de entrada / salida (3 punteros) o 0 |
+| `+0x140` / `+0x144` | ganancia de salida / de envío al bus |
+
 - En el port de Switch, `MIXUpdateSettings` con sus dos llamadas internas es un nativo idéntico bit a bit (`runtime/src/hle/mlb/mix_natives.cpp`, fase 32 del parche de Switch).
+- En el port de Switch, `0x800BC3AC` también es un nativo idéntico bit a bit (`runtime/src/hle/mlb/reverb_natives.cpp`). Una llamada que guardaría un NaN se deshace y la corre la traducción.
 
 ### Streams del comentarista
 

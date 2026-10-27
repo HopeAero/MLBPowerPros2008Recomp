@@ -260,8 +260,40 @@ Measured in October 2026 with the Switch profiler (test match) and checked again
   - `MIXUpdateSettings` walks **every** AX voice and calls `__MIXRmtUpdateSettings` (`0x800C1264`) for each.
   - `__MIXGetVolume` (`0x800BE098`) turns decibels ×10 into a volume with the table at `0x802290B0`.
   - The cost grows with fading channels × voices; the Wii paid the same, the recomp does not inflate it.
-- **Reverb:** `AXFXReverbHiCallback` (`0x800BC3AC`) is the aux callback `__AXOutNewFrame` (`0x800BA0D4`) calls from the audio DMA callback (`0x800BA3F0`). Each DMA block is `0x180` bytes = 96 samples = 3 ms, so it runs 333 times a second (about 5.6 per frame).
+- **Reverb:** `0x800BC3AC` is the AXFX ReverbHi processing function. `AXFXReverbHiCallback` (`0x800BC0E8`) is a single branch to it. `__AXOutNewFrame` (`0x800BA0D4`) calls it from the audio DMA callback (`0x800BA3F0`). Each DMA block is `0x180` bytes = 96 samples = 3 ms, so it runs 333 times a second (about 5.6 per frame).
+  - The game registers `0x800BC0E8` with `0x800B958C` (stores the aux bus callback and context) at `0x8002C260` and `0x8002DD54` (context `r31+0x6508`) and at `0x80069500` (context `r30+0x634`, after setting it up with `0x800BBFFC`).
+  - Input: `r3` points to 3 pointers to 96-sample `int32` buffers (L, R, S), rewritten in place; `r4` is the work area. It is a leaf: it calls nothing. 112-byte stack frame (`r25`-`r31` at `+84`).
+  - If `+0x10C` is nonzero, it clears bit 1 there and returns without processing.
+  - Per sample and channel: `x = (float)(input + bus input)` (an `int32` sum, converted with the double `0x4330000080000000` at `r2-30248`). Then 3 early taps, an optional predelay, 3 parallel combs, 2 all-passes, a one-pole low-pass and a final all-pass of the channel's own.
+  - After the 3 channels: crosstalk `L' = L + (R+S)·k` (likewise for R and S), `fctiwz(· × +0x140)` to the output and, with a bus output, `fctiwz(· × +0x144)` to the bus.
+  - Constants at `r2-30268`..`r2-30256`: `0.0`, `1.0`, `0.6` (times `+0x134`) and `0.5` (times `+0x12C`, gives `k`).
+  - Every index steps by 1 per sample and wraps to 0 at its length (unsigned compare).
+
+| Offset | Reverb work area content |
+|---|---|
+| `+0x00` | 3 pointers: each channel's early line |
+| `+0x0C` | 3 early-line indices: reads at all three, writes `x` at the third |
+| `+0x18` | early-line length |
+| `+0x20` | 3 early-tap coefficients |
+| `+0x2C` | 3 pointers: each channel's predelay line |
+| `+0x38` / `+0x3C` | predelay index / length (length 0 = no predelay) |
+| `+0x44` | 9 pointers: combs, 12 bytes per channel (channel × comb) |
+| `+0x68` / `+0x74` | 3 comb indices / 3 comb lengths |
+| `+0x8C` | 3 comb feedback coefficients |
+| `+0x98` | 6 pointers: all-passes, 8 bytes per channel (channel × stage) |
+| `+0xB0` / `+0xB8` | 2 all-pass indices / 2 lengths |
+| `+0xC8` / `+0xD4` / `+0xE0` | 3 pointers / 3 indices / 3 lengths of each channel's final all-pass |
+| `+0xF8` | all-pass coefficient |
+| `+0xFC` | 3 low-pass states |
+| `+0x108` | low-pass coefficient |
+| `+0x10C` | bypass word (see above) |
+| `+0x12C` | crosstalk |
+| `+0x134` | reverb tail gain |
+| `+0x138` / `+0x13C` | bus input / output descriptor (3 pointers) or 0 |
+| `+0x140` / `+0x144` | output gain / bus send gain |
+
 - In the Switch port, `MIXUpdateSettings` with its two inner calls is a bit-identical native (`runtime/src/hle/mlb/mix_natives.cpp`, phase 32 of the Switch patch).
+- In the Switch port, `0x800BC3AC` is a bit-identical native too (`runtime/src/hle/mlb/reverb_natives.cpp`). A call that would store a NaN is undone and run by the translation.
 
 ### Commentator streams
 
