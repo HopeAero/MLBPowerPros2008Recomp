@@ -192,21 +192,53 @@ públicos del proyecto ni código generado; cualquier puente interno nuevo y lis
 build afectada quedarán en el parche reproducible. El diseño de registros concreto
 se decide en la fase del prototipo, tras medir y cerrar los contratos anteriores.
 
-## Próxima prueba y criterios de avance
+## Sonda stock completada y criterios de avance
 
-Antes de implementar la migración amplia, capturar con la NRO actual y reloj stock:
-`WIICOMPILED_SWITCH_PROFILE=1`, `WIICOMPILED_SWITCH_PROFILE_GX=1`,
-`WIICOMPILED_SWITCH_SPIKES=20`, `WIICOMPILED_SWITCH_SPIKES_MAX=256` y, para juego
-normal, `WIICOMPILED_SWITCH_PROFILE_WINDOW=10`. Opcionalmente el contador existente
-`WIICOMPILED_SWITCH_THREADS=5` ayuda a separar CPU de tiempo transcurrido. El muestreo
-GX perturba los tiempos: se usa para diagnóstico, no para prometer rendimiento.
+Después del «listo» del usuario se ejecutó la NRO P18b actual, sin cambios de runtime,
+con `WIICOMPILED_MATCH_BENCH=1`, `WIICOMPILED_MATCH_SECONDS=90`, perfil principal y
+GX activados, picos a 20 ms/máximo 256 y `WIICOMPILED_SWITCH_THREADS=5`.
+Log: `nxlink-MLBPowerPros2008-20261028-170606.log`; símbolos `elf-syms-P18b.txt`.
+Informe reproducible privado: `local/tmp/cpu/GX-F1-console-report.md`.
 
-La captura libre actual no imprime `SwitchClocks`; la prueba temporizada sí imprime
-relojes al inicio y en el resumen. Usar esa vía para una sonda automatizada corta con
-relojes registrados, y distinguirla de una captura de fildeo: el benchmark sembrado
-no reproduce un estado guardado ni una secuencia idéntica de controles. Una captura
-libre sin registro independiente de relojes se etiquetará sin verificación de stock.
-Enviar solo después del aviso «listo» del usuario para el netloader.
+- Portátil, deko3d, CPU 1020 / GPU 307 / EMC 1331 MHz registrados al inicio y final.
+- 90,0128 s, 5.347 frames, 59,4027 fps. Host p50 16,6676 / p95 18,4216 /
+  p99 21,7355 ms. Diagnóstico instrumentado, no benchmark de rendimiento sin sampler.
+- 124 picos >20 ms, uno >30 ms (33,5 ms), 2.670 muestras P y 2.669 pares W.
+  Sin agotar límite ni perder capturas por cola llena. `wait_processed` aparece
+  en 247 muestras de 90 picos; los PCs del worker cercanos muestran mayormente
+  trabajo de decoder/estado/memoria, no una condvar inactiva en ese subconjunto.
+- Espera media del productor 0,274 ms/frame; decode transcurrido 11,125 ms/frame.
+  No convertir ese último número en uso de CPU de core 1. Cero errores GX registrados.
+- La última ventana deko3d, 1.752 presents, tiene GPU p99 20 ms y 73 frames con GPU
+  >16 ms. Es una ventana del proceso, con numeración distinta de los frames host;
+  no atribuye por sí sola un pico host concreto a GPU. `gpu_samples=0` del resumen
+  Aurora no elimina esta telemetría de timestamps propia de deko3d.
+
+Esto respalda liberar el principal y estudiar solapamiento, pero no demuestra que
+solo trasladar HLE alcance 60 fps estables en todas las escenas. Hay trabajo y esperas
+en CPU, y una ventana GPU por encima del presupuesto. Los pares P/W son secuenciales,
+no simultáneos; el muestreo extra perturba tiempos. El arranque sembrado tampoco es
+un mismo estado guardado con controles idénticos ni una cobertura exhaustiva de fildeo.
+Nxlink y la NRO terminaron; no quedan monitores lanzados.
+
+Los contadores de hilo aportan ahora un criterio de afinidad: 18 dumps durante la
+grabación; descartado el primero, que cruza el inicio, quedan 17 deltas de períodos
+nominales de 5 s. CPU media por delta: principal 4,272 s, worker GX fijado a core 1
+2,587 s, suma de slots registrados fijados a core 2 0,967 s. Equivalen aproximadamente
+a 85% / 52% / 19% de un núcleo con ese denominador nominal. `interval_ms` es tiempo
+CPU, no duración wall medida. El principal permite afinidad 0x7, por lo que no se
+asigna su consumo a un core específico; la suma core 2 excluye sampler/dumper,
+un slot con afinidad compartida y carga del sistema. No demuestra 81% libre.
+Favorece **core 2 como primer candidato de prototipo**, conservando la necesidad de
+medir contrapresión y entrega. Método y límites: `local/tmp/cpu/GX-F1-threads.md`;
+el líder reprodujo de forma independiente los 17 recuentos y medias desde el log.
+
+Para activar el prototipo todavía debe inventariarse y encaminarse cada productor
+Aurora y cada entrada FIFO directa; el único dueño descrito arriba es un requisito,
+no una propiedad ya implementada. Las cachés y objetos host conservados en G7 no se
+prestan al worker: este solo consume registros propios que no muten esos mapas.
+La época de observación de texels y TLUT debe conservarse incluso si el guest modifica
+el origen entre Load y Draw. No hay equivalencia de snapshots anticipados demostrada.
 
 Para avanzar: pruebas host con estado/FIFO idénticos antes y después, incluyendo
 registros mezclados, listas anidadas, punteros reutilizados, consultas tras setters,

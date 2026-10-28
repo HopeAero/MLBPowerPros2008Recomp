@@ -28,11 +28,28 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
   self-check/asserts; 20 ventanas (70–260 s), media 13,46 ms ocupados/frame. Solo tres
   picos >30 ms tras 60 s; 0/98 muestras con `wait_processed`, sin W ni relojes. No
   atribuirlos a FIFO/GPU ni llamarlo benchmark stock verificado.
+- **Sonda en consola completada tras «listo»:** NRO actual P18b, 90 s automáticos con
+  PROFILE_GX=1, SPIKES=20/MAX256 y THREADS=5. CPU1020/GPU307/EMC1331 al inicio y final,
+  portátil/deko3d. 59,4027 fps, p95 18,4216 / p99 21,7355 ms. 124 picos >20 ms, uno
+  >30 (33,5 ms); 2.670 P / 2.669 W, sin agotar el límite. `wait_processed`: 247
+  muestras en 90 picos, con decoder/estado/memoria activos en los W cercanos. Espera
+  productor 0,274 ms/frame; decode elapsed 11,125. No es ahorro ni A/B de offload.
+- Última ventana deko3d: 73 GPU frames >16 ms y p99 GPU 20 ms. Numeración y ventanas
+  distintas de las host; no adjudicar cada pico por igualdad de IDs. El traslado HLE
+  no asegura por sí solo 60 fps sin bajones. Audio sin cambios.
+- Afinidad: 17 deltas útiles de períodos nominales de 5 s dan CPU media principal
+  4,272 s (~85%), worker GX core1 2,587 s (~52%), suma de slots fijos core2 0,967 s
+  (~19%). No mide toda la carga core2 ni prueba 81% libre; faltan sampler/dumper/OS y
+  el principal puede migrar (mask0x7). **Core2 es el primer candidato para probar HLE**.
+  Análisis en `local/tmp/cpu/GX-F1-threads.md`, recuentos/medias verificados por el líder.
+- Log nuevo `nxlink-MLBPowerPros2008-20261028-170606.log`, símbolos `elf-syms-P18b.txt`;
+  informe privado `local/tmp/cpu/GX-F1-console-report.md`. Parsers P11 usan labels
+  separados `GX-F1-main` y `GX-F1-worker` porque ambos escriben el mismo prefijo.
+  NRO/nxlink terminaron, sin monitores pendientes. No fase 66 ni build nuevo.
 - Verificación: `mkswitch.sh` (74 parches + linux + Switch/rebind), `treecheck.sh` y
-  ambos `diff -rq` pasan; árbol runtime/Aurora idéntico. Log:
-  `local/switch/logs/GX-offload-feasibility-verify.txt`. No fase 66, build ni prueba de
-  consola en esta tanda; audio intacto. Se pidió netloader y se espera «listo» antes
-  de enviar la NRO actual con perfil GX y picos a 20 ms. Sin push.
+  ambos `diff -rq` pasan; árbol runtime/Aurora idéntico. Logs:
+  `local/switch/logs/GX-offload-feasibility-verify.txt` y `GX-F1-console-verify.txt`.
+  Sin push.
 
 ## Tanda P11 (2026-10-28): probada en consola; pico GX pendiente
 
