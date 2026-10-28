@@ -1,5 +1,649 @@
+diff --git a/runtime/src/hle/gx/gx_objects.cpp b/runtime/src/hle/gx/gx_objects.cpp
+index ec98605..3350b96 100644
+--- a/runtime/src/hle/gx/gx_objects.cpp
++++ b/runtime/src/hle/gx/gx_objects.cpp
+@@ -66,9 +66,50 @@ struct HleTlutObj {
+     }
+ };
+ 
+-std::mutex g_texObjMutex;
++GxObjMutex g_texObjMutex;
+ std::map<uint32_t, std::unique_ptr<HleTlutObj>> g_HostTlutObjMap;
+-std::mutex g_tlutObjMutex;
++GxObjMutex g_tlutObjMutex;
++
++#if defined(__SWITCH__)
++// G7 (local/tmp/cpu/G7-tex.py): switches, counters and the owner-checked GxObjMutex (gx_internal.h).
++extern "C" int aurora_gx_g7_enabled(void);
++extern "C" int aurora_gx_g7_check(void);
++extern "C" int aurora_gx_g7_lock(void);
++
++int g_gxG7LockMode = -1;
++std::atomic<uintptr_t> g_gxG7LockOwner{0};
++int g_gxG7Enabled = -1;
++int g_gxG7Check = -1;
++
++void GxG7Resolve() noexcept {
++    g_gxG7Enabled = aurora_gx_g7_enabled() != 0 ? 1 : 0;
++    g_gxG7Check = aurora_gx_g7_check() != 0 ? 1 : 0;
++}
++
++void GxG7ResolveLockMode() noexcept {
++    g_gxG7LockMode = (aurora_gx_g7_enabled() != 0 && aurora_gx_g7_lock() != 0) ? 1 : 0;
++}
++
++void GxG7LockSlow(GxObjMutex& mutex, uintptr_t self) noexcept {
++    uintptr_t owner = g_gxG7LockOwner.load(std::memory_order_relaxed);
++    if (owner == 0 && g_gxG7LockOwner.compare_exchange_strong(owner, self, std::memory_order_relaxed)) {
++        owner = self;
++    }
++    if (owner != self) {
++        RT_LOGF(RT_TAG_GX,
++                "G7: a GX texture/TLUT object lock was taken on a second thread (0x%llx, owner 0x%llx); "
++                "this lock assumes one thread. Run with WIICOMPILED_GX_G7_LOCK=0.\n",
++                static_cast<unsigned long long>(self), static_cast<unsigned long long>(owner));
++        std::fflush(stderr);
++        std::abort();
++    }
++    if (mutex.held.load(std::memory_order_relaxed)) {
++        RT_LOGF(RT_TAG_GX, "G7: a GX texture/TLUT object lock was re-entered (the lock would deadlock)\n");
++        std::fflush(stderr);
++        std::abort();
++    }
++}
++#endif
+ 
+ // The texobj table. One slot per guest GXTexObj address holds both the decoded
+ // metadata and the Aurora object, so GXLoadTexObj resolves everything it needs
+@@ -85,6 +126,23 @@ namespace {
+ uint32_t g_texObjSlotMemoAddr = 0;
+ TexObjSlot* g_texObjSlotMemo = nullptr;
+ 
++#if defined(__SWITCH__)
++// Behind the memo, a direct-mapped cache of slot pointers: a match binds a few hundred texobjs a
++// frame, and g_TexObjMeta.find costs a 64-bit modulo and a node walk (FindTexObjSlot, 0.33% of the
++// main thread, profile-stock1). Same safety argument as the memo: slots are never erased and keep
++// their address across rehashes. Also the TLUT maps (std::map, never erased either) for
++// GXInitTlutObj/GXLoadTlut, which MLB calls per draw.
++constexpr uint32_t kGxObjCacheBits = 8;
++inline uint32_t GxObjCacheIndex(uint32_t addr) noexcept {
++    return (addr * 0x9E3779B1u) >> (32 - kGxObjCacheBits);
++}
++struct TexObjSlotCacheEntry {
++    uint32_t addr = 0;
++    TexObjSlot* slot = nullptr;
++};
++std::array<TexObjSlotCacheEntry, 1u << kGxObjCacheBits> g_texObjSlotCache{};
++#endif
++
+ constexpr size_t kTexObjTableReserve = 1024;
+ 
+ } // namespace
+@@ -237,12 +295,23 @@ TexObjSlot* FindTexObjSlot(uint32_t addr) {
+     if (g_texObjSlotMemo != nullptr && g_texObjSlotMemoAddr == addr) {
+         return g_texObjSlotMemo;
+     }
++#if defined(__SWITCH__)
++    TexObjSlotCacheEntry& cached = g_texObjSlotCache[GxObjCacheIndex(addr)];
++    if (cached.slot != nullptr && cached.addr == addr) {
++        g_texObjSlotMemoAddr = addr;
++        g_texObjSlotMemo = cached.slot;
++        return cached.slot;
++    }
++#endif
+     const auto it = g_TexObjMeta.find(addr);
+     if (it == g_TexObjMeta.end()) {
+         return nullptr;
+     }
+     g_texObjSlotMemoAddr = addr;
+     g_texObjSlotMemo = &it->second;
++#if defined(__SWITCH__)
++    cached = TexObjSlotCacheEntry{addr, &it->second};
++#endif
+     return g_texObjSlotMemo;
+ }
+ 
+@@ -257,6 +326,9 @@ TexObjSlot& FindOrCreateTexObjSlot(uint32_t addr) {
+     slot.objAddr = addr;
+     g_texObjSlotMemoAddr = addr;
+     g_texObjSlotMemo = &slot;
++#if defined(__SWITCH__)
++    GxP19Count(kP19SlotsCreated);
++#endif
+     return slot;
+ }
+ 
+@@ -419,6 +491,49 @@ void EnsureTlutObjBoundsLocked() {
+     g_tlutObjBoundsDirty = false;
+ }
+ 
++#if defined(__SWITCH__)
++struct TlutObjCacheEntry {
++    uint32_t addr = 0;
++    std::unique_ptr<HleTlutObj>* host = nullptr; // g_HostTlutObjMap[addr], once it exists
++    TlutObjMeta* meta = nullptr;                 // g_TlutObjMeta[addr], once it exists
++};
++std::array<TlutObjCacheEntry, 1u << kGxObjCacheBits> g_tlutObjCache{};
++
++TlutObjCacheEntry& TlutObjCacheFor(uint32_t addr) noexcept {
++    TlutObjCacheEntry& entry = g_tlutObjCache[GxObjCacheIndex(addr)];
++    if (entry.addr != addr) {
++        entry = TlutObjCacheEntry{addr, nullptr, nullptr};
++    }
++    return entry;
++}
++
++// g_HostTlutObjMap[addr] / .find(addr) and g_TlutObjMeta[addr], through the cache.
++std::unique_ptr<HleTlutObj>& HostTlutObjSlot(uint32_t addr) {
++    TlutObjCacheEntry& entry = TlutObjCacheFor(addr);
++    if (entry.host == nullptr) {
++        entry.host = &g_HostTlutObjMap[addr];
++    }
++    return *entry.host;
++}
++std::unique_ptr<HleTlutObj>* FindHostTlutObjSlot(uint32_t addr) {
++    TlutObjCacheEntry& entry = TlutObjCacheFor(addr);
++    if (entry.host == nullptr) {
++        const auto it = g_HostTlutObjMap.find(addr);
++        if (it != g_HostTlutObjMap.end()) {
++            entry.host = &it->second;
++        }
++    }
++    return entry.host;
++}
++TlutObjMeta& TlutObjMetaSlot(uint32_t addr) {
++    TlutObjCacheEntry& entry = TlutObjCacheFor(addr);
++    if (entry.meta == nullptr) {
++        entry.meta = &g_TlutObjMeta[addr];
++    }
++    return *entry.meta;
++}
++#endif
++
+ bool TexObjBackingDiffers(const TexObjMeta& lhs, const TexObjMeta& rhs) {
+     return CanonicalizeGxMainRamAddress(lhs.dataAddr) != CanonicalizeGxMainRamAddress(rhs.dataAddr) ||
+            lhs.width != rhs.width ||
+@@ -484,6 +599,50 @@ void MarkTexObjSyncedLocked(TexObjSlot& slot) noexcept {
+ 
+ } // namespace
+ 
++#if defined(__SWITCH__)
++// G7 check mode: every field, floats by bits.
++bool G7SameTexObjMeta(const TexObjMeta& a, const TexObjMeta& b) noexcept {
++    const auto bits = [](float f) {
++        uint32_t u = 0;
++        std::memcpy(&u, &f, sizeof(u));
++        return u;
++    };
++    return a.dataAddr == b.dataAddr && a.width == b.width && a.height == b.height && a.format == b.format &&
++           a.wrapS == b.wrapS && a.wrapT == b.wrapT && a.tlut == b.tlut && a.minFilter == b.minFilter &&
++           a.magFilter == b.magFilter && bits(a.minLod) == bits(b.minLod) && bits(a.maxLod) == bits(b.maxLod) &&
++           bits(a.lodBias) == bits(b.lodBias) && a.maxAniso == b.maxAniso && a.biasClamp == b.biasClamp &&
++           a.edgeLod == b.edgeLod && a.mipmap == b.mipmap && a.userData == b.userData &&
++           a.needsUpload == b.needsUpload;
++}
++
++// G7: ExtractTexObjMetaFromGuest(addr) for the 32 guest bytes `shadow` just read at addr. The decode
++// reads those bytes and nothing else, so the same bytes give the same result: MLB re-initialises
++// most of its texture objects (GXInitTexObjCI + GXInitTexObjLOD) with the same arguments before every
++// load, and each load used to decode them again.
++static TexObjMeta G7ExtractTexObjMeta(TexObjSlot& slot, uint32_t addr, const uint64_t (&shadow)[4]) {
++    if (!GxG7Enabled()) {
++        return ExtractTexObjMetaFromGuest(addr);
++    }
++    if (slot.g7ExtractValid && ShadowEquals(slot.g7ExtractShadow, shadow)) {
++        GxG7Count(kG7ExtractMemoHits);
++        if (GxG7Check()) {
++            const TexObjMeta fresh = ExtractTexObjMetaFromGuest(addr);
++            if (!G7SameTexObjMeta(fresh, slot.g7Extracted)) {
++                GxG7Count(kG7CheckMismatches);
++                return fresh;
++            }
++        }
++        return slot.g7Extracted;
++    }
++    GxG7Count(kG7Extracts);
++    const TexObjMeta extracted = ExtractTexObjMetaFromGuest(addr);
++    std::memcpy(slot.g7ExtractShadow, shadow, sizeof(slot.g7ExtractShadow));
++    slot.g7Extracted = extracted;
++    slot.g7ExtractValid = true;
++    return extracted;
++}
++#endif
++
+ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+     TexObjSlot* slot = FindTexObjSlot(addr);
+     if (slot != nullptr) {
+@@ -493,6 +652,16 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+             // full 32-byte compare (not a generation stamp) is what catches plain guest stores
+             // over the struct that never issue a cache op; see TexObjSlot::guestShadow.
+             uint64_t shadow[4];
++#if defined(__SWITCH__)
++            const bool shadowRead = ReadTexObjShadow(addr, shadow);
++            if (shadowRead && slot->hasGuestShadow && ShadowEquals(slot->guestShadow, shadow)) {
++                outMeta = *slot;
++                return true;
++            }
++
++            const TexObjMeta extracted =
++                shadowRead ? G7ExtractTexObjMeta(*slot, addr, shadow) : ExtractTexObjMetaFromGuest(addr);
++#else
+             if (ReadTexObjShadow(addr, shadow) && slot->hasGuestShadow &&
+                 ShadowEquals(slot->guestShadow, shadow)) {
+                 outMeta = *slot;
+@@ -500,6 +669,7 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+             }
+ 
+             const TexObjMeta extracted = ExtractTexObjMetaFromGuest(addr);
++#endif
+             if (IsUsableTexObjMeta(extracted) && TexObjMetaDiffers(*slot, extracted)) {
+                 // The caller writes the merged result back through
+                 // GetTexObjMeta, which is what re-establishes the sync.
+@@ -517,6 +687,9 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+         const bool extractedUsable = IsUsableTexObjMeta(extracted);
+         if (extractedUsable) {
+             QueueTexObjIntervalUpdate(*slot);
++#if defined(__SWITCH__)
++            slot->g7LoadReady = false;
++#endif
+             static_cast<TexObjMeta&>(*slot) = extracted;
+             MarkTexObjSyncedLocked(*slot);
+             outMeta = extracted;
+@@ -541,16 +714,243 @@ TexObjMeta& GetTexObjMeta(uint32_t addr) {
+     TexObjSlot& slot = FindOrCreateTexObjSlot(addr);
+     QueueTexObjIntervalUpdate(slot);
+     MarkTexObjSyncedLocked(slot);
++#if defined(__SWITCH__)
++    slot.g7LoadReady = false; // the caller is about to write the metadata
++#endif
+     return slot;
+ }
+ 
++#if defined(__SWITCH__)
++namespace {
++bool G7IsNan(float value) noexcept {
++    uint32_t bits = 0;
++    std::memcpy(&bits, &value, sizeof(bits));
++    return (bits & 0x7FFFFFFFu) > 0x7F800000u;
++}
++} // namespace
++
++// G7: what GX__LoadTexObj's full path does for a load-ready slot, step by step (after the caller's
++// lock and tid check): TryGetOrExtractTexObjMeta takes its shadow-equal path and hands back the slot;
++// the metadata passes every rejection test it passed when the slot became ready (a function of the
++// metadata, plus Memory::Contains of the same range, re-checked here); the sanitize step leaves the
++// sanitized metadata as is (each step is idempotent; NaN LODs never become ready); needsInit is false
++// (host constructed, cached == meta); no TLUT change; no upload (needsUpload false); then the binding
++// record and GXLoadTexObj as for any load; the two `GetTexObjMeta(oa) = meta` write-backs store the
++// same values, queue an interval patch that finds nothing to change (the slot's interval fields did
++// not move) and re-read the same shadow. So the caller only has to run the binding tail.
++TexObjSlot* G7FindLoadReadySlot(uint32_t addr) {
++    TexObjSlot* slot = FindTexObjSlot(addr);
++    if (slot == nullptr || !slot->g7LoadReady || slot->needsUpload || !slot->hasGuestShadow || !slot->host ||
++        !slot->host->constructed) {
++        return nullptr;
++    }
++    uint64_t shadow[4];
++    if (!ReadTexObjShadow(addr, shadow) || !ShadowEquals(slot->guestShadow, shadow)) {
++        return nullptr;
++    }
++    if (!Memory::Contains(slot->dataAddr, slot->g7LoadSize)) {
++        return nullptr;
++    }
++    return slot;
++}
++
++void G7NoteLoadDone(uint32_t addr, uint32_t size) {
++    TexObjSlot* slot = FindTexObjSlot(addr);
++    if (slot == nullptr || slot->needsUpload || size == 0 || !slot->host || !slot->host->constructed ||
++        G7IsNan(slot->minLod) || G7IsNan(slot->maxLod) || G7IsNan(slot->lodBias)) {
++        return;
++    }
++    slot->g7LoadReady = true;
++    slot->g7LoadSize = size;
++}
++
++uint8_t* G7GuestTexObjHost(uint32_t addr) noexcept {
++    if (!GxG7Enabled()) {
++        return nullptr;
++    }
++    const uint32_t end = addr + 31u;
++    if (end < addr || (end >> MemoryInline::kPageShift) != (addr >> MemoryInline::kPageShift)) {
++        return nullptr;
++    }
++    const uintptr_t encodedBias = MemoryInline::g_fullWritablePageBias[addr >> MemoryInline::kPageShift];
++    if (encodedBias == 0) {
++        return nullptr;
++    }
++    return reinterpret_cast<uint8_t*>((encodedBias - 1u) + addr);
++}
++#endif
++
+ // Same contract as GetTexObjMeta: the caller mutates the returned reference, so
+ // the cached TLUT address bounds have to be recomputed before the next flush.
+ TlutObjMeta& GetTlutObjMeta(uint32_t addr) {
+     g_tlutObjBoundsDirty = true;
++#if defined(__SWITCH__)
++    return TlutObjMetaSlot(addr);
++#else
+     return g_TlutObjMeta[addr];
++#endif
+ }
+ 
++#if defined(__SWITCH__)
++// GXInitTlutObj's write. The bounds only filter MarkTlutObjsDirtyForRange: a range outside them
++// skips the walk, so any superset of the valid palettes' ranges marks exactly what the exact bounds
++// mark. A palette that lands inside them (MLB re-inits the same ones per draw) keeps them one;
++// otherwise they are recomputed, as GetTlutObjMeta has them.
++TlutObjMeta& SetTlutObjMeta(uint32_t addr, uint32_t dataAddr, uint32_t format, uint16_t entries) {
++    TlutObjMeta& meta = TlutObjMetaSlot(addr);
++    meta.dataAddr = dataAddr;
++    meta.format = format;
++    meta.entries = entries;
++    meta.dirty = false;
++    if (!g_tlutObjBoundsDirty && meta.dataAddr != 0 && meta.entries != 0 && IsKnownTlutFormat(meta.format)) {
++        const uint64_t tlutStart = CanonicalizeGxMainRamAddress(meta.dataAddr);
++        const uint64_t tlutEnd = tlutStart + static_cast<uint64_t>(meta.entries) * 2u;
++        if (g_tlutObjBoundsStart >= g_tlutObjBoundsEnd || tlutStart < g_tlutObjBoundsStart ||
++            tlutEnd > g_tlutObjBoundsEnd) {
++            g_tlutObjBoundsDirty = true;
++        }
++    }
++    return meta;
++}
++
++TlutObjMeta* FindTlutObjMeta(uint32_t addr) {
++    TlutObjCacheEntry& entry = TlutObjCacheFor(addr);
++    if (entry.meta == nullptr) {
++        const auto it = g_TlutObjMeta.find(addr);
++        if (it != g_TlutObjMeta.end()) {
++            entry.meta = &it->second;
++        }
++    }
++    return entry.meta;
++}
++
++TexObjSlot* FindTexObjSlotForLoad(uint32_t addr) { return FindTexObjSlot(addr); }
++#endif
++
++#if defined(__SWITCH__)
++int g_gxP19Enabled = -1;
++
++void GxP19Resolve() noexcept { g_gxP19Enabled = aurora_gx_p19_enabled() != 0 ? 1 : 0; }
++
++// The recorded GXInitTexObj[CI] + GXInitTexObjLOD, with the arguments GX__InitTexObj[CI] / GX__InitTexObjLOD
++// would have passed (raw uint32 arguments, converted exactly as those calls did).
++void P19Materialize(HleTexObj& host) {
++    GXTexObj* const obj = host.PublicPtr();
++    const HleTexObj::LazyInit& a = host.init;
++    if (host.lazyCi) {
++        GXInitTexObjCI(obj, a.data, (u16)a.w, (u16)a.h, (GXCITexFmt)a.f, (GXTexWrapMode)a.ws, (GXTexWrapMode)a.wt,
++                       (GXBool)a.m, a.tl);
++    } else {
++        GXInitTexObj(obj, a.data, (u16)a.w, (u16)a.h, (GXTexFmt)a.f, (GXTexWrapMode)a.ws, (GXTexWrapMode)a.wt,
++                     (GXBool)a.m);
++    }
++    if (host.lazyLod) {
++        const HleTexObj::LazyLod& l = host.lod;
++        GXInitTexObjLOD(obj, (GXTexFilter)l.mif, (GXTexFilter)l.maf, l.mil, l.mal, l.lb, (GXBool)l.bc, (GXBool)l.el,
++                        (GXAnisotropy)l.ma);
++    }
++    host.lazy = false;
++    host.lazyLod = false;
++    GxP19Count(kP19LazyBuilt);
++}
++
++static inline GXTexObj* P19HostPtr(HleTexObj& host) {
++    if (host.lazy) [[unlikely]] {
++        P19Materialize(host);
++    }
++    return host.PublicPtr();
++}
++
++void P19InitTexObj(uint32_t oa, uint32_t da, uint32_t canonicalDataAddr, uint32_t w, uint32_t h, uint32_t f,
++                   uint32_t ws, uint32_t wt, uint32_t m, bool ci, uint32_t tl) {
++    // CreateHostTexObj
++    TexObjSlot& created = FindOrCreateTexObjSlot(oa);
++    created.g7LoadReady = false;
++    if (!created.host) {
++        created.host = std::make_unique<HleTexObj>();
++    }
++    HleTexObj& host = *created.host;
++    host.storageLive = true;
++    host.constructed = true;
++    host.lazy = true;
++    host.lazyCi = ci;
++    host.lazyLod = false;
++    // GetTexObjMeta(oa) and the metadata stores of GX__InitTexObj[CI]
++    TexObjMeta& meta = GetTexObjMeta(oa);
++    meta.dataAddr = canonicalDataAddr;
++    meta.width = (u16)w;
++    meta.height = (u16)h;
++    meta.format = f;
++    meta.wrapS = ws;
++    meta.wrapT = wt;
++    meta.mipmap = (m != 0);
++    if (ci) {
++        meta.tlut = tl;
++    }
++    meta.userData = 0;
++    meta.needsUpload = true;
++    // GXInitTexObj[CI](obj, GuestToHostPtr(da), ...) is evaluated here (its log lines, its pointer) and run later.
++    const void* const data = GuestToHostPtr(da);
++    HleTexObj::LazyInit& rec = host.init;
++    if (host.initSeen) {
++        if (rec.data == data && rec.w == w && rec.h == h && rec.f == f && rec.ws == ws && rec.wt == wt &&
++            rec.m == m && rec.tl == tl && rec.ci == ci) {
++            GxP19Count(kP19InitSame);
++        } else if (rec.data != data) {
++            GxP19Count(kP19InitDiffData);
++        } else {
++            GxP19Count(kP19InitDiffOther);
++        }
++    }
++    rec.data = data;
++    rec.w = w;
++    rec.h = h;
++    rec.f = f;
++    rec.ws = ws;
++    rec.wt = wt;
++    rec.m = m;
++    rec.tl = tl;
++    rec.ci = ci;
++    host.initSeen = true;
++    GxP19Count(kP19LazyInits);
++}
++
++HleTexObj* P19PendingHostForLod(uint32_t addr) {
++    TexObjSlot* slot = FindTexObjSlot(addr);
++    if (slot != nullptr && slot->host && slot->host->constructed && slot->host->lazy && !slot->host->lazyLod) {
++        return slot->host.get();
++    }
++    return nullptr;
++}
++
++void P19RecordLod(HleTexObj& host, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc,
++                  uint32_t el, uint32_t ma) {
++    HleTexObj::LazyLod& l = host.lod;
++    l.mif = mif;
++    l.maf = maf;
++    l.mil = mil;
++    l.mal = mal;
++    l.lb = lb;
++    l.bc = bc;
++    l.el = el;
++    l.ma = ma;
++    host.lazyLod = true;
++    GxP19Count(kP19LodDeferred);
++}
++
++GXTexObj* P19TryGetHostTexObjForLoad(uint32_t addr, HleTexObj*& pending) {
++    pending = nullptr;
++    TexObjSlot* slot = FindTexObjSlot(addr);
++    if (slot != nullptr && slot->host && slot->host->constructed) {
++        if (slot->host->lazy) {
++            pending = slot->host.get();
++        }
++        return slot->host->PublicPtr();
++    }
++    return nullptr;
++}
++#endif
++
+ GXTexObj* GetHostTexObj(uint32_t addr) {
+     TexObjSlot* slot = FindTexObjSlot(addr);
+     if (slot == nullptr || !slot->host || !slot->host->constructed) {
+@@ -563,7 +963,11 @@ GXTexObj* GetHostTexObj(uint32_t addr) {
+         MarkHostTexObjConstructed(addr);
+         return obj;
+     }
++#if defined(__SWITCH__)
++    return P19HostPtr(*slot->host);
++#else
+     return slot->host->PublicPtr();
++#endif
+ }
+ 
+ GXTexObj* CreateHostTexObj(uint32_t addr) {
+@@ -573,6 +977,9 @@ GXTexObj* CreateHostTexObj(uint32_t addr) {
+     // The shadow captured before that rewrite mismatches afterwards, so the
+     // next lookup takes exactly one guest re-decode and picks those defaults
+     // (and the computed mipmap maxLod) up.
++#if defined(__SWITCH__)
++    slot.g7LoadReady = false;
++#endif
+     if (!slot.host) {
+         slot.host = std::make_unique<HleTexObj>();
+     } else {
+@@ -592,7 +999,11 @@ void MarkHostTexObjConstructed(uint32_t addr) {
+ GXTexObj* TryGetHostTexObj(uint32_t addr) {
+     TexObjSlot* slot = FindTexObjSlot(addr);
+     if (slot != nullptr && slot->host && slot->host->constructed) {
++#if defined(__SWITCH__)
++        return P19HostPtr(*slot->host);
++#else
+         return slot->host->PublicPtr();
++#endif
+     }
+     return nullptr;
+ }
+@@ -610,7 +1021,7 @@ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size) {
+ 
+     const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
+     const uint64_t dirtyEnd = dirtyStart + size;
+-    std::lock_guard<std::mutex> guard(g_texObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
+ 
+     EnsureTexObjIntervalsLocked();
+     const auto lower = std::lower_bound(
+@@ -660,7 +1071,11 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size) {
+ }
+ 
+ GXTlutObj* CreateHostTlutObj(uint32_t addr) {
++#if defined(__SWITCH__)
++    auto& slot = HostTlutObjSlot(addr);
++#else
+     auto& slot = g_HostTlutObjMap[addr];
++#endif
+     if (!slot) {
+         slot = std::make_unique<HleTlutObj>();
+     } else {
+@@ -671,6 +1086,12 @@ GXTlutObj* CreateHostTlutObj(uint32_t addr) {
+ }
+ 
+ void MarkHostTlutObjConstructed(uint32_t addr) {
++#if defined(__SWITCH__)
++    if (std::unique_ptr<HleTlutObj>* slot = FindHostTlutObjSlot(addr); slot != nullptr && *slot) {
++        (*slot)->constructed = true;
++    }
++    return;
++#endif
+     auto it = g_HostTlutObjMap.find(addr);
+     if (it != g_HostTlutObjMap.end() && it->second) {
+         it->second->constructed = true;
+@@ -678,6 +1099,12 @@ void MarkHostTlutObjConstructed(uint32_t addr) {
+ }
+ 
+ GXTlutObj* GetHostTlutObj(uint32_t addr) {
++#if defined(__SWITCH__)
++    if (std::unique_ptr<HleTlutObj>* slot = FindHostTlutObjSlot(addr);
++        slot != nullptr && *slot && (*slot)->constructed) {
++        return (*slot)->PublicPtr();
++    }
++#endif
+     auto it = g_HostTlutObjMap.find(addr);
+     if (it == g_HostTlutObjMap.end() || !it->second || !it->second->constructed) {
+         const CpuContext* cpu = TryGetCpuContext();
+@@ -699,7 +1126,7 @@ void MarkTlutObjsDirtyForRange(uint32_t addr, uint32_t size) {
+ 
+     const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
+     const uint64_t dirtyEnd = dirtyStart + size;
+-    std::lock_guard<std::mutex> guard(g_tlutObjMutex);
++    std::lock_guard<GxObjMutex> guard(g_tlutObjMutex);
+     EnsureTlutObjBoundsLocked();
+     // Most DCStoreRange calls flush small material/vertex buffers that live
+     // nowhere near a palette, so reject them without walking the map.
+diff --git a/runtime/src/hle/gx/gx_stream_common.h b/runtime/src/hle/gx/gx_stream_common.h
+index 006ab47..8ed9d12 100644
+--- a/runtime/src/hle/gx/gx_stream_common.h
++++ b/runtime/src/hle/gx/gx_stream_common.h
+@@ -361,7 +361,54 @@ struct AuroraVtxPublishOptions {
+     int fmtLoopLast;
+ };
+ 
++#if defined(__SWITCH__)
++} // namespace GxStream
++// G6 (switch phase 44; aurora GXGeometry.cpp): GXSetVtxDesc / GXSetVtxAttrFmt over a list, the same
++// calls in the same order. WIICOMPILED_GX_G6=0 keeps the one-call-per-attribute loops below.
++extern "C" void GXSetVtxDescRun(const GXVtxDescList* list, u32 count);
++extern "C" void GXSetVtxAttrFmtRun(GXVtxFmt vtxfmt, const GXVtxAttrFmtList* list, u32 count);
++extern "C" int aurora_gx_g6_enabled(void);
++namespace GxStream {
++inline bool PublishVtxStateBatched() noexcept {
++    static const bool enabled = aurora_gx_g6_enabled() != 0;
++    return enabled;
++}
++#endif
++
+ inline void PublishAuroraVtxState(GXVtxFmt fmt, const AuroraVtxPublishOptions& options) {
++#if defined(__SWITCH__)
++    if (PublishVtxStateBatched()) {
++        GXVtxDescList descs[26];
++        u32 descCount = 0;
++        for (int attr = 0; attr < 26; ++attr) {
++            if (!options.includeNbt && attr == GX_VA_NBT) {
++                continue;
++            }
++            GXAttrType type = g_hleGxState.vtxDesc[attr];
++            if (type == GX_INDEX8 || type == GX_INDEX16) {
++                type = GX_DIRECT;
++            }
++            descs[descCount++] = GXVtxDescList{static_cast<GXAttr>(attr), type};
++        }
++        GXSetVtxDescRun(descs, descCount);
++
++        GXVtxAttrFmtList fmts[26];
++        u32 fmtCount = 0;
++        for (int attr = options.fmtLoopFirst; attr <= options.fmtLoopLast; ++attr) {
++            if (!options.includeNbt && attr == GX_VA_NBT) {
++                continue;
++            }
++            const GXAttr gxAttr = static_cast<GXAttr>(attr);
++            if (IsMatrixIndexAttr(gxAttr)) {
++                continue;
++            }
++            const auto& f = g_hleGxState.vtxAttrFmt[fmt][attr];
++            fmts[fmtCount++] = GXVtxAttrFmtList{gxAttr, f.cnt, f.type, f.frac};
++        }
++        GXSetVtxAttrFmtRun(fmt, fmts, fmtCount);
++        return;
++    }
++#endif
+     for (int attr = 0; attr < 26; ++attr) {
+         if (!options.includeNbt && attr == GX_VA_NBT) {
+             continue;
 diff --git a/runtime/src/hle/gx/gx_texture.cpp b/runtime/src/hle/gx/gx_texture.cpp
-index b5ebedd..9bbfaf5 100644
+index b5ebedd..afcb894 100644
 --- a/runtime/src/hle/gx/gx_texture.cpp
 +++ b/runtime/src/hle/gx/gx_texture.cpp
 @@ -11,6 +11,13 @@ static void WriteGuestTexObj(uint32_t addr, uint32_t dataAddr, uint16_t width, u
@@ -40,34 +684,69 @@ index b5ebedd..9bbfaf5 100644
      Memory::Write32(addr + 0x00, word0);
      Memory::Write32(addr + 0x04, word1);
      Memory::Write32(addr + 0x08, word2);
-@@ -250,7 +274,7 @@ extern "C" void GX__InitTexObj_801707f8(uint32_t oa, uint32_t da, uint32_t w, ui
+@@ -250,9 +274,17 @@ extern "C" void GX__InitTexObj_801707f8(uint32_t oa, uint32_t da, uint32_t w, ui
                  oa, da, w, h, f, ws, wt, m, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
      }
      const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
 -    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
++#if defined(__SWITCH__)
++    if (GxP19Enabled()) {
++        P19InitTexObj(oa, da, canonicalDataAddr, w, h, f, ws, wt, m, false, 0);
++    } else
++#endif
++    {
++    GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
      meta.dataAddr=canonicalDataAddr; meta.width=(u16)w; meta.height=(u16)h; meta.format=f; meta.wrapS=ws; meta.wrapT=wt; meta.mipmap=(m!=0); meta.userData=0; meta.needsUpload=true;
      GXInitTexObj(obj, GuestToHostPtr(da), (u16)w, (u16)h, (GXTexFmt)f, (GXTexWrapMode)ws, (GXTexWrapMode)wt, (GXBool)m); MarkHostTexObjConstructed(oa);
++    }
      // Also write to guest memory so reads work
-@@ -291,7 +315,7 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
+     WriteGuestTexObj(oa, canonicalDataAddr, (u16)w, (u16)h, f, ws, wt, m != 0, false, 0);
+ }
+@@ -291,9 +323,17 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
                  oa, da, w, h, f, ws, wt, m, tl, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
      }
      const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
 -    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
++#if defined(__SWITCH__)
++    if (GxP19Enabled()) {
++        P19InitTexObj(oa, da, canonicalDataAddr, w, h, f, ws, wt, m, true, tl);
++    } else
++#endif
++    {
++    GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
      meta.dataAddr=canonicalDataAddr; meta.width=(u16)w; meta.height=(u16)h; meta.format=f; meta.wrapS=ws; meta.wrapT=wt; meta.mipmap=(m!=0); meta.tlut=tl; meta.userData=0; meta.needsUpload=true;
      GXInitTexObjCI(obj, GuestToHostPtr(da), (u16)w, (u16)h, (GXCITexFmt)f, (GXTexWrapMode)ws, (GXTexWrapMode)wt, (GXBool)m, tl); MarkHostTexObjConstructed(oa);
++    }
      // Also write to guest memory so reads work
-@@ -306,7 +330,7 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
+     WriteGuestTexObj(oa, canonicalDataAddr, (u16)w, (u16)h, f, ws, wt, m != 0, true, tl);
+     // GXInitTexObjCI clears bit1 in the flags byte; keep guest memory consistent.
+@@ -306,9 +346,22 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
  PPC_NATIVE_OVERRIDE_VOID(80170a04, GX__InitTexObjCI_80170a04, (uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m, uint32_t tl), (oa, da, w, h, f, ws, wt, m, tl));
  
  extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma) {
 -    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = GetHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex); GXTexObj* obj = GetHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
++    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
++#if defined(__SWITCH__)
++    // P19: while the object is still only recorded (GXInitTexObj[CI] just ran) the LOD is recorded with it.
++    HleTexObj* const p19Lazy = GxP19Enabled() ? P19PendingHostForLod(oa) : nullptr;
++    GXTexObj* obj = p19Lazy != nullptr ? nullptr : GetHostTexObj(oa);
++#else
++    GXTexObj* obj = GetHostTexObj(oa);
++#endif
++    TexObjMeta& meta = GetTexObjMeta(oa);
      float fmal = std::isfinite(mal) && mal >= 0.f ? mal : 0.f, fmil = std::isfinite(mil) && mil >= 0.f ? std::min(mil, fmal) : 0.f;
      meta.minFilter=mif; meta.magFilter=maf; meta.minLod=fmil; meta.maxLod=fmal; meta.lodBias=lb; meta.biasClamp=(bc!=0); meta.edgeLod=(el!=0); meta.maxAniso=ma;
++#if defined(__SWITCH__)
++    if (p19Lazy != nullptr) {
++        P19RecordLod(*p19Lazy, mif, maf, fmil, fmal, lb, bc, el, ma);
++    } else
++#endif
      GXInitTexObjLOD(obj, (GXTexFilter)mif, (GXTexFilter)maf, fmil, fmal, lb, (GXBool)bc, (GXBool)el, (GXAnisotropy)ma);
-@@ -316,7 +340,7 @@ extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t m
+     // Also write LOD info to guest memory
+     WriteGuestTexObjLOD(oa, mif, maf, fmil, fmal, lb, bc != 0, el != 0, ma);
+@@ -316,7 +369,7 @@ extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t m
  PPC_NATIVE_OVERRIDE_VOID(80170a4c, GX__InitTexObjLOD_80170a4c, (uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma), (oa, mif, maf, mil, mal, lb, bc, el, ma));
  
  extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32_t wt) {
@@ -76,7 +755,7 @@ index b5ebedd..9bbfaf5 100644
      GXTexObj* obj = GetHostTexObj(oa);
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.wrapS = ws;
-@@ -332,7 +356,7 @@ extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32
+@@ -332,7 +385,7 @@ extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32
  PPC_NATIVE_OVERRIDE_VOID(80170b50, GX__InitTexObjWrapMode_80170b50, (uint32_t oa, uint32_t ws, uint32_t wt), (oa, ws, wt));
  
  extern "C" void GX__InitTexObjTlut_80170b64(uint32_t oa, uint32_t tl) {
@@ -85,7 +764,7 @@ index b5ebedd..9bbfaf5 100644
      GXTexObj* obj = GetHostTexObj(oa);
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.tlut = tl;
-@@ -347,7 +371,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b64, GX__InitTexObjTlut_80170b64, (uint32_t oa, ui
+@@ -347,7 +400,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b64, GX__InitTexObjTlut_80170b64, (uint32_t oa, ui
  
  // GXInitTexObjFilter - sets mag/min filter modes
  extern "C" void GX__InitTexObjFilter_80170b6c(uint32_t oa, uint32_t minFilter, uint32_t magFilter) {
@@ -94,7 +773,7 @@ index b5ebedd..9bbfaf5 100644
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.minFilter = minFilter;
      meta.magFilter = magFilter;
-@@ -375,7 +399,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b6c, GX__InitTexObjFilter_80170b6c, (uint32_t oa,
+@@ -375,7 +428,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b6c, GX__InitTexObjFilter_80170b6c, (uint32_t oa,
  
  // GXInitTexObjLODBias - sets LOD bias value
  extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
@@ -103,7 +782,7 @@ index b5ebedd..9bbfaf5 100644
      TexObjMeta& meta = GetTexObjMeta(oa);
      
      // Clamp bias to [-4.0, 3.99...] range as per SDK
-@@ -404,7 +428,7 @@ extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
+@@ -404,7 +457,7 @@ extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
  PPC_NATIVE_OVERRIDE_VOID(80170b94, GX__InitTexObjLODBias_80170b94, (uint32_t oa, float bias), (oa, bias));
  
  extern "C" void GX__InitTexObjUserData_80170be8(uint32_t oa, uint32_t userData) {
@@ -112,7 +791,7 @@ index b5ebedd..9bbfaf5 100644
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.userData = userData;
  
-@@ -454,7 +478,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -454,7 +507,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
      static uint32_t s_metaLookupLogCount = 0;
      static uint32_t s_unknownFormatLogCount = 0;
      static uint32_t s_invalidDataLogCount = 0;
@@ -121,7 +800,7 @@ index b5ebedd..9bbfaf5 100644
  
      if (tid >= g_boundTexMaps.size()) {
          if (s_invalidTidLogCount < 128) {
-@@ -464,6 +488,57 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -464,6 +517,57 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
          return;
      }
      
@@ -179,8 +858,17 @@ index b5ebedd..9bbfaf5 100644
      // Check if we have metadata for this texture, or try to extract it from guest memory
      TexObjMeta meta;
      if (!TryGetOrExtractTexObjMeta(oa, meta)) {
-@@ -548,9 +623,14 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -545,12 +649,23 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+     meta.lodBias = lodBiasSafe;
+     
+     // Check if host texture object exists, create if needed
++#if defined(__SWITCH__)
++    // P19: the object of a GXInitTexObj[CI] that only recorded its aurora calls is not built here unless it is used.
++    HleTexObj* p19Lazy = nullptr;
++    GXTexObj* obj = P19TryGetHostTexObjForLoad(oa, p19Lazy);
++#else
      GXTexObj* obj = TryGetHostTexObj(oa);
++#endif
      const bool isPalette = IsPaletteTexFormat(meta.format);
      bool needsInit = (obj == nullptr);
 +#if defined(__SWITCH__)
@@ -196,7 +884,37 @@ index b5ebedd..9bbfaf5 100644
          if (cached.width != meta.width || cached.height != meta.height || cached.format != meta.format ||
              cached.wrapS != meta.wrapS || cached.wrapT != meta.wrapT || cached.mipmap != meta.mipmap ||
              cached.minFilter != meta.minFilter || cached.magFilter != meta.magFilter ||
-@@ -586,7 +666,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -563,12 +678,29 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+     }
+     bool tlutChanged = false;
+     bool textureDataUploaded = false;
++#if defined(__SWITCH__)
++    if (p19Lazy != nullptr && !needsInit) {
++        P19Materialize(*p19Lazy); // used as it is: GXInitTexObjTlut / GXInitTexObjData / GXLoadTexObj
++    }
++#endif
+     try {
+         if (needsInit) {
+             if (!obj) {
+                 obj = CreateHostTexObj(oa);
+             }
+             void* dp = GuestToHostPtr(meta.dataAddr, size);
++#if defined(__SWITCH__)
++            if (p19Lazy != nullptr) {
++                if (dp) {
++                    // GXInitTexObj[CI] below overwrites the whole object: the recorded calls never mattered.
++                    p19Lazy->lazy = false;
++                    p19Lazy->lazyLod = false;
++                    GxP19Count(kP19LazyDiscarded);
++                } else {
++                    P19Materialize(*p19Lazy); // the init is skipped: the old object is loaded as it was
++                }
++            }
++#endif
+             if (dp) {
+                 if (isPalette) {
+                     GXInitTexObjCI(obj, dp, meta.width, meta.height, (GXCITexFmt)meta.format,
+@@ -586,7 +718,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
              // Write through GetTexObjMeta so the DCStoreRange interval index is
              // told this entry's backing may have moved.
              GetTexObjMeta(oa) = meta;
@@ -205,7 +923,7 @@ index b5ebedd..9bbfaf5 100644
              GXInitTexObjTlut(obj, meta.tlut);
              GetTexObjMeta(oa).tlut = meta.tlut;
              tlutChanged = true;
-@@ -614,6 +694,20 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -614,6 +746,20 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
          if (!canSkipHostLoad) {
              GXLoadTexObj(obj, (GXTexMapID)tid);
          }
@@ -226,7 +944,7 @@ index b5ebedd..9bbfaf5 100644
      } catch (const std::exception& ex) {
          if (s_hostExceptionLogCount++ < 64) {
              RT_LOGF(RT_TAG_GX,
-@@ -643,7 +737,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170dc8, GX__LoadTexObjPreLoaded_80170dc8, (uint32_t o
+@@ -643,7 +789,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170dc8, GX__LoadTexObjPreLoaded_80170dc8, (uint32_t o
  // ============================================================================
  
  extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp) {
@@ -235,7 +953,7 @@ index b5ebedd..9bbfaf5 100644
      TexObjMeta meta;
      if (!TryGetOrExtractTexObjMeta(oa, meta)) {
          RT_LOGF(RT_TAG_GX, "GXGetTexObjAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
-@@ -657,7 +751,7 @@ extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp,
+@@ -657,7 +803,7 @@ extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp,
  PPC_NATIVE_OVERRIDE_VOID(80170bf8, GX__GetTexObjAll_80170bf8, (uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp), (oa, dp, wp, hp, fp, wsp, wtp, mp));
  
  extern "C" void GX__GetTexObjLODAll_80170cbc(uint32_t oa, uint32_t mifp, uint32_t mafp, uint32_t milp, uint32_t malp, uint32_t lbp, uint32_t bcp, uint32_t elp, uint32_t map) {
@@ -244,7 +962,7 @@ index b5ebedd..9bbfaf5 100644
      TexObjMeta meta;
      if (!TryGetOrExtractTexObjMeta(oa, meta)) {
          RT_LOGF(RT_TAG_GX, "GXGetTexObjLODAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
-@@ -676,8 +770,13 @@ PPC_NATIVE_OVERRIDE_VOID(80170cbc, GX__GetTexObjLODAll_80170cbc, (uint32_t oa, u
+@@ -676,8 +822,13 @@ PPC_NATIVE_OVERRIDE_VOID(80170cbc, GX__GetTexObjLODAll_80170cbc, (uint32_t oa, u
  // ============================================================================
  
  extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, uint32_t e) {
@@ -258,7 +976,7 @@ index b5ebedd..9bbfaf5 100644
      // Leave the object unconstructed on a bad descriptor. A later GXLoadTlut
      // then takes GetHostTlutObj's soft-fail path and gets a fresh empty object
      // instead of aurora reading entries*2 bytes off an unvalidated pointer.
-@@ -686,7 +785,26 @@ extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, u
+@@ -686,7 +837,26 @@ extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, u
  }
  PPC_NATIVE_OVERRIDE_VOID(80170f80, GX__InitTlutObj_80170f80, (uint32_t oa, uint32_t da, uint32_t f, uint32_t e), (oa, da, f, e));
  
