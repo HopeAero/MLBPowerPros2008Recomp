@@ -5122,10 +5122,10 @@ index 0000000..e01a61b
 +#endif
 diff --git a/runtime/src/platform/switch/switch_profiler.cpp b/runtime/src/platform/switch/switch_profiler.cpp
 new file mode 100644
-index 0000000..af8626b
+index 0000000..4474290
 --- /dev/null
 +++ b/runtime/src/platform/switch/switch_profiler.cpp
-@@ -0,0 +1,477 @@
+@@ -0,0 +1,503 @@
 +// Sampling profiler on Horizon: svcSetThreadActivity pauses the main thread (which runs the guest
 +// fibers), svcGetThreadContext3 reads where it is, and it resumes. Started and dumped by the match
 +// benchmark (match_benchmark_overlay.inc) when WIICOMPILED_SWITCH_PROFILE=1.
@@ -5375,12 +5375,38 @@ index 0000000..af8626b
 +    }
 +}
 +
++// WIICOMPILED_SWITCH_PROFILE_WINDOW=<s> (with a free-running spike capture): the main thread's PC/LR
++// histograms of every <s> seconds of a played game, then cleared, so windows (fielding with many
++// players on screen, pitching) can be compared. Printed and cleared by the sampler thread that fills them.
++u64 g_winStart = 0, g_winSamples = 0;
++void WindowMaybeFlush() {
++    static const u64 windowNs = [] {
++        const char* v = std::getenv("WIICOMPILED_SWITCH_PROFILE_WINDOW");
++        return v ? u64(std::strtod(v, nullptr) * 1e9) : u64(0);
++    }();
++    if (!windowNs || !g_spkFree) return;
++    const u64 now = armGetSystemTick();
++    if (!g_winStart) g_winStart = now;
++    if (armTicksToNs(now - g_winStart) < windowNs) return;
++    std::fprintf(stderr, "[pwin] anchor=0x%lx t=%.1f frame=%u samples=%lu\n", reinterpret_cast<u64>(&SwitchProfilerStart),
++                 double(armTicksToNs(now - g_spkBenchStart)) / 1e9, g_spkFrame.load(std::memory_order_relaxed),
++                 g_samples - g_winSamples);
++    for (const auto& [pc, count] : g_pc) std::fprintf(stderr, "[pwin] P %lx %u\n", pc, count);
++    for (const auto& [lr, count] : g_lr) std::fprintf(stderr, "[pwin] L %lx %u\n", lr, count);
++    std::fflush(stderr);
++    g_pc.clear();
++    g_lr.clear();
++    g_winSamples = g_samples;
++    g_winStart = now;
++}
++
 +void Sample(void*) {
 +    const Handle main = envGetMainThreadHandle();
 +    while (g_running.load(std::memory_order_relaxed)) {
 +        svcSleepThread(1'000'000);
 +        SampleOnce(main);
 +        SpkMaybeFlush();
++        WindowMaybeFlush();
 +    }
 +}
 +} // namespace
