@@ -1849,6 +1849,287 @@ index 460791e..aa518c9 100644
  // This shadow register struct contains the GX state Aurora needs on PC.
  struct __GXData_struct {
    u16 vNum;         // vertex count for flush prim
+diff --git a/aurora-main/lib/gfx/auto_mips.hpp b/aurora-main/lib/gfx/auto_mips.hpp
+index 58190c7..23620e7 100644
+--- a/aurora-main/lib/gfx/auto_mips.hpp
++++ b/aurora-main/lib/gfx/auto_mips.hpp
+@@ -6,6 +6,8 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
++#include <memory>
+ #include <vector>
+ 
+ namespace aurora::gfx::auto_mips {
+@@ -52,78 +54,224 @@ inline bool is_cutout(const uint8_t* rgba, size_t pixels) noexcept {
+   }
+   return transparent != 0 && partial * 10 < pixels;
+ }
++
++#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
++static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "auto_mips reads RGBA texels as little-endian words");
++#endif
++
++inline uint32_t load32(const uint8_t* p) noexcept {
++  uint32_t v;
++  std::memcpy(&v, p, 4);
++  return v;
++}
++
++inline void store32(uint8_t* p, uint32_t v) noexcept { std::memcpy(p, &v, 4); }
++
++// m[d] = ceil(2^32 / d). For numerators n <= 4*255*255 + 510 and divisors d in 1..1020 (the only values the
++// downsample can produce), (n * m[d]) >> 32 == n / d exactly (the error n * (m*d - 2^32) < 2^32; checked
++// exhaustively in local/tmp/cpu/P13-mips/test.cpp).
++struct RecipTable {
++  uint64_t m[1021];
++  constexpr RecipTable() : m() {
++    for (uint32_t d = 1; d <= 1020; ++d) {
++      m[d] = ((uint64_t{1} << 32) + d - 1) / d;
++    }
++  }
++};
++inline constexpr RecipTable kRecip{};
++
++// Coverage of a level from the histogram of its alpha values; the same float expression as coverage().
++inline float coverage_hist(const uint32_t* hist, size_t pixels, float scale) noexcept {
++  size_t covered = 0;
++  for (uint32_t a = 0; a < 256; ++a) {
++    covered += static_cast<float>(a) * scale >= static_cast<float>(kCoverageRef) ? hist[a] : 0u;
++  }
++  return pixels != 0 ? static_cast<float>(covered) / static_cast<float>(pixels) : 0.f;
++}
++
++// One box-filtered level with edge clamping (source width or height 1, where texels repeat). Writes the
++// unscaled level to dst (w*h texels); with Hist also counts its alpha values.
++template <bool Hist>
++inline void downsample_clamped(
++    const uint8_t* prev, uint32_t pw, uint32_t ph, uint8_t* cur, uint32_t w, uint32_t h, uint32_t* hist) noexcept {
++  for (uint32_t y = 0; y < h; ++y) {
++    for (uint32_t x = 0; x < w; ++x) {
++      const uint32_t xs[2] = {std::min(x * 2, pw - 1), std::min(x * 2 + 1, pw - 1)};
++      const uint32_t ys[2] = {std::min(y * 2, ph - 1), std::min(y * 2 + 1, ph - 1)};
++      uint32_t sum[3] = {};
++      uint32_t weighted[3] = {};
++      uint32_t alpha = 0;
++      for (uint32_t sy : ys) {
++        for (uint32_t sx : xs) {
++          const uint8_t* p = &prev[(static_cast<size_t>(sy) * pw + sx) * 4];
++          for (int c = 0; c < 3; ++c) {
++            sum[c] += p[c];
++            weighted[c] += p[c] * p[3];
++          }
++          alpha += p[3];
++        }
++      }
++      uint8_t* d = &cur[(static_cast<size_t>(y) * w + x) * 4];
++      for (int c = 0; c < 3; ++c) {
++        d[c] = static_cast<uint8_t>(alpha != 0 ? (weighted[c] + alpha / 2) / alpha : (sum[c] + 2) / 4);
++      }
++      d[3] = static_cast<uint8_t>((alpha + 2) / 4);
++      if (Hist) {
++        ++hist[d[3]];
++      }
++    }
++  }
++}
++
++// The same for pw >= 2 and ph >= 2: x*2+1 <= pw-1 for every x < pw/2 (likewise y), so nothing is clamped.
++// When the four alphas are equal (every opaque or fully transparent block) the alpha weighting cancels:
++// (a*sum + 2a) / 4a == (sum + 2) / 4. Otherwise the division by the alpha sum is a reciprocal multiply.
++template <bool Hist>
++inline void downsample_fast(
++    const uint8_t* prev, uint32_t pw, uint8_t* cur, uint32_t w, uint32_t h, uint32_t* hist) noexcept {
++  const size_t stride = static_cast<size_t>(pw) * 4;
++  for (uint32_t y = 0; y < h; ++y) {
++    const uint8_t* r0 = prev + static_cast<size_t>(y) * 2 * stride;
++    const uint8_t* r1 = r0 + stride;
++    uint8_t* d = cur + static_cast<size_t>(y) * w * 4;
++    for (uint32_t x = 0; x < w; ++x, r0 += 8, r1 += 8, d += 4) {
++      const uint32_t p0 = load32(r0);
++      const uint32_t p1 = load32(r0 + 4);
++      const uint32_t p2 = load32(r1);
++      const uint32_t p3 = load32(r1 + 4);
++      const uint32_t a0 = p0 >> 24;
++      const uint32_t a1 = p1 >> 24;
++      const uint32_t a2 = p2 >> 24;
++      const uint32_t a3 = p3 >> 24;
++      uint32_t out;
++      if (a0 == a1 && a0 == a2 && a0 == a3) {
++        // Red and blue sums share one word (each lane <= 1020 < 65536), green is summed alone.
++        const uint32_t rb = (p0 & 0x00FF00FFu) + (p1 & 0x00FF00FFu) + (p2 & 0x00FF00FFu) + (p3 & 0x00FF00FFu);
++        const uint32_t g = ((p0 >> 8) & 0xFFu) + ((p1 >> 8) & 0xFFu) + ((p2 >> 8) & 0xFFu) + ((p3 >> 8) & 0xFFu);
++        // (4*a0 + 2) / 4 == a0.
++        out = (((rb + 0x00020002u) >> 2) & 0x00FF00FFu) | (((g + 2) >> 2) << 8) | (a0 << 24);
++      } else {
++        const uint32_t alpha = a0 + a1 + a2 + a3;
++        const uint32_t r = (p0 & 0xFFu) * a0 + (p1 & 0xFFu) * a1 + (p2 & 0xFFu) * a2 + (p3 & 0xFFu) * a3;
++        const uint32_t g = ((p0 >> 8) & 0xFFu) * a0 + ((p1 >> 8) & 0xFFu) * a1 + ((p2 >> 8) & 0xFFu) * a2 +
++                           ((p3 >> 8) & 0xFFu) * a3;
++        const uint32_t b = ((p0 >> 16) & 0xFFu) * a0 + ((p1 >> 16) & 0xFFu) * a1 + ((p2 >> 16) & 0xFFu) * a2 +
++                           ((p3 >> 16) & 0xFFu) * a3;
++        const uint64_t m = kRecip.m[alpha]; // alpha is 1..1020 here (not all four zero)
++        const uint32_t half = alpha / 2;
++        const uint32_t qr = static_cast<uint32_t>((static_cast<uint64_t>(r + half) * m) >> 32);
++        const uint32_t qg = static_cast<uint32_t>((static_cast<uint64_t>(g + half) * m) >> 32);
++        const uint32_t qb = static_cast<uint32_t>((static_cast<uint64_t>(b + half) * m) >> 32);
++        out = (qr & 0xFFu) | ((qg & 0xFFu) << 8) | ((qb & 0xFFu) << 16) | (((alpha + 2) >> 2) << 24);
++      }
++      store32(d, out);
++      if (Hist) {
++        ++hist[out >> 24];
++      }
++    }
++  }
++}
+ } // namespace detail
+ 
+ // Returns the whole chain, level 0 first (a copy of base), or empty when the texture is too small to bother.
+ // Colour is averaged weighted by alpha, so transparent black texels don't darken edges. For cut-out textures
+ // each level's alpha is rescaled to keep level 0's alpha-test coverage, so distant crowd and trees don't thin out.
++// The result is bit-identical to the straightforward version (per-level pass, 12 coverage passes of bisection);
++// here the coverage bisection runs on a 256-bin alpha histogram, the unscaled previous level is read in place and
++// the interior is a branch-light 2x2 kernel.
+ inline std::vector<uint8_t> build_chain(const uint8_t* base, uint32_t width, uint32_t height) {
+   const uint32_t levels = level_count(width, height);
+   if (levels < 2) {
+     return {};
+   }
+-  std::vector<uint8_t> chain(chain_bytes(width, height, levels));
+   const size_t basePixels = static_cast<size_t>(width) * height;
+-  std::copy(base, base + basePixels * 4, chain.begin());
++  // Level 0 is the copy; only the tail is value-initialised (and then fully overwritten).
++  std::vector<uint8_t> chain;
++  chain.reserve(chain_bytes(width, height, levels));
++  chain.insert(chain.end(), base, base + basePixels * 4);
++  chain.resize(chain_bytes(width, height, levels));
++
++  // is_cutout() and the coverage of level 0 (alpha >= kCoverageRef) in one pass: texels with alpha < 16,
++  // >= 240 and >= 128 (kCoverageRef is 128, so that is the alpha's top bit); the partial ones are the rest.
++  static_assert(detail::kCoverageRef == 128, "the coverage count below tests the alpha's top bit");
++  size_t transparent = 0;
++  size_t nearOpaque = 0;
++  size_t covered = 0;
++  size_t i = 0;
++  for (; i + 2 <= basePixels; i += 2) {
++    const uint32_t a0 = base[i * 4 + 3];
++    const uint32_t a1 = base[i * 4 + 7];
++    transparent += (a0 < 16) + (a1 < 16);
++    nearOpaque += (a0 >= 240) + (a1 >= 240);
++    covered += (a0 >> 7) + (a1 >> 7);
++  }
++  for (; i < basePixels; ++i) {
++    const uint32_t a = base[i * 4 + 3];
++    transparent += a < 16;
++    nearOpaque += a >= 240;
++    covered += a >> 7;
++  }
++  const size_t partial = basePixels - transparent - nearOpaque;
++  const bool cutout = transparent != 0 && partial * 10 < basePixels;
++  const float baseCoverage =
++      cutout && basePixels != 0 ? static_cast<float>(covered) / static_cast<float>(basePixels) : 0.f;
+ 
+-  const bool cutout = detail::is_cutout(base, basePixels);
+-  const float baseCoverage = cutout ? detail::coverage(base, basePixels, 1.f) : 0.f;
++  // Cut-out: the unscaled level feeds the next one while the stored copy gets the coverage scale, so levels
++  // alternate between two scratch buffers. Otherwise (scale 1) the chain itself is the unscaled level.
++  std::unique_ptr<uint8_t[]> scratch[2];
++  if (cutout) {
++    const uint32_t w1 = std::max(width >> 1, 1u);
++    const uint32_t h1 = std::max(height >> 1, 1u);
++    scratch[0].reset(new uint8_t[static_cast<size_t>(w1) * h1 * 4]);
++    if (levels > 2) {
++      const uint32_t w2 = std::max(w1 >> 1, 1u);
++      const uint32_t h2 = std::max(h1 >> 1, 1u);
++      scratch[1].reset(new uint8_t[static_cast<size_t>(w2) * h2 * 4]);
++    }
++  }
+ 
+-  // The unscaled previous level feeds the next one; only the stored copy gets the coverage scale.
+-  std::vector<uint8_t> prev(base, base + basePixels * 4);
+-  std::vector<uint8_t> cur;
++  const uint8_t* prev = base;
+   uint32_t pw = width;
+   uint32_t ph = height;
+   size_t offset = basePixels * 4;
+   for (uint32_t level = 1; level < levels; ++level) {
+     const uint32_t w = std::max(pw >> 1, 1u);
+     const uint32_t h = std::max(ph >> 1, 1u);
+-    cur.assign(static_cast<size_t>(w) * h * 4, 0);
+-    for (uint32_t y = 0; y < h; ++y) {
+-      for (uint32_t x = 0; x < w; ++x) {
+-        const uint32_t xs[2] = {std::min(x * 2, pw - 1), std::min(x * 2 + 1, pw - 1)};
+-        const uint32_t ys[2] = {std::min(y * 2, ph - 1), std::min(y * 2 + 1, ph - 1)};
+-        uint32_t sum[3] = {};
+-        uint32_t weighted[3] = {};
+-        uint32_t alpha = 0;
+-        for (uint32_t sy : ys) {
+-          for (uint32_t sx : xs) {
+-            const uint8_t* p = &prev[(static_cast<size_t>(sy) * pw + sx) * 4];
+-            for (int c = 0; c < 3; ++c) {
+-              sum[c] += p[c];
+-              weighted[c] += p[c] * p[3];
+-            }
+-            alpha += p[3];
+-          }
+-        }
+-        uint8_t* d = &cur[(static_cast<size_t>(y) * w + x) * 4];
+-        for (int c = 0; c < 3; ++c) {
+-          d[c] = static_cast<uint8_t>(alpha != 0 ? (weighted[c] + alpha / 2) / alpha : (sum[c] + 2) / 4);
+-        }
+-        d[3] = static_cast<uint8_t>((alpha + 2) / 4);
+-      }
+-    }
+-
+-    float scale = 1.f;
+     const size_t pixels = static_cast<size_t>(w) * h;
++    uint8_t* cur = cutout ? scratch[(level - 1) & 1].get() : chain.data() + offset;
++    const bool interior = pw >= 2 && ph >= 2;
++
+     if (cutout) {
++      uint32_t hist[256] = {};
++      if (interior) {
++        detail::downsample_fast<true>(prev, pw, cur, w, h, hist);
++      } else {
++        detail::downsample_clamped<true>(prev, pw, ph, cur, w, h, hist);
++      }
+       // Coverage grows with scale: bisect for the scale that matches level 0.
+       float lo = 0.f;
+       float hi = 4.f;
+       for (int i = 0; i < 12; ++i) {
+         const float mid = (lo + hi) * 0.5f;
+-        (detail::coverage(cur.data(), pixels, mid) < baseCoverage ? lo : hi) = mid;
++        (detail::coverage_hist(hist, pixels, mid) < baseCoverage ? lo : hi) = mid;
+       }
+-      scale = hi;
+-    }
+-    for (size_t i = 0; i < pixels; ++i) {
+-      chain[offset + i * 4 + 0] = cur[i * 4 + 0];
+-      chain[offset + i * 4 + 1] = cur[i * 4 + 1];
+-      chain[offset + i * 4 + 2] = cur[i * 4 + 2];
+-      chain[offset + i * 4 + 3] = static_cast<uint8_t>(std::min(cur[i * 4 + 3] * scale + 0.5f, 255.f));
++      const float scale = hi;
++      uint8_t lut[256];
++      for (uint32_t a = 0; a < 256; ++a) {
++        lut[a] = static_cast<uint8_t>(std::min(a * scale + 0.5f, 255.f));
++      }
++      uint8_t* out = chain.data() + offset;
++      for (size_t i = 0; i < pixels; ++i) {
++        const uint32_t v = detail::load32(cur + i * 4);
++        detail::store32(out + i * 4, (v & 0x00FFFFFFu) | (static_cast<uint32_t>(lut[v >> 24]) << 24));
++      }
++    } else if (interior) {
++      detail::downsample_fast<false>(prev, pw, cur, w, h, nullptr);
++    } else {
++      detail::downsample_clamped<false>(prev, pw, ph, cur, w, h, nullptr);
+     }
+     offset += pixels * 4;
+-    prev.swap(cur);
++    prev = cur;
+     pw = w;
+     ph = h;
+   }
 diff --git a/aurora-main/lib/gfx/clear.cpp b/aurora-main/lib/gfx/clear.cpp
 index f5964f9..2e5b013 100644
 --- a/aurora-main/lib/gfx/clear.cpp
@@ -2405,6 +2686,127 @@ index 3828d3c..9c595d7 100644
  bool has_pending(void* dest = nullptr) noexcept;
  bool prepare_downloads(void* dest = nullptr);
  void encode_downloads(const wgpu::CommandEncoder& encoder, void* dest = nullptr) noexcept;
+diff --git a/aurora-main/lib/gfx/texture.cpp b/aurora-main/lib/gfx/texture.cpp
+index f19f028..b04d822 100644
+--- a/aurora-main/lib/gfx/texture.cpp
++++ b/aurora-main/lib/gfx/texture.cpp
+@@ -43,6 +43,34 @@ wgpu::Extent3D physical_size(wgpu::Extent3D size, TextureFormatInfo info) {
+ }
+ } // namespace
+ 
++#if defined(__SWITCH__)
++// P13: WIICOMPILED_SWITCH_TEXSTATS (texture.hpp).
++TexStats g_texStats;
++int g_texStatsMode = -1;
++void texstats_resolve() noexcept {
++  const char* value = std::getenv("WIICOMPILED_SWITCH_TEXSTATS");
++  g_texStatsMode = (value != nullptr && value[0] != '\0' && value[0] != '0') ? 1 : 0;
++}
++
++namespace {
++// Counts one new_static_texture_2d call and its time, whichever of its returns runs.
++struct StaticCreateStat {
++  const bool on = texstats_enabled();
++  const uint64_t start = on ? texstats_now_ns() : 0;
++  bool tlut = false;
++  uint64_t uploadBytes = 0;
++  ~StaticCreateStat() {
++    if (!on) {
++      return;
++    }
++    (tlut ? g_texStats.tlutCreated : g_texStats.staticCreated).fetch_add(1, std::memory_order_relaxed);
++    g_texStats.createNs.fetch_add(texstats_now_ns() - start, std::memory_order_relaxed);
++    g_texStats.uploadBytes.fetch_add(uploadBytes, std::memory_order_relaxed);
++  }
++};
++} // namespace
++#endif
++
+ TextureFormatInfo format_info(wgpu::TextureFormat format) noexcept {
+   switch (format) {
+     DEFAULT_FATAL("unimplemented texture format {}", magic_enum::enum_name(format));
+@@ -81,6 +109,10 @@ uint64_t calc_texture_size(wgpu::TextureFormat format, u32 width, u32 height, u3
+ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
+                                     bool tlut, const char* label) noexcept {
+   ZoneScoped;
++#if defined(__SWITCH__)
++  StaticCreateStat createStat;
++  createStat.tlut = tlut;
++#endif
+ 
+   mips = clamp_mip_count(width, height, mips, label);
+   // A static RGBA texture the game loads without mips gets a generated chain; TLUTs and palette indices don't.
+@@ -109,7 +141,16 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
+   // Levels past 0 stay unsampled (generatedMips false, the sampler clamps to level 0) if the data is short.
+   std::vector<uint8_t> chain;
+   if (autoMips && data.size() >= static_cast<size_t>(width) * height * 4) {
++#if defined(__SWITCH__)
++    const uint64_t chainStart = createStat.on ? texstats_now_ns() : 0;
++#endif
+     chain = auto_mips::build_chain(data.data(), width, height);
++#if defined(__SWITCH__)
++    if (createStat.on) {
++      g_texStats.autoMips.fetch_add(1, std::memory_order_relaxed);
++      g_texStats.autoMipNs.fetch_add(texstats_now_ns() - chainStart, std::memory_order_relaxed);
++    }
++#endif
+     if (!chain.empty()) {
+       data = {chain.data(), chain.size()};
+       mips = ref.mipCount;
+@@ -117,6 +158,9 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
+     }
+   }
+ 
++#if defined(__SWITCH__)
++  createStat.uploadBytes = data.size();
++#endif
+   uint32_t offset = 0;
+   for (uint32_t mip = 0; mip < mips; ++mip) {
+     const wgpu::Extent3D mipSize{
+diff --git a/aurora-main/lib/gfx/texture.hpp b/aurora-main/lib/gfx/texture.hpp
+index 4f3ecc0..3fc3425 100644
+--- a/aurora-main/lib/gfx/texture.hpp
++++ b/aurora-main/lib/gfx/texture.hpp
+@@ -59,6 +59,39 @@ struct TextureRef {
+   , gxFormat(gxFormat) {}
+ };
+ 
++#if defined(__SWITCH__)
++// P13 (local/tmp/cpu/P13-texcache.py): WIICOMPILED_SWITCH_TEXSTATS=1 prints one "[texstats]" line per second
++// (gx.cpp texstats_tick) with the static texture creations, their cost and the cache outcomes. Off: one
++// predictable branch per call site.
++struct TexStats {
++  std::atomic<uint64_t> staticCreated{0}, tlutCreated{0}, autoMips{0}, autoMipNs{0}, createNs{0}, uploadBytes{0};
++  std::atomic<uint64_t> paletteConv{0}, paletteConvNs{0}, paletteConvBytes{0};
++  std::atomic<uint64_t> digests{0}, digestBytes{0}, digestNs{0};
++  std::atomic<uint64_t> srcMissNew{0}, srcMissChanged{0}, palMissNew{0}, palMissChanged{0};
++  std::atomic<uint64_t> contentHitLive{0}, contentHitRetained{0}, contentStored{0}, contentRetired{0},
++      contentEvicted{0};
++};
++extern TexStats g_texStats;
++extern int g_texStatsMode; // -1 until texstats_resolve
++void texstats_resolve() noexcept;
++inline bool texstats_enabled() noexcept {
++  if (g_texStatsMode < 0) [[unlikely]] {
++    texstats_resolve();
++  }
++  return g_texStatsMode > 0;
++}
++inline uint64_t texstats_now_ns() noexcept {
++  return static_cast<uint64_t>(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++          .count());
++}
++#define TEXSTAT_ADD(field, n)                                                                                         \
++  do {                                                                                                                \
++    if (::aurora::gfx::texstats_enabled())                                                                            \
++      ::aurora::gfx::g_texStats.field.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);                 \
++  } while (0)
++#endif
++
+ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+                                     ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept;
+ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
 diff --git a/aurora-main/lib/gfx/texture_replacement.cpp b/aurora-main/lib/gfx/texture_replacement.cpp
 index 8b55612..1afac0a 100644
 --- a/aurora-main/lib/gfx/texture_replacement.cpp
@@ -4160,10 +4562,636 @@ index 0000000..91f1e12
 +  return n < 0 ? 0 : std::min(n, size - 1);
 +}
 diff --git a/aurora-main/lib/gx/gx.cpp b/aurora-main/lib/gx/gx.cpp
-index 563fd06..619aa25 100644
+index 563fd06..0b910c8 100644
 --- a/aurora-main/lib/gx/gx.cpp
 +++ b/aurora-main/lib/gx/gx.cpp
-@@ -1659,6 +1659,23 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
+@@ -195,6 +195,29 @@ struct StaticPaletteTextureKey {
+   }
+ };
+ 
++#if defined(__SWITCH__)
++// P13 (local/tmp/cpu/P13-texcache.py): what new_static_texture_2d / convert_texture_palette make a texture from.
++struct StaticContentKey {
++  u64 texDigest = 0;
++  u64 tlutDigest = 0;
++  u32 texSize = 0;
++  u32 tlutSize = 0;
++  u32 width = 0;
++  u32 height = 0;
++  u32 mips = 0;
++  u32 format = 0;
++  u32 tlutFormat = 0;
++  u32 flags = 0; // 1 palette texture, 2 TLUT texture, 4 auto mipmaps on
++
++  bool operator==(const StaticContentKey& rhs) const = default;
++  template <typename H>
++  friend H AbslHashValue(H h, const StaticContentKey& key) {
++    return H::combine(std::move(h), key.texDigest, key.tlutDigest, key.texSize, key.tlutSize, key.width, key.height,
++                      key.mips, key.format, key.tlutFormat, key.flags);
++  }
++};
++#endif
++
+ // Revalidation used to keep a full byte-for-byte copy of every cached source and memcmp against it.
+ struct StaticTextureSourceEntry {
+   gfx::TextureHandle handle;
+@@ -202,6 +225,10 @@ struct StaticTextureSourceEntry {
+   u32 sourceSize = 0;
+   u64 validationRevision = 0;
+   u64 sourceGeneration = kGuestWriteUntracked;
++#if defined(__SWITCH__)
++  StaticContentKey contentKey;
++  bool hasContentKey = false;
++#endif
+ };
+ 
+ struct StaticPaletteTextureSourceEntry {
+@@ -213,6 +240,10 @@ struct StaticPaletteTextureSourceEntry {
+   u64 validationRevision = 0;
+   u64 textureGeneration = kGuestWriteUntracked;
+   u64 tlutGeneration = kGuestWriteUntracked;
++#if defined(__SWITCH__)
++  StaticContentKey contentKey;
++  bool hasContentKey = false;
++#endif
+ };
+ 
+ struct CachedTlutTextureEntry {
+@@ -221,6 +252,10 @@ struct CachedTlutTextureEntry {
+   u64 digest = 0;
+   u64 validationRevision = 0;
+   u64 generation = kGuestWriteUntracked;
++#if defined(__SWITCH__)
++  StaticContentKey contentKey;
++  bool hasContentKey = false;
++#endif
+ };
+ 
+ struct TlutObjectCache {
+@@ -343,6 +378,16 @@ static u64 digest_source_bytes(const void* data, size_t size) noexcept {
+   if (data == nullptr || size == 0) {
+     return 0;
+   }
++#if defined(__SWITCH__)
++  if (gfx::texstats_enabled()) {
++    const u64 start = gfx::texstats_now_ns();
++    const u64 digest = static_cast<u64>(xxh3_hash_s(data, size));
++    gfx::g_texStats.digests.fetch_add(1, std::memory_order_relaxed);
++    gfx::g_texStats.digestBytes.fetch_add(size, std::memory_order_relaxed);
++    gfx::g_texStats.digestNs.fetch_add(gfx::texstats_now_ns() - start, std::memory_order_relaxed);
++    return digest;
++  }
++#endif
+   return static_cast<u64>(xxh3_hash_s(data, size));
+ }
+ 
+@@ -435,6 +480,304 @@ static StaticPaletteTextureSourceEntry make_static_palette_texture_source_entry(
+   };
+ }
+ 
++#if defined(__SWITCH__)
++// P13: content-keyed reuse of created static textures (see local/tmp/cpu/P13-texcache.py).
++struct ContentEntry {
++  std::weak_ptr<gfx::TextureRef> weak; // reuse while any cache or binding still holds the texture
++  gfx::TextureHandle retained;         // set while the bounded pool holds it
++  u64 bytes = 0;
++  u64 lastUse = 0;
++};
++static absl::flat_hash_map<StaticContentKey, ContentEntry> s_contentCache;
++static u64 s_contentTick = 0;
++static u64 s_retainedBytes = 0;
++static size_t s_retainedCount = 0;
++static size_t s_contentSweepAt = 4096;
++
++static u64 content_env(const char* name, u64 fallback) noexcept {
++  const char* value = std::getenv(name);
++  if (value == nullptr || value[0] == '\0') {
++    return fallback;
++  }
++  return static_cast<u64>(std::strtoull(value, nullptr, 10));
++}
++static bool content_cache_enabled() noexcept {
++  static const bool enabled = content_env("WIICOMPILED_SWITCH_TEXCONTENT", 1) != 0;
++  return enabled;
++}
++// Retained textures are pinned GPU memory (and descriptor slots): at most this much / this many.
++static u64 retain_cap_bytes() noexcept {
++  static const u64 cap = content_env("WIICOMPILED_SWITCH_TEXRETAIN_MB", 96) << 20;
++  return cap;
++}
++static size_t retain_cap_entries() noexcept {
++  static const size_t cap = static_cast<size_t>(content_env("WIICOMPILED_SWITCH_TEXRETAIN_ENTRIES", 768));
++  return cap;
++}
++
++static u64 content_texture_bytes(const gfx::TextureHandle& handle) noexcept {
++  return gfx::calc_texture_size(handle->format, handle->size.width, handle->size.height, handle->mipCount);
++}
++
++static void content_release_retained(ContentEntry& entry) noexcept {
++  if (!entry.retained) {
++    return;
++  }
++  s_retainedBytes -= entry.bytes;
++  --s_retainedCount;
++  entry.retained.reset();
++}
++
++static gfx::TextureHandle content_lookup(const StaticContentKey& key) noexcept {
++  const auto it = s_contentCache.find(key);
++  if (it == s_contentCache.end()) {
++    return {};
++  }
++  auto& entry = it->second;
++  gfx::TextureHandle handle = entry.weak.lock();
++  if (!handle) {
++    s_contentCache.erase(it);
++    return {};
++  }
++  entry.lastUse = ++s_contentTick;
++  if (entry.retained) {
++    TEXSTAT_ADD(contentHitRetained, 1);
++    content_release_retained(entry); // live in a cache again: stop pinning it
++  } else {
++    TEXSTAT_ADD(contentHitLive, 1);
++  }
++  return handle;
++}
++
++static void content_store(const StaticContentKey& key, const gfx::TextureHandle& handle) noexcept {
++  if (!handle) {
++    return;
++  }
++  if (s_contentCache.size() >= s_contentSweepAt) {
++    absl::erase_if(s_contentCache, [](const auto& item) { return !item.second.retained && item.second.weak.expired(); });
++    s_contentSweepAt = std::max<size_t>(4096, s_contentCache.size() * 2);
++  }
++  auto& entry = s_contentCache[key];
++  content_release_retained(entry);
++  entry.weak = handle;
++  entry.bytes = content_texture_bytes(handle);
++  entry.lastUse = ++s_contentTick;
++  TEXSTAT_ADD(contentStored, 1);
++}
++
++// Drops the least recently retired textures until the pool is at 3/4 of its caps.
++static void content_trim() noexcept {
++  const u64 targetBytes = retain_cap_bytes() / 4 * 3;
++  const size_t targetCount = retain_cap_entries() / 4 * 3;
++  std::vector<std::pair<u64, StaticContentKey>> order;
++  order.reserve(s_retainedCount);
++  for (const auto& [key, entry] : s_contentCache) {
++    if (entry.retained) {
++      order.emplace_back(entry.lastUse, key);
++    }
++  }
++  std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
++  for (const auto& [lastUse, key] : order) {
++    if (s_retainedBytes <= targetBytes && s_retainedCount <= targetCount) {
++      break;
++    }
++    const auto it = s_contentCache.find(key);
++    content_release_retained(it->second);
++    TEXSTAT_ADD(contentEvicted, 1);
++    if (it->second.weak.expired()) {
++      s_contentCache.erase(it);
++    }
++  }
++}
++
++// The caller is the last holder of `handle` (it is about to drop its cache entry): keep the texture for a while.
++static void content_retire(const StaticContentKey& key, const gfx::TextureHandle& handle) noexcept {
++  if (!handle || retain_cap_bytes() == 0) {
++    return;
++  }
++  auto it = s_contentCache.find(key);
++  if (it == s_contentCache.end()) {
++    it = s_contentCache.try_emplace(key).first;
++    it->second.weak = handle;
++    it->second.bytes = content_texture_bytes(handle);
++  }
++  auto& entry = it->second;
++  if (entry.retained || entry.weak.lock() != handle) {
++    return;
++  }
++  entry.retained = handle;
++  entry.lastUse = ++s_contentTick;
++  s_retainedBytes += entry.bytes;
++  ++s_retainedCount;
++  TEXSTAT_ADD(contentRetired, 1);
++  if (s_retainedBytes > retain_cap_bytes() || s_retainedCount > retain_cap_entries()) {
++    content_trim();
++  }
++}
++
++static void retire_static_source_entry(const StaticTextureSourceEntry& entry) noexcept {
++  if (entry.hasContentKey && entry.handle.use_count() <= 1) {
++    content_retire(entry.contentKey, entry.handle);
++  }
++}
++static void retire_static_palette_source_entry(const StaticPaletteTextureSourceEntry& entry) noexcept {
++  if (entry.hasContentKey && entry.handle.use_count() <= 1) {
++    content_retire(entry.contentKey, entry.handle);
++  }
++}
++static void retire_tlut_texture_entry(const CachedTlutTextureEntry& entry) noexcept {
++  if (entry.hasContentKey && entry.handle && entry.handle.use_count() <= 1) {
++    content_retire(entry.contentKey, entry.handle);
++  }
++}
++
++// What a creation needs to know about its source bytes: sampled (generation first, then the digest, as the
++// source entries always did) BEFORE the texture is made, and reused for the entry stored afterwards.
++struct StaticContentProbe {
++  bool valid = false;
++  StaticContentKey key;
++  u64 generation = kGuestWriteUntracked;
++  u64 digest = 0;
++  u32 size = 0;
++  u64 tlutGeneration = kGuestWriteUntracked;
++  u64 tlutDigest = 0;
++  u32 tlutSize = 0;
++};
++
++static StaticContentProbe make_static_content_probe(const StaticTextureKey& key, u32 dataSize) noexcept {
++  StaticContentProbe probe;
++  // dataSize is what the creation reads; the source entry's own size must agree or the entry could not reuse it.
++  if (!content_cache_enabled() || dataSize == 0 || dataSize != static_texture_data_size(key)) {
++    return probe;
++  }
++  probe.generation = guest_write_generation(key.data, dataSize);
++  probe.digest = digest_source_bytes(key.data, dataSize);
++  probe.size = dataSize;
++  probe.key.texDigest = probe.digest;
++  probe.key.texSize = dataSize;
++  probe.key.width = key.width;
++  probe.key.height = key.height;
++  probe.key.mips = key.mips;
++  probe.key.format = key.format;
++  probe.key.flags = webgpu::g_autoMipmaps.load(std::memory_order_relaxed) ? 4u : 0u;
++  probe.valid = true;
++  return probe;
++}
++
++static StaticContentProbe make_palette_content_probe(const StaticPaletteTextureKey& key, u32 dataSize) noexcept {
++  StaticContentProbe probe;
++  const u32 tlutSize = key.tlutEntries * static_cast<u32>(sizeof(u16));
++  if (!content_cache_enabled() || dataSize == 0 || tlutSize == 0 || dataSize != static_texture_data_size(key.texture)) {
++    return probe;
++  }
++  probe.generation = guest_write_generation(key.texture.data, dataSize);
++  probe.tlutGeneration = guest_write_generation(key.tlutData, tlutSize);
++  probe.digest = digest_source_bytes(key.texture.data, dataSize);
++  probe.tlutDigest = digest_source_bytes(key.tlutData, tlutSize);
++  probe.size = dataSize;
++  probe.tlutSize = tlutSize;
++  probe.key.texDigest = probe.digest;
++  probe.key.tlutDigest = probe.tlutDigest;
++  probe.key.texSize = dataSize;
++  probe.key.tlutSize = tlutSize;
++  probe.key.width = key.texture.width;
++  probe.key.height = key.texture.height;
++  probe.key.mips = key.texture.mips;
++  probe.key.format = key.texture.format;
++  probe.key.tlutFormat = key.tlutFormat;
++  probe.key.flags = 1u | (webgpu::g_autoMipmaps.load(std::memory_order_relaxed) ? 4u : 0u);
++  probe.valid = true;
++  return probe;
++}
++
++static StaticContentProbe make_tlut_content_probe(const GXTlutObj_& tlut, size_t tlutSize) noexcept {
++  StaticContentProbe probe;
++  if (!content_cache_enabled() || tlut.data == nullptr || tlutSize == 0) {
++    return probe;
++  }
++  probe.generation = guest_write_generation(tlut.data, tlutSize);
++  probe.digest = digest_source_bytes(tlut.data, tlutSize);
++  probe.size = static_cast<u32>(tlutSize);
++  probe.key.tlutDigest = probe.digest;
++  probe.key.tlutSize = static_cast<u32>(tlutSize);
++  probe.key.width = tlut.numEntries;
++  probe.key.tlutFormat = static_cast<u32>(tlut.format);
++  probe.key.flags = 2u;
++  probe.valid = true;
++  return probe;
++}
++
++static StaticTextureSourceEntry make_static_texture_source_entry_probed(const gfx::TextureHandle& handle,
++                                                                        const StaticContentProbe& probe) {
++  note_texture_cache_stamp();
++  return {
++      .handle = handle,
++      .digest = probe.digest,
++      .sourceSize = probe.size,
++      .validationRevision = s_staticTextureCacheValidationRevision,
++      .sourceGeneration = probe.generation,
++      .contentKey = probe.key,
++      .hasContentKey = true,
++  };
++}
++
++static StaticPaletteTextureSourceEntry make_static_palette_texture_source_entry_probed(
++    const gfx::TextureHandle& handle, const StaticContentProbe& probe) {
++  note_texture_cache_stamp();
++  return {
++      .handle = handle,
++      .textureDigest = probe.digest,
++      .tlutDigest = probe.tlutDigest,
++      .textureSize = probe.size,
++      .tlutSize = probe.tlutSize,
++      .validationRevision = s_staticTextureCacheValidationRevision,
++      .textureGeneration = probe.generation,
++      .tlutGeneration = probe.tlutGeneration,
++      .contentKey = probe.key,
++      .hasContentKey = true,
++  };
++}
++
++// WIICOMPILED_SWITCH_TEXSTATS=1: one line per second (texture.hpp), called once per resolve_sampled_textures.
++static void texstats_tick() noexcept {
++  if (!gfx::texstats_enabled()) {
++    return;
++  }
++  static u64 lastNs = 0;
++  static u64 last[24] = {};
++  const u64 now = gfx::texstats_now_ns();
++  if (now - lastNs < 1000000000ull) {
++    return;
++  }
++  const auto& s = gfx::g_texStats;
++  const u64 cur[24] = {
++      s.staticCreated.load(),   s.tlutCreated.load(),      s.autoMips.load(),         s.autoMipNs.load(),
++      s.createNs.load(),        s.uploadBytes.load(),      s.paletteConv.load(),      s.paletteConvNs.load(),
++      s.paletteConvBytes.load(), s.digests.load(),         s.digestBytes.load(),      s.digestNs.load(),
++      s.srcMissNew.load(),      s.srcMissChanged.load(),   s.palMissNew.load(),       s.palMissChanged.load(),
++      s.contentHitLive.load(),  s.contentHitRetained.load(), s.contentStored.load(),  s.contentRetired.load(),
++      s.contentEvicted.load(),  0,                         0,                         0,
++  };
++  const double seconds = lastNs == 0 ? 1.0 : static_cast<double>(now - lastNs) / 1e9;
++  const auto d = [&](size_t i) { return static_cast<unsigned long long>(cur[i] - last[i]); };
++  const auto ms = [&](size_t i) { return static_cast<double>(cur[i] - last[i]) / 1e6; };
++  if (lastNs != 0) {
++    std::fprintf(stderr,
++                 "[texstats] %.2fs static=%llu tlut=%llu (create %.2f ms, upload %llu KiB) automip=%llu (%.2f ms) "
++                 "pal_conv=%llu (%.2f ms, %llu KiB) digest=%llu (%llu KiB, %.2f ms) src_miss new=%llu changed=%llu "
++                 "pal_miss new=%llu changed=%llu content hit_live=%llu hit_retained=%llu stored=%llu retired=%llu "
++                 "evicted=%llu | cache src=%zu pal=%zu obj=%zu content=%zu retained=%zu (%llu KiB)\n",
++                 seconds, d(0), d(1), ms(4), d(5) >> 10, d(2), ms(3), d(6), ms(7), d(8) >> 10, d(9), d(10) >> 10,
++                 ms(11), d(12), d(13), d(14), d(15), d(16), d(17), d(18), d(19), d(20),
++                 static_texture_source_cache_size(), static_palette_texture_source_cache_size(),
++                 texture_object_cache_size(), s_contentCache.size(), s_retainedCount,
++                 static_cast<unsigned long long>(s_retainedBytes >> 10));
++  }
++  std::memcpy(last, cur, sizeof(last));
++  lastNs = now;
++}
++#endif
++
+ DynamicPaletteKey make_dynamic_palette_key(const GXTexObj_& obj, const GXState::CopyTextureRef& source) {
+   return {
+       .sourceIdentity = source.handle.get(),
+@@ -529,6 +872,9 @@ gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
+         return cached.handle;
+       }
+     }
++#if defined(__SWITCH__)
++    retire_tlut_texture_entry(cache.tlutTexture);
++#endif
+     cache.dynamicPaletteTextures.clear();
+     for (const u32 texObjId : cache.staticTextureUsers) {
+       s_textureObjectCaches.erase(texObjId);
+@@ -536,6 +882,27 @@ gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
+     cache.staticTextureUsers.clear();
+   }
+ 
++#if defined(__SWITCH__)
++  // P13: the same palette bytes seen again (a version bump only counts up) reuse the texture made before.
++  const StaticContentProbe probe = make_tlut_content_probe(tlut, tlutSize);
++  gfx::TextureHandle handle = probe.valid ? content_lookup(probe.key) : gfx::TextureHandle{};
++  if (!handle) {
++    handle = gfx::new_static_texture_2d(tlut.numEntries, 1, 1, gfx::tlut_texture_format(tlut.format),
++                                        {static_cast<const u8*>(tlut.data), tlutSize}, true, "Loaded TLUT");
++    if (probe.valid) {
++      content_store(probe.key, handle);
++    }
++  }
++  if (tlut.tlutObjId != 0) {
++    auto& cache = s_tlutObjectCaches[tlut.tlutObjId];
++    const u64 generation = probe.valid ? probe.generation : guest_write_generation(tlut.data, tlutSize);
++    cache.tlutTexture.handle = handle;
++    cache.tlutTexture.tlutDataVersion = tlut.tlutDataVersion;
++    cache.tlutTexture.digest = probe.valid ? probe.digest : digest_source_bytes(tlut.data, tlutSize);
++    cache.tlutTexture.generation = generation;
++    cache.tlutTexture.contentKey = probe.key;
++    cache.tlutTexture.hasContentKey = probe.valid;
++#else
+   const auto handle =
+       gfx::new_static_texture_2d(tlut.numEntries, 1, 1, gfx::tlut_texture_format(tlut.format),
+                                  {static_cast<const u8*>(tlut.data), tlutSize}, true, "Loaded TLUT");
+@@ -546,6 +913,7 @@ gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
+     cache.tlutTexture.tlutDataVersion = tlut.tlutDataVersion;
+     cache.tlutTexture.digest = digest_source_bytes(tlut.data, tlutSize);
+     cache.tlutTexture.generation = generation;
++#endif
+     cache.tlutTexture.validationRevision = s_staticTextureCacheValidationRevision;
+     note_texture_cache_stamp();
+   }
+@@ -569,6 +937,9 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+   const bool canUseSourceCache = canCacheUpload && obj.data != nullptr;
+   const StaticTextureKey sourceKey = canUseSourceCache ? make_static_texture_key(obj) : StaticTextureKey{};
+   const size_t sourceHash = canUseSourceCache ? absl::Hash<StaticTextureKey>{}(sourceKey) : 0;
++#if defined(__SWITCH__)
++  bool sourceChanged = false; // a source entry of this key was erased because its bytes changed
++#endif
+   if (canUseSourceCache) {
+     if (auto handle = lookup_static_source_front_cache(sourceKey, sourceHash)) {
+       if (obj.texObjId != 0) {
+@@ -578,6 +949,10 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+     }
+     if (auto it = s_staticTextureSourceCache.find(sourceKey); it != s_staticTextureSourceCache.end()) {
+       if (!validate_static_texture_source_entry(sourceKey, it->second)) {
++#if defined(__SWITCH__)
++        retire_static_source_entry(it->second); // the buffer holds other bytes now; these may come back
++        sourceChanged = true;
++#endif
+         s_staticTextureSourceCache.erase(it);
+         clear_static_source_front_cache();
+       } else {
+@@ -591,6 +966,13 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+     }
+   }
+ 
++#if defined(__SWITCH__)
++  StaticContentProbe probe;
++  if (canUseSourceCache) {
++    TEXSTAT_ADD(srcMissChanged, sourceChanged ? 1 : 0);
++    TEXSTAT_ADD(srcMissNew, sourceChanged ? 0 : 1);
++  }
++#endif
+   gfx::TextureHandle handle;
+   if (const auto replacement = gfx::texture_replacement::find_replacement(obj); replacement.has_value()) {
+     handle = *replacement;
+@@ -604,17 +986,52 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+     const u32 dataSize = GXGetTexBufferSize(static_cast<u16>(obj.width()), static_cast<u16>(obj.height()),
+                                             obj.format(), obj.has_mips(),
+                                             obj.has_mips() ? static_cast<u8>(obj.mip_count() - 1) : 0);
++#if defined(__SWITCH__)
++    // P13: the same bytes were made into a texture before (another address, or this one earlier)?
++    bool contentHit = false;
++    if (canUseSourceCache) {
++      probe = make_static_content_probe(sourceKey, dataSize);
++      if (probe.valid) {
++        handle = content_lookup(probe.key);
++        contentHit = static_cast<bool>(handle);
++      }
++    }
++    if (!contentHit) {
++      handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
++                                          {static_cast<const uint8_t*>(obj.data), dataSize}, false, nameStr);
++      if (probe.valid) {
++        content_store(probe.key, handle);
++      }
++    }
++#else
+     handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
+                                         {static_cast<const uint8_t*>(obj.data), dataSize}, false, nameStr);
++#endif
+   }
+   if (canCacheUpload) {
+     store_cached_texture(obj, handle);
+     if (canUseSourceCache) {
+       if (s_staticTextureSourceCache.size() >= 512) {
++#if defined(__SWITCH__)
++        // P13: what nothing else holds goes to the retention pool instead of being destroyed.
++        absl::erase_if(s_staticTextureSourceCache, [](const auto& item) {
++          if (item.second.handle.use_count() > 1) {
++            return false;
++          }
++          retire_static_source_entry(item.second);
++          return true;
++        });
++#else
+         absl::erase_if(s_staticTextureSourceCache, [](const auto& item) { return item.second.handle.use_count() <= 1; });
++#endif
+         clear_static_source_front_cache();
+       }
++#if defined(__SWITCH__)
++      s_staticTextureSourceCache[sourceKey] = probe.valid ? make_static_texture_source_entry_probed(handle, probe)
++                                                          : make_static_texture_source_entry(sourceKey, handle);
++#else
+       s_staticTextureSourceCache[sourceKey] = make_static_texture_source_entry(sourceKey, handle);
++#endif
+       store_static_source_front_cache(sourceKey, sourceHash, handle);
+       if (obj.texObjId != 0) {
+         record_tex_obj_source_key(obj.texObjId, sourceKey);
+@@ -641,10 +1058,17 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
+   const bool canUseSourceCache = !obj.no_cache() && !tlut.no_cache() && obj.data != nullptr && tlut.data != nullptr;
+   const StaticPaletteTextureKey sourceKey =
+       canUseSourceCache ? make_static_palette_texture_key(obj, tlut) : StaticPaletteTextureKey{};
++#if defined(__SWITCH__)
++  bool sourceChanged = false; // a source entry of this key was erased because its bytes changed
++#endif
+   if (canUseSourceCache) {
+     if (auto it = s_staticPaletteTextureSourceCache.find(sourceKey);
+         it != s_staticPaletteTextureSourceCache.end()) {
+       if (!validate_static_palette_texture_source_entry(sourceKey, it->second)) {
++#if defined(__SWITCH__)
++        retire_static_palette_source_entry(it->second);
++        sourceChanged = true;
++#endif
+         s_staticPaletteTextureSourceCache.erase(it);
+       } else {
+         const auto& handle = it->second.handle;
+@@ -657,6 +1081,13 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
+     }
+   }
+ 
++#if defined(__SWITCH__)
++  StaticContentProbe probe;
++  if (canUseSourceCache) {
++    TEXSTAT_ADD(palMissChanged, sourceChanged ? 1 : 0);
++    TEXSTAT_ADD(palMissNew, sourceChanged ? 0 : 1);
++  }
++#endif
+   gfx::TextureHandle handle;
+   if (const auto replacement = gfx::texture_replacement::find_replacement(obj); replacement.has_value()) {
+     handle = *replacement;
+@@ -664,9 +1095,27 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
+     const u32 dataSize = GXGetTexBufferSize(static_cast<u16>(obj.width()), static_cast<u16>(obj.height()),
+                                             obj.format(), obj.has_mips(),
+                                             obj.has_mips() ? static_cast<u8>(obj.mip_count() - 1) : 0);
++#if defined(__SWITCH__)
++    // P13: this texture with this palette (by content) was converted before: share that texture.
++    if (canUseSourceCache) {
++      probe = make_palette_content_probe(sourceKey, dataSize);
++      if (probe.valid) {
++        handle = content_lookup(probe.key);
++      }
++    }
++    if (!handle) {
++      const u64 convStart = gfx::texstats_enabled() ? gfx::texstats_now_ns() : 0;
++#endif
+     auto converted = gfx::convert_texture_palette(
+         obj.format(), obj.width(), obj.height(), obj.mip_count(), {static_cast<const u8*>(obj.data), dataSize},
+         tlut.format, tlut.numEntries, {static_cast<const u8*>(tlut.data), static_cast<size_t>(tlut.numEntries) * 2});
++#if defined(__SWITCH__)
++    if (gfx::texstats_enabled()) {
++      TEXSTAT_ADD(paletteConv, 1);
++      TEXSTAT_ADD(paletteConvNs, gfx::texstats_now_ns() - convStart);
++      TEXSTAT_ADD(paletteConvBytes, converted.data.size());
++    }
++#endif
+     if (converted.data.empty()) {
+       return {};
+     }
+@@ -674,14 +1123,36 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
+         gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
+                                    {converted.data.data(), converted.data.size()}, false, "GX Static Palette Texture");
+     handle->hasArbitraryMips = converted.hasArbitraryMips;
++#if defined(__SWITCH__)
++      if (probe.valid) {
++        content_store(probe.key, handle);
++      }
++    }
++#endif
+   }
+   if (!obj.no_cache() && !tlut.no_cache()) {
+     store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion);
+     if (canUseSourceCache) {
+       if (s_staticPaletteTextureSourceCache.size() >= 256) {
++#if defined(__SWITCH__)
++        absl::erase_if(s_staticPaletteTextureSourceCache, [](const auto& item) {
++          if (item.second.handle.use_count() > 1) {
++            return false;
++          }
++          retire_static_palette_source_entry(item.second);
++          return true;
++        });
++#else
+         absl::erase_if(s_staticPaletteTextureSourceCache, [](const auto& item) { return item.second.handle.use_count() <= 1; });
++#endif
+       }
++#if defined(__SWITCH__)
++      s_staticPaletteTextureSourceCache[sourceKey] =
++          probe.valid ? make_static_palette_texture_source_entry_probed(handle, probe)
++                      : make_static_palette_texture_source_entry(sourceKey, handle);
++#else
+       s_staticPaletteTextureSourceCache[sourceKey] = make_static_palette_texture_source_entry(sourceKey, handle);
++#endif
+       if (obj.texObjId != 0) {
+         record_tex_obj_palette_source_key(obj.texObjId, sourceKey);
+       }
+@@ -1272,6 +1743,9 @@ GXState::CopyTextureRef* find_copy_texture_for_texobj(const GXTexObj_& obj) noex
+ 
+ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
+   ZoneScoped;
++#if defined(__SWITCH__)
++  texstats_tick(); // WIICOMPILED_SWITCH_TEXSTATS=1
++#endif
+ 
+   for (u32 i = 0; i < MaxTextures; ++i) {
+     if (!info.sampledTextures.test(i)) {
+@@ -1659,6 +2133,23 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
    return g_device.CreateRenderPipeline(&descriptor);
  }
  
@@ -9484,919 +10512,3 @@ index 006ab47..8ed9d12 100644
      for (int attr = 0; attr < 26; ++attr) {
          if (!options.includeNbt && attr == GX_VA_NBT) {
              continue;
-diff --git a/runtime/src/hle/gx/gx_texture.cpp b/runtime/src/hle/gx/gx_texture.cpp
-index b5ebedd..9bbfaf5 100644
---- a/runtime/src/hle/gx/gx_texture.cpp
-+++ b/runtime/src/hle/gx/gx_texture.cpp
-@@ -11,6 +11,13 @@ static void WriteGuestTexObj(uint32_t addr, uint32_t dataAddr, uint16_t width, u
-                              uint32_t format, uint32_t wrapS, uint32_t wrapT, bool mipmap,
-                              bool writeTlut, uint32_t tlut) {
-     dataAddr = CanonicalizeGxMainRamAddress(dataAddr);
-+#if defined(__SWITCH__)
-+    // G7: when all 32 bytes sit in one full writable 1 MiB page, each Memory::Write* below takes
-+    // MkwTryWriteGuestScalarCoarse to (bias - 1) + its address, so the final bytes are written as one
-+    // image instead (the zeroing pass included: word 4, and word 6 without a TLUT, stay 0).
-+    uint8_t* const g7Host = G7GuestTexObjHost(addr);
-+    if (g7Host == nullptr)
-+#endif
-     for (int i = 0; i < 8; i++) {
-         Memory::Write32(addr + i * 4, 0);
-     }
-@@ -79,6 +86,23 @@ static void WriteGuestTexObj(uint32_t addr, uint32_t dataAddr, uint16_t width, u
-     const uint16_t blockCount = static_cast<uint16_t>((blocksX * blocksY) & 0x7FFFu);
-     uint8_t flags = mipmap ? 0x03u : 0x02u;
- 
-+#if defined(__SWITCH__)
-+    if (g7Host != nullptr) {
-+        const uint32_t image[8] = {
-+            __builtin_bswap32(word0),
-+            __builtin_bswap32(word1),
-+            __builtin_bswap32(word2),
-+            __builtin_bswap32(word3),
-+            0u,
-+            __builtin_bswap32(format),
-+            writeTlut ? __builtin_bswap32(tlut) : 0u,
-+            __builtin_bswap32((static_cast<uint32_t>(blockCount) << 16) | (static_cast<uint32_t>(blockType) << 8) | flags),
-+        };
-+        std::memcpy(g7Host, image, sizeof(image));
-+        GxG7Count(kG7ImageWrites);
-+        return;
-+    }
-+#endif
-     Memory::Write32(addr + 0x00, word0);
-     Memory::Write32(addr + 0x04, word1);
-     Memory::Write32(addr + 0x08, word2);
-@@ -250,7 +274,7 @@ extern "C" void GX__InitTexObj_801707f8(uint32_t oa, uint32_t da, uint32_t w, ui
-                 oa, da, w, h, f, ws, wt, m, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
-     }
-     const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
--    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
-     meta.dataAddr=canonicalDataAddr; meta.width=(u16)w; meta.height=(u16)h; meta.format=f; meta.wrapS=ws; meta.wrapT=wt; meta.mipmap=(m!=0); meta.userData=0; meta.needsUpload=true;
-     GXInitTexObj(obj, GuestToHostPtr(da), (u16)w, (u16)h, (GXTexFmt)f, (GXTexWrapMode)ws, (GXTexWrapMode)wt, (GXBool)m); MarkHostTexObjConstructed(oa);
-     // Also write to guest memory so reads work
-@@ -291,7 +315,7 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
-                 oa, da, w, h, f, ws, wt, m, tl, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
-     }
-     const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
--    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
-     meta.dataAddr=canonicalDataAddr; meta.width=(u16)w; meta.height=(u16)h; meta.format=f; meta.wrapS=ws; meta.wrapT=wt; meta.mipmap=(m!=0); meta.tlut=tl; meta.userData=0; meta.needsUpload=true;
-     GXInitTexObjCI(obj, GuestToHostPtr(da), (u16)w, (u16)h, (GXCITexFmt)f, (GXTexWrapMode)ws, (GXTexWrapMode)wt, (GXBool)m, tl); MarkHostTexObjConstructed(oa);
-     // Also write to guest memory so reads work
-@@ -306,7 +330,7 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
- PPC_NATIVE_OVERRIDE_VOID(80170a04, GX__InitTexObjCI_80170a04, (uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m, uint32_t tl), (oa, da, w, h, f, ws, wt, m, tl));
- 
- extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma) {
--    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = GetHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex); GXTexObj* obj = GetHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
-     float fmal = std::isfinite(mal) && mal >= 0.f ? mal : 0.f, fmil = std::isfinite(mil) && mil >= 0.f ? std::min(mil, fmal) : 0.f;
-     meta.minFilter=mif; meta.magFilter=maf; meta.minLod=fmil; meta.maxLod=fmal; meta.lodBias=lb; meta.biasClamp=(bc!=0); meta.edgeLod=(el!=0); meta.maxAniso=ma;
-     GXInitTexObjLOD(obj, (GXTexFilter)mif, (GXTexFilter)maf, fmil, fmal, lb, (GXBool)bc, (GXBool)el, (GXAnisotropy)ma);
-@@ -316,7 +340,7 @@ extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t m
- PPC_NATIVE_OVERRIDE_VOID(80170a4c, GX__InitTexObjLOD_80170a4c, (uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma), (oa, mif, maf, mil, mal, lb, bc, el, ma));
- 
- extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32_t wt) {
--    std::lock_guard<std::mutex> guard(g_texObjMutex);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
-     GXTexObj* obj = GetHostTexObj(oa);
-     TexObjMeta& meta = GetTexObjMeta(oa);
-     meta.wrapS = ws;
-@@ -332,7 +356,7 @@ extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32
- PPC_NATIVE_OVERRIDE_VOID(80170b50, GX__InitTexObjWrapMode_80170b50, (uint32_t oa, uint32_t ws, uint32_t wt), (oa, ws, wt));
- 
- extern "C" void GX__InitTexObjTlut_80170b64(uint32_t oa, uint32_t tl) {
--    std::lock_guard<std::mutex> guard(g_texObjMutex);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
-     GXTexObj* obj = GetHostTexObj(oa);
-     TexObjMeta& meta = GetTexObjMeta(oa);
-     meta.tlut = tl;
-@@ -347,7 +371,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b64, GX__InitTexObjTlut_80170b64, (uint32_t oa, ui
- 
- // GXInitTexObjFilter - sets mag/min filter modes
- extern "C" void GX__InitTexObjFilter_80170b6c(uint32_t oa, uint32_t minFilter, uint32_t magFilter) {
--    std::lock_guard<std::mutex> guard(g_texObjMutex);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
-     TexObjMeta& meta = GetTexObjMeta(oa);
-     meta.minFilter = minFilter;
-     meta.magFilter = magFilter;
-@@ -375,7 +399,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b6c, GX__InitTexObjFilter_80170b6c, (uint32_t oa,
- 
- // GXInitTexObjLODBias - sets LOD bias value
- extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
--    std::lock_guard<std::mutex> guard(g_texObjMutex);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
-     TexObjMeta& meta = GetTexObjMeta(oa);
-     
-     // Clamp bias to [-4.0, 3.99...] range as per SDK
-@@ -404,7 +428,7 @@ extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
- PPC_NATIVE_OVERRIDE_VOID(80170b94, GX__InitTexObjLODBias_80170b94, (uint32_t oa, float bias), (oa, bias));
- 
- extern "C" void GX__InitTexObjUserData_80170be8(uint32_t oa, uint32_t userData) {
--    std::lock_guard<std::mutex> guard(g_texObjMutex);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
-     TexObjMeta& meta = GetTexObjMeta(oa);
-     meta.userData = userData;
- 
-@@ -454,7 +478,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
-     static uint32_t s_metaLookupLogCount = 0;
-     static uint32_t s_unknownFormatLogCount = 0;
-     static uint32_t s_invalidDataLogCount = 0;
--    std::lock_guard<std::mutex> guard(g_texObjMutex);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
- 
-     if (tid >= g_boundTexMaps.size()) {
-         if (s_invalidTidLogCount < 128) {
-@@ -464,6 +488,57 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
-         return;
-     }
-     
-+#if defined(__SWITCH__)
-+    // G7: a texture object loaded before and unchanged since (guest bytes, metadata, host object, no
-+    // upload pending; G7FindLoadReadySlot in gx_objects.cpp says why): of the full path below only the
-+    // binding tail has an effect, so that is all this runs, with the same exception handling and the
-+    // same guest stores at the end. WIICOMPILED_GX_G7_CHECK=1 runs the full path and compares.
-+    TexObjSlot* g7Ready = nullptr;
-+    BoundTexInfo g7Bound{};
-+    bool g7Skip = false;
-+    TexObjMeta g7Meta{};
-+    if (GxG7Enabled()) {
-+        g7Ready = G7FindLoadReadySlot(oa);
-+        if (g7Ready != nullptr) {
-+            static_cast<GxTextureBindingContract::SamplerState&>(g7Bound) = *g7Ready;
-+            g7Bound.objAddr = oa;
-+            g7Bound.dataAddr = CanonicalizeGxMainRamAddress(g7Ready->dataAddr);
-+            g7Skip = GxTextureBindingContract::CanSkipHostLoad(g_boundTexMaps[tid], g7Bound, false, false, false);
-+            if (!GxG7Check()) {
-+                GxG7Count(kG7LoadsFast);
-+                try {
-+                    g_boundTexMaps[tid] = g7Bound;
-+                    if (!g7Skip) {
-+                        GXLoadTexObj(g7Ready->host->PublicPtr(), (GXTexMapID)tid);
-+                    }
-+                } catch (const std::exception& ex) {
-+                    g7Ready->g7LoadReady = false;
-+                    if (s_hostExceptionLogCount++ < 64) {
-+                        RT_LOGF(RT_TAG_GX,
-+                                "GXLoadTexObj rejected reason=host-exception (%s) oa=0x%08X tid=%u fmt=0x%X %ux%u data=0x%08X\n",
-+                                ex.what(), oa, tid, g7Ready->format, g7Ready->width, g7Ready->height,
-+                                g7Ready->dataAddr);
-+                    }
-+                    BindUnloadableTexturePlaceholder(tid);
-+                    return;
-+                } catch (...) {
-+                    g7Ready->g7LoadReady = false;
-+                    if (s_hostExceptionLogCount++ < 64) {
-+                        RT_LOGF(RT_TAG_GX,
-+                                "GXLoadTexObj rejected reason=host-exception-unknown oa=0x%08X tid=%u fmt=0x%X %ux%u data=0x%08X\n",
-+                                oa, tid, g7Ready->format, g7Ready->width, g7Ready->height, g7Ready->dataAddr);
-+                    }
-+                    BindUnloadableTexturePlaceholder(tid);
-+                    return;
-+                }
-+                try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) { Memory::Write32(gd + 0x5FCu, Memory::Read32(gd + 0x5FCu) | 1u); Memory::Write16(gd + 2, 0); } } catch (...) {}
-+                return;
-+            }
-+            g7Meta = *g7Ready;
-+        }
-+        GxG7Count(kG7LoadsFull);
-+    }
-+#endif
-     // Check if we have metadata for this texture, or try to extract it from guest memory
-     TexObjMeta meta;
-     if (!TryGetOrExtractTexObjMeta(oa, meta)) {
-@@ -548,9 +623,14 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
-     GXTexObj* obj = TryGetHostTexObj(oa);
-     const bool isPalette = IsPaletteTexFormat(meta.format);
-     bool needsInit = (obj == nullptr);
-+#if defined(__SWITCH__)
-+    TexObjSlot* const metaSlot = FindTexObjSlotForLoad(oa); // g_TexObjMeta.find, through the slot cache
-+#else
-     const auto metaIt = g_TexObjMeta.find(oa);
--    if (!needsInit && metaIt != g_TexObjMeta.end()) {
--        const TexObjMeta& cached = metaIt->second;
-+    TexObjSlot* const metaSlot = metaIt != g_TexObjMeta.end() ? &metaIt->second : nullptr;
-+#endif
-+    if (!needsInit && metaSlot != nullptr) {
-+        const TexObjMeta& cached = *metaSlot;
-         if (cached.width != meta.width || cached.height != meta.height || cached.format != meta.format ||
-             cached.wrapS != meta.wrapS || cached.wrapT != meta.wrapT || cached.mipmap != meta.mipmap ||
-             cached.minFilter != meta.minFilter || cached.magFilter != meta.magFilter ||
-@@ -586,7 +666,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
-             // Write through GetTexObjMeta so the DCStoreRange interval index is
-             // told this entry's backing may have moved.
-             GetTexObjMeta(oa) = meta;
--        } else if (isPalette && metaIt != g_TexObjMeta.end() && metaIt->second.tlut != meta.tlut) {
-+        } else if (isPalette && metaSlot != nullptr && metaSlot->tlut != meta.tlut) {
-             GXInitTexObjTlut(obj, meta.tlut);
-             GetTexObjMeta(oa).tlut = meta.tlut;
-             tlutChanged = true;
-@@ -614,6 +694,20 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
-         if (!canSkipHostLoad) {
-             GXLoadTexObj(obj, (GXTexMapID)tid);
-         }
-+#if defined(__SWITCH__)
-+        if (GxG7Enabled()) {
-+            // Check mode: the shortcut above would have bound the same record, made the same
-+            // GXLoadTexObj decision and left the same metadata.
-+            if (g7Ready != nullptr &&
-+                (needsInit || tlutChanged || textureDataUploaded || canSkipHostLoad != g7Skip ||
-+                 !GxTextureBindingContract::SameBinding(newBound, g7Bound) || !G7SameTexObjMeta(meta, g7Meta))) {
-+                GxG7Count(kG7CheckMismatches);
-+            }
-+            if (dp != nullptr) {
-+                G7NoteLoadDone(oa, size);
-+            }
-+        }
-+#endif
-     } catch (const std::exception& ex) {
-         if (s_hostExceptionLogCount++ < 64) {
-             RT_LOGF(RT_TAG_GX,
-@@ -643,7 +737,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170dc8, GX__LoadTexObjPreLoaded_80170dc8, (uint32_t o
- // ============================================================================
- 
- extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp) {
--    std::lock_guard<std::mutex> guard(g_texObjMutex);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
-     TexObjMeta meta;
-     if (!TryGetOrExtractTexObjMeta(oa, meta)) {
-         RT_LOGF(RT_TAG_GX, "GXGetTexObjAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
-@@ -657,7 +751,7 @@ extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp,
- PPC_NATIVE_OVERRIDE_VOID(80170bf8, GX__GetTexObjAll_80170bf8, (uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp), (oa, dp, wp, hp, fp, wsp, wtp, mp));
- 
- extern "C" void GX__GetTexObjLODAll_80170cbc(uint32_t oa, uint32_t mifp, uint32_t mafp, uint32_t milp, uint32_t malp, uint32_t lbp, uint32_t bcp, uint32_t elp, uint32_t map) {
--    std::lock_guard<std::mutex> guard(g_texObjMutex);
-+    std::lock_guard<GxObjMutex> guard(g_texObjMutex);
-     TexObjMeta meta;
-     if (!TryGetOrExtractTexObjMeta(oa, meta)) {
-         RT_LOGF(RT_TAG_GX, "GXGetTexObjLODAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
-@@ -676,8 +770,13 @@ PPC_NATIVE_OVERRIDE_VOID(80170cbc, GX__GetTexObjLODAll_80170cbc, (uint32_t oa, u
- // ============================================================================
- 
- extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, uint32_t e) {
-+#if defined(__SWITCH__)
-+    std::lock_guard<GxObjMutex> guard(g_tlutObjMutex); GXTlutObj* obj = CreateHostTlutObj(oa);
-+    TlutObjMeta& meta = SetTlutObjMeta(oa, CanonicalizeGxMainRamAddress(da), f, (u16)e);
-+#else
-     std::lock_guard<std::mutex> guard(g_tlutObjMutex); GXTlutObj* obj = CreateHostTlutObj(oa); TlutObjMeta& meta = GetTlutObjMeta(oa);
-     meta.dataAddr=CanonicalizeGxMainRamAddress(da); meta.format=f; meta.entries=(u16)e; meta.dirty=false;
-+#endif
-     // Leave the object unconstructed on a bad descriptor. A later GXLoadTlut
-     // then takes GetHostTlutObj's soft-fail path and gets a fresh empty object
-     // instead of aurora reading entries*2 bytes off an unvalidated pointer.
-@@ -686,7 +785,26 @@ extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, u
- }
- PPC_NATIVE_OVERRIDE_VOID(80170f80, GX__InitTlutObj_80170f80, (uint32_t oa, uint32_t da, uint32_t f, uint32_t e), (oa, da, f, e));
- 
-+#if defined(__SWITCH__)
-+// As below, with the g_TlutObjMeta lookup through gx_objects.cpp's address cache.
-+extern "C" void GX__LoadTlut_80170fa8(uint32_t oa, uint32_t tl) {
-+    std::lock_guard<GxObjMutex> guard(g_tlutObjMutex);
-+    if (tl >= kMaxTluts) { RT_LOGF(RT_TAG_GX, "GXLoadTlut: invalid TLUT index %u (oa=0x%08X)\n", tl, oa); return; }
-+    if (TlutObjMeta* tlutMeta = FindTlutObjMeta(oa); tlutMeta != nullptr && tlutMeta->dirty) {
-+        if (ValidateTlutData(oa, *tlutMeta)) {
-+            GXTlutObj* rebuild = CreateHostTlutObj(oa);
-+            GXInitTlutObj(rebuild, GuestToHostPtr(tlutMeta->dataAddr), (GXTlutFmt)tlutMeta->format, tlutMeta->entries);
-+            MarkHostTlutObjConstructed(oa);
-+        }
-+        tlutMeta->dirty = false;
-+    }
-+    GXTlutObj* obj = GetHostTlutObj(oa);
-+    GXLoadTlut(obj, (GXTlut)tl);
-+    try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) Memory::Write16(gd + 2, 0); } catch (...) {}
-+}
-+#else
- extern "C" void GX__LoadTlut_80170fa8(uint32_t oa, uint32_t tl) { std::lock_guard<std::mutex> guard(g_tlutObjMutex); if (tl >= kMaxTluts) { RT_LOGF(RT_TAG_GX, "GXLoadTlut: invalid TLUT index %u (oa=0x%08X)\n", tl, oa); return; } auto metaIt = g_TlutObjMeta.find(oa); if (metaIt != g_TlutObjMeta.end() && metaIt->second.dirty) { if (ValidateTlutData(oa, metaIt->second)) { GXTlutObj* rebuild = CreateHostTlutObj(oa); GXInitTlutObj(rebuild, GuestToHostPtr(metaIt->second.dataAddr), (GXTlutFmt)metaIt->second.format, metaIt->second.entries); MarkHostTlutObjConstructed(oa); } metaIt->second.dirty = false; } GXTlutObj* obj = GetHostTlutObj(oa); GXLoadTlut(obj, (GXTlut)tl); try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) Memory::Write16(gd + 2, 0); } catch (...) {} }
-+#endif
- PPC_NATIVE_OVERRIDE_VOID(80170fa8, GX__LoadTlut_80170fa8, (uint32_t oa, uint32_t tl), (oa, tl));
- 
- // ============================================================================
-diff --git a/runtime/src/hle/gx/gx_transform.cpp b/runtime/src/hle/gx/gx_transform.cpp
-index f2a82a5..22a237d 100644
---- a/runtime/src/hle/gx/gx_transform.cpp
-+++ b/runtime/src/hle/gx/gx_transform.cpp
-@@ -143,8 +143,19 @@ PPC_NATIVE_OVERRIDE_VOID(801730cc, GX__GetProjectionv_801730cc, (uint32_t pa), (
- // Matrix Loading
- // ============================================================================
- 
-+#if defined(__SWITCH__)
-+// aurora GXTransform.cpp: the guest matrix words as they are (their float round trip below is a
-+// bitwise copy), one FIFO write.
-+extern "C" void GXLoadPosMtxImmBE(const void* mtxBe, u32 id);
-+extern "C" void GXLoadNrmMtxImmBE(const void* mtxBe, u32 id, u32 rowStride);
-+#endif
-+
- extern "C" void GX__LoadPosMtxImm_8017310c(uint32_t ma, uint32_t id) {
--    const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma); float m[12];
-+    const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma);
-+#if defined(__SWITCH__)
-+    if (raw) { GXLoadPosMtxImmBE(raw, id); return; }
-+#endif
-+    float m[12];
-     SwapBeF32ArrayToHost(raw, m, 12);
-     GXLoadPosMtxImm((float(*)[4])m, id);
- }
-@@ -154,12 +165,19 @@ extern "C" void GX__LoadPosMtxIndx_8017315c(uint32_t mi, uint32_t id) {
-     const auto& arr=g_hleGxState.vtxArray[GX_POS_MTX_ARRAY];
-     if(arr.base==0||arr.stride==0) return;
-     const uint32_t* raw=(const uint32_t*)GuestToHostPtr(arr.base+mi*arr.stride, 48);
-+#if defined(__SWITCH__)
-+    if(raw){ GXLoadPosMtxImmBE(raw, id); return; }
-+#endif
-     if(raw){ float m[12]; SwapBeF32ArrayToHost(raw,m,12); GXLoadPosMtxImm((float(*)[4])m,id); }
- }
- PPC_NATIVE_OVERRIDE_VOID(8017315c, GX__LoadPosMtxIndx_8017315c, (uint32_t mi, uint32_t id), (mi, id));
- 
- extern "C" void GX__LoadNrmMtxImm_80173188(uint32_t ma, uint32_t id) {
--    const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma, 48); float m[12];
-+    const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma, 48);
-+#if defined(__SWITCH__)
-+    if (raw) { GXLoadNrmMtxImmBE(raw, id, 4); return; }
-+#endif
-+    float m[12];
-     SwapBeF32ArrayToHost(raw, m, 12); GXLoadNrmMtxImm((float(*)[4])m, id);
- }
- PPC_NATIVE_OVERRIDE_VOID(80173188, GX__LoadNrmMtxImm_80173188, (uint32_t ma, uint32_t id), (ma, id));
-@@ -168,6 +186,9 @@ extern "C" void GX__LoadNrmMtxIndx3x3_801731e0(uint32_t mi, uint32_t id) {
-     const auto& arr=g_hleGxState.vtxArray[GX_NRM_MTX_ARRAY];
-     if(arr.base==0||arr.stride==0) return;
-     const uint32_t* raw=(const uint32_t*)GuestToHostPtr(arr.base+mi*arr.stride, 36);
-+#if defined(__SWITCH__)
-+    if(raw){ GXLoadNrmMtxImmBE(raw, id, 3); return; }
-+#endif
-     if(raw){
-         float src[9]{};
-         float m[12]{};
-diff --git a/runtime/src/hle/gx/gx_vertex.cpp b/runtime/src/hle/gx/gx_vertex.cpp
-index 80c9be0..cbf22cc 100644
---- a/runtime/src/hle/gx/gx_vertex.cpp
-+++ b/runtime/src/hle/gx/gx_vertex.cpp
-@@ -37,7 +37,7 @@ extern "C" void GX__ClearVtxDesc_8016dc34() {
-         changed |= g_hleGxState.vtxDesc[i] != GX_NONE;
-         g_hleGxState.vtxDesc[i]=GX_NONE;
-     }
--    if (changed) g_hleGxState.InvalidateVtxLayoutHash();
-+    if (changed) g_hleGxState.InvalidateVtxDescHash();
-     // GXClearVtxDesc resets descriptors only; array base/stride state persists.
-     GXClearVtxDesc();
- }
-@@ -51,7 +51,7 @@ extern "C" void GX__SetVtxDesc_8016d3a4(uint32_t a, uint32_t t) {
-     if (a == GX_VA_NBT) {
-         g_hleGxState.vtxDesc[GX_VA_NBT] = GX_NONE;
-     }
--    if (g_hleGxState.vtxDesc[attr] != oldType) g_hleGxState.InvalidateVtxLayoutHash();
-+    if (g_hleGxState.vtxDesc[attr] != oldType) g_hleGxState.InvalidateVtxDescHash();
-     if(IsMatrixIndexAttr((GXAttr)attr)) return;
-     GXSetVtxDesc((GXAttr)a, (t==GX_INDEX8||t==GX_INDEX16)?GX_DIRECT:(GXAttrType)t);
- }
-@@ -114,7 +114,7 @@ extern "C" void GX__SetVtxAttrFmt_8016dc68(uint32_t vf, uint32_t a, uint32_t c,
-         }
-         const auto& newFmt = g_hleGxState.vtxAttrFmt[vf][attr];
-         if (oldFmt.cnt != newFmt.cnt || oldFmt.type != newFmt.type || oldFmt.frac != newFmt.frac) {
--            g_hleGxState.InvalidateVtxLayoutHash();
-+            g_hleGxState.InvalidateVtxAttrFmtRowHash(vf);
-         }
-     }
-     if (vf >= GX_MAX_VTXFMT || a < GX_VA_POS || a >= GX_VA_MAX_ATTR) {
-diff --git a/runtime/src/hle/input/wpad.cpp b/runtime/src/hle/input/wpad.cpp
-index b3985ff..f46ef94 100644
---- a/runtime/src/hle/input/wpad.cpp
-+++ b/runtime/src/hle/input/wpad.cpp
-@@ -2,6 +2,9 @@
- #include "memory.h"
- #include "hle/controller_status_contract.h"
- #include "wii_remote_input.h"
-+#if defined(__SWITCH__)
-+#include "compute_preempt.h"
-+#endif
- 
- #include <cstdint>
- 
-@@ -35,6 +38,9 @@ void InvokeWpadCallback(uint32_t callback, uint32_t chan, int32_t result)
-     auto& cpu = GetPersistentCpuContext();
-     cpu.gpr[3] = chan;
-     cpu.gpr[4] = static_cast<uint32_t>(result);
-+#if defined(__SWITCH__)
-+    MkwComputePreemptHoldScope interruptLevel;  // T8: the WPAD completion callback
-+#endif
-     InvokeIndirectCpu(callback, &cpu);
- }
- 
-diff --git a/runtime/src/hle/mlb/envmap_natives.cpp b/runtime/src/hle/mlb/envmap_natives.cpp
-new file mode 100644
-index 0000000..4e7543c
---- /dev/null
-+++ b/runtime/src/hle/mlb/envmap_natives.cpp
-@@ -0,0 +1,512 @@
-+// MLB Power Pros 2008 (RL8E54): a native 0x8000D770, the CPU sphere-map pass, the hottest game
-+// function of a match on the Switch main thread (run 5 profile: 4.1% self plus ~0.8% in the sqrt
-+// native it calls once per vertex).
-+//
-+// void EnvMapCoords(Model* m) (only caller 0x8000CD0C): for every vertex of every mesh of
-+// m->shape (m+0x18) it computes a sphere-map texture coordinate pair. Per vertex: p = M * pos
-+// (PSMTXMultVec), n = R * nrm (PSMTXMultVec with the translation column zeroed, or PSMTXMultVecSR
-+// on the same skinning matrix), p normalized (PSVECNormalize 0x800635B4: frsqrte and one
-+// Newton-Raphson step), r = p - 2 (p.n) n, r.z += 1, s = 0.5 / sqrt(r.r) (sqrt at 0x80128FD0, a
-+// zero root replaced by 1e-7), u = su (0.5 - r.x s), v = sv (0.5 - r.y s), two floats stored per
-+// vertex in the mesh's current UV buffer (the descriptor flips buffers on every call through
-+// 0x80058B98). M is the view-model matrix (PSMTXConcat of the camera matrix with the model's);
-+// skinned models (byte gfx+0x2030 set) take one matrix per vertex from the palette at gfx+0x2034
-+// indexed by a byte stream. docs/en/reverse-engineering.md section 10 has the layout.
-+//
-+// The translation spends this on the scalar-single emulation of every operation (each fmuls
-+// rounds its second operand to 25 bits, each result goes through a double), on the stack round
-+// trips of the inlined leaves (12 psq loads, 8 psq stores, 6 lfs and 3 stfs per vertex) and on
-+// the full register sync around the sqrt call. Here a vertex is the same arithmetic in host
-+// single precision, on the facts below, the stack scratch and the sqrt native's frame are
-+// written once (only the last vertex's values are observable) and the root is computed inline.
-+//
-+// Why host singles give the translation's bits (round to nearest; FPCR.FZ on or off, as it is):
-+// every operand of every single op here is a single (lfs/psq loads and earlier single results),
-+// so PpcForce25BitInline(c) is the identity, a*c is exact in a double, and rounding a double sum,
-+// quotient or square root of singles to single equals the correctly rounded single result
-+// (53 >= 2*24 + 2). FCVT and the single op flush tiny results the same way under FZ (ARMv8
-+// FPRound), and FZ flushes subnormal inputs in both. ps_madd is the same fused fmla per lane.
-+// psq_st (both widths) turns a subnormal into its signed zero: kept explicitly. The normalize
-+// step's frsqrte, its three fmuls and the fnmsubs use the translation's own helpers (frsqrte's
-+// estimate is not a single). NaN results are where the two could part (the translation resolves
-+// ps lanes x86-style, and which of two NaN operands a plain double op returns depends on the
-+// operand order its compiler picked), so a NaN never reaches the fast path's output: see below.
-+//
-+// Rollback: everything this function writes before and during the vertex loops is undoable
-+// (the stack between sp-64 and r1+8 is snapshotted at entry, the UV words and the buffer flip
-+// go through an undo log), and no guest code runs before the loops end. When any vertex or mesh
-+// falls outside the fast path, every write is undone, the context restored, and the translation
-+// (kept by REGISTER_NATIVE_FUNCTION_AS) runs the whole call: bit for bit what it would have
-+// done. Outside the fast path: a vertex with a NaN anywhere (it reaches u or v) or with r.r
-+// zero, infinite or NaN (the sqrt native's special paths, errno), a mesh whose arrays wrap,
-+// touch the MMIO window, overlap the stack area the loop writes or caches ([sp-32, sp+0x100))
-+// or whose UV buffer overlaps the small-data constants ([r2-0x8000, r2)), a descriptor, index
-+// or palette read in the MMIO window or that stack area, an undo log overflow, GQR0 != 0 and
-+// the checked access mode.
-+//
-+// Kept exactly on the fast path (cross-checked with the translation in qemu-aarch64, see the
-+// snippet header): every guest store (frame, saved registers, the 3x4 copies, the descriptor
-+// flip, the UV pairs, the stack scratch, the sqrt native's frame below sp), the registers each
-+// callee sees (0x80059350 saves r27-r31 and LR into its frame: r21-r31 track the original,
-+// ctx->lr is 0x8000DC08 there as the translation sets it), r1, r2, r13, r14-r31, f14-f31, LR,
-+// CR2-CR4 and GQRs at return. The volatile registers (r0, r3-r12, f0-f13, CR0/1/5-7, XER, CTR)
-+// are left as the EABI allows: the translation itself leaves different values there depending
-+// on whether its callees run state-free, and the only caller reloads none of them.
-+//
-+// This file builds like the translated code (-O2 -fno-fast-math -ffp-contract=off, outside the
-+// unity build: runtime/CMakeLists.txt): a contracted multiply-add or a reassociated sum would
-+// change bits, and -ffinite-math-only would fold the NaN tests away.
-+#if defined(__SWITCH__)
-+#include <cmath>
-+#include <cstdint>
-+#include <cstring>
-+
-+#include "abi_bridge.h"
-+#include "memory.h"
-+#include "ppc_runtime.h"
-+#include "compute_preempt.h"
-+
-+extern "C" void func_8000D770(CpuContext* ctx);              // the translation (kept: _AS registration)
-+extern "C" void MLB_PSMTXConcat_800A890C(CpuContext* ctx);   // hle/mlb/mtx_natives.cpp
-+
-+namespace mlb_envmap {
-+
-+// ---- guest memory, flat view (callers have proven the range plain) ----
-+
-+inline uint8_t* Host(uint32_t address) { return MKW_FLAT_GUEST_BASE + address; }
-+
-+inline uint32_t Bits(float value) {
-+    uint32_t bits;
-+    std::memcpy(&bits, &value, sizeof bits);
-+    return bits;
-+}
-+
-+inline float Float(uint32_t bits) {
-+    float value;
-+    std::memcpy(&value, &bits, sizeof value);
-+    return value;
-+}
-+
-+inline uint32_t Load32(uint32_t address) {
-+    uint32_t raw;
-+    std::memcpy(&raw, Host(address), sizeof raw);
-+    return __builtin_bswap32(raw);
-+}
-+
-+inline float LoadF(uint32_t address) { return Float(Load32(address)); }
-+
-+inline void Store32(uint32_t address, uint32_t value) {
-+    const uint32_t raw = __builtin_bswap32(value);
-+    std::memcpy(Host(address), &raw, sizeof raw);
-+}
-+
-+inline void Store64(uint32_t address, uint64_t value) {
-+    const uint64_t raw = __builtin_bswap64(value);
-+    std::memcpy(Host(address), &raw, sizeof raw);
-+}
-+
-+// psq_st's single narrowing of a non-NaN lane: a subnormal or zero keeps only its sign.
-+inline float PsqStored(float value) {
-+    const uint32_t bits = Bits(value);
-+    return (bits & 0x7FFFFFFFu) < 0x00800000u ? Float(bits & 0x80000000u) : value;
-+}
-+
-+// One instruction each, so nothing can be fused, reassociated or widened.
-+inline float Mul(float a, float b) { float r; __asm__("fmul %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
-+inline float Add(float a, float b) { float r; __asm__("fadd %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
-+inline float Sub(float a, float b) { float r; __asm__("fsub %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
-+inline float Div(float a, float b) { float r; __asm__("fdiv %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
-+inline float Fma(float a, float c, float b) {  // a * c + b, one rounding (ps_madd's lane)
-+    float r;
-+    __asm__("fmadd %s0, %s1, %s2, %s3" : "=w"(r) : "w"(a), "w"(c), "w"(b));
-+    return r;
-+}
-+inline float SqrtS(float a) { float r; __asm__("fsqrt %s0, %s1" : "=w"(r) : "w"(a)); return r; }
-+inline double SqrtD(double a) { double r; __asm__("fsqrt %d0, %d1" : "=w"(r) : "w"(a)); return r; }
-+inline double Widen(float a) { double r; __asm__("fcvt %d0, %s1" : "=w"(r) : "w"(a)); return r; }
-+
-+// ---- ranges ----
-+
-+constexpr uint32_t kStackBelow = 32u;    // the sqrt native's frame under sp
-+constexpr uint32_t kStackAbove = 0x100u; // scratch, matrices and the palette pointer up to sp+0xFC
-+
-+// [address, address + length) neither wraps nor touches 0xCC000000-0xCDFFFFFF.
-+inline bool Plain(uint32_t address, uint64_t length) {
-+    const uint64_t end = static_cast<uint64_t>(address) + length;
-+    return end <= 0x100000000ull && (end <= 0xCC000000ull || address >= 0xCE000000u);
-+}
-+
-+inline bool Disjoint(uint64_t a, uint64_t aLength, uint64_t b, uint64_t bLength) {
-+    return a + aLength <= b || b + bLength <= a;
-+}
-+
-+// ---- rollback ----
-+
-+// The UV words and the buffer flip, with the values they replaced. Guest code runs on the main
-+// thread only and no guest call happens while the log is live, so one log serves every call.
-+struct UndoLog {
-+    static constexpr uint32_t kCapacity = 16384;
-+    uint32_t address[kCapacity];
-+    uint32_t old[kCapacity];
-+    uint32_t count;
-+};
-+UndoLog g_undo;
-+
-+[[gnu::always_inline]] inline void LoggedStore32(uint32_t address, uint32_t value) {
-+    g_undo.address[g_undo.count] = address;
-+    g_undo.old[g_undo.count] = Load32(address);
-+    ++g_undo.count;
-+    Store32(address, value);
-+}
-+
-+struct Call {
-+    CpuContext* ctx;
-+    uint32_t sp, r2;
-+    uint64_t stackGuard;  // sp - 32
-+    uint64_t sdataGuard;  // r2 - 0x8000
-+};
-+
-+// A read or write the loops make: plain RAM outside the stack area they write or cache.
-+inline bool Clear(const Call& c, uint32_t address, uint64_t length) {
-+    return Plain(address, length) && Disjoint(address, length, c.stackGuard, kStackBelow + kStackAbove);
-+}
-+
-+// ---- the loop's constants and stack inputs ----
-+
-+struct Consts {
-+    float two, one, zero, half, su, sv;  // registers set up before the mesh loop
-+    float nz, nh, n3, alt;              // loaded per vertex by the translation (normalize, zero root)
-+};
-+
-+struct Scratch {  // the last vertex's stack values, written once after the loops
-+    float p[3], n[3], r[3];
-+    float sum;
-+    bool pending;
-+};
-+
-+struct Layout {   // stack offsets of one of the two loops
-+    uint32_t p, n, r;
-+};
-+
-+// ---- one vertex in host singles ----
-+
-+struct Vec { float x, y, z; };
-+
-+// PSMTXMultVec, each row: (m0 x + m2 z) + (m1 y + m3) with ps_mul, ps_madd and ps_sum0, stored by psq_st.
-+inline float Row(const float* m, float x, float y, float z) {
-+    return PsqStored(Add(Fma(m[2], z, Mul(m[0], x)), Fma(m[3], 1.0f, Mul(m[1], y))));
-+}
-+
-+inline Vec MultVec(const float* m, const Vec& v) {
-+    return {Row(m, v.x, v.y, v.z), Row(m + 4, v.x, v.y, v.z), Row(m + 8, v.x, v.y, v.z)};
-+}
-+
-+// PSMTXMultVecSR, each row: (m0 x + m1 y) + m2 z with ps_mul, ps_sum0 and ps_madd.
-+inline float RowSR(const float* m, float x, float y, float z) {
-+    return PsqStored(Fma(m[2], z, Add(Mul(m[0], x), Mul(m[1], y))));
-+}
-+
-+inline Vec MultVecSR(const float* m, const Vec& v) {
-+    return {RowSR(m, v.x, v.y, v.z), RowSR(m + 4, v.x, v.y, v.z), RowSR(m + 8, v.x, v.y, v.z)};
-+}
-+
-+// PSVECNormalize in place (0x800635B4): s = (z z + x x) + y y; unchanged when s equals its zero
-+// constant; else k from frsqrte and one Newton step (the translation's helpers), p *= k.
-+inline Vec Normalize(const Vec& p, const Consts& k) {
-+    const float s = Add(Fma(p.z, p.z, Mul(p.x, p.x)), Mul(p.y, p.y));
-+    if (Widen(s) == Widen(k.nz)) return p;
-+    const double sd = Widen(s);
-+    const double e = PPC_Frsqrte(sd);
-+    double f6 = PpcFmulsInline(e, e);
-+    const double f0 = PpcFmulsInline(e, Widen(k.nh));
-+    f6 = PPC_Fnmsubs(f6, sd, Widen(k.n3));
-+    const float scale = static_cast<float>(PpcFmulsInline(f6, f0));
-+    return {PsqStored(Mul(p.x, scale)), PsqStored(Mul(p.y, scale)), PsqStored(Mul(p.z, scale))};
-+}
-+
-+inline Vec LoadVec(uint32_t address) { return {LoadF(address), LoadF(address + 4u), LoadF(address + 8u)}; }
-+
-+inline void LoadMatrix(uint32_t address, float* m) {
-+    for (int i = 0; i < 12; ++i) m[i] = LoadF(address + 4u * static_cast<uint32_t>(i));
-+}
-+
-+// One vertex; false (nothing stored) when it is not for the fast path.
-+template <bool Skinned>
-+[[gnu::always_inline]] inline bool Vertex(const float* m, const float* rot, uint32_t pos, uint32_t nrm,
-+                                          uint32_t out, const Consts& k, Scratch& s) {
-+    const Vec p = Normalize(MultVec(m, LoadVec(pos)), k);
-+    const Vec n = Skinned ? MultVecSR(m, LoadVec(nrm)) : MultVec(rot, LoadVec(nrm));
-+    const float t = Mul(k.two, Add(Mul(p.z, n.z), Add(Mul(p.x, n.x), Mul(p.y, n.y))));
-+    const float rx = Sub(p.x, Mul(n.x, t));
-+    const float ry = Sub(p.y, Mul(n.y, t));
-+    const float rz = Add(k.one, Sub(p.z, Mul(n.z, t)));
-+    const float sum = Add(Mul(rz, rz), Add(Mul(rx, rx), Mul(ry, ry)));
-+    if (!(sum > 0.0f) || !(sum < INFINITY)) [[unlikely]] return false;
-+    float root = SqrtS(sum);
-+    if (Widen(k.zero) == Widen(root)) root = k.alt;
-+    const float scale = Div(k.half, root);
-+    const float u = Mul(k.su, Sub(k.half, Mul(rx, scale)));
-+    const float v = Mul(k.sv, Sub(k.half, Mul(ry, scale)));
-+    if (std::isnan(u) || std::isnan(v)) [[unlikely]] return false;
-+    LoggedStore32(out, Bits(u));
-+    LoggedStore32(out + 4u, Bits(v));
-+    s.p[0] = p.x; s.p[1] = p.y; s.p[2] = p.z;
-+    s.n[0] = n.x; s.n[1] = n.y; s.n[2] = n.z;
-+    s.r[0] = rx; s.r[1] = ry; s.r[2] = rz;
-+    s.sum = sum;
-+    s.pending = true;
-+    return true;
-+}
-+
-+// The stack as the last vertex left it, the sqrt native's frame included.
-+inline void Flush(uint32_t sp, const Layout& l, Scratch& s) {
-+    if (!s.pending) return;
-+    for (uint32_t i = 0; i < 3; ++i) {
-+        Store32(sp + l.p + 4u * i, Bits(s.p[i]));
-+        Store32(sp + l.n + 4u * i, Bits(s.n[i]));
-+        Store32(sp + l.r + 4u * i, Bits(s.r[i]));
-+    }
-+    const double x = Widen(s.sum);
-+    const double root = SqrtD(x);
-+    uint64_t xBits, rootBits;
-+    std::memcpy(&xBits, &x, sizeof xBits);
-+    std::memcpy(&rootBits, &root, sizeof rootBits);
-+    Store32(sp - 32u, sp);
-+    Store64(sp - 24u, xBits);
-+    Store32(sp - 16u, static_cast<uint32_t>(rootBits >> 32));
-+    Store32(sp - 12u, static_cast<uint32_t>(rootBits));
-+    s.pending = false;
-+}
-+
-+// A mesh's arrays: plain, clear of the stack area, the UV buffer clear of the constants, and
-+// room in the log for its UV words.
-+inline bool MeshFits(const Call& c, uint32_t pos, uint32_t nrm, uint32_t out, uint64_t vertices) {
-+    return 2u * vertices <= UndoLog::kCapacity - g_undo.count && Clear(c, pos, 12u * vertices) &&
-+           Clear(c, nrm, 12u * vertices) && Clear(c, out, 8u * vertices) &&
-+           Disjoint(out, 8u * vertices, c.sdataGuard, 0x8000u);
-+}
-+
-+// ---- the shape descriptor accessors (leaves 0x80059278-0x80059314, inlined); false = rollback ----
-+
-+struct Mesh { uint32_t pos, nrm, uv, vertices; };
-+
-+inline bool ReadMesh(const Call& c, uint32_t shape, uint32_t index, Mesh& mesh) {
-+    if (!Clear(c, shape + 0x18u, 16u)) return false;
-+    const uint32_t buffer = Load32(shape + 0x18u);
-+    const uint32_t meshes = Load32(shape + 0x24u);
-+    const uint32_t entry = Load32(shape + 0x20u) + (index + buffer * meshes) * 0x1Cu;  // mullw, add, mulli
-+    if (!Clear(c, entry, 0x1Cu)) return false;
-+    mesh.pos = Load32(entry + 8u);                                                     // 0x800592CC
-+    mesh.nrm = Load32(entry + 12u);                                                    // 0x800592F0
-+    if (((*Host(entry + 0x18u) >> 3) & 1u) != 0) {                                     // 0x80059290
-+        const uint32_t holder = Load32(entry);
-+        if (!Clear(c, holder + 0x18u, 4u)) return false;
-+        mesh.uv = Load32(holder + 0x18u);
-+    } else {
-+        mesh.uv = 0;
-+    }
-+    mesh.vertices = static_cast<uint32_t>((static_cast<uint64_t>(mesh.nrm - mesh.pos) * 0xAAAAAAABull) >> 32) >> 3;
-+    return true;                                                                       // 0x80059314
-+}
-+
-+// Undo every write since entry and run the translation from the entry state.
-+[[gnu::noinline, gnu::cold]] void Rollback(CpuContext* ctx, const CpuContext& entry, uint32_t stackLow,
-+                                           const uint8_t* stack, uint32_t stackLength) {
-+    while (g_undo.count != 0) {
-+        --g_undo.count;
-+        Store32(g_undo.address[g_undo.count], g_undo.old[g_undo.count]);
-+    }
-+    std::memcpy(Host(stackLow), stack, stackLength);
-+    *ctx = entry;
-+    func_8000D770(ctx);
-+}
-+
-+}  // namespace mlb_envmap
-+
-+extern "C" void MLB_EnvMapCoords_8000D770(CpuContext* ctx) {
-+    using namespace mlb_envmap;
-+    HleTraceCall("MLB_EnvMapCoords_8000D770");
-+    const uint32_t r1 = ctx->gpr[1], r2 = ctx->gpr[2], r13 = ctx->gpr[13];
-+    const uint32_t model = ctx->gpr[3];
-+    const uint32_t sp = r1 + (0u - 400u - (r1 & 15u));
-+    // Everything the fast path writes on the stack lies in [sp-64, r1+8): PSMTXConcat's back
-+    // chain at sp-64 up to the LR save word at r1+4.
-+    const uint32_t stackLow = sp - 64u;
-+    const uint32_t stackLength = r1 + 8u - stackLow;
-+    if (GuestFlat::RequiresCheckedAccess() || ctx->gqr[0] != 0 || sp < 64u || r2 < 0x8000u ||
-+        !Plain(stackLow, stackLength) || !Plain(model + 0x18u, 12u) || !Plain(r13 - 30108u, 4u) ||
-+        !Plain(r2 - 0x8000u, 0x8000u)) [[unlikely]] {
-+        func_8000D770(ctx);
-+        return;
-+    }
-+    const CpuContext entry = *ctx;
-+    uint8_t stack[64 + 400 + 15 + 8];
-+    std::memcpy(stack, Host(stackLow), stackLength);
-+    g_undo.count = 0;
-+    const Call c{ctx, sp, r2, static_cast<uint64_t>(sp) - kStackBelow, static_cast<uint64_t>(r2) - 0x8000u};
-+#define MLB_ENVMAP_ROLLBACK() do { Rollback(ctx, entry, stackLow, stack, stackLength); return; } while (false)
-+
-+    uint32_t r21 = ctx->gpr[21], r22 = ctx->gpr[22], r23 = ctx->gpr[23], r24 = ctx->gpr[24], r25 = ctx->gpr[25];
-+    uint32_t r26 = ctx->gpr[26], r27 = ctx->gpr[27], r28 = ctx->gpr[28], r29 = ctx->gpr[29], r30 = ctx->gpr[30];
-+    uint32_t r31 = ctx->gpr[31];
-+
-+    // Prologue: clrlwi/subfic/stwux (a 16-byte aligned frame of 0x190 + (r1 & 15)), LR, f26-f31 as
-+    // stfd + psq_st pairs, _savegpr_21.
-+    Store32(sp, r1);
-+    Store32(r1 + 4u, ctx->lr);
-+    for (uint32_t i = 0; i < 6; ++i) {
-+        const double saved = ctx->fpr[31 - i].d;
-+        MemoryInline::FlatWriteRamFloat64(r1 - 16u - 16u * i, saved);
-+        PPC_PsqStStackInline<0u, 0u>(ctx, r1 - 8u - 16u * i, PPC_PsFromScalarInline(saved));
-+    }
-+    const uint32_t r11 = r1 - 96u;
-+    for (uint32_t reg = 21; reg <= 31; ++reg) Store32(r11 - 4u * (32u - reg), ctx->gpr[reg]);
-+    ctx->gpr[1] = sp;
-+    ctx->xer |= 0x20000000u;  // subfic's carry: 0xFFFFFE70 >= (r1 & 15)
-+
-+    const uint32_t shape0 = Load32(model + 0x18u);
-+    r31 = model;
-+    if (shape0 != 0) {
-+        if (!Clear(c, shape0 + 24u, 8u)) MLB_ENVMAP_ROLLBACK();
-+        // stfs of lfs values: the double the load made (FZ flushes a subnormal there), narrowed back.
-+        const double init = Widen(LoadF(r2 - 32660u));
-+        for (uint32_t o = 96; o <= 108; o += 4) MemoryInline::FlatWriteRamFloat32(sp + o, init);
-+        // 0x80058B98: flip the shape's UV buffer, buffer = buffer + 1 < count ? buffer + 1 : 0.
-+        {
-+            uint32_t next = Load32(shape0 + 24u) + 1u;
-+            const uint32_t buffers = Load32(shape0 + 28u);
-+            LoggedStore32(shape0 + 24u, next);
-+            if (static_cast<int32_t>(next) >= static_cast<int32_t>(buffers)) next = 0;
-+            LoggedStore32(shape0 + 24u, next);
-+        }
-+        // M = gfx[+0x1F5C] * copy of gfx[+0x1FCC] (0x8005FA84 -> PSMTXConcat), at sp+0xA0.
-+        const uint32_t gfx = Load32(r13 - 30108u);
-+        if (!Clear(c, gfx + 8028u, 48u) || !Clear(c, gfx + 8140u, 48u) || !Clear(c, gfx + 0x2030u, 12u))
-+            MLB_ENVMAP_ROLLBACK();
-+        for (uint32_t o = 0; o < 48; o += 8) {
-+            const uint32_t a = Load32(gfx + 8140u + o);
-+            const uint32_t b = Load32(gfx + 8144u + o);
-+            Store32(sp + 212u + o, b);
-+            Store32(sp + 208u + o, a);
-+        }
-+        ctx->gpr[0] = sp + 160u;
-+        ctx->gpr[3] = gfx + 8028u;
-+        ctx->gpr[4] = sp + 208u;
-+        ctx->gpr[5] = sp + 160u;
-+        {
-+            MkwComputePreemptHoldScope nested;  // T8: no compute preemption point inside this native
-+            MLB_PSMTXConcat_800A890C(ctx);
-+        }
-+        // R = M without its translation column, at sp+0x70 (r28-r30 keep M's first row).
-+        for (uint32_t w = 0; w < 12; ++w) Store32(sp + 0x70u + 4u * w, Load32(sp + 0xA0u + 4u * w));
-+        r30 = Load32(sp + 0xA0u);
-+        r29 = Load32(sp + 0xA4u);
-+        r28 = Load32(sp + 0xA8u);
-+        const double column = Widen(LoadF(r2 - 32656u));
-+        for (uint32_t o = 0x7Cu; o <= 0x9Cu; o += 0x10u) MemoryInline::FlatWriteRamFloat32(sp + o, column);
-+        float m[12], rot[12];
-+        LoadMatrix(sp + 0xA0u, m);
-+        LoadMatrix(sp + 0x70u, rot);
-+        // 0x80046610(gfx, sp+0x10, sp+0x14): the skinning palette and its companion word, or zeros.
-+        const uint32_t gfx2 = Load32(r13 - 30108u);
-+        if (gfx2 != gfx) MLB_ENVMAP_ROLLBACK();  // only if a stack store hit the pointer: no fast path
-+        if (*Host(gfx2 + 0x2030u) != 0) {
-+            Store32(sp + 0x14u, Load32(gfx2 + 0x2038u));
-+            Store32(sp + 0x10u, Load32(gfx2 + 0x2034u));
-+        } else {
-+            Store32(sp + 0x14u, 0);
-+            Store32(sp + 0x10u, 0);
-+        }
-+        Consts k;
-+        k.two = LoadF(r2 - 32652u);
-+        k.one = LoadF(r2 - 32660u);
-+        k.zero = LoadF(r2 - 32656u);
-+        k.half = LoadF(r2 - 32644u);
-+        k.su = LoadF(sp + 96u);
-+        k.sv = LoadF(sp + 100u);
-+        k.nz = LoadF(r2 - 30824u);
-+        k.nh = LoadF(r2 - 30812u);
-+        k.n3 = LoadF(r2 - 30808u);
-+        k.alt = LoadF(r2 - 32648u);
-+        const bool skinned = Load32(sp + 0x10u) != 0;
-+        // The model's fields are read again between vertices: not in the stack area.
-+        if (!Clear(c, r31 + 0x18u, 12u) || !Clear(c, Load32(r31 + 24u) + 0x24u, 4u)) MLB_ENVMAP_ROLLBACK();
-+        const uint32_t meshes = Load32(Load32(r31 + 24u) + 0x24u);  // 0x80059278
-+        Scratch s{};
-+        if (!skinned) {
-+            // Loop 1 (0x8000D918): pos r30, nrm r27, uv r26, i r24 < n r28 over meshes r25 < r29.
-+            r29 = meshes;
-+            for (r25 = 0; static_cast<int32_t>(r25) < static_cast<int32_t>(r29); ++r25) {
-+                Mesh mesh;
-+                if (!ReadMesh(c, Load32(r31 + 24u), r25, mesh)) MLB_ENVMAP_ROLLBACK();
-+                r30 = mesh.pos; r27 = mesh.nrm; r26 = mesh.uv; r28 = mesh.vertices;
-+                r24 = 0;
-+                const int32_t count = static_cast<int32_t>(r28);
-+                if (count <= 0) continue;
-+                if (!MeshFits(c, r30, r27, r26, static_cast<uint64_t>(count))) MLB_ENVMAP_ROLLBACK();
-+                for (; static_cast<int32_t>(r24) < count; ++r24, r30 += 12u, r27 += 12u, r26 += 8u)
-+                    if (!Vertex<false>(m, rot, r30, r27, r26, k, s)) [[unlikely]] MLB_ENVMAP_ROLLBACK();
-+            }
-+            Flush(sp, Layout{0x54u, 0x48u, 0x3Cu}, s);
-+            ctx->fpr[26].d = Widen(k.sv); ctx->fpr[27].d = Widen(k.su); ctx->fpr[28].d = Widen(k.half);
-+            ctx->fpr[29].d = Widen(k.zero); ctx->fpr[30].d = Widen(k.one); ctx->fpr[31].d = Widen(k.two);
-+        } else {
-+            // Loop 2 (0x8000DA90): M = [sp+0x10] + 48 * byte[r23]; pos r25, nrm r26, uv r27,
-+            // i r22 < n r29 over meshes r24 < r28; r30 steps the index stream table, r21 keeps M.
-+            const uint32_t palette = Load32(sp + 0x10u);
-+            r28 = meshes;
-+            r30 = 0;
-+            for (r24 = 0; static_cast<int32_t>(r24) < static_cast<int32_t>(r28); ++r24, r30 += 4u) {
-+                Mesh mesh;
-+                if (!ReadMesh(c, Load32(r31 + 24u), r24, mesh)) MLB_ENVMAP_ROLLBACK();
-+                r25 = mesh.pos; r26 = mesh.nrm; r27 = mesh.uv;
-+                // 0x80059280 only computes an address nobody reads.
-+                const uint32_t streams = Load32(r31 + 32u);
-+                if (!Clear(c, streams + r30, 4u)) MLB_ENVMAP_ROLLBACK();
-+                r23 = Load32(streams + r30);
-+                r29 = mesh.vertices;
-+                r22 = 0;
-+                const int32_t count = static_cast<int32_t>(r29);
-+                if (count <= 0) continue;
-+                if (!MeshFits(c, r25, r26, r27, static_cast<uint64_t>(count))) MLB_ENVMAP_ROLLBACK();
-+                for (; static_cast<int32_t>(r22) < count; ++r22, ++r23, r25 += 12u, r26 += 12u, r27 += 8u) {
-+                    if (!Clear(c, r23, 1u)) [[unlikely]] MLB_ENVMAP_ROLLBACK();
-+                    const uint32_t matrix = palette + 48u * *Host(r23);
-+                    if (!Clear(c, matrix, 48u)) [[unlikely]] MLB_ENVMAP_ROLLBACK();
-+                    float mi[12];
-+                    LoadMatrix(matrix, mi);
-+                    if (!Vertex<true>(mi, mi, r25, r26, r27, k, s)) [[unlikely]] MLB_ENVMAP_ROLLBACK();
-+                    r21 = matrix;
-+                }
-+            }
-+            Flush(sp, Layout{0x30u, 0x24u, 0x18u}, s);
-+            ctx->fpr[26].d = Widen(k.zero); ctx->fpr[27].d = Widen(k.half); ctx->fpr[28].d = Widen(k.su);
-+            ctx->fpr[29].d = Widen(k.sv); ctx->fpr[30].d = Widen(k.two); ctx->fpr[31].d = Widen(k.one);
-+        }
-+        g_undo.count = 0;
-+        // 0x80059350(shape): flushes the UV buffers (its frame saves r27-r31 and LR), then
-+        // GXInvalidateVtxCache. Guest code from here on: no rollback past this point.
-+        ctx->gpr[3] = Load32(r31 + 24u);
-+        ctx->gpr[21] = r21; ctx->gpr[22] = r22; ctx->gpr[23] = r23; ctx->gpr[24] = r24; ctx->gpr[25] = r25;
-+        ctx->gpr[26] = r26; ctx->gpr[27] = r27; ctx->gpr[28] = r28; ctx->gpr[29] = r29; ctx->gpr[30] = r30;
-+        ctx->gpr[31] = r31;
-+        ctx->lr = 0x8000DC08u;
-+        InvokeDirectCpu<0x80059350u>(ctx);
-+        InvokeDirectCpu<0x800C48D4u>(ctx);
-+    }
-+#undef MLB_ENVMAP_ROLLBACK
-+
-+    // Epilogue: f26-f31 from their stfd slots, _restgpr_21, LR, r1 from the back chain.
-+    const uint32_t r10 = MemoryInline::FlatRead32(sp);
-+    const uint32_t r11e = r10 - 96u;
-+    for (uint32_t i = 0; i < 6; ++i) ctx->fpr[31 - i].d = MemoryInline::FlatReadFloat64(r10 - 16u - 16u * i);
-+    for (uint32_t reg = 21; reg <= 31; ++reg) ctx->gpr[reg] = MemoryInline::FlatRead32(r11e - 4u * (32u - reg));
-+    const uint32_t lr = MemoryInline::FlatRead32(r10 + 4u);
-+    ctx->gpr[0] = lr;
-+    ctx->gpr[10] = r10;
-+    ctx->gpr[11] = r11e;
-+    ctx->lr = lr;
-+    ctx->gpr[1] = r10;
-+}
-+REGISTER_NATIVE_FUNCTION_AS(0x8000D770, MLB_EnvMapCoords_8000D770, "EnvMapCoords");
-+#endif

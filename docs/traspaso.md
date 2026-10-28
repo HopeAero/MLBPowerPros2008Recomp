@@ -21,6 +21,13 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
 - Verificación: `mkswitch.sh` pasa (74 parches + linux + Switch y rebind), `treecheck.sh` y ambos `diff -rq` confirman runtime/Aurora idénticos. Compilación completa con `MLB_SWITCH_JOBS=4 bash tools/switch/build-nro.sh --graphics vulkan`: éxito, NRO de 114 MiB en `local/switch/build/MLBPowerPros2008.nro`; no cambió ninguno de los 48.223 archivos emitidos por el traductor. Checker de contenido y diff sin errores.
 - Registros de esta tanda: `local/switch/logs/P11-{mkswitch,treecheck,build,wake-check,analysis-check}.txt`; símbolos nuevos en `elf-syms-P11.txt`. Ambas pruebas de consola usaron `WIICOMPILED_MATCH_BENCH=1 WIICOMPILED_MATCH_SECONDS=90 WIICOMPILED_SWITCH_PROFILE=1 WIICOMPILED_SWITCH_SPIKES=30 WIICOMPILED_SWITCH_SPIKES_MAX=256`.
 
+## Tanda P13 (2026-10-28): texturas recreadas, probada en consola
+
+- Fases **60** (`auto_mips::build_chain` 2–3× más rápido, idéntico byte a byte) y **61** (caché de texturas por contenido + pool LRU de 96 MiB, solo Switch; `WIICOMPILED_SWITCH_TEXSTATS=1`). Detalle y causa en `docs/ingenieria-inversa.md` (picos de fildeo). Snippets `local/tmp/cpu/P13-*.py`, pruebas en `local/tmp/cpu/P13-mips/` y `P13-test/`.
+- Benchmark 90 s stock portátil (1020/307/1331): 59,42 fps, p95 18,22, p99 22,63; **0 picos >30 ms** (base 4, P11 1). Entró en la misma escena final pesada que la base: 193 frames tardíos frente a 231. Esa escena está **limitada por GPU** (73 frames con GPU >16 ms, p99 GPU 20 ms): siguiente frente si se quiere p99 limpio.
+- Falta: prueba jugando (fildeo, toma inicial) con `WIICOMPILED_SWITCH_SPIKES=30 WIICOMPILED_SWITCH_SPIKES_MAX=256 WIICOMPILED_SWITCH_TEXSTATS=1`. Vigilar en el log dk `descriptors: all N image slots in use` (el pool ocupa descriptores).
+- NRO: `local/switch/build/P13-candidate.nro`; anterior `P12-baseline.nro`.
+
 ## Siguiente paso: comparar desde el mismo estado
 
 **Medir el efecto de P11 en los picos de fildeo y la toma inicial**, comparando el mismo estado y controles, a reloj stock. Primero benchmark de 90 s con picos; luego probe breve de fildeo. Si la espera GX sigue dominando, muestrear también el worker de core 1 antes de alterar barreras (propuesta en `P11-profile-fifo-review.md`). Datos anteriores:
