@@ -1052,6 +1052,10 @@ Investigation dated October 28, 2026, `RL8E54`. Private sources: `nxlink-run23.t
 
 Phases 56–58 are reproduced by the Switch patches, with changes to earlier generated text folded into phases 22, 45 and 41 respectively. Local correctness checks do not replace a console comparison from the same saved state at stock clocks.
 
+**P11 console probe:** two seeded benchmark starts, 90 s each, handheld, CPU1020/GPU307/EMC1331 MHz confirmed at both ends. Previous NRO: 59.3913 FPS, p95 18.6312 ms, p99 22.5669 ms, producer FIFO wait 0.309 ms/frame. P11: 59.8245 FPS, p95 17.1506 ms, p99 19.6526 ms, wait 0.187 ms/frame; zero GX errors in either. Autoplay is not an identical replay: the previous build entered different gameplay phases near the end, with 73 GPU>16 ms frames in its final window versus 1 for P11. These differences alone therefore do not establish a patch speedup. The same benchmark frame4115 spike remains: 33.1 ms before and 32.5 ms with P11, both with 19 samples including the GX wait; neither spike had I/O or shader compilation. Decoder-side evidence is still needed. Sources: `nxlink-P11-baseline-20261028-113902.log`, `nxlink-MLBPowerPros2008-20261028-113447.log`, matching symbols and `local/tmp/cpu/P11-console*` analysis.
+
+**GX worker sampling (phase 59):** `WIICOMPILED_SWITCH_PROFILE_GX=1` with spike capture adds `[spike] W` PC/LR rows with their own timestamp. Main resumes before GX pauses; frame changes discard the association. It does not scan the GX stack or add another sampling thread, and separately counts pause/read/resume failures. Disabled by default. All 18 extracted-source checks cover errors and frame changes; the actual source compiles for AArch64. This is diagnostic: extra SVCs perturb timing, and generic-wait PC/LR may not identify the mutex or its owner.
+
 ### Match camera
 
 Found on 18 October 2026 for the stadium preview (`runtime/src/hle/mlb/game_camera.cpp`, patch `wiicompiled-stadium-viewer`). Methods: MEM1 dumps every 3 s (`WIICOMPILED_DEBUG_MEM1`) searched for plausible eye/target pairs; a write watchpoint on the eye (`WIICOMPILED_DEBUG_WATCH`) resolved with `llvm-nm`; temporary wrappers in the shards.

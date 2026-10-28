@@ -8,7 +8,7 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
 - **Audio:** resuelto. El narrador va a tiempo (ticker de 5 ms a 200 despertares/s, 0 pasadas perdidas) y no hay huecos de salida aunque caigan los fps. El usuario lo confirmó de oído: "el audio va perfecto, ni lo tocaría".
 - **Lo pendiente:** bajones de **un frame** (30–36 ms) al fildear y en la toma inicial que muestra a todos los jugadores. El usuario observa que *cuantos más fildeadores y corredores hay en pantalla, más caen los fps* (CPU ~80% al lanzar o batear, ~90–92% al fildear). Prueba 23: 39 picos de más de 30 ms en 16 570 frames de partido.
 
-## Tanda P11 (2026-10-28): cambios locales, consola pendiente
+## Tanda P11 (2026-10-28): probada en consola; pico GX pendiente
 
 - Fases **56–58** de `local/tmp/switch_edit.py`, integradas en el texto de las fases 22/45/41 para respetar el orden de generación:
   - **56:** FIFO publica el segmento que espera el productor; el worker solo avisa cuando lo alcanza. Mantiene las barreras SC, el mutex y el callback cada 1 ms. Ensayo con código real: 512 segmentos pendientes, 512 avisos → 1; 40 ejecuciones de estrés pasan, con presión del ring, esperas anidadas y visibilidad de memoria.
@@ -16,9 +16,10 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
   - **58:** handles de `ReadExact` sin búfer de stdio. La biblioteca newlib instalada demuestra rellenos auxiliares de `fseeko`/`fread`; no hay caché de bytes ni cambios de DMA/callbacks. 1.067 comprobaciones pasan. La lectura física sigue siendo síncrona; vigilar el coste de lecturas pequeñas.
 - **Sin nativa nueva:** prototipo de cuaterniones `0x806EEDF4` idéntico en 200.000 casos de qemu, pero su ahorro estimado (~0,024 ms/frame) no justifica integrarlo para esta tarea. Queda solo en `local/tmp/cpu/P11-native-test/`.
 - Análisis: `local/tmp/cpu/P11-profile-report.md` y `P11-profile-fifo-review.md`. Run23 >5000: 39 picos, 1.270 muestras; espera GX de fin de frame 26,2 %, GX propio 20,9 %, código traducido propio 26,5 %. No hay recuentos de jugadores para calcular ms/jugador. Run23 no imprimió relojes; run12 sí confirma CPU 1020/GPU 307 al inicio y al final. `gx_fifo_decode_ms` mide tiempo transcurrido, incluidas esperas; no CPU pura del worker.
-- **No se ha medido aún una mejora en consola.** Audio intacto. Para comparar, se conservó la NRO anterior en `local/switch/build/P11-baseline.nro`; enviarla con `--path mlbpowerpros2008/MLBPowerPros2008.nro` para usar el mismo directorio y estado guardado.
+- **Dos benchmarks de 90 s completados en consola**, portátil, CPU 1020/GPU 307/EMC 1331 al inicio y al final. Anterior: 59,3913 FPS, p95 18,6312 ms, p99 22,5669 ms, espera FIFO 0,309 ms/frame; P11: 59,8245 FPS, p95 17,1506 ms, p99 19,6526 ms, espera FIFO 0,187 ms/frame. Sin errores GX. **No es una prueba causal de ahorro:** el autoplay no repite cada frame; la anterior entró en escenas más pesadas al final (73 frames GPU >16 ms frente a 1 en P11). El mismo pico del frame 4115 persiste, 33,1 → 32,5 ms, con 19 muestras de espera GX en ambas y sin E/S/shaders. Logs: `nxlink-P11-baseline-20261028-113902.log` y `nxlink-MLBPowerPros2008-20261028-113447.log`; informes en `local/tmp/cpu/P11-console*`.
+- Audio intacto. La NRO anterior está en `local/switch/build/P11-baseline.nro` y la candidata P11 en `P11-candidate.nro`. Enviar cualquiera con `--path mlbpowerpros2008/MLBPowerPros2008.nro` usa el mismo directorio de datos. El benchmark arranca un partido sembrado; no carga un estado guardado ni es una repetición idéntica de controles.
 - Verificación: `mkswitch.sh` pasa (74 parches + linux + Switch y rebind), `treecheck.sh` y ambos `diff -rq` confirman runtime/Aurora idénticos. Compilación completa con `MLB_SWITCH_JOBS=4 bash tools/switch/build-nro.sh --graphics vulkan`: éxito, NRO de 114 MiB en `local/switch/build/MLBPowerPros2008.nro`; no cambió ninguno de los 48.223 archivos emitidos por el traductor. Checker de contenido y diff sin errores.
-- Registros de esta tanda: `local/switch/logs/P11-{mkswitch,treecheck,build,wake-check,analysis-check}.txt`; símbolos nuevos en `elf-syms-P11.txt`. Se pidió al usuario netloader en 192.168.0.105 y relojes stock; falta su respuesta. Al probar, usar `WIICOMPILED_MATCH_BENCH=1 WIICOMPILED_MATCH_SECONDS=90 WIICOMPILED_SWITCH_PROFILE=1 WIICOMPILED_SWITCH_SPIKES=30 WIICOMPILED_SWITCH_SPIKES_MAX=256` para registrar relojes al inicio y al final y poder comparar las capturas.
+- Registros de esta tanda: `local/switch/logs/P11-{mkswitch,treecheck,build,wake-check,analysis-check}.txt`; símbolos nuevos en `elf-syms-P11.txt`. Ambas pruebas de consola usaron `WIICOMPILED_MATCH_BENCH=1 WIICOMPILED_MATCH_SECONDS=90 WIICOMPILED_SWITCH_PROFILE=1 WIICOMPILED_SWITCH_SPIKES=30 WIICOMPILED_SWITCH_SPIKES_MAX=256`.
 
 ## Siguiente paso: comparar desde el mismo estado
 
@@ -40,7 +41,7 @@ Otras palancas medidas:
 
 ## Cómo se trabaja (flujo probado)
 
-- **Patch de Switch:** se genera desde `local/tmp/switch_edit.py`, con fases 1–58 de `sub()` / `write()` y folds de los cambios al texto de fases anteriores.
+- **Patch de Switch:** se genera desde `local/tmp/switch_edit.py`, con fases 1–59 de `sub()` / `write()` y folds de los cambios al texto de fases anteriores.
   - `bash local/tmp/mkswitch.sh` (desde MSYS2) regenera `tools/patches/wiicompiled-switch.patch` y `-2.patch` (dos archivos por el límite de 512 KiB del repo) y valida la cadena sobre un árbol limpio con rebind.
   - `bash local/tmp/treecheck.sh` + `diff -rq local/switch/work/treecheck/runtime local/switch/work/mlb/src/runtime`: el árbol de build debe coincidir 100% con el que generan los patches. Hacerlo antes de cada commit.
 - **Agentes:** el brief compartido está en `local/tmp/cpu/BRIEF.md`.
@@ -55,6 +56,7 @@ Otras palancas medidas:
   - Benchmark: `WIICOMPILED_MATCH_BENCH=1 WIICOMPILED_MATCH_SECONDS=90`.
   - Diagnóstico de audio: `WIICOMPILED_AUDIO_STATS=1 WIICOMPILED_SOUND_TICK_STATS=1`.
   - Perfil: `WIICOMPILED_SWITCH_PROFILE=1`.
+  - Perfil emparejado del worker GX (fase 59, opcional): `WIICOMPILED_SWITCH_PROFILE_GX=1` junto con picos. Añade líneas W de PC/LR con su instante, después de reanudar el principal; no escanea la pila GX. Descarta cruces de frame y cuenta errores. **Diagnóstico, no benchmark de rendimiento:** los SVC extra perturban los tiempos. Analizador: `python local/tmp/cpu/P11-console-worker.py <log> --syms <tabla> --label <salida>`.
   - Picos: `WIICOMPILED_SWITCH_SPIKES=30 WIICOMPILED_SWITCH_SPIKES_MAX=256` (sirve también jugando normal).
   - Archivos: `WIICOMPILED_SWITCH_IO_LOG=1`.
   - **Revisar siempre** `cpu_mhz` / `gpu_mhz` al inicio y al final: el usuario a veces tiene sys-clk con overclock.

@@ -4206,10 +4206,10 @@ index 0000000..e01a61b
 +#endif
 diff --git a/runtime/src/platform/switch/switch_profiler.cpp b/runtime/src/platform/switch/switch_profiler.cpp
 new file mode 100644
-index 0000000..14fa21e
+index 0000000..af8626b
 --- /dev/null
 +++ b/runtime/src/platform/switch/switch_profiler.cpp
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,477 @@
 +// Sampling profiler on Horizon: svcSetThreadActivity pauses the main thread (which runs the guest
 +// fibers), svcGetThreadContext3 reads where it is, and it resumes. Started and dumped by the match
 +// benchmark (match_benchmark_overlay.inc) when WIICOMPILED_SWITCH_PROFILE=1.
@@ -4249,6 +4249,11 @@ index 0000000..14fa21e
 +Thread g_thread;
 +std::unordered_map<u64, u32> g_pc, g_lr;
 +u64 g_samples = 0, g_failed = 0;
++// P12: optional paired core-1 PC/LR samples; the worker publishes its real handle once.
++std::atomic<Handle> g_gxThread{0};
++bool g_gxEnabled = false;
++u64 g_gxSamples = 0, g_gxPauseFailed = 0, g_gxReadFailed = 0, g_gxResumeFailed = 0;
++u64 g_gxUnregistered = 0, g_gxMainResumeFailed = 0, g_gxFrameChanged = 0;
 +// samples taken while the host frame in progress is already past 17 ms (SwitchProfilerFrame marks each
 +// frame's start): what the main thread does in the frames that miss a vblank
 +std::atomic<u64> g_frameStart{0};
@@ -4267,6 +4272,7 @@ index 0000000..14fa21e
 +
 +struct SpkSample {
 +    u64 tick, pc, lr;
++    u64 gxTick, gxPc, gxLr;  // zero tick: no paired worker context
 +    u64 ra[kSpkRa];
 +    u32 frame, raCount;
 +};
@@ -4313,7 +4319,7 @@ index 0000000..14fa21e
 +u64 g_spkUpperNs = 0;       // longer frames are loads, not spikes (WIICOMPILED_SWITCH_SPIKES_UPTO; free-running: 150)
 +u32 g_spkLong = 0;          // frames skipped for that
 +char* g_spkText = nullptr;  // one spike's lines, written with one fwrite
-+constexpr size_t kSpkTextSize = 48 * 1024;
++constexpr size_t kSpkTextSize = 64 * 1024;  // P12: room for P + optional W at all 256 samples
 +
 +// A word on the stack that is a return address: in the code segment, right after a BL or BLR.
 +bool SpkIsReturn(u64 a) {
@@ -4388,6 +4394,28 @@ index 0000000..14fa21e
 +    }
 +}
 +
++// Main has already resumed. Never scan the worker stack or hold it while collecting other stats.
++void SampleGx(SpkSample& spike, bool mainResumed) {
++    spike.gxTick = 0;
++    if (!mainResumed) { ++g_gxMainResumeFailed; return; }
++    const Handle worker = g_gxThread.load(std::memory_order_acquire);
++    if (!worker) { ++g_gxUnregistered; return; }
++    if (R_FAILED(svcSetThreadActivity(worker, ThreadActivity_Paused))) { ++g_gxPauseFailed; return; }
++    const u32 frame = g_spkFrame.load(std::memory_order_relaxed);
++    const u64 tick = armGetSystemTick();
++    ThreadContext context{};
++    const bool read = frame == spike.frame && R_SUCCEEDED(svcGetThreadContext3(&context, worker));
++    const bool sameFrame = frame == spike.frame && g_spkFrame.load(std::memory_order_relaxed) == frame;
++    // Resume on every successful pause, including a failed read or a frame that advanced.
++    if (R_FAILED(svcSetThreadActivity(worker, ThreadActivity_Runnable))) ++g_gxResumeFailed;
++    if (!sameFrame) { ++g_gxFrameChanged; return; }
++    if (!read) { ++g_gxReadFailed; return; }
++    spike.gxTick = tick;
++    spike.gxPc = context.pc.x;
++    spike.gxLr = context.lr;
++    ++g_gxSamples;
++}
++
 +void SampleOnce(Handle main) {
 +    if (R_FAILED(svcSetThreadActivity(main, ThreadActivity_Paused))) { ++g_failed; return; }
 +    ThreadContext context{};
@@ -4399,11 +4427,12 @@ index 0000000..14fa21e
 +        spike->tick = armGetSystemTick();
 +        spike->raCount = SpkScanStack(context.sp, spike->ra);
 +    }
-+    svcSetThreadActivity(main, ThreadActivity_Runnable);
++    const bool resumed = R_SUCCEEDED(svcSetThreadActivity(main, ThreadActivity_Runnable));
 +    if (!read) { ++g_failed; return; }
 +    if (spike) {
 +        spike->pc = context.pc.x;
 +        spike->lr = context.lr;
++        if (g_gxEnabled) SampleGx(*spike, resumed);
 +        ++g_spkRingNext;
 +        SpkAfterSample(spike->frame, spike->tick);
 +    }
@@ -4439,6 +4468,11 @@ index 0000000..14fa21e
 +    }
 +}
 +} // namespace
++
++// Called by the GX FIFO worker after pinning itself; no extra thread or scheduling changes.
++extern "C" void SwitchProfilerRegisterGxThread() {
++    g_gxThread.store(threadGetCurHandle(), std::memory_order_release);
++}
 +
 +// Mode, renderer and clocks right now, so a report says whether it ran docked, handheld or
 +// overclocked (sys-clk changes them under the game). Phase 25 puts it in the benchmark summary.
@@ -4505,6 +4539,8 @@ index 0000000..14fa21e
 +}
 +
 +bool StartSampler() {
++    const char* gx = std::getenv("WIICOMPILED_SWITCH_PROFILE_GX");
++    g_gxEnabled = gx && gx[0] == '1' && gx[1] == '\0';
 +    // Core 2, above the game's priority and the AX mix worker's (0x2B there: equal priority never
 +    // preempts, so samples waited for the mix and landed after the game thread's join).
 +    if (R_FAILED(threadCreate(&g_thread, Sample, nullptr, nullptr, 0x10000, 0x2A, 2)) ||
@@ -4586,6 +4622,12 @@ index 0000000..14fa21e
 +                 reinterpret_cast<u64>(&SwitchProfilerStart), g_spkTextLo, g_spkTextHi, double(g_spkThresholdNs) / 1e6,
 +                 g_spikeCount, g_spkTotal, g_spkLimit, g_spikesDropped, g_spkQueueFull, g_spkLong,
 +                 g_spkFrame.load(std::memory_order_relaxed));
++    if (g_gxEnabled) {
++        std::fprintf(stderr, "[spike] worker samples=%lu pause_failed=%lu read_failed=%lu resume_failed=%lu "
++                     "unregistered=%lu main_resume_failed=%lu frame_changed=%lu\n",
++                     g_gxSamples, g_gxPauseFailed, g_gxReadFailed, g_gxResumeFailed,
++                     g_gxUnregistered, g_gxMainResumeFailed, g_gxFrameChanged);
++    }
 +    for (u32 i = 0; i < g_spikeCount; ++i) {
 +        const Spike& s = g_spikes[i];
 +        const SpkContext& b = s.begin;
@@ -4608,6 +4650,10 @@ index 0000000..14fa21e
 +            put("[spike] P %.2f %lx %lx", x.tick > s.request.start ? ms(x.tick - s.request.start) : 0.0, x.pc, x.lr);
 +            for (u32 r = 0; r < x.raCount; ++r) put(" %lx", x.ra[r]);
 +            put("\n");
++            if (x.gxTick) {
++                put("[spike] W %.2f %lx %lx\n",
++                    x.gxTick > s.request.start ? ms(x.gxTick - s.request.start) : 0.0, x.gxPc, x.gxLr);
++            }
 +        }
 +        std::fwrite(g_spkText, 1, o, stderr);
 +    }
