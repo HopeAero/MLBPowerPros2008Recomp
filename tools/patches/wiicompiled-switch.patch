@@ -7070,10 +7070,49 @@ index 9504488..019f48f 100644
      // PAGE_READONLY read window that returned zero turned missing devices into silent hangs instead.
      if (!CommitPlaceholder(g_base + 0xCC000000u, 0x02000000u, kProtNone)) {
 diff --git a/runtime/src/hle/audio/audio.cpp b/runtime/src/hle/audio/audio.cpp
-index a276446..b321ee5 100644
+index a276446..7b57ea4 100644
 --- a/runtime/src/hle/audio/audio.cpp
 +++ b/runtime/src/hle/audio/audio.cpp
-@@ -387,6 +387,20 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -17,6 +17,12 @@
+ #include <mutex>
+ #include <vector>
+ 
++#if defined(__SWITCH__)
++// S9: hle/os/os_scheduler.cpp. The CNTPCT at which the next AI DMA block is due, for the compute
++// preemption points (they deliver it as the AI interrupt would, instead of in a burst at the idle loop).
++extern "C" void MkwAiPreemptPublishDue(int64_t tick);
++#endif
++
+ namespace {
+ constexpr uint32_t kDefaultSampleRate = 32000u;
+ constexpr uint32_t kAudioChannels = 2u;
+@@ -29,6 +35,15 @@ constexpr uint32_t kAIDmaCallbackAddr = 0x80386480u;
+ // Max completed 3 ms DMA blocks delivered per tick. Draining several at once catches up
+ // backlog from a long frame without letting a large stall spiral into an unbounded loop.
+ constexpr int kMaxBlocksPerTick = 4;
++#if defined(__SWITCH__)
++// S9: blocks the current tick may deliver (MkwAiPreemptService: 1). Ticks run on the guest thread.
++int g_aiTickBlockCap = kMaxBlocksPerTick;
++// S9: a debt (blocks still owed after a tick) is offered to the next compute preemption point this
++// long after the tick, not at once: the block's mix, posted by the AI callback, is then done on the
++// mix worker (core 2) when the next block joins it, instead of being helped or waited for on the game
++// thread as in a back-to-back burst. ~6x real time; a mix is 0.2-0.4 ms (run 21: 55 voices/block).
++constexpr double kAiCatchUpSpacingSeconds = 0.0005;
++#endif
+ 
+ struct AIDmaState {
+     std::mutex mutex;
+@@ -381,12 +396,30 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+     if (!enabled || startAddr == 0 || length == 0 || sampleRate == 0) {
+         return;
+     }
++#if defined(__SWITCH__)
++    void SwitchSpikeAudioTick();  // platform/switch/switch_profiler.cpp (S8): the spike dumps' audio gap
++    SwitchSpikeAudioTick();
++#endif
+     // Local diagnostics: tick cadence, blocks and backlog every 2 s (WIICOMPILED_AUDIO_STATS=1).
+     static const bool stats = [] { const char* v = std::getenv("WIICOMPILED_AUDIO_STATS"); return v && *v == '1'; }();
+     static auto statsStart = std::chrono::steady_clock::now();
      static auto lastTick = statsStart;
      static uint64_t statTicks = 0, statBlocks = 0, statCapped = 0;
      static double statMaxGapMs = 0, statMaxBacklogMs = 0;
@@ -7094,7 +7133,7 @@ index a276446..b321ee5 100644
      if (stats) {
          const auto now = std::chrono::steady_clock::now();
          statMaxGapMs = std::max(statMaxGapMs, std::chrono::duration<double, std::milli>(now - lastTick).count());
-@@ -401,6 +415,29 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -401,6 +434,29 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
                      statBlocks * (length / (sampleRate * 4.0)) * 1000.0, (unsigned long long)statCapped, statMaxGapMs,
                      statMaxBacklogMs, (unsigned long long)b.pushes, (unsigned long long)b.drops,
                      (unsigned long long)b.starved, b.minQueued == (1 << 30) ? 0 : b.minQueued, b.maxQueued, b.ratio);
@@ -7124,7 +7163,19 @@ index a276446..b321ee5 100644
              statsStart = now;
              statTicks = statBlocks = statCapped = 0;
              statMaxGapMs = statMaxBacklogMs = 0;
-@@ -447,7 +484,22 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -421,6 +477,11 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+         }
+     } activeTickReset;
+ 
++#if defined(__SWITCH__)
++    // S9: this tick's start (its poll credited the accumulator up to now), for the next due time.
++    int64_t aiTickStart;
++    asm volatile("mrs %0, cntpct_el0" : "=r"(aiTickStart));
++#endif
+     const double bytesPerSecond = static_cast<double>(sampleRate) * kAudioChannels * kBytesPerSample;
+     const double blockDuration = static_cast<double>(length) / bytesPerSecond;
+     if (blockDuration <= 0.0) {
+@@ -447,7 +508,22 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
          // that reads its PB write-back and aux buffers (__AXOutNewFrame via the AI DMA
          // callback), so the mix worker must finish first; the join also publishes its
          // aux-out shadow.
@@ -7147,7 +7198,7 @@ index a276446..b321ee5 100644
  
          if (!EnsureAudioBackend(sampleRate)) {
              std::lock_guard<std::mutex> lock(g_ai.mutex);
-@@ -468,6 +520,13 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -468,6 +544,13 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
              }
          }
  
@@ -7161,7 +7212,7 @@ index a276446..b321ee5 100644
          if (callback != 0) {
              // Pointer lookup avoids copying the registry record per audio block.
              const auto* info = TranslatedFunctionRegistry::FindByAddressPtr(callback);
-@@ -484,6 +543,11 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -484,6 +567,11 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
                  AxDspHle::ServiceDeferredCallbacks();
              }
          }
@@ -7173,7 +7224,39 @@ index a276446..b321ee5 100644
  
          {
              std::lock_guard<std::mutex> lock(g_ai.mutex);
-@@ -513,6 +577,12 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -495,10 +583,20 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+         }
+ 
+         ++statBlocks;
++#if defined(__SWITCH__)
++        // S9: a compute preemption point delivers one block (MkwAiPreemptService below).
++        if (++blocksCompleted >= g_aiTickBlockCap) {
++            if (blocksCompleted >= kMaxBlocksPerTick) {
++                ++statCapped;
++            }
++            break;
++        }
++#else
+         if (++blocksCompleted >= kMaxBlocksPerTick) {
+             ++statCapped;
+             break;
+         }
++#endif
+     }
+ 
+     {
+@@ -510,9 +608,23 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+             }
+         }
+         statMaxBacklogMs = std::max(statMaxBacklogMs, g_ai.accumulatorSeconds * 1000.0);
++#if defined(__SWITCH__)
++        // S9: the next block completes when the accumulator reaches blockDuration; still owed (the
++        // tick's cap left a debt): kAiCatchUpSpacingSeconds after this tick. 19.2 MHz system counter.
++        MkwAiPreemptPublishDue(aiTickStart + static_cast<int64_t>((g_ai.accumulatorSeconds >= blockDuration
++                                                                       ? kAiCatchUpSpacingSeconds
++                                                                       : blockDuration - g_ai.accumulatorSeconds) *
++                                                                  19200000.0));
++#endif
          g_ai.tickActive = false;
          activeTickReset.armed = false;
      }
@@ -7186,6 +7269,39 @@ index a276446..b321ee5 100644
  }
  
  namespace {
+@@ -527,7 +639,14 @@ int64_t ConsumeAudioPollDeltaMicros()
+ 
+     const Clock::time_point now = Clock::now();
+     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastPoll).count();
++#if defined(__SWITCH__)
++    // S9: carry the sub-microsecond remainder, so the credit stays exact wall time however often the
++    // AI is polled (the compute preemption points add ~330 polls a second; truncating every delta lost
++    // ~0.5 us per poll, ~0.05% of the blocks at the idle loop's ~1100 polls a second already).
++    lastPoll = elapsed >= 0 && elapsed <= 100'000 ? lastPoll + std::chrono::microseconds(elapsed) : now;
++#else
+     lastPoll = now;
++#endif
+ 
+     if (elapsed < 0) {
+         elapsed = 0;
+@@ -567,3 +686,17 @@ void Audio_HLE_PollDeferred()
+     }
+     OS_HLE_EndDeferredGuestCallbacks();
+ }
++
++#if defined(__SWITCH__)
++// S9: the AI DMA interrupt taken at a compute preemption point (hle/os/os_scheduler.cpp
++// MkwComputePreemptSlow, which saved the interrupted register file and checked that the hardware
++// could take an interrupt there): Audio_HLE_PollDeferred limited to one block.
++extern "C" void MkwAiPreemptService()
++{
++    struct Cap {
++        Cap() { g_aiTickBlockCap = 1; }
++        ~Cap() { g_aiTickBlockCap = kMaxBlocksPerTick; }
++    } cap;
++    Audio_HLE_PollDeferred();
++}
++#endif
 diff --git a/runtime/src/hle/audio/ax_mix.cpp b/runtime/src/hle/audio/ax_mix.cpp
 index 0bb8fa0..fd2c16c 100644
 --- a/runtime/src/hle/audio/ax_mix.cpp
