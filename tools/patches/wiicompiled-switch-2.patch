@@ -3474,6 +3474,1119 @@ index eeedef2..a6fb804 100644
      for (int y = 0; y < kYearPictureHeight; ++y)
          for (int x = 0; x < kYearPictureWidth; ++x)
              Memory::Write8(texels + C8Offset(u0 + x, v0 + y, 512), picture[y * kYearPictureWidth + x]);
+diff --git a/runtime/src/hle/mlb/thp_natives.cpp b/runtime/src/hle/mlb/thp_natives.cpp
+new file mode 100644
+index 0000000..47d869a
+--- /dev/null
++++ b/runtime/src/hle/mlb/thp_natives.cpp
+@@ -0,0 +1,1107 @@
++// MLB Power Pros 2008 (RL8E54): native 8x8 inverse DCTs of the THP movie decoder (Dolphin SDK
++// THPDec: __THPInverseDCTNoYPos 0x80084C7C and __THPInverseDCTY8 0x80085108). The game plays THP
++// video; its MCU-row decoders (__THPDecompressiMCURow512x448 0x80084A30, 0x8008559C, 0x800857EC) call
++// one of these per 8x8 block: six per MCU (4 Y, U, V), four NoYPos and two Y8. Stock-match window
++// profile (local/switch/logs/nxlink-MLBPowerPros2008-20261028-130311.log, windows with the camera
++// on many players): 1.61 + 0.93 ms/frame of the main thread.
++//
++// void IDCT(const s16 coef[64] /* r3 */, u32 xPos /* r4 */): dequantize row by row with the
++// table at *(r13-28672) (64 singles, 8 per coefficient row), a 1-D 8-point transform per row into
++// the 64-float workspace at 0x802B6860 (rows whose coefficients 4-7 / 2-3 / 1 are zero take
++// shortcuts, as many branches of the original), a 1-D transform per column pair out of the
++// workspace (4 iterations of two columns), and u8 stores (psq_st, GQR6 = 0x3D043D04: x * 1/8,
++// truncated, clamped to 0..255; NaN -> 0) into the plane at *(r13-28608): rows of 8 bytes, the
++// 8 rows of the block as two 4-row halves at r6 and r7. Per-plane stride *(r13-28640) is 512 (Y)
++// or 256 (U, V) in the 512x448 decoder. NoYPos: out + (xPos << 2); Y8 adds 8 rows of the stride
++// (stride << 3). Constants (singles at r2-30792: f29 f28 f27 f26 f25) are the IDCT's rotation
++// factors and the rounding/level bias f25 added to the DC terms.
++//
++// The translation computes every pair with the ps helpers (a NaN resolver per op), checks and
++// resolves each memory range, byte-swaps each access, and keeps CR0 and the 24 temporaries
++// through its register file. Here pass 1 (the eight row transforms, with the branches, CR0 and
++// registers of the original: a transliteration) is the same operations in the same order as single
++// NEON instructions on float32x2_t (lane 1 = ps0, lane 0 = ps1 as ppc_isa_float.h), and pass 2
++// does the translation's four column-pair iterations at once on float32x4_t (the ops are
++// lane-wise: a column's result does not depend on its neighbours) with the 8 output rows stored as
++// 8-byte vectors. Guest memory goes through the flat view with one rev per access, the constants
++// are hoisted, and the exit state the translation leaves is reproduced: r0, r3-r8, r10, CR0, CTR,
++// f0-f13 (r1 and f25-f31 return unchanged; the translation never writes the callee-saved slots,
++// only the back chain at r1-128). Instruction count per call (qemu, a typical sparse block): 4240
++// translated -> 1220 here, dense block 5600 -> 1660.
++//
++// Why plain NEON gives the translation's bits: every pair op is IEEE single arithmetic per lane
++// (vadd/vsub/vmul, vfma for ps_madd/msub/nmsub as PpcFmaddPairInline/PpcFmsubPairInline); the
++// translation's NaN resolver acts only on NaN lanes. A NaN or infinity cannot arise from finite
++// bounded inputs (|s16| <= 2^15, |table| < 2^23, |constant| < 2^8: no intermediate exceeds 2^105),
++// so the fast path requires exactly that of the 64 table entries and the 5 constants (a
++// constant must also not be subnormal: PsFromScalar's double -> single narrowing flushes it under
++// FZ, a compiler-dependent detail) and runs the translation otherwise. Subnormal products are
++// left to the hardware as in the translation (same FPCR.FZ). The workspace holds singles through
++// psq_st type 0 (subnormal -> signed zero), the output goes through the U8 scale-61 quantizer.
++//
++// Fast path conditions, checked at entry (else the translation runs the whole call; the back
++// chain store it starts with has been done and is idempotent): flat view, GQR0 = 0, no wrap of
++// any source range (constants, parameter block, coefficients, table), none of them overlaps the
++// workspace, both output ranges (rows of the two halves, 38 bytes) are inside no wrap, outside
++// the MMIO window (0xCC000000-0xCDFFFFFF), disjoint from each other and from the workspace (so the
++// order of the 64 output stores, which differs from the translation's, is immaterial). Table: only its
++// 256 bytes are read, all of them (the translation reads fewer when rows are zero; a table in
++// readable memory is a given for the game).
++//
++// This file builds like the translated code (-O2 -fno-fast-math -ffp-contract=off, outside the
++// unity build: runtime/CMakeLists.txt, as mtx_natives.cpp).
++#if defined(__SWITCH__)
++#include <arm_neon.h>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++
++extern "C" void func_80084C7C(CpuContext* ctx);  // the translations (kept: _AS registration)
++extern "C" void func_80085108(CpuContext* ctx);
++
++namespace mlb_thp {
++[[gnu::noinline, gnu::cold]] void TranslatedNoYPos(CpuContext& ctx) { func_80084C7C(&ctx); }
++[[gnu::noinline, gnu::cold]] void TranslatedY8(CpuContext& ctx) { func_80085108(&ctx); }
++}  // namespace mlb_thp
++
++namespace mlb_thp {
++
++using V = float32x2_t;
++
++constexpr uint32_t kWorkspace = 0x802B6860u;  // 64 singles, row-major, 32 bytes per row
++
++[[gnu::always_inline]] inline uint8_t* Host(uint32_t address) { return MKW_FLAT_GUEST_BASE + address; }
++
++[[gnu::always_inline]] inline uint32_t Rd32(uint32_t address) {
++    uint32_t value;
++    std::memcpy(&value, Host(address), sizeof value);
++    return __builtin_bswap32(value);
++}
++[[gnu::always_inline]] inline uint32_t Rd16(uint32_t address) {
++    uint16_t value;
++    std::memcpy(&value, Host(address), sizeof value);
++    return __builtin_bswap16(value);
++}
++[[gnu::always_inline]] inline void Wr32(uint32_t address, uint32_t value) {
++    value = __builtin_bswap32(value);
++    std::memcpy(Host(address), &value, sizeof value);
++}
++
++// psq_l, GQR0 = 0: two singles, ps0 first in memory. Lane 1 = ps0, lane 0 = ps1: a 64-bit
++// byte reversal. NaN lanes are quieted by the translation; none reach here (see the header).
++[[gnu::always_inline]] inline V LdF(uint32_t address) {
++    return vreinterpret_f32_u8(vrev64_u8(vld1_u8(Host(address))));
++}
++
++// psq_l, GQR5 = 0x00070007: two signed 16-bit integers (ps0 first), scale 0, converted exactly.
++[[gnu::always_inline]] inline V LdS16(uint32_t address) {
++    const uint32_t packed = Rd32(address);
++    const int32x2_t lanes = {static_cast<int16_t>(packed), static_cast<int16_t>(packed >> 16)};
++    return vcvt_f32_s32(lanes);
++}
++
++// psq_st, GQR0 = 0: a single below the normal range keeps only its sign (the translation's
++// PpcStorePsqFloatBitsInline; NaN quieting never applies).
++[[gnu::always_inline]] inline void StF(uint32_t address, V value) {
++    const uint32x2_t bits = vreinterpret_u32_f32(value);
++    const uint32x2_t tiny = vclt_u32(vand_u32(bits, vdup_n_u32(0x7FFFFFFFu)), vdup_n_u32(0x00800000u));
++    const uint32x2_t stored = vbsl_u32(tiny, vand_u32(bits, vdup_n_u32(0x80000000u)), bits);
++    vst1_u8(Host(address), vrev64_u8(vreinterpret_u8_u32(stored)));
++}
++
++// The big-endian image psq_st type 0 writes for a pair (StF without the store), for a value stored more than once.
++[[gnu::always_inline]] inline uint8x8_t Img(V value) {
++    const uint32x2_t bits = vreinterpret_u32_f32(value);
++    const uint32x2_t tiny = vclt_u32(vand_u32(bits, vdup_n_u32(0x7FFFFFFFu)), vdup_n_u32(0x00800000u));
++    return vrev64_u8(vreinterpret_u8_u32(vbsl_u32(tiny, vand_u32(bits, vdup_n_u32(0x80000000u)), bits)));
++}
++[[gnu::always_inline]] inline void StI(uint32_t address, uint8x8_t image) { vst1_u8(Host(address), image); }
++
++[[gnu::always_inline]] inline V PAdd(V a, V b) { return vadd_f32(a, b); }
++[[gnu::always_inline]] inline V PSub(V a, V b) { return vsub_f32(a, b); }
++[[gnu::always_inline]] inline V PMul(V a, V b) { return vmul_f32(a, b); }
++[[gnu::always_inline]] inline V PMadd(V a, V c, V b) { return vfma_f32(b, a, c); }
++[[gnu::always_inline]] inline V PMsub(V a, V c, V b) { return vfma_f32(vneg_f32(b), a, c); }
++[[gnu::always_inline]] inline V PNmsub(V a, V c, V b) { return vneg_f32(vfma_f32(vneg_f32(b), a, c)); }
++[[gnu::always_inline]] inline V PMerge00(V a, V b) { return vtrn2_f32(b, a); }             // {a.ps0, b.ps0}
++[[gnu::always_inline]] inline V PMerge01(V a, V b) { return vcopy_lane_f32(b, 1, a, 1); }  // {a.ps0, b.ps1}
++[[gnu::always_inline]] inline V PMerge10(V a, V b) { return vext_f32(b, a, 1); }           // {a.ps1, b.ps0}
++[[gnu::always_inline]] inline V PMerge11(V a, V b) { return vtrn1_f32(b, a); }             // {a.ps1, b.ps1}
++
++[[gnu::always_inline]] inline V Bc(uint32_t bits) { return vreinterpret_f32_u32(vdup_n_u32(bits)); }
++
++inline uint64_t Raw(V pair) { return vget_lane_u64(vreinterpret_u64_f32(pair), 0); }
++
++inline bool Wraps(uint32_t address, uint32_t length) { return address > UINT32_MAX - (length - 1u); }
++inline bool Overlap(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen) {
++    return uint64_t{a} < uint64_t{b} + blen && uint64_t{b} < uint64_t{a} + alen;
++}
++inline bool Mmio(uint32_t address) { return (address & 0xFE000000u) == 0xCC000000u; }
++
++// The 5 constants (f29 f28 f27 f26 f25 at k): each zero or normal, magnitude below 2^8.
++[[gnu::always_inline]] inline bool GoodConstants(uint32_t k) {
++    const uint32x4_t first = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(Host(k))));
++    const uint32x4_t fifth = vdupq_n_u32(Rd32(k + 16u));
++    const uint32x4_t any = vdupq_n_u32(0x7FFFFFFFu), limit = vdupq_n_u32(0x43800000u), normal = vdupq_n_u32(0x00800000u);
++    const uint32x4_t m1 = vandq_u32(first, any), m2 = vandq_u32(fifth, any);
++    const uint32x4_t ok1 = vandq_u32(vcltq_u32(m1, limit), vorrq_u32(vceqzq_u32(m1), vcgeq_u32(m1, normal)));
++    const uint32x4_t ok2 = vandq_u32(vcltq_u32(m2, limit), vorrq_u32(vceqzq_u32(m2), vcgeq_u32(m2, normal)));
++    return vminvq_u32(vandq_u32(ok1, ok2)) != 0u;
++}
++
++// The 64 dequantization singles: none NaN, infinite or of magnitude 2^23 or more. vld4 splits the
++// big-endian singles by byte; byte 0 holds the sign and the top 7 exponent bits: <= 74 means a
++// biased exponent below 150.
++[[gnu::always_inline]] inline bool GoodTable(uint32_t table) {
++    const uint8_t* const host = Host(table);
++    const uint8x16_t mask = vdupq_n_u8(0x7F);
++    const uint8x16_t a = vandq_u8(vld4q_u8(host).val[0], mask), b = vandq_u8(vld4q_u8(host + 64).val[0], mask),
++                     c = vandq_u8(vld4q_u8(host + 128).val[0], mask), d = vandq_u8(vld4q_u8(host + 192).val[0], mask);
++    return vmaxvq_u8(vmaxq_u8(vmaxq_u8(a, b), vmaxq_u8(c, d))) <= 74u;
++}
++
++// What the entry checks leave to the body.
++struct Plane {
++    uint32_t stride;  // *(r13-28640)
++    uint32_t out;     // *(r13-28608)
++};
++
++// The registers the natives read, and write on the fast path. The registered functions copy them from
++// and to the CpuContext with literal indexes (the translator derives the call contract from those).
++struct In {
++    uint32_t r1, r2, r3, r4, r13, cr, xer, gqr0;
++};
++struct Out {
++    uint32_t r0, r3, r4, r5, r6, r7, r8, r10, cr, ctr;
++    uint64_t f[14];  // f0-f13
++};
++
++// The entry checks. On success the back chain is stored; the body re-reads what it needs.
++[[gnu::always_inline]] inline bool Check(const In& in, bool y8, Plane& plane) {
++    if (GuestFlat::RequiresCheckedAccess() || in.gqr0 != 0u) return false;
++    const uint32_t r1 = in.r1;
++    Wr32(r1 - 128u, r1);  // stwu r1, -128(r1): the translation's first action (idempotent when it runs after us)
++    const uint32_t k = in.r2 - 30792u, g = in.r13 - 28672u, coef = in.r3;
++    if (Wraps(k, 20u) || Wraps(g, 68u) || Wraps(coef, 144u)) return false;
++    if (Overlap(g, 68u, kWorkspace, 256u) || Overlap(coef, 144u, kWorkspace, 256u)) return false;
++    const uint32_t table = Rd32(g);
++    if (Wraps(table, 264u) || Overlap(table, 264u, kWorkspace, 256u)) return false;
++    if (!GoodConstants(k) || !GoodTable(table)) return false;
++    const uint32_t stride = Rd32(g + 32u), out = Rd32(g + 64u);
++    const uint32_t first = (y8 ? (stride << 3) : 0u) + (in.r4 << 2);
++    const uint32_t o6 = out + first, o7 = o6 + (stride << 2);
++    if (Wraps(o6, 38u) || Wraps(o7, 38u) || Mmio(o6) || Mmio(o6 + 37u) || Mmio(o7) || Mmio(o7 + 37u)) return false;
++    if (Overlap(o6, 38u, kWorkspace, 256u) || Overlap(o7, 38u, kWorkspace, 256u) || Overlap(o6, 38u, o7, 38u)) return false;
++    plane = {stride, out};
++    return true;
++}
++
++using Q = float32x4_t;
++
++// Four columns of the second 1-D transform at once (the translation does two columns per iteration, in
++// the same operations: every op is lane-wise, so a column's results do not depend on its neighbours).
++// Memory order lanes: lane c = the column at ws + 4c. Rows are 32 bytes apart in the workspace.
++[[gnu::always_inline]] inline Q LdQ(const uint8_t* host) {
++    return vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(host)));
++}
++[[gnu::always_inline]] inline Q QMsub(Q a, Q c, Q b) { return vfmaq_f32(vnegq_f32(b), a, c); }
++
++// The columns' 8 results, row i of the block (rows 0-3 go to the first half, 4-7 to the second).
++struct Columns {
++    Q out[8];
++    Q f[14];  // f0-f13 as the translation's last iteration leaves them (this group's lanes)
++};
++
++[[gnu::always_inline]] inline Columns Transform(const uint8_t* ws, Q k25, Q k26, Q k27, Q k28, Q k29) {
++    Columns r;
++    Q f10 = LdQ(ws + 0 * 32), f11 = LdQ(ws + 4 * 32), f12 = LdQ(ws + 2 * 32), f13 = LdQ(ws + 6 * 32);
++    Q f6 = vaddq_f32(f10, f11);
++    Q f8 = vsubq_f32(f10, f11);
++    f6 = vaddq_f32(f6, k25);
++    Q f7 = vaddq_f32(f12, f13);
++    Q f9 = vsubq_f32(f12, f13);
++    f8 = vaddq_f32(f8, k25);
++    Q f0 = vaddq_f32(f6, f7);
++    f9 = QMsub(f9, k29, f7);
++    Q f4 = LdQ(ws + 1 * 32);
++    Q f3 = vsubq_f32(f6, f7);
++    Q f5 = LdQ(ws + 3 * 32);
++    f6 = LdQ(ws + 5 * 32);
++    f7 = LdQ(ws + 7 * 32);
++    Q f1 = vaddq_f32(f8, f9);
++    Q f2 = vsubq_f32(f8, f9);
++    f8 = vaddq_f32(f6, f5);
++    f9 = vaddq_f32(f4, f7);
++    f6 = vsubq_f32(f6, f5);
++    f4 = vsubq_f32(f4, f7);
++    f7 = vaddq_f32(f9, f8);
++    f5 = vsubq_f32(f9, f8);
++    f8 = vaddq_f32(f6, f4);
++    f9 = vaddq_f32(f0, f7);
++    const Q f30 = vsubq_f32(f0, f7);
++    r.out[0] = f9;
++    r.out[7] = f30;
++    f8 = vmulq_f32(f8, k28);
++    f6 = vfmaq_f32(f8, f6, k26);
++    f4 = QMsub(f4, k27, f8);
++    f6 = vsubq_f32(f6, f7);
++    f9 = vaddq_f32(f1, f6);
++    f5 = QMsub(f5, k29, f6);
++    const Q f31 = vsubq_f32(f1, f6);
++    r.out[1] = f9;
++    r.out[6] = f31;
++    f8 = vaddq_f32(f2, f5);
++    f4 = vaddq_f32(f4, f5);
++    r.out[2] = f8;
++    f9 = vsubq_f32(f3, f4);
++    f0 = vaddq_f32(f3, f4);
++    r.out[3] = f9;
++    f1 = vsubq_f32(f2, f5);
++    r.out[4] = f0;
++    r.out[5] = f1;
++    r.f[0] = f0; r.f[1] = f1; r.f[2] = f2; r.f[3] = f3; r.f[4] = f4; r.f[5] = f5; r.f[6] = f6;
++    r.f[7] = f7; r.f[8] = f8; r.f[9] = f9; r.f[10] = f10; r.f[11] = f11; r.f[12] = f12; r.f[13] = f13;
++    return r;
++}
++
++// One row of the block: 8 columns, x * 0.125 truncated and clamped to 0..255 (PpcQuantizePsqU8Scale61Inline;
++// FCVTZU gives 0 for negatives and NaN and saturates, the saturating narrows clamp at 255).
++[[gnu::always_inline]] inline void StoreRow(uint32_t address, Q left, Q right) {
++    const uint16x4_t lo = vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(left, 0.125f)));
++    const uint16x4_t hi = vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(right, 0.125f)));
++    vst1_u8(Host(address), vqmovn_u16(vcombine_u16(lo, hi)));
++}
++
++// The pair (columns 6, 7) a column group's last two lanes hold, as the translation's f register.
++[[gnu::always_inline]] inline V LastPair(Q q) { return vrev64_f32(vget_high_f32(q)); }
++
++[[gnu::noinline]] bool RunNoYPos(const In& in, Out& out) {
++    Plane plane;
++    if (!Check(in, false, plane)) return false;
++    uint32_t r0 = 0, r3 = in.r3, r4 = in.r4, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r10 = 0;
++    const uint32_t r2 = in.r2, r13 = in.r13;
++    uint32_t cr = in.cr, ctr = 0;
++    const uint32_t xer = in.xer;
++    V f0 = vdup_n_f32(0), f1 = f0, f2 = f0, f3 = f0, f4 = f0, f5 = f0, f6 = f0, f7 = f0, f8 = f0, f9 = f0,
++      f10 = f0, f11 = f0, f12 = f0, f13 = f0, f30 = f0, f31 = f0;
++    uint32_t gr_1 = 0, gr_10 = 0, gr_2 = 0, gr_3 = 0, gr_4 = 0, gr_5 = 0, gr_6 = 0, gr_7 = 0, gr_8 = 0, gr_9 = 0, r10_psq_ea_10 = 0, r10_psq_ea_11 = 0, r10_psq_ea_12 = 0, r10_psq_ea_13 = 0, r10_psq_ea_14 = 0, r10_psq_ea_15 = 0, r10_psq_ea_3 = 0, r10_psq_ea_4 = 0, r10_psq_ea_5 = 0, r10_psq_ea_6 = 0, r10_psq_ea_7 = 0, r10_psq_ea_8 = 0, r10_psq_ea_9 = 0, r10_psq_tmp_3 = 0, r10_psq_tmp_4 = 0, r10_psq_tmp_5 = 0, r3_psq_addr_3 = 0, r3_psq_addr_4 = 0, r3_psq_tmp_3 = 0, r3_psq_tmp_4 = 0, r3_psq_tmp_5 = 0, r3_psq_tmp_6 = 0, r3_psq_tmp_7 = 0, r5_psq_addr_3 = 0, r5_psq_addr_4 = 0, r5_psq_addr_5 = 0, r5_psq_tmp_3 = 0, r5_psq_tmp_4 = 0, r5_psq_tmp_5 = 0, r5_psq_tmp_6 = 0;
++    uint8x8_t im0 = vdup_n_u8(0);
++    // The constants (f29 f28 f27 f26 f25), as the broadcast pairs PsFromScalar makes of them.
++    const uint32_t gr_0 = r2 - 30792u;
++    const V k29 = Bc(Rd32(gr_0 + 0u)), k28 = Bc(Rd32(gr_0 + 4u)), k27 = Bc(Rd32(gr_0 + 8u)),
++            k26 = Bc(Rd32(gr_0 + 12u)), k25 = Bc(Rd32(gr_0 + 16u));
++    r5 = 0x802B6860u;
++    r10 = r5 - 8u;
++    gr_1 = r13 - 28672u;
++    r5 = Rd32(gr_1 + 0u);
++    ctr = 8;
++    goto loc_80084CE4;
++
++    loc_80084CE4:
++    {
++    gr_2 = r3;
++    f10 = LdS16(gr_2 + 0u);
++    f11 = LdF(r5);
++    r0 = Rd32(gr_2 + 8u + 4u);
++    r8 = Rd32(gr_2 + 8u + 0u);
++    f10 = PMul(f10, f11);
++    r6 = Rd32(gr_2 + 4u);
++    r0 = (r0 | r8);
++    r7 = Rd16(gr_2 + 2u);
++    }
++    
++    loc_80084D04:
++    {
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r0), static_cast<int32_t>(0));
++    }
++    
++    loc_80084D08:
++    {
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_80084E44;
++    }
++    }
++    
++    loc_80084D0C:
++    {
++    f0 = PMerge00(f10, f10);
++    im0 = Img(f0);
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r6), static_cast<int32_t>(0));
++    }
++    
++    loc_80084D14:
++    {
++    r10_psq_tmp_3 = (r10 + 8);
++    StI(r10_psq_tmp_3, im0);
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_80084DB0;
++    }
++    }
++    
++    loc_80084D1C:
++    {
++    r10_psq_tmp_4 = (r10 + 16);
++    StI(r10_psq_tmp_4, im0);
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r7), static_cast<int32_t>(0));
++    }
++    
++    loc_80084D24:
++    {
++    r10_psq_tmp_5 = (r10 + 24);
++    StI(r10_psq_tmp_5, im0);
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_80084D40;
++    }
++    }
++    
++    loc_80084D2C:
++    {
++    r10_psq_ea_3 = (r10 + 32);
++    StI(r10_psq_ea_3, im0);
++    r10 = r10_psq_ea_3;
++    r3 = (r3 + 16);
++    r5 = (r5 + 32);
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80084CE4;
++    }
++    }
++    
++    loc_80084D3C:
++    {
++    goto loc_80084F04;
++    }
++    
++    loc_80084D40:
++    {
++    f2 = PMsub(f10, k28, f10);
++    r5_psq_addr_3 = (r5 + 32);
++    f11 = LdF(r5_psq_addr_3);
++    r5 = r5_psq_addr_3;
++    f1 = PSub(k28, k27);
++    gr_3 = (r3 + 16);
++    r6 = Rd32(gr_3 + 4u);
++    f9 = PMerge00(f10, f10);
++    r7 = Rd16(gr_3 + 2u);
++    f3 = PMsub(f10, k29, f2);
++    f5 = PMerge11(f10, f2);
++    f4 = PNmsub(f10, f1, f3);
++    f7 = PAdd(f9, f5);
++    r3_psq_tmp_3 = (r3 + 16);
++    f10 = LdS16(gr_3 + 0u);
++    r0 = Rd32(gr_3 + 12u);
++    f5 = PSub(f9, f5);
++    f6 = PMerge11(f3, f4);
++    r8 = Rd32(gr_3 + 8u);
++    f8 = PAdd(f9, f6);
++    f6 = PSub(f9, f6);
++    r10_psq_ea_4 = (r10 + 8);
++    gr_4 = r10_psq_ea_4;
++    StF(gr_4 + 0u, f7);
++    r10 = r10_psq_ea_4;
++    f6 = PMerge10(f6, f6);
++    r10_psq_ea_5 = (r10 + 8);
++    StF(gr_4 + 8u, f8);
++    r10 = r10_psq_ea_5;
++    f5 = PMerge10(f5, f5);
++    r0 = (r0 | r8);
++    r10_psq_ea_6 = (r10 + 8);
++    StF(gr_4 + 16u, f6);
++    r10 = r10_psq_ea_6;
++    f10 = PMul(f10, f11);
++    r10_psq_ea_7 = (r10 + 8);
++    StF(gr_4 + 24u, f5);
++    r10 = r10_psq_ea_7;
++    r3 = (r3 + 16);
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80084D04;
++    }
++    }
++    
++    loc_80084DAC:
++    {
++    goto loc_80084F04;
++    }
++    
++    loc_80084DB0:
++    {
++    r3_psq_tmp_4 = (r3 + 4);
++    gr_5 = r3_psq_tmp_4;
++    f1 = LdS16(gr_5 + 0u);
++    r5_psq_tmp_3 = (r5 + 8);
++    gr_6 = r5_psq_tmp_3;
++    f9 = LdF(gr_6 + 0u);
++    r0 = Rd32(gr_5 + 24u);
++    f1 = PMul(f1, f9);
++    r8 = Rd32(gr_5 + 16u + 4u);
++    r6 = Rd32(gr_5 + 16u + 0u);
++    r7 = Rd16(gr_5 + 14u);
++    f3 = PSub(f10, f1);
++    f2 = PAdd(f10, f1);
++    f8 = PMul(f3, k28);
++    f4 = PMadd(f1, k29, f3);
++    f5 = PNmsub(f1, k29, f2);
++    f6 = PNmsub(f1, k26, f8);
++    f7 = PNmsub(f10, k27, f8);
++    f4 = PMerge00(f2, f4);
++    f6 = PSub(f6, f2);
++    f5 = PMerge00(f5, f3);
++    f8 = PMsub(f3, k29, f6);
++    f2 = PMerge11(f2, f6);
++    r3_psq_addr_3 = (r3 + 16);
++    f10 = LdS16(gr_5 + 12u);
++    r3 = r3_psq_addr_3;
++    r5_psq_addr_4 = (r5 + 32);
++    f11 = LdF(gr_6 + 24u);
++    r5 = r5_psq_addr_4;
++    f7 = PSub(f7, f8);
++    f9 = PAdd(f4, f2);
++    f4 = PSub(f4, f2);
++    f3 = PMerge11(f8, f7);
++    r10_psq_ea_8 = (r10 + 8);
++    gr_7 = r10_psq_ea_8;
++    StF(gr_7 + 0u, f9);
++    r10 = r10_psq_ea_8;
++    r0 = (r0 | r8);
++    f0 = PAdd(f5, f3);
++    f1 = PSub(f5, f3);
++    r10_psq_ea_9 = (r10 + 8);
++    StF(gr_7 + 8u, f0);
++    r10 = r10_psq_ea_9;
++    f4 = PMerge10(f4, f4);
++    f1 = PMerge10(f1, f1);
++    r10_psq_ea_10 = (r10 + 8);
++    StF(gr_7 + 16u, f1);
++    r10 = r10_psq_ea_10;
++    f10 = PMul(f10, f11);
++    r10_psq_ea_11 = (r10 + 8);
++    StF(gr_7 + 24u, f4);
++    r10 = r10_psq_ea_11;
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80084D04;
++    }
++    }
++    
++    loc_80084E40:
++    {
++    goto loc_80084F04;
++    }
++    
++    loc_80084E44:
++    {
++    r3_psq_tmp_5 = (r3 + 4);
++    gr_8 = r3_psq_tmp_5;
++    f9 = LdS16(gr_8 + 0u);
++    r5_psq_tmp_4 = (r5 + 8);
++    gr_9 = r5_psq_tmp_4;
++    f5 = LdF(gr_9 + 0u);
++    f9 = PMul(f9, f5);
++    r3_psq_tmp_6 = (r3 + 8);
++    f2 = LdS16(gr_8 + 4u);
++    r5_psq_tmp_5 = (r5 + 16);
++    f6 = LdF(gr_9 + 8u);
++    f0 = PMerge01(f10, f9);
++    r3_psq_tmp_7 = (r3 + 12);
++    f3 = LdS16(gr_8 + 8u);
++    f1 = PMerge01(f9, f10);
++    r5_psq_tmp_6 = (r5 + 24);
++    f7 = LdF(gr_9 + 16u);
++    r0 = Rd32(gr_8 + 24u);
++    f4 = PMadd(f2, f6, f0);
++    f5 = PNmsub(f2, f6, f0);
++    r8 = Rd32(gr_8 + 20u);
++    f6 = PMadd(f3, f7, f1);
++    r6 = Rd32(gr_8 + 16u);
++    f7 = PNmsub(f3, f7, f1);
++    r7 = Rd16(gr_8 + 14u);
++    f0 = PAdd(f4, f6);
++    f8 = PSub(f7, f5);
++    f2 = PMsub(f7, k29, f6);
++    f3 = PSub(f4, f6);
++    f8 = PMul(f8, k28);
++    f1 = PAdd(f5, f2);
++    f2 = PSub(f5, f2);
++    f6 = PNmsub(f5, k26, f8);
++    f4 = PMsub(f7, k27, f8);
++    f1 = PMerge00(f0, f1);
++    f6 = PSub(f6, f0);
++    f2 = PMerge00(f2, f3);
++    f5 = PMadd(f3, k29, f6);
++    f7 = PMerge11(f0, f6);
++    r3_psq_addr_4 = (r3 + 16);
++    f10 = LdS16(gr_8 + 12u);
++    r3 = r3_psq_addr_4;
++    r5_psq_addr_5 = (r5 + 32);
++    f11 = LdF(gr_9 + 24u);
++    r5 = r5_psq_addr_5;
++    f4 = PSub(f4, f5);
++    f3 = PAdd(f1, f7);
++    f0 = PSub(f1, f7);
++    f4 = PMerge11(f5, f4);
++    f10 = PMul(f10, f11);
++    f5 = PAdd(f2, f4);
++    f6 = PSub(f2, f4);
++    f5 = PMerge10(f5, f5);
++    r10_psq_ea_12 = (r10 + 8);
++    gr_10 = r10_psq_ea_12;
++    StF(gr_10 + 0u, f3);
++    r10 = r10_psq_ea_12;
++    f0 = PMerge10(f0, f0);
++    r10_psq_ea_13 = (r10 + 8);
++    StF(gr_10 + 8u, f6);
++    r10 = r10_psq_ea_13;
++    r10_psq_ea_14 = (r10 + 8);
++    StF(gr_10 + 16u, f5);
++    r10 = r10_psq_ea_14;
++    r0 = (r0 | r8);
++    r10_psq_ea_15 = (r10 + 8);
++    StF(gr_10 + 24u, f0);
++    r10 = r10_psq_ea_15;
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80084D04;
++    }
++    }
++
++loc_80084F04:
++    {
++        // The second transform, four columns at a time; then the exit state of the translation's last
++        // iteration (r4-r7 advanced by 2 per loop iteration, three iterations; r10 likewise by 8).
++        const uint32_t stride = plane.stride;
++        r0 = plane.out;
++        r3 = 3;
++        r4 = r4 << 2;
++        r5 = r4 + (stride << 2);
++        r6 = r0 + r4;
++        r7 = r0 + r5;
++        const uint8_t* const ws = Host(kWorkspace);
++        const Q q25 = vdupq_lane_f32(k25, 0), q26 = vdupq_lane_f32(k26, 0), q27 = vdupq_lane_f32(k27, 0),
++                q28 = vdupq_lane_f32(k28, 0), q29 = vdupq_lane_f32(k29, 0);
++        const Columns left = Transform(ws, q25, q26, q27, q28, q29);
++        const Columns right = Transform(ws + 16, q25, q26, q27, q28, q29);
++        for (int i = 0; i < 4; ++i) {
++            StoreRow(r6 + 8u * static_cast<uint32_t>(i), left.out[i], right.out[i]);
++            StoreRow(r7 + 8u * static_cast<uint32_t>(i), left.out[4 + i], right.out[4 + i]);
++        }
++        r4 += 6;
++        r5 += 6;
++        r6 += 6;
++        r7 += 6;
++        r10 = kWorkspace + 24u;
++        ctr = 0;
++        f0 = LastPair(right.f[0]); f1 = LastPair(right.f[1]); f2 = LastPair(right.f[2]); f3 = LastPair(right.f[3]);
++        f4 = LastPair(right.f[4]); f5 = LastPair(right.f[5]); f6 = LastPair(right.f[6]); f7 = LastPair(right.f[7]);
++        f8 = LastPair(right.f[8]); f9 = LastPair(right.f[9]); f10 = LastPair(right.f[10]); f11 = LastPair(right.f[11]);
++        f12 = LastPair(right.f[12]); f13 = LastPair(right.f[13]);
++
++    }
++
++    out.r0 = r0;
++    out.r3 = r3;
++    out.r4 = r4;
++    out.r5 = r5;
++    out.r6 = r6;
++    out.r7 = r7;
++    out.r8 = r8;
++    out.r10 = r10;
++    out.f[0] = Raw(f0);
++    out.f[1] = Raw(f1);
++    out.f[2] = Raw(f2);
++    out.f[3] = Raw(f3);
++    out.f[4] = Raw(f4);
++    out.f[5] = Raw(f5);
++    out.f[6] = Raw(f6);
++    out.f[7] = Raw(f7);
++    out.f[8] = Raw(f8);
++    out.f[9] = Raw(f9);
++    out.f[10] = Raw(f10);
++    out.f[11] = Raw(f11);
++    out.f[12] = Raw(f12);
++    out.f[13] = Raw(f13);
++    out.cr = cr;
++    out.ctr = ctr;
++    return true;
++}
++
++[[gnu::noinline]] bool RunY8(const In& in, Out& out) {
++    Plane plane;
++    if (!Check(in, true, plane)) return false;
++    uint32_t r0 = 0, r3 = in.r3, r4 = in.r4, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r10 = 0;
++    const uint32_t r2 = in.r2, r13 = in.r13;
++    uint32_t cr = in.cr, ctr = 0;
++    const uint32_t xer = in.xer;
++    V f0 = vdup_n_f32(0), f1 = f0, f2 = f0, f3 = f0, f4 = f0, f5 = f0, f6 = f0, f7 = f0, f8 = f0, f9 = f0,
++      f10 = f0, f11 = f0, f12 = f0, f13 = f0, f30 = f0, f31 = f0;
++    uint32_t gr_1 = 0, gr_10 = 0, gr_2 = 0, gr_3 = 0, gr_4 = 0, gr_5 = 0, gr_6 = 0, gr_7 = 0, gr_8 = 0, gr_9 = 0, r10_psq_ea_10 = 0, r10_psq_ea_11 = 0, r10_psq_ea_12 = 0, r10_psq_ea_13 = 0, r10_psq_ea_14 = 0, r10_psq_ea_15 = 0, r10_psq_ea_3 = 0, r10_psq_ea_4 = 0, r10_psq_ea_5 = 0, r10_psq_ea_6 = 0, r10_psq_ea_7 = 0, r10_psq_ea_8 = 0, r10_psq_ea_9 = 0, r10_psq_tmp_3 = 0, r10_psq_tmp_4 = 0, r10_psq_tmp_5 = 0, r3_psq_addr_3 = 0, r3_psq_addr_4 = 0, r3_psq_tmp_3 = 0, r3_psq_tmp_4 = 0, r3_psq_tmp_5 = 0, r3_psq_tmp_6 = 0, r3_psq_tmp_7 = 0, r5_psq_addr_3 = 0, r5_psq_addr_4 = 0, r5_psq_addr_5 = 0, r5_psq_tmp_3 = 0, r5_psq_tmp_4 = 0, r5_psq_tmp_5 = 0, r5_psq_tmp_6 = 0;
++    uint8x8_t im0 = vdup_n_u8(0);
++    // The constants (f29 f28 f27 f26 f25), as the broadcast pairs PsFromScalar makes of them.
++    const uint32_t gr_0 = r2 - 30792u;
++    const V k29 = Bc(Rd32(gr_0 + 0u)), k28 = Bc(Rd32(gr_0 + 4u)), k27 = Bc(Rd32(gr_0 + 8u)),
++            k26 = Bc(Rd32(gr_0 + 12u)), k25 = Bc(Rd32(gr_0 + 16u));
++    r5 = 0x802B6860u;
++    r10 = r5 - 8u;
++    gr_1 = r13 - 28672u;
++    r5 = Rd32(gr_1 + 0u);
++    ctr = 8;
++    goto loc_80085170;
++
++    loc_80085170:
++    {
++    gr_2 = r3;
++    f10 = LdS16(gr_2 + 0u);
++    f11 = LdF(r5);
++    r0 = Rd32(gr_2 + 8u + 4u);
++    r8 = Rd32(gr_2 + 8u + 0u);
++    f10 = PMul(f10, f11);
++    r6 = Rd32(gr_2 + 4u);
++    r7 = Rd16(gr_2 + 2u);
++    r0 = (r0 | r8);
++    }
++    
++    loc_80085190:
++    {
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r0), static_cast<int32_t>(0));
++    }
++    
++    loc_80085194:
++    {
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_800852D0;
++    }
++    }
++    
++    loc_80085198:
++    {
++    f0 = PMerge00(f10, f10);
++    im0 = Img(f0);
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r6), static_cast<int32_t>(0));
++    }
++    
++    loc_800851A0:
++    {
++    r10_psq_tmp_3 = (r10 + 8);
++    StI(r10_psq_tmp_3, im0);
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_8008523C;
++    }
++    }
++    
++    loc_800851A8:
++    {
++    r10_psq_tmp_4 = (r10 + 16);
++    StI(r10_psq_tmp_4, im0);
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r7), static_cast<int32_t>(0));
++    }
++    
++    loc_800851B0:
++    {
++    r10_psq_tmp_5 = (r10 + 24);
++    StI(r10_psq_tmp_5, im0);
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_800851CC;
++    }
++    }
++    
++    loc_800851B8:
++    {
++    r10_psq_ea_3 = (r10 + 32);
++    StI(r10_psq_ea_3, im0);
++    r10 = r10_psq_ea_3;
++    r3 = (r3 + 16);
++    r5 = (r5 + 32);
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80085170;
++    }
++    }
++    
++    loc_800851C8:
++    {
++    goto loc_80085390;
++    }
++    
++    loc_800851CC:
++    {
++    f2 = PMsub(f10, k28, f10);
++    r5_psq_addr_3 = (r5 + 32);
++    f11 = LdF(r5_psq_addr_3);
++    r5 = r5_psq_addr_3;
++    f1 = PSub(k28, k27);
++    gr_3 = (r3 + 16);
++    r6 = Rd32(gr_3 + 4u);
++    f9 = PMerge00(f10, f10);
++    r7 = Rd16(gr_3 + 2u);
++    f3 = PMsub(f10, k29, f2);
++    f5 = PMerge11(f10, f2);
++    f4 = PNmsub(f10, f1, f3);
++    f7 = PAdd(f9, f5);
++    r3_psq_tmp_3 = (r3 + 16);
++    f10 = LdS16(gr_3 + 0u);
++    r0 = Rd32(gr_3 + 12u);
++    f5 = PSub(f9, f5);
++    f6 = PMerge11(f3, f4);
++    r8 = Rd32(gr_3 + 8u);
++    f8 = PAdd(f9, f6);
++    f6 = PSub(f9, f6);
++    r10_psq_ea_4 = (r10 + 8);
++    gr_4 = r10_psq_ea_4;
++    StF(gr_4 + 0u, f7);
++    r10 = r10_psq_ea_4;
++    f6 = PMerge10(f6, f6);
++    r10_psq_ea_5 = (r10 + 8);
++    StF(gr_4 + 8u, f8);
++    r10 = r10_psq_ea_5;
++    f5 = PMerge10(f5, f5);
++    r0 = (r0 | r8);
++    r10_psq_ea_6 = (r10 + 8);
++    StF(gr_4 + 16u, f6);
++    r10 = r10_psq_ea_6;
++    f10 = PMul(f10, f11);
++    r10_psq_ea_7 = (r10 + 8);
++    StF(gr_4 + 24u, f5);
++    r10 = r10_psq_ea_7;
++    r3 = (r3 + 16);
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80085190;
++    }
++    }
++    
++    loc_80085238:
++    {
++    goto loc_80085390;
++    }
++    
++    loc_8008523C:
++    {
++    r3_psq_tmp_4 = (r3 + 4);
++    gr_5 = r3_psq_tmp_4;
++    f1 = LdS16(gr_5 + 0u);
++    r5_psq_tmp_3 = (r5 + 8);
++    gr_6 = r5_psq_tmp_3;
++    f9 = LdF(gr_6 + 0u);
++    r0 = Rd32(gr_5 + 24u);
++    f1 = PMul(f1, f9);
++    r8 = Rd32(gr_5 + 16u + 4u);
++    r6 = Rd32(gr_5 + 16u + 0u);
++    r7 = Rd16(gr_5 + 14u);
++    f3 = PSub(f10, f1);
++    f2 = PAdd(f10, f1);
++    f8 = PMul(f3, k28);
++    f4 = PMadd(f1, k29, f3);
++    f5 = PNmsub(f1, k29, f2);
++    f6 = PNmsub(f1, k26, f8);
++    f7 = PNmsub(f10, k27, f8);
++    f4 = PMerge00(f2, f4);
++    f6 = PSub(f6, f2);
++    f5 = PMerge00(f5, f3);
++    f8 = PMsub(f3, k29, f6);
++    f2 = PMerge11(f2, f6);
++    r3_psq_addr_3 = (r3 + 16);
++    f10 = LdS16(gr_5 + 12u);
++    r3 = r3_psq_addr_3;
++    r5_psq_addr_4 = (r5 + 32);
++    f11 = LdF(gr_6 + 24u);
++    r5 = r5_psq_addr_4;
++    f7 = PSub(f7, f8);
++    f9 = PAdd(f4, f2);
++    f4 = PSub(f4, f2);
++    f3 = PMerge11(f8, f7);
++    r10_psq_ea_8 = (r10 + 8);
++    gr_7 = r10_psq_ea_8;
++    StF(gr_7 + 0u, f9);
++    r10 = r10_psq_ea_8;
++    r0 = (r0 | r8);
++    f0 = PAdd(f5, f3);
++    f1 = PSub(f5, f3);
++    r10_psq_ea_9 = (r10 + 8);
++    StF(gr_7 + 8u, f0);
++    r10 = r10_psq_ea_9;
++    f4 = PMerge10(f4, f4);
++    f1 = PMerge10(f1, f1);
++    r10_psq_ea_10 = (r10 + 8);
++    StF(gr_7 + 16u, f1);
++    r10 = r10_psq_ea_10;
++    f10 = PMul(f10, f11);
++    r10_psq_ea_11 = (r10 + 8);
++    StF(gr_7 + 24u, f4);
++    r10 = r10_psq_ea_11;
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80085190;
++    }
++    }
++    
++    loc_800852CC:
++    {
++    goto loc_80085390;
++    }
++    
++    loc_800852D0:
++    {
++    r3_psq_tmp_5 = (r3 + 4);
++    gr_8 = r3_psq_tmp_5;
++    f9 = LdS16(gr_8 + 0u);
++    r5_psq_tmp_4 = (r5 + 8);
++    gr_9 = r5_psq_tmp_4;
++    f5 = LdF(gr_9 + 0u);
++    f9 = PMul(f9, f5);
++    r3_psq_tmp_6 = (r3 + 8);
++    f2 = LdS16(gr_8 + 4u);
++    r5_psq_tmp_5 = (r5 + 16);
++    f6 = LdF(gr_9 + 8u);
++    f0 = PMerge01(f10, f9);
++    r3_psq_tmp_7 = (r3 + 12);
++    f3 = LdS16(gr_8 + 8u);
++    f1 = PMerge01(f9, f10);
++    r5_psq_tmp_6 = (r5 + 24);
++    f7 = LdF(gr_9 + 16u);
++    r0 = Rd32(gr_8 + 24u);
++    f4 = PMadd(f2, f6, f0);
++    f5 = PNmsub(f2, f6, f0);
++    r8 = Rd32(gr_8 + 20u);
++    f6 = PMadd(f3, f7, f1);
++    r6 = Rd32(gr_8 + 16u);
++    f7 = PNmsub(f3, f7, f1);
++    r7 = Rd16(gr_8 + 14u);
++    f0 = PAdd(f4, f6);
++    f8 = PSub(f7, f5);
++    f2 = PMsub(f7, k29, f6);
++    f3 = PSub(f4, f6);
++    f8 = PMul(f8, k28);
++    f1 = PAdd(f5, f2);
++    f2 = PSub(f5, f2);
++    f6 = PNmsub(f5, k26, f8);
++    f4 = PMsub(f7, k27, f8);
++    f1 = PMerge00(f0, f1);
++    f6 = PSub(f6, f0);
++    f2 = PMerge00(f2, f3);
++    f5 = PMadd(f3, k29, f6);
++    f7 = PMerge11(f0, f6);
++    r3_psq_addr_4 = (r3 + 16);
++    f10 = LdS16(gr_8 + 12u);
++    r3 = r3_psq_addr_4;
++    r5_psq_addr_5 = (r5 + 32);
++    f11 = LdF(gr_9 + 24u);
++    r5 = r5_psq_addr_5;
++    f4 = PSub(f4, f5);
++    f3 = PAdd(f1, f7);
++    f0 = PSub(f1, f7);
++    f4 = PMerge11(f5, f4);
++    f10 = PMul(f10, f11);
++    f5 = PAdd(f2, f4);
++    f6 = PSub(f2, f4);
++    f5 = PMerge10(f5, f5);
++    r10_psq_ea_12 = (r10 + 8);
++    gr_10 = r10_psq_ea_12;
++    StF(gr_10 + 0u, f3);
++    r10 = r10_psq_ea_12;
++    f0 = PMerge10(f0, f0);
++    r10_psq_ea_13 = (r10 + 8);
++    StF(gr_10 + 8u, f6);
++    r10 = r10_psq_ea_13;
++    r10_psq_ea_14 = (r10 + 8);
++    StF(gr_10 + 16u, f5);
++    r10 = r10_psq_ea_14;
++    r0 = (r0 | r8);
++    r10_psq_ea_15 = (r10 + 8);
++    StF(gr_10 + 24u, f0);
++    r10 = r10_psq_ea_15;
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80085190;
++    }
++    }
++
++loc_80085390:
++    {
++        // The second transform, four columns at a time; then the exit state of the translation's last
++        // iteration (r4-r7 advanced by 2 per loop iteration, three iterations; r10 likewise by 8).
++        const uint32_t stride = plane.stride;
++        r0 = plane.out;
++        r3 = 3;
++        r4 = (stride << 3) + (r4 << 2);
++        r5 = r4 + (stride << 2);
++        r6 = r0 + r4;
++        r7 = r0 + r5;
++        const uint8_t* const ws = Host(kWorkspace);
++        const Q q25 = vdupq_lane_f32(k25, 0), q26 = vdupq_lane_f32(k26, 0), q27 = vdupq_lane_f32(k27, 0),
++                q28 = vdupq_lane_f32(k28, 0), q29 = vdupq_lane_f32(k29, 0);
++        const Columns left = Transform(ws, q25, q26, q27, q28, q29);
++        const Columns right = Transform(ws + 16, q25, q26, q27, q28, q29);
++        for (int i = 0; i < 4; ++i) {
++            StoreRow(r6 + 8u * static_cast<uint32_t>(i), left.out[i], right.out[i]);
++            StoreRow(r7 + 8u * static_cast<uint32_t>(i), left.out[4 + i], right.out[4 + i]);
++        }
++        r4 += 6;
++        r5 += 6;
++        r6 += 6;
++        r7 += 6;
++        r10 = kWorkspace + 24u;
++        ctr = 0;
++        f0 = LastPair(right.f[0]); f1 = LastPair(right.f[1]); f2 = LastPair(right.f[2]); f3 = LastPair(right.f[3]);
++        f4 = LastPair(right.f[4]); f5 = LastPair(right.f[5]); f6 = LastPair(right.f[6]); f7 = LastPair(right.f[7]);
++        f8 = LastPair(right.f[8]); f9 = LastPair(right.f[9]); f10 = LastPair(right.f[10]); f11 = LastPair(right.f[11]);
++        f12 = LastPair(right.f[12]); f13 = LastPair(right.f[13]);
++
++    }
++
++    out.r0 = r0;
++    out.r3 = r3;
++    out.r4 = r4;
++    out.r5 = r5;
++    out.r6 = r6;
++    out.r7 = r7;
++    out.r8 = r8;
++    out.r10 = r10;
++    out.f[0] = Raw(f0);
++    out.f[1] = Raw(f1);
++    out.f[2] = Raw(f2);
++    out.f[3] = Raw(f3);
++    out.f[4] = Raw(f4);
++    out.f[5] = Raw(f5);
++    out.f[6] = Raw(f6);
++    out.f[7] = Raw(f7);
++    out.f[8] = Raw(f8);
++    out.f[9] = Raw(f9);
++    out.f[10] = Raw(f10);
++    out.f[11] = Raw(f11);
++    out.f[12] = Raw(f12);
++    out.f[13] = Raw(f13);
++    out.cr = cr;
++    out.ctr = ctr;
++    return true;
++}
++
++
++}  // namespace mlb_thp
++
++// The registered functions. The translator derives a native's guest-state contract (what callers sync
++// around the call, and through it every ancestor's ABI) from the literal ctx->gpr/fpr/cr/xer/ctr accesses
++// of its body (RuntimeNativeGuestEffectAnalyzer). These bodies declare exactly the translation's own ABI
++// (RECOMP_GUEST_ABI gpr_read 0x25FF gpr_write 0x5FB fpr_read 0xFE000FFF fpr_write 0xFE003FFF, CR, XER read)
++// so the generated callers do not change: reads of r0-r8, r10, r13 and f0-f11, f25-f31 and writes of
++// r0, r1, r3-r8, r10 and f0-f13, f25-f31 (the callee-saved registers the translation reads and writes back
++// unchanged), CR and CTR. The context pointer is not passed on (a pointer argument makes the contract
++// complete-context and ripples through every ancestor): the translation is reached through a reference,
++// GQR0 is read as (*ctx).gqr[0] (a member other than gpr/fpr/cr/xer/ctr/lr would do the same).
++namespace {
++const bool g_thpEnabled = [] {
++    const char* value = std::getenv("WIICOMPILED_NATIVE_THPIDCT");  // 0: always the translation
++    return !(value != nullptr && value[0] == '0');
++}();
++}  // namespace
++
++extern "C" void MLB_THPInverseDCTNoYPos_80084C7C(CpuContext* ctx) {
++    HleTraceCall("MLB_THPInverseDCTNoYPos_80084C7C");
++    const mlb_thp::In in = {ctx->gpr[1], ctx->gpr[2], ctx->gpr[3], ctx->gpr[4], ctx->gpr[13], ctx->cr, ctx->xer,
++                            (*ctx).gqr[0]};
++    // Declared reads (the translation's contract; the fast path reads none of them).
++    [[maybe_unused]] const uint32_t declaredGprReads[] = {ctx->gpr[0], ctx->gpr[5], ctx->gpr[6], ctx->gpr[7], ctx->gpr[8],
++                                                          ctx->gpr[10]};
++    [[maybe_unused]] const uint64_t declaredFprReads[] = {
++        ctx->fpr[0].raw, ctx->fpr[1].raw, ctx->fpr[2].raw, ctx->fpr[3].raw, ctx->fpr[4].raw, ctx->fpr[5].raw,
++        ctx->fpr[6].raw, ctx->fpr[7].raw, ctx->fpr[8].raw, ctx->fpr[9].raw, ctx->fpr[10].raw, ctx->fpr[11].raw};
++    // f25-f31 are the translation's callee-saved registers: read at entry, written back unchanged.
++    const uint64_t f25 = ctx->fpr[25].raw, f26 = ctx->fpr[26].raw, f27 = ctx->fpr[27].raw, f28 = ctx->fpr[28].raw,
++                   f29 = ctx->fpr[29].raw, f30 = ctx->fpr[30].raw, f31 = ctx->fpr[31].raw;
++    mlb_thp::Out out;
++    if (g_thpEnabled && mlb_thp::RunNoYPos(in, out)) [[likely]] {
++        ctx->gpr[0] = out.r0;
++        ctx->gpr[1] = in.r1;
++        ctx->gpr[3] = out.r3;
++        ctx->gpr[4] = out.r4;
++        ctx->gpr[5] = out.r5;
++        ctx->gpr[6] = out.r6;
++        ctx->gpr[7] = out.r7;
++        ctx->gpr[8] = out.r8;
++        ctx->gpr[10] = out.r10;
++        ctx->fpr[0].raw = out.f[0];
++        ctx->fpr[1].raw = out.f[1];
++        ctx->fpr[2].raw = out.f[2];
++        ctx->fpr[3].raw = out.f[3];
++        ctx->fpr[4].raw = out.f[4];
++        ctx->fpr[5].raw = out.f[5];
++        ctx->fpr[6].raw = out.f[6];
++        ctx->fpr[7].raw = out.f[7];
++        ctx->fpr[8].raw = out.f[8];
++        ctx->fpr[9].raw = out.f[9];
++        ctx->fpr[10].raw = out.f[10];
++        ctx->fpr[11].raw = out.f[11];
++        ctx->fpr[12].raw = out.f[12];
++        ctx->fpr[13].raw = out.f[13];
++        ctx->fpr[25].raw = f25;
++        ctx->fpr[26].raw = f26;
++        ctx->fpr[27].raw = f27;
++        ctx->fpr[28].raw = f28;
++        ctx->fpr[29].raw = f29;
++        ctx->fpr[30].raw = f30;
++        ctx->fpr[31].raw = f31;
++        ctx->cr = out.cr;
++        ctx->ctr = out.ctr;
++        return;
++    }
++    mlb_thp::TranslatedNoYPos(*ctx);
++}
++
++extern "C" void MLB_THPInverseDCTY8_80085108(CpuContext* ctx) {
++    HleTraceCall("MLB_THPInverseDCTY8_80085108");
++    const mlb_thp::In in = {ctx->gpr[1], ctx->gpr[2], ctx->gpr[3], ctx->gpr[4], ctx->gpr[13], ctx->cr, ctx->xer,
++                            (*ctx).gqr[0]};
++    // Declared reads (the translation's contract; the fast path reads none of them).
++    [[maybe_unused]] const uint32_t declaredGprReads[] = {ctx->gpr[0], ctx->gpr[5], ctx->gpr[6], ctx->gpr[7], ctx->gpr[8],
++                                                          ctx->gpr[10]};
++    [[maybe_unused]] const uint64_t declaredFprReads[] = {
++        ctx->fpr[0].raw, ctx->fpr[1].raw, ctx->fpr[2].raw, ctx->fpr[3].raw, ctx->fpr[4].raw, ctx->fpr[5].raw,
++        ctx->fpr[6].raw, ctx->fpr[7].raw, ctx->fpr[8].raw, ctx->fpr[9].raw, ctx->fpr[10].raw, ctx->fpr[11].raw};
++    // f25-f31 are the translation's callee-saved registers: read at entry, written back unchanged.
++    const uint64_t f25 = ctx->fpr[25].raw, f26 = ctx->fpr[26].raw, f27 = ctx->fpr[27].raw, f28 = ctx->fpr[28].raw,
++                   f29 = ctx->fpr[29].raw, f30 = ctx->fpr[30].raw, f31 = ctx->fpr[31].raw;
++    mlb_thp::Out out;
++    if (g_thpEnabled && mlb_thp::RunY8(in, out)) [[likely]] {
++        ctx->gpr[0] = out.r0;
++        ctx->gpr[1] = in.r1;
++        ctx->gpr[3] = out.r3;
++        ctx->gpr[4] = out.r4;
++        ctx->gpr[5] = out.r5;
++        ctx->gpr[6] = out.r6;
++        ctx->gpr[7] = out.r7;
++        ctx->gpr[8] = out.r8;
++        ctx->gpr[10] = out.r10;
++        ctx->fpr[0].raw = out.f[0];
++        ctx->fpr[1].raw = out.f[1];
++        ctx->fpr[2].raw = out.f[2];
++        ctx->fpr[3].raw = out.f[3];
++        ctx->fpr[4].raw = out.f[4];
++        ctx->fpr[5].raw = out.f[5];
++        ctx->fpr[6].raw = out.f[6];
++        ctx->fpr[7].raw = out.f[7];
++        ctx->fpr[8].raw = out.f[8];
++        ctx->fpr[9].raw = out.f[9];
++        ctx->fpr[10].raw = out.f[10];
++        ctx->fpr[11].raw = out.f[11];
++        ctx->fpr[12].raw = out.f[12];
++        ctx->fpr[13].raw = out.f[13];
++        ctx->fpr[25].raw = f25;
++        ctx->fpr[26].raw = f26;
++        ctx->fpr[27].raw = f27;
++        ctx->fpr[28].raw = f28;
++        ctx->fpr[29].raw = f29;
++        ctx->fpr[30].raw = f30;
++        ctx->fpr[31].raw = f31;
++        ctx->cr = out.cr;
++        ctx->ctr = out.ctr;
++        return;
++    }
++    mlb_thp::TranslatedY8(*ctx);
++}
++
++REGISTER_NATIVE_FUNCTION_AS(0x80084C7C, MLB_THPInverseDCTNoYPos_80084C7C, "THPInverseDCTNoYPos");
++REGISTER_NATIVE_FUNCTION_AS(0x80085108, MLB_THPInverseDCTY8_80085108, "THPInverseDCTY8");
++#endif
 diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
 index 83faaac..15fb008 100644
 --- a/runtime/src/hle/mlb/two_way.cpp
