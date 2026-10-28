@@ -8,6 +8,32 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
 - **Audio:** resuelto. El narrador va a tiempo (ticker de 5 ms a 200 despertares/s, 0 pasadas perdidas) y no hay huecos de salida aunque caigan los fps. El usuario lo confirmó de oído: "el audio va perfecto, ni lo tocaría".
 - **Lo pendiente:** bajones de **un frame** (30–36 ms) al fildear y en la toma inicial que muestra a todos los jugadores. El usuario observa que *cuantos más fildeadores y corredores hay en pantalla, más caen los fps* (CPU ~80% al lanzar o batear, ~90–92% al fildear). Prueba 23: 39 picos de más de 30 ms en 16 570 frames de partido.
 
+## GX-F1 (2026-10-28): factibilidad, sin cambios de runtime
+
+- Se siguió `local/tmp/codex-gx-brief.md` con tres subagentes **gpt-6-luna / max**.
+  Informe integrado: [docs/gx-offload-feasibility.md](gx-offload-feasibility.md).
+  Informes privados por ámbito: `local/tmp/cpu/GX-offload-{state,memory,order}-feasibility.md`.
+- **Viable con condiciones:** cola ordenada y único dueño Aurora; conservar efectos
+  guest/retornos y sombra síncrona. Se confirmó viewport consultado por dos callers
+  y scissor inline que lee RAM guest; los anchors MKW `UNBOUND` no identifican targets
+  MLB. No se resolvieron todos los getters anónimos/indirectos.
+- Bloqueos antes del prototipo amplio: vida e instante de lectura de DL/arrays/texels/
+  TLUT; G7 exige un solo hilo dueño; el servicio `sWaitService` asume hilo guest;
+  `GX_HLE_MidCommand`, callbacks, CopyDisp y readback EFB necesitan conservar contexto
+  y barreras. No basta pasar punteros ni alternar productores tras un drain.
+- Primer paso conservador dejando objetos y scan en principal: presupuesto ~2,6 ms
+  **brutos**, neto menor y no medido. Objetivo amplio 3–4 ms exige migrar más familias.
+  No elegir core 1/2 usando los ~11 ms de decode: incluyen esperas, no CPU pura.
+- Reanálisis P18b reproducible: `python local/tmp/cpu/GX-offload-profile.py` pasa
+  self-check/asserts; 20 ventanas (70–260 s), media 13,46 ms ocupados/frame. Solo tres
+  picos >30 ms tras 60 s; 0/98 muestras con `wait_processed`, sin W ni relojes. No
+  atribuirlos a FIFO/GPU ni llamarlo benchmark stock verificado.
+- Verificación: `mkswitch.sh` (74 parches + linux + Switch/rebind), `treecheck.sh` y
+  ambos `diff -rq` pasan; árbol runtime/Aurora idéntico. Log:
+  `local/switch/logs/GX-offload-feasibility-verify.txt`. No fase 66, build ni prueba de
+  consola en esta tanda; audio intacto. Se pidió netloader y se espera «listo» antes
+  de enviar la NRO actual con perfil GX y picos a 20 ms. Sin push.
+
 ## Tanda P11 (2026-10-28): probada en consola; pico GX pendiente
 
 - Fases **56–58** de `local/tmp/switch_edit.py`, integradas en el texto de las fases 22/45/41 para respetar el orden de generación:
