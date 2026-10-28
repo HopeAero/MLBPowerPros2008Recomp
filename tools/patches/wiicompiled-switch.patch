@@ -1264,7 +1264,7 @@ index 80b3b92..789dc44 100644
    __gx->dirtyState = 0;
  }
 diff --git a/aurora-main/lib/dolphin/gx/GXTexture.cpp b/aurora-main/lib/dolphin/gx/GXTexture.cpp
-index 684ba79..0d5db3b 100644
+index 684ba79..d99ef42 100644
 --- a/aurora-main/lib/dolphin/gx/GXTexture.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXTexture.cpp
 @@ -60,6 +60,10 @@ struct TlutIdentityRecord {
@@ -1361,7 +1361,38 @@ index 684ba79..0d5db3b 100644
  } // namespace
  
  extern "C" {
-@@ -290,6 +363,32 @@ void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
+@@ -211,6 +284,30 @@ void GXInitTexObjLOD(GXTexObj* obj_, GXTexFilter minFilt, GXTexFilter magFilt, f
+   SET_REG_FIELD(0, obj->mode1, 8, 8, static_cast<u8>(16.0f * clampedMax));
+ }
+ 
++#if defined(__SWITCH__)
++// G7 (fifo.hpp): the runtime texture-object path's switches and counters.
++uint64_t aurora_gx_g7_counters[aurora::gx::fifo::kG7CounterCount] = {};
++static int g7_env(const char* name, int fallback) {
++  const char* value = std::getenv(name);
++  if (value == nullptr || value[0] == '\0') {
++    return fallback;
++  }
++  return value[0] == '0' ? 0 : 1;
++}
++int aurora_gx_g7_enabled(void) {
++  static const int enabled = g7_env("WIICOMPILED_GX_G7", 1);
++  return enabled;
++}
++int aurora_gx_g7_check(void) {
++  static const int check = aurora_gx_g7_enabled() != 0 ? g7_env("WIICOMPILED_GX_G7_CHECK", 0) : 0;
++  return check;
++}
++int aurora_gx_g7_lock(void) {
++  static const int lock = aurora_gx_g7_enabled() != 0 ? g7_env("WIICOMPILED_GX_G7_LOCK", 1) : 0;
++  return lock;
++}
++#endif
++
+ void GXInitTexObjData(GXTexObj* obj_, const void* data) {
+   auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
+   obj->data = data;
+@@ -290,6 +387,32 @@ void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
    SET_REG_FIELD(0, image2, 8, 24, GXTexImage2Ids[id]);
    SET_REG_FIELD(0, obj->image3, 8, 24, GXTexImage3Ids[id]);
  
@@ -1394,7 +1425,7 @@ index 684ba79..0d5db3b 100644
    GX_WRITE_RAS_REG(obj->mode0);
    GX_WRITE_RAS_REG(obj->mode1);
    GX_WRITE_RAS_REG(obj->image0);
-@@ -419,6 +518,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
+@@ -419,6 +542,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
  
  void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
    auto* obj = reinterpret_cast<const GXTlutObj_*>(obj_);
@@ -2723,7 +2754,7 @@ index 9818084..bd1b21a 100644
 +
 +#include "fifo_async.inc"
 diff --git a/aurora-main/lib/gx/fifo.hpp b/aurora-main/lib/gx/fifo.hpp
-index b01ea45..99519b7 100644
+index b01ea45..8d7f5fc 100644
 --- a/aurora-main/lib/gx/fifo.hpp
 +++ b/aurora-main/lib/gx/fifo.hpp
 @@ -16,6 +16,48 @@ extern uint32_t sDlSize;
@@ -2775,7 +2806,7 @@ index b01ea45..99519b7 100644
  void init();
  
  // Out-of-line slow path: grows internal buffer then appends data
-@@ -76,11 +118,135 @@ inline void write_f32(const float val) {
+@@ -76,14 +118,160 @@ inline void write_f32(const float val) {
  // Display list recording
  void begin_display_list(uint8_t* buf, uint32_t size);
  uint32_t end_display_list();
@@ -2912,12 +2943,37 @@ index b01ea45..99519b7 100644
  // Internal buffer inspection
  const uint8_t* get_buffer_data();
  uint32_t get_buffer_size();
+ void clear_buffer();
+ 
+ } // namespace aurora::gx::fifo
++
++#if defined(__SWITCH__)
++// G7 (local/tmp/cpu/G7-tex.py): the runtime's texture-object path (gx_objects.cpp, gx_texture.cpp).
++// Switches (GXTexture.cpp, read once): WIICOMPILED_GX_G7=0 turns it off, WIICOMPILED_GX_G7_LOCK=0 keeps
++// only the test-and-set GX object lock, WIICOMPILED_GX_G7_CHECK=1 runs the full paths and compares.
++namespace aurora::gx::fifo {
++// Main-thread counters for the benchmark summary (gx_g7_per_frame); the runtime bumps them.
++enum G7Counter : uint32_t {
++  kG7LoadsFast = 0,     // GXLoadTexObj served by the load-ready path
++  kG7LoadsFull,         // GXLoadTexObj that ran the full path
++  kG7ExtractMemoHits,   // guest GXTexObj re-decodes served from the slot's memo
++  kG7Extracts,          // guest GXTexObj re-decodes run
++  kG7ImageWrites,       // WriteGuestTexObj as one 32-byte store
++  kG7CheckMismatches,   // check mode: shortcut != full path
++  kG7CounterCount
++};
++} // namespace aurora::gx::fifo
++extern "C" uint64_t aurora_gx_g7_counters[aurora::gx::fifo::kG7CounterCount];
++extern "C" int aurora_gx_g7_enabled(void);
++extern "C" int aurora_gx_g7_check(void);
++extern "C" int aurora_gx_g7_lock(void);
++#endif
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 new file mode 100644
-index 0000000..ddfa123
+index 0000000..33fef05
 --- /dev/null
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -0,0 +1,1158 @@
+@@ -0,0 +1,1169 @@
 +// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
 +// at the end of fifo.cpp.
 +//
@@ -3055,6 +3111,7 @@ index 0000000..ddfa123
 +#if defined(__SWITCH__)
 +  uint64_t a3[kA3CounterCount]{};
 +  uint64_t g6[kG6CounterCount]{};
++  uint64_t g7[kG7CounterCount]{};
 +#endif
 +};
 +Snapshot sMark;
@@ -3077,6 +3134,7 @@ index 0000000..ddfa123
 +#if defined(__SWITCH__)
 +  std::memcpy(s.a3, aurora_gx_a3_counters, sizeof(s.a3));
 +  std::memcpy(s.g6, aurora_gx_g6_counters, sizeof(s.g6));
++  std::memcpy(s.g7, aurora_gx_g7_counters, sizeof(s.g7));
 +#endif
 +  return s;
 +}
@@ -4035,6 +4093,8 @@ index 0000000..ddfa123
 +      "gx_g6_per_frame enabled=%d dl_refs=%.1f dl_ref_kib=%.1f dl_copies=%.1f dl_copy_kib=%.1f "
 +      "regonly_hits=%.1f regonly_stores=%.2f check_mismatches=%.0f scan_cache_clears=%.0f "
 +      "mirror_syncs=%.1f mirror_rows=%.1f host_kib_now=%.0f\n"
++      "gx_g7_per_frame enabled=%d lock=%d check=%d loads_fast=%.1f loads_full=%.1f extract_memo_hits=%.1f "
++      "extracts=%.1f image_writes=%.1f check_mismatches=%.0f\n"
 +#endif
 +      ,
 +      modeName, frames, sExactRawDraws ? 1 : 0, sCheckArrays ? 1 : 0, drains(DrainReason::Draw) / frames,
@@ -4071,7 +4131,14 @@ index 0000000..ddfa123
 +      delta(now.g6[kG6ScanCacheClears], base.g6[kG6ScanCacheClears]),
 +      delta(now.g6[kG6MirrorSyncs], base.g6[kG6MirrorSyncs]) / frames,
 +      delta(now.g6[kG6MirrorRowsCopied], base.g6[kG6MirrorRowsCopied]) / frames,
-+      static_cast<double>(now.g6[kG6HostBytesLive]) / 1024.0
++      static_cast<double>(now.g6[kG6HostBytesLive]) / 1024.0,
++      aurora_gx_g7_enabled(), aurora_gx_g7_lock(), aurora_gx_g7_check(),
++      delta(now.g7[kG7LoadsFast], base.g7[kG7LoadsFast]) / frames,
++      delta(now.g7[kG7LoadsFull], base.g7[kG7LoadsFull]) / frames,
++      delta(now.g7[kG7ExtractMemoHits], base.g7[kG7ExtractMemoHits]) / frames,
++      delta(now.g7[kG7Extracts], base.g7[kG7Extracts]) / frames,
++      delta(now.g7[kG7ImageWrites], base.g7[kG7ImageWrites]) / frames,
++      delta(now.g7[kG7CheckMismatches], base.g7[kG7CheckMismatches])
 +#endif
 +  );
 +  return n < 0 ? 0 : std::min(n, size - 1);
@@ -5022,6 +5089,98 @@ index b13a196..3efd579 100644
 +    std::atomic<uint64_t> m_readyKey{0};
 +#endif
  };
+diff --git a/runtime/include/compute_preempt.h b/runtime/include/compute_preempt.h
+new file mode 100644
+index 0000000..e155698
+--- /dev/null
++++ b/runtime/include/compute_preempt.h
+@@ -0,0 +1,86 @@
++#pragma once
++// T8 (switch phase 51): compute preemption points. On unless WIICOMPILED_COMPUTE_PREEMPT=0.
++//
++// Guest threads are cooperative fibers on one host thread, so a due OSSleepTicks timer (MLB's 5 ms
++// sound ticker above all: the commentary phrase clocks) only fires at a scheduler pass. Translated
++// code can compute 8-20 ms without one (home-run camera, base running, replays). These points take
++// the alarm interrupt at the entry of hot compute leaf natives (PSMTXConcat, __ieee754_sqrt,
++// __fill_mem: hle/mlb/mtx_natives.cpp, msl_natives.cpp), i.e. at a guest `bl` from translated code,
++// and only when hle/os/os_scheduler.cpp MkwComputePreemptSlow finds it is a point where the hardware
++// could take the interrupt: see there. Only this header and the .cpp files that include it see it
++// (never the translated code), so changing it rebuilds a handful of runtime objects.
++#if defined(__SWITCH__)
++#include <cstdint>
++
++extern "C" {
++// Visits left before the next deadline check (hle/os/os_scheduler.cpp).
++extern uint32_t g_mkwComputePreemptCountdown;
++// Nonzero while runtime code runs guest code where the hardware would not take the interrupt (a
++// synchronous DVD/WPAD completion callback, a native's nested leaf call): the points refuse.
++extern uint32_t g_mkwComputePreemptHold;
++void MkwComputePreemptSlow();
++}
++
++// Load, compare, store; every kMkwComputePreemptInterval-th visit compares CNTPCT with the earliest
++// sleep deadline. Takes no CpuContext: the registered natives' contract (the registers they read
++// and write) stays what it was.
++inline void MkwComputePreemptPoll() {
++    const uint32_t n = __atomic_load_n(&g_mkwComputePreemptCountdown, __ATOMIC_RELAXED);
++    if (n > 1) [[likely]] {
++        __atomic_store_n(&g_mkwComputePreemptCountdown, n - 1, __ATOMIC_RELAXED);
++        return;
++    }
++    MkwComputePreemptSlow();
++}
++
++struct MkwComputePreemptHoldScope {
++    MkwComputePreemptHoldScope() noexcept {
++        __atomic_store_n(&g_mkwComputePreemptHold, __atomic_load_n(&g_mkwComputePreemptHold, __ATOMIC_RELAXED) + 1,
++                         __ATOMIC_RELAXED);
++    }
++    ~MkwComputePreemptHoldScope() {
++        __atomic_store_n(&g_mkwComputePreemptHold, __atomic_load_n(&g_mkwComputePreemptHold, __ATOMIC_RELAXED) - 1,
++                         __ATOMIC_RELAXED);
++    }
++    MkwComputePreemptHoldScope(const MkwComputePreemptHoldScope&) = delete;
++    MkwComputePreemptHoldScope& operator=(const MkwComputePreemptHoldScope&) = delete;
++};
++
++// The guard, as a pure function (host-tested: local/tmp/cpu/T8-test). Every condition must hold for
++// the point to switch threads; the first failing one is returned.
++enum class MkwComputePreemptVerdict : uint8_t {
++    Take,
++    NotSchedulerThread,  // a poll on another host thread
++    Held,                // inside a DVD/WPAD completion callback or a native's nested leaf call
++    PrivateContext,      // a callback on its own register file (GuestInterruptCallbackContext, ...)
++    InterruptsOff,       // guest MSR[EE] clear
++    SchedulerDisabled,   // alarm handler, deferred VI/alarm/audio batch (scheduler disable count)
++    InRetrace,           // VI retrace callbacks
++    GxMidCommand,        // inside GXBegin/GXEnd, a display-list recording or a partial FIFO command
++    NotRunningThread,    // idle loop, SelectThread's switch callback, a thread mid-switch
++};
++struct MkwComputePreemptState {
++    bool schedulerThread;
++    uint32_t hold;
++    bool sharedContext;  // TryGetCpuContext() == &GetPersistentCpuContext()
++    bool interruptsEnabled;
++    uint32_t schedulerDisableCount;
++    bool inRetrace;
++    bool gxMidCommand;
++    uint32_t runningThread;  // OSRunningThread (0: idle)
++    uint32_t currentContext; // OSCurrentContext
++    uint16_t runningState;   // its OSThread state (2: RUNNING)
++};
++inline MkwComputePreemptVerdict MkwComputePreemptDecide(const MkwComputePreemptState& s) noexcept {
++    if (!s.schedulerThread) return MkwComputePreemptVerdict::NotSchedulerThread;
++    if (s.hold != 0) return MkwComputePreemptVerdict::Held;
++    if (!s.sharedContext) return MkwComputePreemptVerdict::PrivateContext;
++    if (!s.interruptsEnabled) return MkwComputePreemptVerdict::InterruptsOff;
++    if (s.schedulerDisableCount != 0) return MkwComputePreemptVerdict::SchedulerDisabled;
++    if (s.inRetrace) return MkwComputePreemptVerdict::InRetrace;
++    if (s.gxMidCommand) return MkwComputePreemptVerdict::GxMidCommand;
++    if (s.runningThread == 0 || s.currentContext != s.runningThread || s.runningState != 2)
++        return MkwComputePreemptVerdict::NotRunningThread;
++    return MkwComputePreemptVerdict::Take;
++}
++#endif
 diff --git a/runtime/include/guest_flat_memory.h b/runtime/include/guest_flat_memory.h
 index 2514913..4b52f5b 100644
 --- a/runtime/include/guest_flat_memory.h
@@ -7028,10 +7187,10 @@ index a276446..b321ee5 100644
  
  namespace {
 diff --git a/runtime/src/hle/audio/ax_mix.cpp b/runtime/src/hle/audio/ax_mix.cpp
-index 0bb8fa0..697d98c 100644
+index 0bb8fa0..fd2c16c 100644
 --- a/runtime/src/hle/audio/ax_mix.cpp
 +++ b/runtime/src/hle/audio/ax_mix.cpp
-@@ -30,6 +30,9 @@
+@@ -30,9 +30,39 @@
  #include <string>
  #include <thread>
  
@@ -7041,7 +7200,476 @@ index 0bb8fa0..697d98c 100644
  namespace AxDspHle {
  namespace {
  
-@@ -1395,6 +1398,9 @@ private:
++#if defined(__SWITCH__) || defined(WIICOMPILED_AX_SPLIT_TEST)
++// A thread joining a running mix helps it (AXWii::ProcessPBListSplit / JoinMixHelping).
++#define WIICOMPILED_AX_SPLIT_MIX 1
++#else
++#define WIICOMPILED_AX_SPLIT_MIX 0
++#endif
++
++#if WIICOMPILED_AX_SPLIT_MIX
++// True only on the mix worker thread: the one thread that opens split jobs.
++thread_local bool t_axSplitOwner = false;
++
++bool AxSplitEnabledFromEnv() {
++    const char* value = std::getenv("WIICOMPILED_AX_SPLIT");
++    return !(value && value[0] == '0');
++}
++
++bool AxSplitStatsFromEnv() {
++    const char* value = std::getenv("WIICOMPILED_AUDIO_STATS");
++    return value && value[0] == '1';
++}
++
++uint64_t AxSplitNowNs() {
++    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++#endif
++
+ std::filesystem::path FindDspCoefficientRom() {
+     if (const auto executableDirectory = RuntimeConfigFile::ExecutableDirectory()) {
+         const auto adjacent = *executableDirectory / "dsp_coef.bin";
+@@ -116,6 +146,13 @@ public:
+ 
+     void JoinMix() {
+         if (m_mixThread.joinable()) {
++#if WIICOMPILED_AX_SPLIT_MIX
++            if (m_splitEnabled) {
++                JoinMixHelping();
++                PublishAuxOutputs();
++                return;
++            }
++#endif
+             std::unique_lock<std::mutex> lock(m_mixMutex);
+             m_mixIdle.wait(lock, [this] { return !m_mixPending && !m_mixBusy; });
+         }
+@@ -677,32 +714,412 @@ private:
+     }
+ 
+     void ProcessPBList(uint32_t pbAddr, bool newFilter, bool oldAxLayout) {
++#if WIICOMPILED_AX_SPLIT_MIX
++        if (t_axSplitOwner && m_splitEnabled && ProcessPBListSplit(pbAddr, newFilter, oldAxLayout)) {
++            return;
++        }
++#endif
+         uint32_t guard = 0;
+         while (pbAddr && guard++ < 256) {
+             AXPBWii pb{};
+             ReadPB(pbAddr, pb);
+-            AXBuffers buffers = MixBuffers();
+-            const AXMixControl control = ConvertMixerControl(Hilo(pb.mixer_control_hi, pb.mixer_control_lo));
+-            bool& wasRunning = m_wasRunning[pbAddr];
+-            if (pb.running != 1 && wasRunning) {
+-                Depop(buffers, control, pb.dpop);
++            MixVoice(pbAddr, pb, m_wasRunning[pbAddr], MixBuffers(), newFilter, oldAxLayout);
++            pbAddr = Hilo(pb.next_pb_hi, pb.next_pb_lo);
++        }
++    }
++
++    // One voice of a PROCESS command, `pb` already read from `pbAddr`; the sequential walk and the
++    // split (any thread) run this same body.
++    void MixVoice(uint32_t pbAddr, AXPBWii& pb, bool& wasRunning, AXBuffers buffers, bool newFilter,
++                  bool oldAxLayout) {
++        const AXMixControl control = ConvertMixerControl(Hilo(pb.mixer_control_hi, pb.mixer_control_lo));
++        if (pb.running != 1 && wasRunning) {
++            Depop(buffers, control, pb.dpop);
++        }
++        wasRunning = pb.running == 1;
++        if (oldAxLayout && (pb.updates.num_updates[0] | pb.updates.num_updates[1] | pb.updates.num_updates[2]) != 0) {
++            const auto updates = LoadPBUpdates(pb);
++            for (uint32_t ms = 0; ms < 3; ++ms) {
++                ApplyPBUpdatesForMs(pb, updates, ms);
++                ProcessVoice(pb, buffers, 32, control, BaseCoefficients(), newFilter);
++                AdvanceBuffers(buffers, 32, 6);
++            }
++        } else {
++            ProcessVoice(pb, buffers, kAxSamplesPerFrame, control, BaseCoefficients(), newFilter);
++        }
++        WritePB(pbAddr, pb);
++    }
++
++#if WIICOMPILED_AX_SPLIT_MIX
++    // ---- Split mix: one PROCESS command's voices shared by the worker and a thread joining it ----
++    // A voice touches its own PB (read once, written back once), adds per-voice clamped samples into
++    // the buses (out[i] += s; nothing saturates or reads a bus until the next command), reads sample
++    // bytes and its update list, and its own m_wasRunning entry. So when no voice reads or writes
++    // another voice's PB bytes, any order on any thread gives the same PB write-backs, and the buses
++    // equal SETUP's values plus all contributions in any grouping (int32 adds wrap mod 2^32). The
++    // prewalk proves that condition from the PB contents or the sequential walk runs instead.
++    static constexpr uint32_t kSplitMinVoices = 4;
++    static constexpr uint32_t kSplitMaxVoices = 256;  // ProcessPBList's guard
++
++    static size_t GuestPBBytes(PBLayout layout) {
++        std::array<PBSegment, 3> segments{};
++        const size_t count = PBSegmentsForLayout(layout, segments);
++        return segments[count - 1].guestOffset + segments[count - 1].byteCount;
++    }
++
++    // Accelerator byte span [lo, hi] (DSP ARAM addressing) against the PB envelope, resolved like
++    // ResolveAramWindow/AramAliasesFor: bit 28 selects MEM2 (offset masked to kMem2Size), otherwise
++    // MEM1 masked to 32 MB. A span inside one 32 MB block is one contiguous host range in both.
++    static bool AramSpanClear(uint64_t lo, uint64_t hi, uintptr_t pbLo, uintptr_t pbHi) {
++        if (((lo ^ hi) >> 25) != 0) {
++            return false;
++        }
++        const bool mem2 = (lo & 0x10000000u) != 0;
++        const uint8_t* base = (mem2 ? g_mixMem2 : g_mixMem1).load(std::memory_order_relaxed);
++        if (base == nullptr) {
++            return true;  // nothing resolves there: the accelerator reads silence
++        }
++        const uint64_t mask = mem2 ? static_cast<uint64_t>(Memory::kMem2Size - 1u) : 0x01ffffffu;
++        const uintptr_t first = reinterpret_cast<uintptr_t>(base) + static_cast<uintptr_t>(lo & mask);
++        const uintptr_t last = reinterpret_cast<uintptr_t>(base) + static_cast<uintptr_t>(hi & mask);
++        return last < pbLo || first >= pbHi;
++    }
++
++    // Every byte the accelerator can read for a voice whose PB passes through `states` while it reads
++    // at most `reads` samples: each read moves the position +1 (+3 across an ADPCM frame header), 0
++    // (decode 1) or back to the loop start (+1), so it stays in [min(loop, cur), max(loop, end, cur) +
++    // 3 * reads + 3]; positions >= 2^30 (mask/wrap territory) are refused.
++    static bool VoiceReadsClear(const AXPBWii* states, size_t stateCount, uint64_t reads, uintptr_t pbLo,
++                                uintptr_t pbHi) {
++        uint64_t lo = UINT64_MAX;
++        uint64_t top = 0;
++        for (size_t s = 0; s < stateCount; ++s) {
++            const PBAudioAddr& a = states[s].audio_addr;
++            const uint64_t start = Hilo(a.loop_addr_hi, a.loop_addr_lo) & 0x3fffffffu;
++            const uint64_t end = Hilo(a.end_addr_hi, a.end_addr_lo) & 0x3fffffffu;
++            const uint64_t cur = Hilo(a.cur_addr_hi, a.cur_addr_lo) & 0xbfffffffu;
++            lo = std::min(lo, std::min(start, cur));
++            top = std::max(top, std::max(std::max(start, end), cur));
++        }
++        const uint64_t hi = top + 3u * reads + 3u;
++        if (hi >= 0x40000000u) {
++            return false;
++        }
++        for (size_t s = 0; s < stateCount; ++s) {
++            const uint16_t format = states[s].audio_addr.sample_format;
++            const uint32_t size = format & 3u;
++            if (size == 0 && !AramSpanClear(lo >> 1, hi >> 1, pbLo, pbHi)) return false;
++            if (size == 1 && !AramSpanClear(lo, hi, pbLo, pbHi)) return false;
++            if (size == 2 && !AramSpanClear(lo * 2u, hi * 2u + 1u, pbLo, pbHi)) return false;
++            if (((format >> 2) & 3u) == 0 && !AramSpanClear((lo & ~uint64_t{15}) >> 1, hi >> 1, pbLo, pbHi)) {
++                return false;
+             }
+-            wasRunning = pb.running == 1;
++        }
++        return true;
++    }
++
++    static uint64_t SplitMaxReads(const AXPBWii& pb, uint32_t samples) {
++        return static_cast<uint64_t>(samples) * ((Hilo(pb.src.ratio_hi, pb.src.ratio_lo) >> 16) + 1u);
++    }
++
++    bool SplitVoicesIndependent(uint32_t count, size_t pbBytes, bool oldAxLayout) {
++        std::array<uintptr_t, kSplitMaxVoices> sorted;
++        std::copy(m_splitHost.begin(), m_splitHost.begin() + count, sorted.begin());
++        std::sort(sorted.begin(), sorted.begin() + count);
++        for (uint32_t i = 1; i < count; ++i) {
++            if (sorted[i] - sorted[i - 1] < pbBytes) {
++                return false;
++            }
++        }
++        const uintptr_t pbLo = sorted[0];
++        const uintptr_t pbHi = sorted[count - 1] + pbBytes;
++        for (uint32_t i = 0; i < count; ++i) {
++            const AXPBWii& pb = m_splitPB[i];
+             if (oldAxLayout && (pb.updates.num_updates[0] | pb.updates.num_updates[1] | pb.updates.num_updates[2]) != 0) {
++                const uint32_t dataAddr = Hilo(pb.updates.data_hi, pb.updates.data_lo);
++                if (dataAddr != 0) {
++                    constexpr size_t kUpdateBytes = 32 * sizeof(PBUpdate);
++                    const uint8_t* data = MixResolveRange(dataAddr, kUpdateBytes);
++                    if (data == nullptr) {
++                        return false;
++                    }
++                    const uintptr_t d = reinterpret_cast<uintptr_t>(data);
++                    if (d < pbHi && d + kUpdateBytes > pbLo) {
++                        return false;
++                    }
++                }
+                 const auto updates = LoadPBUpdates(pb);
++                // The voice's own read-back cursor is the one PB word the accelerator writes between
++                // two update batches; an update writing half of it would combine with that, so the
++                // states below would not bound the position. Rare; refused.
++                constexpr uint16_t kCurHi = offsetof(AXPBWii, audio_addr.cur_addr_hi) / sizeof(uint16_t);
++                constexpr uint16_t kCurLo = offsetof(AXPBWii, audio_addr.cur_addr_lo) / sizeof(uint16_t);
++                for (const PBUpdate& update : updates) {
++                    if (update.pb_offset == kCurHi || update.pb_offset == kCurLo) {
++                        return false;
++                    }
++                }
++                std::array<AXPBWii, 4> states;
++                states[0] = pb;
++                uint64_t reads = 0;
+                 for (uint32_t ms = 0; ms < 3; ++ms) {
+-                    ApplyPBUpdatesForMs(pb, updates, ms);
+-                    ProcessVoice(pb, buffers, 32, control, BaseCoefficients(), newFilter);
+-                    AdvanceBuffers(buffers, 32, 6);
++                    states[ms + 1] = states[ms];
++                    ApplyPBUpdatesForMs(states[ms + 1], updates, ms);
++                    reads += SplitMaxReads(states[ms + 1], 32);
++                }
++                if (!VoiceReadsClear(states.data(), states.size(), reads, pbLo, pbHi)) {
++                    return false;
+                 }
++            } else if (!VoiceReadsClear(&pb, 1, SplitMaxReads(pb, kAxSamplesPerFrame), pbLo, pbHi)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    void CountSplitStat(std::atomic<uint64_t>& counter, uint64_t value = 1) {
++        if (m_splitStats) {
++            counter.fetch_add(value, std::memory_order_relaxed);
++        }
++    }
++
++    // Worker only (t_axSplitOwner). False = nothing done, run the sequential walk.
++    bool ProcessPBListSplit(uint32_t pbAddr, bool newFilter, bool oldAxLayout) {
++        const PBLayout layout = m_pbLayout;
++        if (layout == PBLayout::Unknown) {
++            return false;  // ReadPB may still settle the layout: sequential
++        }
++        CountSplitStat(m_statProcess);
++        const size_t pbBytes = GuestPBBytes(layout);
++        uint32_t count = 0;
++        uint32_t guard = 0;
++        while (pbAddr && guard++ < kSplitMaxVoices) {
++            const uint8_t* host = MixResolveRange(pbAddr, pbBytes);
++            if (host == nullptr) {
++                CountSplitStat(m_statBail);
++                return false;
++            }
++            m_splitAddr[count] = pbAddr;
++            m_splitHost[count] = reinterpret_cast<uintptr_t>(host);
++            AXPBWii& pb = m_splitPB[count];
++            ReadPBWithLayout(pbAddr, pb, layout);  // = ReadPB with the layout known
++            ++count;
++            if (oldAxLayout && (pb.updates.num_updates[0] | pb.updates.num_updates[1] | pb.updates.num_updates[2]) != 0) {
++                // The sequential walk follows next_pb after the voice's per-ms updates (ProcessVoice
++                // never writes next_pb_*): replay them on a copy.
++                AXPBWii state = pb;
++                const auto updates = LoadPBUpdates(state);
++                for (uint32_t ms = 0; ms < 3; ++ms) {
++                    ApplyPBUpdatesForMs(state, updates, ms);
++                }
++                pbAddr = Hilo(state.next_pb_hi, state.next_pb_lo);
+             } else {
+-                ProcessVoice(pb, buffers, kAxSamplesPerFrame, control, BaseCoefficients(), newFilter);
++                pbAddr = Hilo(pb.next_pb_hi, pb.next_pb_lo);
+             }
+-            WritePB(pbAddr, pb);
+-            pbAddr = Hilo(pb.next_pb_hi, pb.next_pb_lo);
+         }
++        if (count < kSplitMinVoices || !SplitVoicesIndependent(count, pbBytes, oldAxLayout)) {
++            CountSplitStat(m_statBail);
++            return false;
++        }
++        for (uint32_t i = 0; i < count; ++i) {
++            m_splitWas[i] = &m_wasRunning[m_splitAddr[i]];  // map nodes are stable; no insert while open
++        }
++        m_splitCount = count;
++        m_splitNewFilter = newFilter;
++        m_splitOldLayout = oldAxLayout;
++        m_splitHelperClaimed = 0;
++        m_splitNext.store(0, std::memory_order_relaxed);
++        bool wakeJoiner = false;
++        {
++            std::lock_guard<std::mutex> lock(m_mixMutex);
++            m_splitOpen.store(true, std::memory_order_seq_cst);
++            ++m_splitSeq;
++            wakeJoiner = m_splitJoinWaiters != 0;
++        }
++        if (wakeJoiner) {
++            m_mixIdle.notify_all();  // a joiner already asleep in JoinMixHelping (else no syscall)
++        }
++
++        // Closes the job and waits out the helper even if a voice throws.
++        struct CloseJob {
++            AXWii& ax;
++            ~CloseJob() {
++                ax.m_splitOpen.store(false, std::memory_order_seq_cst);
++                const uint64_t t0 = ax.m_splitStats ? AxSplitNowNs() : 0;
++                while (ax.m_splitHelpers.load(std::memory_order_seq_cst) != 0) {
++                    std::this_thread::yield();
++                }
++                if (ax.m_splitStats) {
++                    ax.m_statWaitNs.fetch_add(AxSplitNowNs() - t0, std::memory_order_relaxed);
++                }
++            }
++        };
++        {
++            CloseJob close{*this};
++            const AXBuffers buffers = MixBuffers();
++            for (;;) {
++                const uint32_t i = m_splitNext.fetch_add(1, std::memory_order_relaxed);
++                if (i >= count) {
++                    break;
++                }
++                MixVoice(m_splitAddr[i], m_splitPB[i], *m_splitWas[i], buffers, newFilter, oldAxLayout);
++            }
++        }
++        if (m_splitHelperClaimed != 0) {
++            MergeHelperBuses();
++            CountSplitStat(m_statHelperVoices, m_splitHelperClaimed);
++        }
++        CountSplitStat(m_statSplit);
++        CountSplitStat(m_statVoices, count);
++        return true;
+     }
+ 
++    AXBuffers HelperBuffers() {
++        AXBuffers buffers{};
++        for (size_t i = 0; i < kAxRegularBusCount; ++i) {
++            buffers[i] = m_splitBus[i].data();
++        }
++        for (size_t i = 0; i < kAxWiimoteBusCount; ++i) {
++            buffers[kAxRegularBusCount + i] = m_splitWmBus[i].data();
++        }
++        return buffers;
++    }
++
++    void MergeHelperBuses() {
++        for (size_t b = 0; b < kAxRegularBusCount; ++b) {
++            for (uint32_t i = 0; i < kAxSamplesPerFrame; ++i) {
++                m_bus[b][i] = static_cast<int>(static_cast<uint32_t>(m_bus[b][i]) +
++                                               static_cast<uint32_t>(m_splitBus[b][i]));
++            }
++        }
++        for (size_t b = 0; b < kAxWiimoteBusCount; ++b) {
++            for (uint32_t i = 0; i < kAxWiimoteSamplesPerFrame; ++i) {
++                m_wmBus[b][i] = static_cast<int>(static_cast<uint32_t>(m_wmBus[b][i]) +
++                                                 static_cast<uint32_t>(m_splitWmBus[b][i]));
++            }
++        }
++    }
++
++    // Joining thread: claims voices of the open job into the private buses.
++    void HelpSplitJob() {
++        uint32_t expected = 0;
++        if (!m_splitHelpers.compare_exchange_strong(expected, 1u, std::memory_order_seq_cst)) {
++            return;
++        }
++        if (!m_splitOpen.load(std::memory_order_seq_cst)) {
++            m_splitHelpers.store(0, std::memory_order_seq_cst);
++            return;
++        }
++        const uint64_t t0 = m_splitStats ? AxSplitNowNs() : 0;
++        const uint32_t count = m_splitCount;
++        const bool newFilter = m_splitNewFilter;
++        const bool oldAxLayout = m_splitOldLayout;
++        const bool wasWorker = t_onMixWorker;
++        t_onMixWorker = true;  // the worker's fail-safe guest accessors, same results
++        uint32_t claimed = 0;
++        try {
++            const AXBuffers buffers = HelperBuffers();
++            for (;;) {
++                const uint32_t i = m_splitNext.fetch_add(1, std::memory_order_relaxed);
++                if (i >= count) {
++                    break;
++                }
++                if (claimed++ == 0) {
++                    for (auto& bus : m_splitBus) bus.fill(0);
++                    for (auto& bus : m_splitWmBus) bus.fill(0);
++                }
++                MixVoice(m_splitAddr[i], m_splitPB[i], *m_splitWas[i], buffers, newFilter, oldAxLayout);
++            }
++        } catch (const std::exception& error) {
++            ReportMixWorkerFailure(error.what());
++        } catch (...) {
++            ReportMixWorkerFailure("unknown exception");
++        }
++        t_onMixWorker = wasWorker;
++        m_splitHelperClaimed = claimed;
++        if (m_splitStats) {
++            m_statHelperNs.fetch_add(AxSplitNowNs() - t0, std::memory_order_relaxed);
++        }
++        m_splitHelpers.store(0, std::memory_order_seq_cst);
++    }
++
++    // Joining thread: the posted mix the worker has not picked up yet, run here.
++    void RunMixOnThisThread() {
++        const bool wasWorker = t_onMixWorker;
++        t_onMixWorker = true;
++        try {
++            ExecuteCommandList(m_mixLayout, m_mixCmdListSize);
++        } catch (const std::exception& error) {
++            ReportMixWorkerFailure(error.what());
++        } catch (...) {
++            ReportMixWorkerFailure("unknown exception");
++        }
++        t_onMixWorker = wasWorker;
++    }
++
++    void JoinMixHelping() {
++        {
++            std::unique_lock<std::mutex> lock(m_mixMutex);
++            for (;;) {
++                if (!m_mixPending && !m_mixBusy) {
++                    break;
++                }
++                if (m_mixPending && !m_mixBusy) {
++                    m_mixPending = false;
++                    m_mixBusy = true;
++                    lock.unlock();
++                    CountSplitStat(m_statSteals);
++                    RunMixOnThisThread();
++                    lock.lock();
++                    m_mixBusy = false;
++                    m_mixIdle.notify_all();
++                    continue;
++                }
++                if (m_splitOpen.load(std::memory_order_seq_cst) && m_splitSeq != m_splitHelpedSeq) {
++                    m_splitHelpedSeq = m_splitSeq;
++                    lock.unlock();
++                    HelpSplitJob();
++                    lock.lock();
++                    continue;
++                }
++                ++m_splitJoinWaiters;
++                m_mixIdle.wait(lock);  // the mix finishing or a split job opening
++                --m_splitJoinWaiters;
++            }
++        }
++        if (m_splitStats) {
++            ReportSplitStats();
++        }
++    }
++
++    void ReportSplitStats() {
++        const uint64_t now = AxSplitNowNs();
++        if (m_splitStatsStart == 0) {
++            m_splitStatsStart = now;
++            return;
++        }
++        if (now - m_splitStatsStart < 2'000'000'000ull) {
++            return;
++        }
++        m_splitStatsStart = now;
++        auto take = [](std::atomic<uint64_t>& counter) {
++            return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed));
++        };
++        const unsigned long long process = take(m_statProcess);
++        const unsigned long long split = take(m_statSplit);
++        const unsigned long long bail = take(m_statBail);
++        const unsigned long long voices = take(m_statVoices);
++        const unsigned long long helperVoices = take(m_statHelperVoices);
++        const unsigned long long steals = take(m_statSteals);
++        const double helperMs = take(m_statHelperNs) / 1e6;
++        const double waitMs = take(m_statWaitNs) / 1e6;
++        RT_LOGF(RT_TAG_AUDIO,
++                "[audio-stats] ax split: process %llu split %llu bail %llu, voices %llu helper %llu, "
++                "steals %llu, helper %.2f ms, worker wait %.2f ms\n",
++                process, split, bail, voices, helperVoices, steals, helperMs, waitMs);
++    }
++#endif
++
+     // Four consecutive 0x200-halfword polyphase banks; only the voice resample selects a
+     // bank (VoiceCoefficients). Wiimote downsample always uses bank 0 at its fixed ratio.
+     const int16_t* BaseCoefficients() const {
+@@ -1395,7 +1812,13 @@ private:
      }
  
      void MixWorkerMain() {
@@ -7049,8 +7677,52 @@ index 0bb8fa0..697d98c 100644
 +        SwitchPinCurrentThread(2, 0x2B);  // short bursts that must land on time
 +#endif
          t_onMixWorker = true;
++#if WIICOMPILED_AX_SPLIT_MIX
++        t_axSplitOwner = true;
++#endif
          for (;;) {
              {
+                 std::unique_lock<std::mutex> lock(m_mixMutex);
+@@ -1476,6 +1899,39 @@ private:
+     uint32_t m_auxInCount = 0;
+     std::array<AuxBlock, 24> m_auxOut{};
+     std::array<AuxBlock, 24> m_auxIn{};
++
++#if WIICOMPILED_AX_SPLIT_MIX
++    // Split job (ProcessPBListSplit). Written by the worker before m_splitOpen is set (seq_cst) and
++    // read by the helper after it sees it set; the helper's results are read after m_splitHelpers
++    // drops back to 0.
++    bool m_splitEnabled = AxSplitEnabledFromEnv();
++    bool m_splitStats = AxSplitStatsFromEnv();
++    std::atomic<bool> m_splitOpen{false};
++    std::atomic<uint32_t> m_splitHelpers{0};
++    std::atomic<uint32_t> m_splitNext{0};
++    uint32_t m_splitSeq = 0;        // under m_mixMutex
++    uint32_t m_splitHelpedSeq = 0;  // under m_mixMutex
++    uint32_t m_splitJoinWaiters = 0;  // under m_mixMutex
++    uint32_t m_splitCount = 0;
++    uint32_t m_splitHelperClaimed = 0;
++    bool m_splitNewFilter = false;
++    bool m_splitOldLayout = false;
++    std::array<uint32_t, kSplitMaxVoices> m_splitAddr{};
++    std::array<uintptr_t, kSplitMaxVoices> m_splitHost{};
++    std::array<bool*, kSplitMaxVoices> m_splitWas{};
++    std::array<AXPBWii, kSplitMaxVoices> m_splitPB{};
++    std::array<std::array<int, kAxSamplesPerFrame>, kAxRegularBusCount> m_splitBus{};
++    std::array<std::array<int, kAxWiimoteSamplesPerFrame>, kAxWiimoteBusCount> m_splitWmBus{};
++    uint64_t m_splitStatsStart = 0;  // joining thread
++    std::atomic<uint64_t> m_statProcess{0};
++    std::atomic<uint64_t> m_statSplit{0};
++    std::atomic<uint64_t> m_statBail{0};
++    std::atomic<uint64_t> m_statVoices{0};
++    std::atomic<uint64_t> m_statHelperVoices{0};
++    std::atomic<uint64_t> m_statSteals{0};
++    std::atomic<uint64_t> m_statHelperNs{0};
++    std::atomic<uint64_t> m_statWaitNs{0};
++#endif
+ };
+ 
+ AXWii& Instance() {
 diff --git a/runtime/src/hle/gx/gx_copy.cpp b/runtime/src/hle/gx/gx_copy.cpp
 index eaf6809..f9821a8 100644
 --- a/runtime/src/hle/gx/gx_copy.cpp
@@ -7138,7 +7810,7 @@ index 49fed99..2593379 100644
  }
  
 diff --git a/runtime/src/hle/gx/gx_dl.cpp b/runtime/src/hle/gx/gx_dl.cpp
-index 818478d..fa13c1d 100644
+index 818478d..f9079de 100644
 --- a/runtime/src/hle/gx/gx_dl.cpp
 +++ b/runtime/src/hle/gx/gx_dl.cpp
 @@ -10,14 +10,37 @@
@@ -7508,7 +8180,7 @@ index 818478d..fa13c1d 100644
          const auto& entry = record.result;
          const bool identityMatches = entry.listAddr == CanonicalizeGxMainRamAddress(listAddr) &&
                                       entry.nbytes == nbytes && entry.layoutHash == layoutHash;
-@@ -574,28 +834,61 @@ static DlScanCacheProbe ProbeDlScanCache(const uint8_t* list, uint32_t listAddr,
+@@ -574,27 +834,61 @@ static DlScanCacheProbe ProbeDlScanCache(const uint8_t* list, uint32_t listAddr,
  }
  
  static size_t DlScanCacheRecordBytes(const DlScanCacheRecord& record) {
@@ -7565,16 +8237,15 @@ index 818478d..fa13c1d 100644
          s_cache.storedCommandBytes = 0;
          replacing = false;
          replacedBytes = 0;
--    }
 +#if defined(__SWITCH__)
 +        if (s_cache.front) {
 +            std::fill_n(s_cache.front.get(), kDlScanFrontSlots, DlScanFrontSlot{});
 +        }
-+#endif    }
++#endif
+     }
      DlScanCacheRecord record{};
      record.result = entry;
-     record.mayContainDraw = mayContainDraw;
-@@ -610,12 +903,19 @@ static void StoreDlScanCache(uint32_t listAddr, uint32_t nbytes, uint64_t layout
+@@ -610,12 +904,19 @@ static void StoreDlScanCache(uint32_t listAddr, uint32_t nbytes, uint64_t layout
      if (flattened != nullptr && flattenedBytes != 0) {
          record.flattened.assign(flattened, flattened + flattenedBytes);
      }
@@ -7594,7 +8265,7 @@ index 818478d..fa13c1d 100644
  }
  
  static void BuildScanVertexLayout(GXVtxFmt vtxfmt, std::array<ScanAttrStep, 26>& indexedSteps,
-@@ -813,6 +1113,25 @@ static bool DisplayListMayContainDraw(const uint8_t* data, uint32_t nbytes) {
+@@ -813,6 +1114,25 @@ static bool DisplayListMayContainDraw(const uint8_t* data, uint32_t nbytes) {
      return !WalkDisplayList(data, nbytes, visitor, 0);
  }
  
@@ -7620,7 +8291,7 @@ index 818478d..fa13c1d 100644
  // Interpreter fallback
  struct DlInterpretVisitor {
      static constexpr int kMaxDepth = 8;
-@@ -1059,7 +1378,21 @@ static std::array<AppliedArrayState, GX_VA_MAX_ATTR> s_appliedArrays{};
+@@ -1059,7 +1379,21 @@ static std::array<AppliedArrayState, GX_VA_MAX_ATTR> s_appliedArrays{};
  static bool s_appliedVtxStateMatchesHle = false;
  static uint32_t s_appliedVtxStateGeneration = 0;
  
@@ -7642,7 +8313,7 @@ index 818478d..fa13c1d 100644
      s_appliedVtxDescValid = false;
      s_appliedVtxAttrFmtValid = false;
      s_appliedVtxStateMatchesHle = false;
-@@ -1085,6 +1418,43 @@ static void SyncAppliedVtxStateFromHleReal() {
+@@ -1085,6 +1419,43 @@ static void SyncAppliedVtxStateFromHleReal() {
      std::memcpy(s_appliedSourceVtxDesc.data(), g_hleGxState.vtxDesc, sizeof(g_hleGxState.vtxDesc));
      s_appliedVtxDescValid = true;
  
@@ -7686,7 +8357,7 @@ index 818478d..fa13c1d 100644
      std::memcpy(s_appliedVtxAttrFmt, g_hleGxState.vtxAttrFmt, sizeof(g_hleGxState.vtxAttrFmt));
      s_appliedVtxAttrFmtValid = true;
  
-@@ -1121,6 +1491,16 @@ static void ApplyAuroraVtxDesc() {
+@@ -1121,6 +1492,16 @@ static void ApplyAuroraVtxDesc() {
      if (!hadValidState) {
          s_appliedVtxStateMatchesHle = false;
      }
@@ -7703,7 +8374,7 @@ index 818478d..fa13c1d 100644
      for (int attr = 0; attr < 26; ++attr) {
          if (attr == GX_VA_NBT) continue;
          const GXAttr gxAttr = static_cast<GXAttr>(attr);
-@@ -1134,15 +1514,17 @@ static void ApplyAuroraVtxDesc() {
+@@ -1134,15 +1515,17 @@ static void ApplyAuroraVtxDesc() {
          // (MLB skinned models) makes aurora mis-size each vertex and decode the rest of
          // the list as XF loads.
          if (!needsPublish && gxAttr <= GX_VA_TEX7) {
@@ -7722,7 +8393,7 @@ index 818478d..fa13c1d 100644
          }
      }
      s_appliedVtxDescValid = true;
-@@ -1174,6 +1556,9 @@ static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
+@@ -1174,6 +1557,9 @@ static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
          }
          GXSetVtxAttrFmt(fmt, static_cast<GXAttr>(attr), f.cnt, f.type, f.frac);
          s_appliedVtxAttrFmt[fmt][attr] = f;
@@ -7732,7 +8403,7 @@ index 818478d..fa13c1d 100644
      }
      s_appliedVtxAttrFmtValid = true;
  }
-@@ -1185,6 +1570,12 @@ static void ApplyAuroraVtxAttrFmtAll() {
+@@ -1185,6 +1571,12 @@ static void ApplyAuroraVtxAttrFmtAll() {
  }
  
  static void ApplyAuroraVtxAttrFmtForDisplayList(GXVtxFmt fmt, bool mixed) {
@@ -7745,7 +8416,7 @@ index 818478d..fa13c1d 100644
      if (!mixed && fmt < GX_MAX_VTXFMT) {
          ApplyAuroraVtxAttrFmt(fmt);
          return;
-@@ -1206,6 +1597,44 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
+@@ -1206,6 +1598,44 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
      SyncAppliedVtxStateFromHleReal();
  }
  
@@ -7790,7 +8461,7 @@ index 818478d..fa13c1d 100644
  static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX_ATTR>& maxIdx,
                                              const std::array<bool, GX_VA_MAX_ATTR>& sawIdx,
                                              GXVtxFmt vtxfmt,
-@@ -1252,7 +1681,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
+@@ -1252,7 +1682,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
              ok = false;
              continue;
          }
@@ -7803,7 +8474,7 @@ index 818478d..fa13c1d 100644
      }
      return ok;
  }
-@@ -1298,6 +1731,21 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1298,6 +1732,21 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
          const uint8_t* list = static_cast<const uint8_t*>(GuestToHostPtr(listAddr, nbytes));
          if (!list) return;
  
@@ -7825,7 +8496,7 @@ index 818478d..fa13c1d 100644
          const bool allowScanCache = nbytes <= kDlScanCacheMaxEntryBytes;
          const uint64_t scanLayoutHash = allowScanCache ? HashScanLayoutState() : 0;
          // The digest is computed lazily inside the probe: an entry whose covering
-@@ -1310,11 +1758,30 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1310,11 +1759,30 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
  
          // The scan a cached record came from already walked the list for this,
          // so only a miss pays for DisplayListMayContainDraw.
@@ -7856,7 +8527,7 @@ index 818478d..fa13c1d 100644
              GXCallDisplayList(list, nbytes);
              // The republish is required even for register-only lists (verified by
              // experiment: dropping it corrupts in-race geometry decode). It is
-@@ -1339,8 +1806,26 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1339,8 +1807,26 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
          bool flattenOk = false;
          const uint8_t* auroraStream = nullptr;
          uint32_t auroraStreamBytes = 0;
@@ -7883,7 +8554,7 @@ index 818478d..fa13c1d 100644
              scanOk = entry.scanOk;
              maxIdx = entry.maxIdx;
              sawIdx = entry.sawIdx;
-@@ -1369,8 +1854,17 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1369,8 +1855,17 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                      auroraStream = list;
                      auroraStreamBytes = nbytes;
                  } else {
@@ -7903,7 +8574,7 @@ index 818478d..fa13c1d 100644
                  }
              }
          } else {
-@@ -1426,10 +1920,22 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1426,10 +1921,22 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
  
                  const uint64_t contentDigest =
                      probe.digestValid ? probe.contentDigest : DlContentDigest(list, nbytes);
@@ -7927,7 +8598,7 @@ index 818478d..fa13c1d 100644
              }
          }
  
-@@ -1447,6 +1953,11 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1447,6 +1954,11 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              if (flattenApplyOk) {
                  EnsureAuroraFrameActive();
                  GXMarkFrameWork();
@@ -7939,7 +8610,7 @@ index 818478d..fa13c1d 100644
                  GXCallDisplayList(auroraStream, auroraStreamBytes);
                  // No flip back to GX_DIRECT here
                  SyncAppliedVtxStateFromHleReal();
-@@ -1467,6 +1978,11 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1467,6 +1979,11 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              if (applyOk) {
                  EnsureAuroraFrameActive();
                  GXMarkFrameWork();
@@ -7951,11 +8622,52 @@ index 818478d..fa13c1d 100644
                  GXCallDisplayList(list, nbytes);
  
                  SyncAppliedVtxStateFromHleReal();
+diff --git a/runtime/src/hle/gx/gx_fifo.cpp b/runtime/src/hle/gx/gx_fifo.cpp
+index a77e96e..189f97b 100644
+--- a/runtime/src/hle/gx/gx_fifo.cpp
++++ b/runtime/src/hle/gx/gx_fifo.cpp
+@@ -10,6 +10,16 @@ using namespace GxStream;
+ 
+ HleGxState g_hleGxState;
+ 
++#if defined(__SWITCH__)
++// T8 (switch phase 51): the compute preemption points (os_scheduler.cpp) refuse while a GX command
++// is open: inside GXBegin/GXEnd, while a display list records, or with a partial FIFO command
++// buffered. A switch there would let the idle loop's retrace service do Aurora frame work in the
++// middle of it (run 17's renderer errors came from points inside GXBegin/GXCallDisplayList).
++extern "C" bool GX_HLE_MidCommand() {
++    return IsDisplayListActive() || g_hleGxState.inBegin || g_hleGxState.fifoByteCount != 0;
++}
++#endif
++
+ namespace aurora::gx::fifo {
+ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
+                      uint32_t vertexBytes);
 diff --git a/runtime/src/hle/gx/gx_internal.h b/runtime/src/hle/gx/gx_internal.h
-index 8656dba..7998058 100644
+index 8656dba..de9acc0 100644
 --- a/runtime/src/hle/gx/gx_internal.h
 +++ b/runtime/src/hle/gx/gx_internal.h
-@@ -255,9 +255,34 @@ struct HleGxState {
+@@ -159,6 +159,19 @@ struct TexObjSlot : TexObjMeta {
+     uint32_t indexedSize = 0;
+     bool inIntervalIndex = false;
+     bool pendingIntervalUpdate = false;
++#if defined(__SWITCH__)
++    // G7 (gx_objects.cpp G7FindLoadReadySlot): set by a GXLoadTexObj that completed its full path,
++    // cleared by every metadata write (GetTexObjMeta, the TryGetOrExtractTexObjMeta re-decode) and by
++    // CreateHostTexObj. While set, the fields above are the sanitized metadata that load wrote back,
++    // with `g7LoadSize` the texture size it validated.
++    bool g7LoadReady = false;
++    uint32_t g7LoadSize = 0;
++    // G7: the last ExtractTexObjMetaFromGuest of this slot and the 32 guest bytes it decoded (it reads
++    // nothing else), so the same bytes again are served without the decode.
++    bool g7ExtractValid = false;
++    uint64_t g7ExtractShadow[4] = {0, 0, 0, 0};
++    TexObjMeta g7Extracted{};
++#endif
+ };
+ 
+ struct TlutObjMeta {
+@@ -255,9 +268,34 @@ struct HleGxState {
      size_t fifoReadOffset = 0;
      size_t fifoByteCount = 0;
  
@@ -7990,7 +8702,7 @@ index 8656dba..7998058 100644
          ++vtxStateGeneration;
      }
      GXAttr NextEnabledAttr(int startAttr);
-@@ -343,6 +368,15 @@ TexObjMeta& GetTexObjMeta(uint32_t addr);
+@@ -343,8 +381,57 @@ TexObjMeta& GetTexObjMeta(uint32_t addr);
  TexObjMeta ExtractTexObjMetaFromGuest(uint32_t addr);
  bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta);
  TlutObjMeta& GetTlutObjMeta(uint32_t addr);
@@ -8005,8 +8717,50 @@ index 8656dba..7998058 100644
 +#endif
  GXTexObj* GetHostTexObj(uint32_t addr);
  GXTexObj* TryGetHostTexObj(uint32_t addr);
++#if defined(__SWITCH__)
++// G7 (local/tmp/cpu/G7-tex.py; WIICOMPILED_GX_G7=0 turns it off), gx_objects.cpp.
++extern "C" uint64_t aurora_gx_g7_counters[];
++extern int g_gxG7Enabled; // -1 until GxG7Resolve
++extern int g_gxG7Check;
++[[gnu::cold, gnu::noinline]] void GxG7Resolve() noexcept;
++inline bool GxG7Enabled() noexcept {
++    if (g_gxG7Enabled < 0) [[unlikely]] {
++        GxG7Resolve();
++    }
++    return g_gxG7Enabled != 0;
++}
++// WIICOMPILED_GX_G7_CHECK=1: run the full paths and compare
++inline bool GxG7Check() noexcept {
++    if (g_gxG7Check < 0) [[unlikely]] {
++        GxG7Resolve();
++    }
++    return g_gxG7Check != 0;
++}
++inline void GxG7Count(uint32_t counter, uint64_t n = 1) noexcept { aurora_gx_g7_counters[counter] += n; }
++// aurora fifo.hpp's G7Counter (gx_g7_per_frame in the gx_fifo summary).
++constexpr uint32_t kG7LoadsFast = 0;        // GXLoadTexObj served by the load-ready path
++constexpr uint32_t kG7LoadsFull = 1;        // GXLoadTexObj that ran the full path
++constexpr uint32_t kG7ExtractMemoHits = 2;  // guest GXTexObj re-decodes served from the slot's memo
++constexpr uint32_t kG7Extracts = 3;         // guest GXTexObj re-decodes run
++constexpr uint32_t kG7ImageWrites = 4;      // WriteGuestTexObj as one 32-byte store
++constexpr uint32_t kG7CheckMismatches = 5;  // WIICOMPILED_GX_G7_CHECK=1: shortcut != full path
++// The slot of `addr` when GXLoadTexObj's full path would end exactly where the last one left it:
++// the slot is load-ready (TexObjSlot::g7LoadReady), needs no upload, its host object is constructed,
++// the guest bytes still equal its shadow (so TryGetOrExtractTexObjMeta would hand back the slot as
++// is) and its texture range is still mapped. nullptr otherwise. Caller holds g_texObjMutex.
++TexObjSlot* G7FindLoadReadySlot(uint32_t addr);
++// After a full GXLoadTexObj path wrote its metadata back (and got a host pointer for the data).
++void G7NoteLoadDone(uint32_t addr, uint32_t size);
++// Every TexObjMeta field equal (floats by bits); the check mode's compare.
++bool G7SameTexObjMeta(const TexObjMeta& a, const TexObjMeta& b) noexcept;
++// Host pointer of the 32-byte guest GXTexObj at `addr` when every Memory::Write* of WriteGuestTexObj
++// would take the coarse writable-page path to it (all 32 bytes in one full writable page).
++uint8_t* G7GuestTexObjHost(uint32_t addr) noexcept;
++#endif
  GXTexObj* CreateHostTexObj(uint32_t addr);
-@@ -386,8 +420,29 @@ extern bool g_alphaCompareValid;
+ void MarkHostTexObjConstructed(uint32_t addr);
+ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size);
+@@ -386,8 +473,76 @@ extern bool g_alphaCompareValid;
  extern std::array<BoundTexInfo, 8> g_boundTexMaps;
  extern TexCopyState g_texCopyState;
  
@@ -8018,17 +8772,64 @@ index 8656dba..7998058 100644
 +// pthread layer to libnx's mutexLock/mutexUnlock on every GXLoadTexObj/GXInitTlutObj/GXLoadTlut
 +// (~1% of the main thread, profile-stock1). A test-and-set lock keeps the exclusion, should another
 +// thread ever take one, for an uncontended exchange and a release store.
++struct GxObjMutex;
++// G7 (local/tmp/cpu/G7-tex.py): the lock is taken on one thread only, so with G7 it checks that instead
++// of paying for cross-thread ordering. Run 13b, whole match: the exchange and the release store were
++// ~1% of the main thread (the stlrb waits for every store before it, FIFO packet and guest stores
++// included: 181 of GX__LoadTexObj's 931 samples sit right after it). Owner-checked mode keeps the
++// lock word (re-entry and a second thread abort with a log line instead of racing); mode 0 is the
++// test-and-set lock below. WIICOMPILED_GX_G7=0 or WIICOMPILED_GX_G7_LOCK=0 select mode 0. Resolved
++// once, at the first lock, and never changed after.
++extern int g_gxG7LockMode;                       // -1 unresolved, 0 test-and-set, 1 owner-checked
++extern std::atomic<uintptr_t> g_gxG7LockOwner;   // thread (TPIDRRO_EL0) of the first lock
++void GxG7ResolveLockMode() noexcept;
++[[gnu::cold, gnu::noinline]] void GxG7LockSlow(GxObjMutex& mutex, uintptr_t self) noexcept;
++inline uintptr_t GxG7ThreadId() noexcept {
++    uintptr_t self;
++    __asm__("mrs %0, tpidrro_el0" : "=r"(self));
++    return self;
++}
 +struct GxObjMutex {
 +    std::atomic<bool> held{false};
-+    void lock() noexcept {
++    [[gnu::always_inline]] void lock() noexcept {
++        if (g_gxG7LockMode < 0) [[unlikely]] {
++            GxG7ResolveLockMode();
++        }
++        if (g_gxG7LockMode > 0) [[likely]] {
++            const uintptr_t self = GxG7ThreadId();
++            if (self != g_gxG7LockOwner.load(std::memory_order_relaxed) ||
++                held.load(std::memory_order_relaxed)) [[unlikely]] {
++                GxG7LockSlow(*this, self);
++            }
++            held.store(true, std::memory_order_relaxed);
++            return;
++        }
 +        while (held.exchange(true, std::memory_order_acquire)) {
 +            while (held.load(std::memory_order_relaxed)) {
 +                std::this_thread::sleep_for(std::chrono::microseconds(1));
 +            }
 +        }
 +    }
-+    bool try_lock() noexcept { return !held.exchange(true, std::memory_order_acquire); }
-+    void unlock() noexcept { held.store(false, std::memory_order_release); }
++    bool try_lock() noexcept {
++        if (g_gxG7LockMode < 0) [[unlikely]] {
++            GxG7ResolveLockMode();
++        }
++        if (g_gxG7LockMode > 0) {
++            if (held.load(std::memory_order_relaxed)) {
++                return false;
++            }
++            lock();
++            return true;
++        }
++        return !held.exchange(true, std::memory_order_acquire);
++    }
++    [[gnu::always_inline]] void unlock() noexcept {
++        if (g_gxG7LockMode > 0) [[likely]] {
++            held.store(false, std::memory_order_relaxed);
++            return;
++        }
++        held.store(false, std::memory_order_release);
++    }
 +};
 +#else
 +using GxObjMutex = std::mutex;
@@ -8064,10 +8865,10 @@ index 1b1d392..8a03ec3 100644
      InitializeHostLightFromGuest(host, la);
      GXLoadLightObjImm(&host, static_cast<GXLightID>(lid));
 diff --git a/runtime/src/hle/gx/gx_objects.cpp b/runtime/src/hle/gx/gx_objects.cpp
-index ec98605..7b76e63 100644
+index ec98605..ba3e1b7 100644
 --- a/runtime/src/hle/gx/gx_objects.cpp
 +++ b/runtime/src/hle/gx/gx_objects.cpp
-@@ -66,9 +66,9 @@ struct HleTlutObj {
+@@ -66,9 +66,50 @@ struct HleTlutObj {
      }
  };
  
@@ -8076,10 +8877,51 @@ index ec98605..7b76e63 100644
  std::map<uint32_t, std::unique_ptr<HleTlutObj>> g_HostTlutObjMap;
 -std::mutex g_tlutObjMutex;
 +GxObjMutex g_tlutObjMutex;
++
++#if defined(__SWITCH__)
++// G7 (local/tmp/cpu/G7-tex.py): switches, counters and the owner-checked GxObjMutex (gx_internal.h).
++extern "C" int aurora_gx_g7_enabled(void);
++extern "C" int aurora_gx_g7_check(void);
++extern "C" int aurora_gx_g7_lock(void);
++
++int g_gxG7LockMode = -1;
++std::atomic<uintptr_t> g_gxG7LockOwner{0};
++int g_gxG7Enabled = -1;
++int g_gxG7Check = -1;
++
++void GxG7Resolve() noexcept {
++    g_gxG7Enabled = aurora_gx_g7_enabled() != 0 ? 1 : 0;
++    g_gxG7Check = aurora_gx_g7_check() != 0 ? 1 : 0;
++}
++
++void GxG7ResolveLockMode() noexcept {
++    g_gxG7LockMode = (aurora_gx_g7_enabled() != 0 && aurora_gx_g7_lock() != 0) ? 1 : 0;
++}
++
++void GxG7LockSlow(GxObjMutex& mutex, uintptr_t self) noexcept {
++    uintptr_t owner = g_gxG7LockOwner.load(std::memory_order_relaxed);
++    if (owner == 0 && g_gxG7LockOwner.compare_exchange_strong(owner, self, std::memory_order_relaxed)) {
++        owner = self;
++    }
++    if (owner != self) {
++        RT_LOGF(RT_TAG_GX,
++                "G7: a GX texture/TLUT object lock was taken on a second thread (0x%llx, owner 0x%llx); "
++                "this lock assumes one thread. Run with WIICOMPILED_GX_G7_LOCK=0.\n",
++                static_cast<unsigned long long>(self), static_cast<unsigned long long>(owner));
++        std::fflush(stderr);
++        std::abort();
++    }
++    if (mutex.held.load(std::memory_order_relaxed)) {
++        RT_LOGF(RT_TAG_GX, "G7: a GX texture/TLUT object lock was re-entered (the lock would deadlock)\n");
++        std::fflush(stderr);
++        std::abort();
++    }
++}
++#endif
  
  // The texobj table. One slot per guest GXTexObj address holds both the decoded
  // metadata and the Aurora object, so GXLoadTexObj resolves everything it needs
-@@ -85,6 +85,23 @@ namespace {
+@@ -85,6 +126,23 @@ namespace {
  uint32_t g_texObjSlotMemoAddr = 0;
  TexObjSlot* g_texObjSlotMemo = nullptr;
  
@@ -8103,7 +8945,7 @@ index ec98605..7b76e63 100644
  constexpr size_t kTexObjTableReserve = 1024;
  
  } // namespace
-@@ -237,12 +254,23 @@ TexObjSlot* FindTexObjSlot(uint32_t addr) {
+@@ -237,12 +295,23 @@ TexObjSlot* FindTexObjSlot(uint32_t addr) {
      if (g_texObjSlotMemo != nullptr && g_texObjSlotMemoAddr == addr) {
          return g_texObjSlotMemo;
      }
@@ -8127,7 +8969,7 @@ index ec98605..7b76e63 100644
      return g_texObjSlotMemo;
  }
  
-@@ -419,6 +447,49 @@ void EnsureTlutObjBoundsLocked() {
+@@ -419,6 +488,49 @@ void EnsureTlutObjBoundsLocked() {
      g_tlutObjBoundsDirty = false;
  }
  
@@ -8177,7 +9019,163 @@ index ec98605..7b76e63 100644
  bool TexObjBackingDiffers(const TexObjMeta& lhs, const TexObjMeta& rhs) {
      return CanonicalizeGxMainRamAddress(lhs.dataAddr) != CanonicalizeGxMainRamAddress(rhs.dataAddr) ||
             lhs.width != rhs.width ||
-@@ -548,9 +619,49 @@ TexObjMeta& GetTexObjMeta(uint32_t addr) {
+@@ -484,6 +596,50 @@ void MarkTexObjSyncedLocked(TexObjSlot& slot) noexcept {
+ 
+ } // namespace
+ 
++#if defined(__SWITCH__)
++// G7 check mode: every field, floats by bits.
++bool G7SameTexObjMeta(const TexObjMeta& a, const TexObjMeta& b) noexcept {
++    const auto bits = [](float f) {
++        uint32_t u = 0;
++        std::memcpy(&u, &f, sizeof(u));
++        return u;
++    };
++    return a.dataAddr == b.dataAddr && a.width == b.width && a.height == b.height && a.format == b.format &&
++           a.wrapS == b.wrapS && a.wrapT == b.wrapT && a.tlut == b.tlut && a.minFilter == b.minFilter &&
++           a.magFilter == b.magFilter && bits(a.minLod) == bits(b.minLod) && bits(a.maxLod) == bits(b.maxLod) &&
++           bits(a.lodBias) == bits(b.lodBias) && a.maxAniso == b.maxAniso && a.biasClamp == b.biasClamp &&
++           a.edgeLod == b.edgeLod && a.mipmap == b.mipmap && a.userData == b.userData &&
++           a.needsUpload == b.needsUpload;
++}
++
++// G7: ExtractTexObjMetaFromGuest(addr) for the 32 guest bytes `shadow` just read at addr. The decode
++// reads those bytes and nothing else, so the same bytes give the same result: MLB re-initialises
++// most of its texture objects (GXInitTexObjCI + GXInitTexObjLOD) with the same arguments before every
++// load, and each load used to decode them again.
++static TexObjMeta G7ExtractTexObjMeta(TexObjSlot& slot, uint32_t addr, const uint64_t (&shadow)[4]) {
++    if (!GxG7Enabled()) {
++        return ExtractTexObjMetaFromGuest(addr);
++    }
++    if (slot.g7ExtractValid && ShadowEquals(slot.g7ExtractShadow, shadow)) {
++        GxG7Count(kG7ExtractMemoHits);
++        if (GxG7Check()) {
++            const TexObjMeta fresh = ExtractTexObjMetaFromGuest(addr);
++            if (!G7SameTexObjMeta(fresh, slot.g7Extracted)) {
++                GxG7Count(kG7CheckMismatches);
++                return fresh;
++            }
++        }
++        return slot.g7Extracted;
++    }
++    GxG7Count(kG7Extracts);
++    const TexObjMeta extracted = ExtractTexObjMetaFromGuest(addr);
++    std::memcpy(slot.g7ExtractShadow, shadow, sizeof(slot.g7ExtractShadow));
++    slot.g7Extracted = extracted;
++    slot.g7ExtractValid = true;
++    return extracted;
++}
++#endif
++
+ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+     TexObjSlot* slot = FindTexObjSlot(addr);
+     if (slot != nullptr) {
+@@ -493,6 +649,16 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+             // full 32-byte compare (not a generation stamp) is what catches plain guest stores
+             // over the struct that never issue a cache op; see TexObjSlot::guestShadow.
+             uint64_t shadow[4];
++#if defined(__SWITCH__)
++            const bool shadowRead = ReadTexObjShadow(addr, shadow);
++            if (shadowRead && slot->hasGuestShadow && ShadowEquals(slot->guestShadow, shadow)) {
++                outMeta = *slot;
++                return true;
++            }
++
++            const TexObjMeta extracted =
++                shadowRead ? G7ExtractTexObjMeta(*slot, addr, shadow) : ExtractTexObjMetaFromGuest(addr);
++#else
+             if (ReadTexObjShadow(addr, shadow) && slot->hasGuestShadow &&
+                 ShadowEquals(slot->guestShadow, shadow)) {
+                 outMeta = *slot;
+@@ -500,6 +666,7 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+             }
+ 
+             const TexObjMeta extracted = ExtractTexObjMetaFromGuest(addr);
++#endif
+             if (IsUsableTexObjMeta(extracted) && TexObjMetaDiffers(*slot, extracted)) {
+                 // The caller writes the merged result back through
+                 // GetTexObjMeta, which is what re-establishes the sync.
+@@ -517,6 +684,9 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+         const bool extractedUsable = IsUsableTexObjMeta(extracted);
+         if (extractedUsable) {
+             QueueTexObjIntervalUpdate(*slot);
++#if defined(__SWITCH__)
++            slot->g7LoadReady = false;
++#endif
+             static_cast<TexObjMeta&>(*slot) = extracted;
+             MarkTexObjSyncedLocked(*slot);
+             outMeta = extracted;
+@@ -541,16 +711,119 @@ TexObjMeta& GetTexObjMeta(uint32_t addr) {
+     TexObjSlot& slot = FindOrCreateTexObjSlot(addr);
+     QueueTexObjIntervalUpdate(slot);
+     MarkTexObjSyncedLocked(slot);
++#if defined(__SWITCH__)
++    slot.g7LoadReady = false; // the caller is about to write the metadata
++#endif
+     return slot;
+ }
+ 
++#if defined(__SWITCH__)
++namespace {
++bool G7IsNan(float value) noexcept {
++    uint32_t bits = 0;
++    std::memcpy(&bits, &value, sizeof(bits));
++    return (bits & 0x7FFFFFFFu) > 0x7F800000u;
++}
++} // namespace
++
++// G7: what GX__LoadTexObj's full path does for a load-ready slot, step by step (after the caller's
++// lock and tid check): TryGetOrExtractTexObjMeta takes its shadow-equal path and hands back the slot;
++// the metadata passes every rejection test it passed when the slot became ready (a function of the
++// metadata, plus Memory::Contains of the same range, re-checked here); the sanitize step leaves the
++// sanitized metadata as is (each step is idempotent; NaN LODs never become ready); needsInit is false
++// (host constructed, cached == meta); no TLUT change; no upload (needsUpload false); then the binding
++// record and GXLoadTexObj as for any load; the two `GetTexObjMeta(oa) = meta` write-backs store the
++// same values, queue an interval patch that finds nothing to change (the slot's interval fields did
++// not move) and re-read the same shadow. So the caller only has to run the binding tail.
++TexObjSlot* G7FindLoadReadySlot(uint32_t addr) {
++    TexObjSlot* slot = FindTexObjSlot(addr);
++    if (slot == nullptr || !slot->g7LoadReady || slot->needsUpload || !slot->hasGuestShadow || !slot->host ||
++        !slot->host->constructed) {
++        return nullptr;
++    }
++    uint64_t shadow[4];
++    if (!ReadTexObjShadow(addr, shadow) || !ShadowEquals(slot->guestShadow, shadow)) {
++        return nullptr;
++    }
++    if (!Memory::Contains(slot->dataAddr, slot->g7LoadSize)) {
++        return nullptr;
++    }
++    return slot;
++}
++
++void G7NoteLoadDone(uint32_t addr, uint32_t size) {
++    TexObjSlot* slot = FindTexObjSlot(addr);
++    if (slot == nullptr || slot->needsUpload || size == 0 || !slot->host || !slot->host->constructed ||
++        G7IsNan(slot->minLod) || G7IsNan(slot->maxLod) || G7IsNan(slot->lodBias)) {
++        return;
++    }
++    slot->g7LoadReady = true;
++    slot->g7LoadSize = size;
++}
++
++uint8_t* G7GuestTexObjHost(uint32_t addr) noexcept {
++    if (!GxG7Enabled()) {
++        return nullptr;
++    }
++    const uint32_t end = addr + 31u;
++    if (end < addr || (end >> MemoryInline::kPageShift) != (addr >> MemoryInline::kPageShift)) {
++        return nullptr;
++    }
++    const uintptr_t encodedBias = MemoryInline::g_fullWritablePageBias[addr >> MemoryInline::kPageShift];
++    if (encodedBias == 0) {
++        return nullptr;
++    }
++    return reinterpret_cast<uint8_t*>((encodedBias - 1u) + addr);
++}
++#endif
++
+ // Same contract as GetTexObjMeta: the caller mutates the returned reference, so
  // the cached TLUT address bounds have to be recomputed before the next flush.
  TlutObjMeta& GetTlutObjMeta(uint32_t addr) {
      g_tlutObjBoundsDirty = true;
@@ -8227,7 +9225,17 @@ index ec98605..7b76e63 100644
  GXTexObj* GetHostTexObj(uint32_t addr) {
      TexObjSlot* slot = FindTexObjSlot(addr);
      if (slot == nullptr || !slot->host || !slot->host->constructed) {
-@@ -610,7 +721,7 @@ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size) {
+@@ -573,6 +846,9 @@ GXTexObj* CreateHostTexObj(uint32_t addr) {
+     // The shadow captured before that rewrite mismatches afterwards, so the
+     // next lookup takes exactly one guest re-decode and picks those defaults
+     // (and the computed mipmap maxLod) up.
++#if defined(__SWITCH__)
++    slot.g7LoadReady = false;
++#endif
+     if (!slot.host) {
+         slot.host = std::make_unique<HleTexObj>();
+     } else {
+@@ -610,7 +886,7 @@ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size) {
  
      const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
      const uint64_t dirtyEnd = dirtyStart + size;
@@ -8236,7 +9244,7 @@ index ec98605..7b76e63 100644
  
      EnsureTexObjIntervalsLocked();
      const auto lower = std::lower_bound(
-@@ -660,7 +771,11 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size) {
+@@ -660,7 +936,11 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size) {
  }
  
  GXTlutObj* CreateHostTlutObj(uint32_t addr) {
@@ -8248,7 +9256,7 @@ index ec98605..7b76e63 100644
      if (!slot) {
          slot = std::make_unique<HleTlutObj>();
      } else {
-@@ -671,6 +786,12 @@ GXTlutObj* CreateHostTlutObj(uint32_t addr) {
+@@ -671,6 +951,12 @@ GXTlutObj* CreateHostTlutObj(uint32_t addr) {
  }
  
  void MarkHostTlutObjConstructed(uint32_t addr) {
@@ -8261,7 +9269,7 @@ index ec98605..7b76e63 100644
      auto it = g_HostTlutObjMap.find(addr);
      if (it != g_HostTlutObjMap.end() && it->second) {
          it->second->constructed = true;
-@@ -678,6 +799,12 @@ void MarkHostTlutObjConstructed(uint32_t addr) {
+@@ -678,6 +964,12 @@ void MarkHostTlutObjConstructed(uint32_t addr) {
  }
  
  GXTlutObj* GetHostTlutObj(uint32_t addr) {
@@ -8274,7 +9282,7 @@ index ec98605..7b76e63 100644
      auto it = g_HostTlutObjMap.find(addr);
      if (it == g_HostTlutObjMap.end() || !it->second || !it->second->constructed) {
          const CpuContext* cpu = TryGetCpuContext();
-@@ -699,7 +826,7 @@ void MarkTlutObjsDirtyForRange(uint32_t addr, uint32_t size) {
+@@ -699,7 +991,7 @@ void MarkTlutObjsDirtyForRange(uint32_t addr, uint32_t size) {
  
      const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
      const uint64_t dirtyEnd = dirtyStart + size;
@@ -8343,10 +9351,48 @@ index 006ab47..8ed9d12 100644
          if (!options.includeNbt && attr == GX_VA_NBT) {
              continue;
 diff --git a/runtime/src/hle/gx/gx_texture.cpp b/runtime/src/hle/gx/gx_texture.cpp
-index b5ebedd..0bd096e 100644
+index b5ebedd..9bbfaf5 100644
 --- a/runtime/src/hle/gx/gx_texture.cpp
 +++ b/runtime/src/hle/gx/gx_texture.cpp
-@@ -250,7 +250,7 @@ extern "C" void GX__InitTexObj_801707f8(uint32_t oa, uint32_t da, uint32_t w, ui
+@@ -11,6 +11,13 @@ static void WriteGuestTexObj(uint32_t addr, uint32_t dataAddr, uint16_t width, u
+                              uint32_t format, uint32_t wrapS, uint32_t wrapT, bool mipmap,
+                              bool writeTlut, uint32_t tlut) {
+     dataAddr = CanonicalizeGxMainRamAddress(dataAddr);
++#if defined(__SWITCH__)
++    // G7: when all 32 bytes sit in one full writable 1 MiB page, each Memory::Write* below takes
++    // MkwTryWriteGuestScalarCoarse to (bias - 1) + its address, so the final bytes are written as one
++    // image instead (the zeroing pass included: word 4, and word 6 without a TLUT, stay 0).
++    uint8_t* const g7Host = G7GuestTexObjHost(addr);
++    if (g7Host == nullptr)
++#endif
+     for (int i = 0; i < 8; i++) {
+         Memory::Write32(addr + i * 4, 0);
+     }
+@@ -79,6 +86,23 @@ static void WriteGuestTexObj(uint32_t addr, uint32_t dataAddr, uint16_t width, u
+     const uint16_t blockCount = static_cast<uint16_t>((blocksX * blocksY) & 0x7FFFu);
+     uint8_t flags = mipmap ? 0x03u : 0x02u;
+ 
++#if defined(__SWITCH__)
++    if (g7Host != nullptr) {
++        const uint32_t image[8] = {
++            __builtin_bswap32(word0),
++            __builtin_bswap32(word1),
++            __builtin_bswap32(word2),
++            __builtin_bswap32(word3),
++            0u,
++            __builtin_bswap32(format),
++            writeTlut ? __builtin_bswap32(tlut) : 0u,
++            __builtin_bswap32((static_cast<uint32_t>(blockCount) << 16) | (static_cast<uint32_t>(blockType) << 8) | flags),
++        };
++        std::memcpy(g7Host, image, sizeof(image));
++        GxG7Count(kG7ImageWrites);
++        return;
++    }
++#endif
+     Memory::Write32(addr + 0x00, word0);
+     Memory::Write32(addr + 0x04, word1);
+     Memory::Write32(addr + 0x08, word2);
+@@ -250,7 +274,7 @@ extern "C" void GX__InitTexObj_801707f8(uint32_t oa, uint32_t da, uint32_t w, ui
                  oa, da, w, h, f, ws, wt, m, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
      }
      const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
@@ -8355,7 +9401,7 @@ index b5ebedd..0bd096e 100644
      meta.dataAddr=canonicalDataAddr; meta.width=(u16)w; meta.height=(u16)h; meta.format=f; meta.wrapS=ws; meta.wrapT=wt; meta.mipmap=(m!=0); meta.userData=0; meta.needsUpload=true;
      GXInitTexObj(obj, GuestToHostPtr(da), (u16)w, (u16)h, (GXTexFmt)f, (GXTexWrapMode)ws, (GXTexWrapMode)wt, (GXBool)m); MarkHostTexObjConstructed(oa);
      // Also write to guest memory so reads work
-@@ -291,7 +291,7 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
+@@ -291,7 +315,7 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
                  oa, da, w, h, f, ws, wt, m, tl, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
      }
      const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
@@ -8364,7 +9410,7 @@ index b5ebedd..0bd096e 100644
      meta.dataAddr=canonicalDataAddr; meta.width=(u16)w; meta.height=(u16)h; meta.format=f; meta.wrapS=ws; meta.wrapT=wt; meta.mipmap=(m!=0); meta.tlut=tl; meta.userData=0; meta.needsUpload=true;
      GXInitTexObjCI(obj, GuestToHostPtr(da), (u16)w, (u16)h, (GXCITexFmt)f, (GXTexWrapMode)ws, (GXTexWrapMode)wt, (GXBool)m, tl); MarkHostTexObjConstructed(oa);
      // Also write to guest memory so reads work
-@@ -306,7 +306,7 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
+@@ -306,7 +330,7 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
  PPC_NATIVE_OVERRIDE_VOID(80170a04, GX__InitTexObjCI_80170a04, (uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m, uint32_t tl), (oa, da, w, h, f, ws, wt, m, tl));
  
  extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma) {
@@ -8373,7 +9419,7 @@ index b5ebedd..0bd096e 100644
      float fmal = std::isfinite(mal) && mal >= 0.f ? mal : 0.f, fmil = std::isfinite(mil) && mil >= 0.f ? std::min(mil, fmal) : 0.f;
      meta.minFilter=mif; meta.magFilter=maf; meta.minLod=fmil; meta.maxLod=fmal; meta.lodBias=lb; meta.biasClamp=(bc!=0); meta.edgeLod=(el!=0); meta.maxAniso=ma;
      GXInitTexObjLOD(obj, (GXTexFilter)mif, (GXTexFilter)maf, fmil, fmal, lb, (GXBool)bc, (GXBool)el, (GXAnisotropy)ma);
-@@ -316,7 +316,7 @@ extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t m
+@@ -316,7 +340,7 @@ extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t m
  PPC_NATIVE_OVERRIDE_VOID(80170a4c, GX__InitTexObjLOD_80170a4c, (uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma), (oa, mif, maf, mil, mal, lb, bc, el, ma));
  
  extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32_t wt) {
@@ -8382,7 +9428,7 @@ index b5ebedd..0bd096e 100644
      GXTexObj* obj = GetHostTexObj(oa);
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.wrapS = ws;
-@@ -332,7 +332,7 @@ extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32
+@@ -332,7 +356,7 @@ extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32
  PPC_NATIVE_OVERRIDE_VOID(80170b50, GX__InitTexObjWrapMode_80170b50, (uint32_t oa, uint32_t ws, uint32_t wt), (oa, ws, wt));
  
  extern "C" void GX__InitTexObjTlut_80170b64(uint32_t oa, uint32_t tl) {
@@ -8391,7 +9437,7 @@ index b5ebedd..0bd096e 100644
      GXTexObj* obj = GetHostTexObj(oa);
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.tlut = tl;
-@@ -347,7 +347,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b64, GX__InitTexObjTlut_80170b64, (uint32_t oa, ui
+@@ -347,7 +371,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b64, GX__InitTexObjTlut_80170b64, (uint32_t oa, ui
  
  // GXInitTexObjFilter - sets mag/min filter modes
  extern "C" void GX__InitTexObjFilter_80170b6c(uint32_t oa, uint32_t minFilter, uint32_t magFilter) {
@@ -8400,7 +9446,7 @@ index b5ebedd..0bd096e 100644
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.minFilter = minFilter;
      meta.magFilter = magFilter;
-@@ -375,7 +375,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b6c, GX__InitTexObjFilter_80170b6c, (uint32_t oa,
+@@ -375,7 +399,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b6c, GX__InitTexObjFilter_80170b6c, (uint32_t oa,
  
  // GXInitTexObjLODBias - sets LOD bias value
  extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
@@ -8409,7 +9455,7 @@ index b5ebedd..0bd096e 100644
      TexObjMeta& meta = GetTexObjMeta(oa);
      
      // Clamp bias to [-4.0, 3.99...] range as per SDK
-@@ -404,7 +404,7 @@ extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
+@@ -404,7 +428,7 @@ extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
  PPC_NATIVE_OVERRIDE_VOID(80170b94, GX__InitTexObjLODBias_80170b94, (uint32_t oa, float bias), (oa, bias));
  
  extern "C" void GX__InitTexObjUserData_80170be8(uint32_t oa, uint32_t userData) {
@@ -8418,7 +9464,7 @@ index b5ebedd..0bd096e 100644
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.userData = userData;
  
-@@ -454,7 +454,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -454,7 +478,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
      static uint32_t s_metaLookupLogCount = 0;
      static uint32_t s_unknownFormatLogCount = 0;
      static uint32_t s_invalidDataLogCount = 0;
@@ -8427,7 +9473,65 @@ index b5ebedd..0bd096e 100644
  
      if (tid >= g_boundTexMaps.size()) {
          if (s_invalidTidLogCount < 128) {
-@@ -548,9 +548,14 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -464,6 +488,57 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+         return;
+     }
+     
++#if defined(__SWITCH__)
++    // G7: a texture object loaded before and unchanged since (guest bytes, metadata, host object, no
++    // upload pending; G7FindLoadReadySlot in gx_objects.cpp says why): of the full path below only the
++    // binding tail has an effect, so that is all this runs, with the same exception handling and the
++    // same guest stores at the end. WIICOMPILED_GX_G7_CHECK=1 runs the full path and compares.
++    TexObjSlot* g7Ready = nullptr;
++    BoundTexInfo g7Bound{};
++    bool g7Skip = false;
++    TexObjMeta g7Meta{};
++    if (GxG7Enabled()) {
++        g7Ready = G7FindLoadReadySlot(oa);
++        if (g7Ready != nullptr) {
++            static_cast<GxTextureBindingContract::SamplerState&>(g7Bound) = *g7Ready;
++            g7Bound.objAddr = oa;
++            g7Bound.dataAddr = CanonicalizeGxMainRamAddress(g7Ready->dataAddr);
++            g7Skip = GxTextureBindingContract::CanSkipHostLoad(g_boundTexMaps[tid], g7Bound, false, false, false);
++            if (!GxG7Check()) {
++                GxG7Count(kG7LoadsFast);
++                try {
++                    g_boundTexMaps[tid] = g7Bound;
++                    if (!g7Skip) {
++                        GXLoadTexObj(g7Ready->host->PublicPtr(), (GXTexMapID)tid);
++                    }
++                } catch (const std::exception& ex) {
++                    g7Ready->g7LoadReady = false;
++                    if (s_hostExceptionLogCount++ < 64) {
++                        RT_LOGF(RT_TAG_GX,
++                                "GXLoadTexObj rejected reason=host-exception (%s) oa=0x%08X tid=%u fmt=0x%X %ux%u data=0x%08X\n",
++                                ex.what(), oa, tid, g7Ready->format, g7Ready->width, g7Ready->height,
++                                g7Ready->dataAddr);
++                    }
++                    BindUnloadableTexturePlaceholder(tid);
++                    return;
++                } catch (...) {
++                    g7Ready->g7LoadReady = false;
++                    if (s_hostExceptionLogCount++ < 64) {
++                        RT_LOGF(RT_TAG_GX,
++                                "GXLoadTexObj rejected reason=host-exception-unknown oa=0x%08X tid=%u fmt=0x%X %ux%u data=0x%08X\n",
++                                oa, tid, g7Ready->format, g7Ready->width, g7Ready->height, g7Ready->dataAddr);
++                    }
++                    BindUnloadableTexturePlaceholder(tid);
++                    return;
++                }
++                try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) { Memory::Write32(gd + 0x5FCu, Memory::Read32(gd + 0x5FCu) | 1u); Memory::Write16(gd + 2, 0); } } catch (...) {}
++                return;
++            }
++            g7Meta = *g7Ready;
++        }
++        GxG7Count(kG7LoadsFull);
++    }
++#endif
+     // Check if we have metadata for this texture, or try to extract it from guest memory
+     TexObjMeta meta;
+     if (!TryGetOrExtractTexObjMeta(oa, meta)) {
+@@ -548,9 +623,14 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
      GXTexObj* obj = TryGetHostTexObj(oa);
      const bool isPalette = IsPaletteTexFormat(meta.format);
      bool needsInit = (obj == nullptr);
@@ -8444,7 +9548,7 @@ index b5ebedd..0bd096e 100644
          if (cached.width != meta.width || cached.height != meta.height || cached.format != meta.format ||
              cached.wrapS != meta.wrapS || cached.wrapT != meta.wrapT || cached.mipmap != meta.mipmap ||
              cached.minFilter != meta.minFilter || cached.magFilter != meta.magFilter ||
-@@ -586,7 +591,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -586,7 +666,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
              // Write through GetTexObjMeta so the DCStoreRange interval index is
              // told this entry's backing may have moved.
              GetTexObjMeta(oa) = meta;
@@ -8453,7 +9557,28 @@ index b5ebedd..0bd096e 100644
              GXInitTexObjTlut(obj, meta.tlut);
              GetTexObjMeta(oa).tlut = meta.tlut;
              tlutChanged = true;
-@@ -643,7 +648,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170dc8, GX__LoadTexObjPreLoaded_80170dc8, (uint32_t o
+@@ -614,6 +694,20 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+         if (!canSkipHostLoad) {
+             GXLoadTexObj(obj, (GXTexMapID)tid);
+         }
++#if defined(__SWITCH__)
++        if (GxG7Enabled()) {
++            // Check mode: the shortcut above would have bound the same record, made the same
++            // GXLoadTexObj decision and left the same metadata.
++            if (g7Ready != nullptr &&
++                (needsInit || tlutChanged || textureDataUploaded || canSkipHostLoad != g7Skip ||
++                 !GxTextureBindingContract::SameBinding(newBound, g7Bound) || !G7SameTexObjMeta(meta, g7Meta))) {
++                GxG7Count(kG7CheckMismatches);
++            }
++            if (dp != nullptr) {
++                G7NoteLoadDone(oa, size);
++            }
++        }
++#endif
+     } catch (const std::exception& ex) {
+         if (s_hostExceptionLogCount++ < 64) {
+             RT_LOGF(RT_TAG_GX,
+@@ -643,7 +737,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170dc8, GX__LoadTexObjPreLoaded_80170dc8, (uint32_t o
  // ============================================================================
  
  extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp) {
@@ -8462,7 +9587,7 @@ index b5ebedd..0bd096e 100644
      TexObjMeta meta;
      if (!TryGetOrExtractTexObjMeta(oa, meta)) {
          RT_LOGF(RT_TAG_GX, "GXGetTexObjAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
-@@ -657,7 +662,7 @@ extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp,
+@@ -657,7 +751,7 @@ extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp,
  PPC_NATIVE_OVERRIDE_VOID(80170bf8, GX__GetTexObjAll_80170bf8, (uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp), (oa, dp, wp, hp, fp, wsp, wtp, mp));
  
  extern "C" void GX__GetTexObjLODAll_80170cbc(uint32_t oa, uint32_t mifp, uint32_t mafp, uint32_t milp, uint32_t malp, uint32_t lbp, uint32_t bcp, uint32_t elp, uint32_t map) {
@@ -8471,7 +9596,7 @@ index b5ebedd..0bd096e 100644
      TexObjMeta meta;
      if (!TryGetOrExtractTexObjMeta(oa, meta)) {
          RT_LOGF(RT_TAG_GX, "GXGetTexObjLODAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
-@@ -676,8 +681,13 @@ PPC_NATIVE_OVERRIDE_VOID(80170cbc, GX__GetTexObjLODAll_80170cbc, (uint32_t oa, u
+@@ -676,8 +770,13 @@ PPC_NATIVE_OVERRIDE_VOID(80170cbc, GX__GetTexObjLODAll_80170cbc, (uint32_t oa, u
  // ============================================================================
  
  extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, uint32_t e) {
@@ -8485,7 +9610,7 @@ index b5ebedd..0bd096e 100644
      // Leave the object unconstructed on a bad descriptor. A later GXLoadTlut
      // then takes GetHostTlutObj's soft-fail path and gets a fresh empty object
      // instead of aurora reading entries*2 bytes off an unvalidated pointer.
-@@ -686,7 +696,26 @@ extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, u
+@@ -686,7 +785,26 @@ extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, u
  }
  PPC_NATIVE_OVERRIDE_VOID(80170f80, GX__InitTlutObj_80170f80, (uint32_t oa, uint32_t da, uint32_t f, uint32_t e), (oa, da, f, e));
  
@@ -8599,12 +9724,36 @@ index 80c9be0..cbf22cc 100644
          }
      }
      if (vf >= GX_MAX_VTXFMT || a < GX_VA_POS || a >= GX_VA_MAX_ATTR) {
+diff --git a/runtime/src/hle/input/wpad.cpp b/runtime/src/hle/input/wpad.cpp
+index b3985ff..f46ef94 100644
+--- a/runtime/src/hle/input/wpad.cpp
++++ b/runtime/src/hle/input/wpad.cpp
+@@ -2,6 +2,9 @@
+ #include "memory.h"
+ #include "hle/controller_status_contract.h"
+ #include "wii_remote_input.h"
++#if defined(__SWITCH__)
++#include "compute_preempt.h"
++#endif
+ 
+ #include <cstdint>
+ 
+@@ -35,6 +38,9 @@ void InvokeWpadCallback(uint32_t callback, uint32_t chan, int32_t result)
+     auto& cpu = GetPersistentCpuContext();
+     cpu.gpr[3] = chan;
+     cpu.gpr[4] = static_cast<uint32_t>(result);
++#if defined(__SWITCH__)
++    MkwComputePreemptHoldScope interruptLevel;  // T8: the WPAD completion callback
++#endif
+     InvokeIndirectCpu(callback, &cpu);
+ }
+ 
 diff --git a/runtime/src/hle/mlb/envmap_natives.cpp b/runtime/src/hle/mlb/envmap_natives.cpp
 new file mode 100644
-index 0000000..01ef176
+index 0000000..4e7543c
 --- /dev/null
 +++ b/runtime/src/hle/mlb/envmap_natives.cpp
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,512 @@
 +// MLB Power Pros 2008 (RL8E54): a native 0x8000D770, the CPU sphere-map pass, the hottest game
 +// function of a match on the Switch main thread (run 5 profile: 4.1% self plus ~0.8% in the sqrt
 +// native it calls once per vertex).
@@ -8671,6 +9820,7 @@ index 0000000..01ef176
 +#include "abi_bridge.h"
 +#include "memory.h"
 +#include "ppc_runtime.h"
++#include "compute_preempt.h"
 +
 +extern "C" void func_8000D770(CpuContext* ctx);              // the translation (kept: _AS registration)
 +extern "C" void MLB_PSMTXConcat_800A890C(CpuContext* ctx);   // hle/mlb/mtx_natives.cpp
@@ -8999,7 +10149,10 @@ index 0000000..01ef176
 +        ctx->gpr[3] = gfx + 8028u;
 +        ctx->gpr[4] = sp + 208u;
 +        ctx->gpr[5] = sp + 160u;
-+        MLB_PSMTXConcat_800A890C(ctx);
++        {
++            MkwComputePreemptHoldScope nested;  // T8: no compute preemption point inside this native
++            MLB_PSMTXConcat_800A890C(ctx);
++        }
 +        // R = M without its translation column, at sp+0x70 (r28-r30 keep M's first row).
 +        for (uint32_t w = 0; w < 12; ++w) Store32(sp + 0x70u + 4u * w, Load32(sp + 0xA0u + 4u * w));
 +        r30 = Load32(sp + 0xA0u);
@@ -9112,2108 +10265,4 @@ index 0000000..01ef176
 +    ctx->gpr[1] = r10;
 +}
 +REGISTER_NATIVE_FUNCTION_AS(0x8000D770, MLB_EnvMapCoords_8000D770, "EnvMapCoords");
-+#endif
-diff --git a/runtime/src/hle/mlb/mix_natives.cpp b/runtime/src/hle/mlb/mix_natives.cpp
-new file mode 100644
-index 0000000..f3daee6
---- /dev/null
-+++ b/runtime/src/hle/mlb/mix_natives.cpp
-@@ -0,0 +1,1637 @@
-+// MLB Power Pros 2008 (RL8E54): a native MIXUpdateSettings (0x800BFB24, the AX MIX library),
-+// 1.8% of the Switch main thread in the stock match profile (run 3), plus the 1.1% of its
-+// per-voice callee __MIXRmtUpdateSettings (0x800C1264).
-+//
-+// Who calls it: the game's sound engine thread (0x80027A54), woken every 5 ms by its ticker
-+// thread (0x80027BF8, OSSleepTicks), walks its 55 channels (0x8002D768) and calls
-+// MIXUpdateSettings once per channel that starts or fades, after each MIXSetFader; every call
-+// walks all AX voices (r13-27104) and calls __MIXRmtUpdateSettings for each one that has a
-+// voice. The AX user frame callback (0x80027BF4) is an empty blr. All of it is guest-thread code
-+// (fibers on the main thread), as the single Broadway core ran it on the Wii: the per-frame
-+// cost is the game's own, not an HLE artefact.
-+//
-+// The translation spends most of that time on the call boundary: one InvokeDirectCpu with a
-+// full register sync, a guest stack frame and the spills around it per voice, and CR0/XER
-+// bookkeeping at every compare. This is the same instruction sequence with __MIXRmtUpdateSettings
-+// and its __MIXGetVolume calls (0x800BE098) inlined, guest registers as locals, CR0 kept as the
-+// last compare's three flags and XER[CA] as one bit.
-+//
-+// Kept exactly, also for the volatile registers (cross-checked against the translation in
-+// qemu-aarch64, see below): every guest load and store in program order (stack frames included,
-+// the epilogues read r26-r31, r30/r31 and LR back from the stack as the original does), the
-+// MMIO write policy of each store (the translation's one ResolveRangeHost group, the 15 remote
-+// speaker halfwords at AXVPB+0x104, is resolved the same way), r0 r1 r3-r9 r11 r26-r31, CR0,
-+// XER[CA] and LR as the translation leaves them; r10, r12, CR1-7, CTR and the FPRs untouched.
-+// The checked access mode (no flat view) runs the translation itself, which
-+// REGISTER_NATIVE_FUNCTION_AS keeps in the build.
-+//
-+// The body below is the guest code instruction for instruction (each `VOL(x)` is the inlined
-+// __MIXGetVolume: x <= -904 -> 0, x >= 60 -> 0xFF64, else the table at 0x802290B0 indexed by x).
-+// The registered function reads and writes the CpuContext only through constant indexes; it
-+// hands the context to nothing but the checked-mode fallback, which takes it by reference so
-+// the translator's contract analysis sees exactly the registers the translation itself uses.
-+#if defined(__SWITCH__)
-+#include <cstdint>
-+#include <cstring>
-+
-+#include "abi_bridge.h"
-+#include "memory.h"
-+
-+extern "C" void func_800BFB24(CpuContext* ctx);  // the translation (kept: _AS registration)
-+
-+namespace mlb_mix {
-+
-+struct Regs {
-+    uint32_t r0, r1, r3, r4, r5, r6, r7, r8, r9, r11, r13, r26, r27, r28, r29, r30, r31;
-+    uint32_t cr, xer, lr;
-+};
-+
-+[[gnu::always_inline]] inline uint32_t Rotl(uint32_t v, unsigned s) { return (v << s) | (v >> ((32u - s) & 31u)); }
-+[[gnu::always_inline]] inline uint32_t Mulhw(uint32_t a, uint32_t b) {
-+    return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int32_t>(b)) >> 32);
-+}
-+[[gnu::always_inline]] inline uint32_t SrawiCarry(uint32_t v, unsigned sh) {
-+    return (static_cast<int32_t>(v) < 0 && (v & ((1u << sh) - 1u)) != 0) ? 1u : 0u;
-+}
-+[[gnu::always_inline]] inline uint32_t Load32(uint8_t* base, uint32_t a) {
-+    uint32_t v; std::memcpy(&v, base + a, 4); return __builtin_bswap32(v);
-+}
-+[[gnu::always_inline]] inline uint32_t Load16(uint8_t* base, uint32_t a) {
-+    uint16_t v; std::memcpy(&v, base + a, 2); return __builtin_bswap16(v);
-+}
-+[[gnu::always_inline]] inline void Store32(uint8_t* base, uint32_t a, uint32_t v) {
-+    v = __builtin_bswap32(v); std::memcpy(base + a, &v, 4);
-+}
-+[[gnu::always_inline]] inline void Store16(uint8_t* base, uint32_t a, uint32_t v) {
-+    const uint16_t h = __builtin_bswap16(static_cast<uint16_t>(v)); std::memcpy(base + a, &h, 2);
-+}
-+// MemoryInline::FlatWrite16/32 with the flat view active: the MMIO window takes the slow path.
-+[[gnu::always_inline]] inline void Write32(uint8_t* base, uint32_t a, uint32_t v) {
-+    if (MemoryInline::FlatWriteNeedsPolicy(a)) [[unlikely]] { MemoryInline::Write32Slow(a, v); return; }
-+    Store32(base, a, v);
-+}
-+[[gnu::always_inline]] inline void Write16(uint8_t* base, uint32_t a, uint32_t v) {
-+    if (MemoryInline::FlatWriteNeedsPolicy(a)) [[unlikely]] { MemoryInline::Write16Slow(a, static_cast<uint16_t>(v)); return; }
-+    Store16(base, a, v);
-+}
-+
-+// The flat view only (GuestFlat::RequiresCheckedAccess() false).
-+[[gnu::noinline]] void UpdateSettingsFlat(Regs& R) {
-+    uint8_t* const base = MKW_FLAT_GUEST_BASE;
-+    uint32_t r0 = R.r0, r1 = R.r1, r3 = R.r3, r4 = R.r4, r5 = R.r5, r6 = R.r6, r7 = R.r7, r8 = R.r8, r9 = R.r9;
-+    uint32_t r11 = R.r11, r13 = R.r13, r26 = R.r26, r27 = R.r27, r28 = R.r28, r29 = R.r29, r30 = R.r30, r31 = R.r31;
-+    uint32_t lr = R.lr;
-+    uint32_t ca = (R.xer >> 29) & 1u;
-+    bool lt = false, gt = false, eq = false;  // CR0 of the last compare (SO is XER[SO], unchanged)
-+    uint8_t* g0 = nullptr;
-+    uint32_t pfRt = 0;  // the remote table base (r13-27096) as the last __MIXRmtUpdateSettings read it
-+
-+#define LD32(a) Load32(base, (a))
-+#define LD16(a) Load16(base, (a))
-+#define ST32(a, v) Write32(base, (a), (v))
-+#define ST16(a, v) Write16(base, (a), (v))
-+#define STRAM32(a, v) Store32(base, (a), (v))
-+#define STG16(g, off, a, v) MemoryInline::WriteResolved16((g), (off), (a), static_cast<uint16_t>(v))
-+#define CMPS(a, b) do { const int32_t x_ = static_cast<int32_t>(a), y_ = static_cast<int32_t>(b); lt = x_ < y_; gt = x_ > y_; eq = x_ == y_; } while (false)
-+#define CMPU(a, b) do { const uint32_t x_ = (a), y_ = (b); lt = x_ < y_; gt = x_ > y_; eq = x_ == y_; } while (false)
-+#define LT lt
-+#define GT gt
-+#define EQ eq
-+// A cache hint only (PRFM: no fault, no guest-visible effect): the walk is bound by the load latency of
-+// the channel (0x70) and remote (0x44) entries, one new line per voice; ask for voice i+2's now.
-+#define PF(a) __builtin_prefetch(base + static_cast<uint32_t>(a), 0, 3)
-+#define VOL(x) do { CMPS((x), -904); if (!gt) { r0 = 0u; break; } CMPS((x), 60); if (!lt) { r0 = r29 - 156u; break; } \
-+        r0 = (x) << 1; r7 = r30 + r0; r0 = LD16(r7 + 0x710u); } while (false)
-+    // stwu r1,-32(r1); mflr r0; stw r0,36(r1); addi r11,r1,32; _savegpr_26 (one resolved range, as the translation)
-+#define MIX_PROLOGUE() do { \
-+        g0 = MemoryInline::ResolveRangeHost(r1 - 32u, 0, 40u, false, true); \
-+        MemoryInline::WriteResolved32(g0, 0u, r1 - 32u, r1); \
-+        r1 = r1 - 32u; \
-+        r0 = lr; \
-+        MemoryInline::WriteResolved32(g0, 36u, r1 + 36u, r0); \
-+        r11 = r1 + 32u; \
-+        if (!MemoryInline::WriteResolvedPair32(g0, 8u, (static_cast<uint64_t>(r26) << 32) | r27)) { \
-+            MemoryInline::WriteResolved32(g0, 8u, r11 - 24u, r26); MemoryInline::WriteResolved32(g0, 12u, r11 - 20u, r27); } \
-+        if (!MemoryInline::WriteResolvedPair32(g0, 16u, (static_cast<uint64_t>(r28) << 32) | r29)) { \
-+            MemoryInline::WriteResolved32(g0, 16u, r11 - 16u, r28); MemoryInline::WriteResolved32(g0, 20u, r11 - 12u, r29); } \
-+        if (!MemoryInline::WriteResolvedPair32(g0, 24u, (static_cast<uint64_t>(r30) << 32) | r31)) { \
-+            MemoryInline::WriteResolved32(g0, 24u, r11 - 8u, r30); MemoryInline::WriteResolved32(g0, 28u, r11 - 4u, r31); } \
-+    } while (false)
-+    // addi r11,r1,32; _restgpr_26; lwz r0,36(r1); mtlr r0; addi r1,r1,32; blr
-+#define MIX_EPILOGUE_AND_RETURN() do { \
-+        r11 = r1 + 32u; \
-+        r26 = LD32(r11 - 24u); r27 = LD32(r11 - 20u); r28 = LD32(r11 - 16u); \
-+        r29 = LD32(r11 - 12u); r30 = LD32(r11 - 8u); r31 = LD32(r11 - 4u); \
-+        r0 = LD32(r1 + 36u); lr = r0; r1 = r1 + 32u; \
-+        goto L_ret; \
-+    } while (false)
-+
-+    MIX_PROLOGUE();
-+    r0 = LD32((r13 - 27108u));
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800C119C;
-+    r3 = (0x80230000u);
-+    r26 = 0x0u;
-+    r27 = 0x0u;
-+    r29 = (0x10000u);
-+    r30 = (r3 - 30304u);
-+    r28 = 0x0u;
-+    r31 = (0x2aab0000u);
-+    goto L_800C1190;
-+L_800BFB64:
-+    r4 = LD32((r13 - 27112u));
-+    r3 = 0x0u;
-+    r0 = 0x0u;
-+    r5 = r4 + r27;
-+    PF(r5 + 0xE0u); PF(r5 + 0x120u); PF(r5 + 0x14Fu);
-+    if (pfRt != 0u) { PF(pfRt + (r26 + 2u) * 0x44u); PF(pfRt + (r26 + 2u) * 0x44u + 0x43u); }
-+    r4 = LD32(r4 + r27);
-+    CMPS(r4, 0);
-+    if (EQ) goto L_800C1188;
-+    r7 = LD32((r5 + 4u));
-+    r6 = 0x0u;
-+    r7 = r7 & 0x20000000u;
-+    CMPS(r7, 0);
-+    if (EQ) goto L_800BFBA8;
-+    r7 = LD16((r5 + 62u));
-+    r3 = 0x1u;
-+    ST16((r5 + 60u), r7);
-+    r7 = LD32((r5 + 4u));
-+    r7 = r7 & 0xdfffffffu;
-+    ST32((r5 + 4u), r7);
-+L_800BFBA8:
-+    r8 = LD32((r5 + 4u));
-+    r7 = r8 & 0x10000000u;
-+    CMPS(r7, 0);
-+    if (EQ) goto L_800BFC0C;
-+    r3 = r8 & 0x00000008u;
-+    CMPS(r3, 0);
-+    if (EQ) goto L_800BFBC4;
-+    ST16((r5 + 62u), r28);
-+    goto L_800BFBF8;
-+L_800BFBC4:
-+    r3 = LD32((r5 + 8u));
-+    CMPS(r3, -904);
-+    if (GT) goto L_800BFBD8;
-+    r3 = 0x0u;
-+    goto L_800BFBF4;
-+L_800BFBD8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_800BFBE8;
-+    r3 = (r29 - 156u);
-+    goto L_800BFBF4;
-+L_800BFBE8:
-+    r3 = Rotl(r3, 1) & 0xfffffffeu;
-+    r3 = r30 + r3;
-+    r3 = LD16((r3 + 1808u));
-+L_800BFBF4:
-+    ST16((r5 + 62u), r3);
-+L_800BFBF8:
-+    r7 = LD32((r5 + 4u));
-+    r3 = 0x1u;
-+    r7 = r7 & 0xefffffffu;
-+    r7 = r7 | 0x20000000u;
-+    ST32((r5 + 4u), r7);
-+L_800BFC0C:
-+    r7 = LD32((r5 + 4u));
-+    r7 = r7 & 0x80000000u;
-+    CMPS(r7, 0);
-+    if (EQ) goto L_800BFC88;
-+    r7 = LD16((r5 + 66u));
-+    r0 = 0x1u;
-+    ST16((r5 + 64u), r7);
-+    r7 = LD16((r5 + 70u));
-+    ST16((r5 + 68u), r7);
-+    r7 = LD16((r5 + 74u));
-+    ST16((r5 + 72u), r7);
-+    r7 = LD16((r5 + 78u));
-+    ST16((r5 + 76u), r7);
-+    r7 = LD16((r5 + 82u));
-+    ST16((r5 + 80u), r7);
-+    r7 = LD16((r5 + 86u));
-+    ST16((r5 + 84u), r7);
-+    r7 = LD16((r5 + 90u));
-+    ST16((r5 + 88u), r7);
-+    r7 = LD16((r5 + 94u));
-+    ST16((r5 + 92u), r7);
-+    r7 = LD16((r5 + 98u));
-+    ST16((r5 + 96u), r7);
-+    r7 = LD16((r5 + 102u));
-+    ST16((r5 + 100u), r7);
-+    r7 = LD16((r5 + 106u));
-+    ST16((r5 + 104u), r7);
-+    r7 = LD16((r5 + 110u));
-+    ST16((r5 + 108u), r7);
-+    r7 = LD32((r5 + 4u));
-+    r7 = r7 & 0x7fffffffu;
-+    ST32((r5 + 4u), r7);
-+L_800BFC88:
-+    r7 = LD32((r5 + 4u));
-+    r7 = r7 & 0x40000000u;
-+    CMPS(r7, 0);
-+    if (EQ) goto L_800C0DF4;
-+    r0 = LD32((r13 - 27100u));
-+    CMPS(r0, 3);
-+    if (EQ) goto L_800C082C;
-+    if (!LT) goto L_800C0DE0;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800BFCB4;
-+    if (!LT) goto L_800C0238;
-+    goto L_800C0DE0;
-+L_800BFCB4:
-+    r7 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 44u));
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 66u), r0);
-+    r7 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 44u));
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 70u), r0);
-+    r7 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 48u));
-+    r7 = r7 + r0;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 74u), r0);
-+    r0 = LD32((r5 + 4u));
-+    r0 = r0 & 0x00000001u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800BFE34;
-+    r7 = LD32((r5 + 12u));
-+    r0 = LD32((r5 + 44u));
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 78u), r0);
-+    r7 = LD32((r5 + 12u));
-+    r0 = LD32((r5 + 44u));
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 82u), r0);
-+    r7 = LD32((r5 + 12u));
-+    r0 = LD32((r5 + 48u));
-+    r7 = r7 + r0;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 86u), r0);
-+    goto L_800BFF04;
-+L_800BFE34:
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 12u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 78u), r0);
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 12u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 82u), r0);
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = LD32((r5 + 48u));
-+    r0 = r8 + r0;
-+    r7 = r0 + r7;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 86u), r0);
-+L_800BFF04:
-+    r0 = LD32((r5 + 4u));
-+    r0 = r0 & 0x00000002u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800BFFCC;
-+    r7 = LD32((r5 + 16u));
-+    r0 = LD32((r5 + 44u));
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 90u), r0);
-+    r7 = LD32((r5 + 16u));
-+    r0 = LD32((r5 + 44u));
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 94u), r0);
-+    r7 = LD32((r5 + 16u));
-+    r0 = LD32((r5 + 48u));
-+    r7 = r7 + r0;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 98u), r0);
-+    goto L_800C009C;
-+L_800BFFCC:
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 16u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 90u), r0);
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 16u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 94u), r0);
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = LD32((r5 + 48u));
-+    r0 = r8 + r0;
-+    r7 = r0 + r7;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 98u), r0);
-+L_800C009C:
-+    r0 = LD32((r5 + 4u));
-+    r0 = r0 & 0x00000004u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800C0164;
-+    r7 = LD32((r5 + 20u));
-+    r0 = LD32((r5 + 44u));
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 102u), r0);
-+    r7 = LD32((r5 + 20u));
-+    r0 = LD32((r5 + 44u));
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 106u), r0);
-+    r7 = LD32((r5 + 20u));
-+    r0 = LD32((r5 + 48u));
-+    r7 = r7 + r0;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 110u), r0);
-+    goto L_800C0DE0;
-+L_800C0164:
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 20u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 102u), r0);
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 20u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 106u), r0);
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 20u));
-+    r7 = LD32((r5 + 48u));
-+    r0 = r8 + r0;
-+    r7 = r0 + r7;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 110u), r0);
-+    goto L_800C0DE0;
-+L_800C0238:
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 36u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 66u), r0);
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 40u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 70u), r0);
-+    r7 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 48u));
-+    r7 = r7 + r0;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 74u), r0);
-+    r0 = LD32((r5 + 4u));
-+    r0 = r0 & 0x00000001u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800C03D8;
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = LD32((r5 + 36u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 78u), r0);
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = LD32((r5 + 40u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 82u), r0);
-+    r7 = LD32((r5 + 12u));
-+    r0 = LD32((r5 + 48u));
-+    r7 = r7 + r0;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 86u), r0);
-+    goto L_800C04B8;
-+L_800C03D8:
-+    r9 = LD32((r5 + 44u));
-+    r7 = LD32((r5 + 36u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 78u), r0);
-+    r9 = LD32((r5 + 44u));
-+    r7 = LD32((r5 + 40u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 82u), r0);
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = LD32((r5 + 48u));
-+    r0 = r8 + r0;
-+    r7 = r0 + r7;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 86u), r0);
-+L_800C04B8:
-+    r0 = LD32((r5 + 4u));
-+    r0 = r0 & 0x00000002u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800C0590;
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = LD32((r5 + 36u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 90u), r0);
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = LD32((r5 + 40u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 94u), r0);
-+    r7 = LD32((r5 + 16u));
-+    r0 = LD32((r5 + 48u));
-+    r7 = r7 + r0;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 98u), r0);
-+    goto L_800C0670;
-+L_800C0590:
-+    r9 = LD32((r5 + 44u));
-+    r7 = LD32((r5 + 36u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 90u), r0);
-+    r9 = LD32((r5 + 44u));
-+    r7 = LD32((r5 + 40u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 94u), r0);
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = LD32((r5 + 48u));
-+    r0 = r8 + r0;
-+    r7 = r0 + r7;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 98u), r0);
-+L_800C0670:
-+    r0 = LD32((r5 + 4u));
-+    r0 = r0 & 0x00000004u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800C0748;
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 20u));
-+    r7 = LD32((r5 + 36u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 102u), r0);
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 20u));
-+    r7 = LD32((r5 + 40u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 106u), r0);
-+    r7 = LD32((r5 + 20u));
-+    r0 = LD32((r5 + 48u));
-+    r7 = r7 + r0;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 110u), r0);
-+    goto L_800C0DE0;
-+L_800C0748:
-+    r9 = LD32((r5 + 44u));
-+    r7 = LD32((r5 + 36u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 20u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 102u), r0);
-+    r9 = LD32((r5 + 44u));
-+    r7 = LD32((r5 + 40u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 20u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 106u), r0);
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 20u));
-+    r7 = LD32((r5 + 48u));
-+    r0 = r8 + r0;
-+    r7 = r0 + r7;
-+    r7 = (r7 - 30u);
-+    VOL(r7);
-+    ST16((r5 + 110u), r0);
-+    goto L_800C0DE0;
-+L_800C082C:
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 36u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 66u), r0);
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 40u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 70u), r0);
-+    r8 = LD32((r5 + 48u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 52u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 74u), r0);
-+    r8 = LD32((r5 + 48u));
-+    r0 = LD32((r5 + 32u));
-+    r7 = LD32((r5 + 56u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 102u), r0);
-+    r0 = LD32((r5 + 4u));
-+    r0 = r0 & 0x00000001u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800C0A5C;
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = LD32((r5 + 36u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 78u), r0);
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = LD32((r5 + 40u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 82u), r0);
-+    r8 = LD32((r5 + 48u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = LD32((r5 + 52u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 86u), r0);
-+    r8 = LD32((r5 + 48u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = LD32((r5 + 56u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 106u), r0);
-+    goto L_800C0B8C;
-+L_800C0A5C:
-+    r9 = LD32((r5 + 44u));
-+    r7 = LD32((r5 + 36u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 78u), r0);
-+    r9 = LD32((r5 + 44u));
-+    r7 = LD32((r5 + 40u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 82u), r0);
-+    r9 = LD32((r5 + 48u));
-+    r7 = LD32((r5 + 52u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 86u), r0);
-+    r9 = LD32((r5 + 48u));
-+    r7 = LD32((r5 + 56u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 12u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 106u), r0);
-+L_800C0B8C:
-+    r0 = LD32((r5 + 4u));
-+    r0 = r0 & 0x00000002u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800C0CAC;
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = LD32((r5 + 36u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 90u), r0);
-+    r8 = LD32((r5 + 44u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = LD32((r5 + 40u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 94u), r0);
-+    r8 = LD32((r5 + 48u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = LD32((r5 + 52u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 98u), r0);
-+    r8 = LD32((r5 + 48u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = LD32((r5 + 56u));
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 110u), r0);
-+    goto L_800C0DDC;
-+L_800C0CAC:
-+    r9 = LD32((r5 + 44u));
-+    r7 = LD32((r5 + 36u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 90u), r0);
-+    r9 = LD32((r5 + 44u));
-+    r7 = LD32((r5 + 40u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 94u), r0);
-+    r9 = LD32((r5 + 48u));
-+    r7 = LD32((r5 + 52u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 98u), r0);
-+    r9 = LD32((r5 + 48u));
-+    r7 = LD32((r5 + 56u));
-+    r8 = LD32((r5 + 32u));
-+    r0 = LD32((r5 + 16u));
-+    r7 = r9 + r7;
-+    r0 = r8 + r0;
-+    r0 = r7 + r0;
-+    VOL(r0);
-+    ST16((r5 + 110u), r0);
-+L_800C0DDC:
-+    r6 = r6 | 0x80000000u;
-+L_800C0DE0:
-+    r7 = LD32((r5 + 4u));
-+    r0 = 0x1u;
-+    r7 = r7 & 0xbfffffffu;
-+    r7 = r7 | 0x80000000u;
-+    ST32((r5 + 4u), r7);
-+L_800C0DF4:
-+    CMPS(r3, 0);
-+    if (EQ) goto L_800C0E34;
-+    r3 = LD16((r5 + 60u));
-+    r8 = (r31 - 21845u);
-+    ST16((r4 + 146u), r3);
-+    r7 = LD16((r5 + 60u));
-+    r3 = LD16((r5 + 62u));
-+    r3 = r3 - r7;
-+    r3 = Mulhw(r8, r3);
-+    ca = SrawiCarry(r3, 4); r3 = uint32_t(int32_t(r3) >> 4);
-+    r7 = Rotl(r3, 1) & 0x00000001u;
-+    r3 = r3 + r7;
-+    ST16((r4 + 148u), r3);
-+    r3 = LD32((r4 + 28u));
-+    r3 = r3 | 0x100u;
-+    ST32((r4 + 28u), r3);
-+L_800C0E34:
-+    CMPS(r0, 0);
-+    if (EQ) goto L_800C1180;
-+    r0 = LD16((r5 + 64u));
-+    r3 = (r4 + 62u);
-+    CMPS(r0, 0);
-+    ST16((r4 + 60u), r0);
-+    if (EQ) goto L_800C0E54;
-+    r6 = r6 | 0x1u;
-+L_800C0E54:
-+    r7 = LD16((r5 + 64u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 66u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 0u), r7);
-+    if (EQ) goto L_800C0E84;
-+    r6 = r6 | 0x4u;
-+L_800C0E84:
-+    r0 = LD16((r5 + 68u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 2u), r0);
-+    if (EQ) goto L_800C0E98;
-+    r6 = r6 | 0x2u;
-+L_800C0E98:
-+    r7 = LD16((r5 + 68u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 70u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 4u), r7);
-+    if (EQ) goto L_800C0EC8;
-+    r6 = r6 | 0x4u;
-+L_800C0EC8:
-+    r0 = LD16((r5 + 76u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 6u), r0);
-+    if (EQ) goto L_800C0EDC;
-+    r6 = r6 | 0x10000u;
-+L_800C0EDC:
-+    r7 = LD16((r5 + 76u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 78u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 8u), r7);
-+    if (EQ) goto L_800C0F0C;
-+    r6 = r6 | 0x40000u;
-+L_800C0F0C:
-+    r0 = LD16((r5 + 80u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 10u), r0);
-+    if (EQ) goto L_800C0F20;
-+    r6 = r6 | 0x20000u;
-+L_800C0F20:
-+    r7 = LD16((r5 + 80u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 82u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 12u), r7);
-+    if (EQ) goto L_800C0F50;
-+    r6 = r6 | 0x40000u;
-+L_800C0F50:
-+    r0 = LD16((r5 + 88u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 14u), r0);
-+    if (EQ) goto L_800C0F64;
-+    r6 = r6 | 0x200000u;
-+L_800C0F64:
-+    r7 = LD16((r5 + 88u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 90u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 16u), r7);
-+    if (EQ) goto L_800C0F94;
-+    r6 = r6 | 0x800000u;
-+L_800C0F94:
-+    r0 = LD16((r5 + 92u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 18u), r0);
-+    if (EQ) goto L_800C0FA8;
-+    r6 = r6 | 0x400000u;
-+L_800C0FA8:
-+    r7 = LD16((r5 + 92u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 94u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 20u), r7);
-+    if (EQ) goto L_800C0FD8;
-+    r6 = r6 | 0x800000u;
-+L_800C0FD8:
-+    r0 = LD16((r5 + 100u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 22u), r0);
-+    if (EQ) goto L_800C0FEC;
-+    r6 = r6 | 0x4000000u;
-+L_800C0FEC:
-+    r7 = LD16((r5 + 100u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 102u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 24u), r7);
-+    if (EQ) goto L_800C101C;
-+    r6 = r6 | 0x10000000u;
-+L_800C101C:
-+    r0 = LD16((r5 + 104u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 26u), r0);
-+    if (EQ) goto L_800C1030;
-+    r6 = r6 | 0x8000000u;
-+L_800C1030:
-+    r7 = LD16((r5 + 104u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 106u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 28u), r7);
-+    if (EQ) goto L_800C1060;
-+    r6 = r6 | 0x10000000u;
-+L_800C1060:
-+    r0 = LD16((r5 + 72u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 30u), r0);
-+    if (EQ) goto L_800C1074;
-+    r6 = r6 | 0x8u;
-+L_800C1074:
-+    r7 = LD16((r5 + 72u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 74u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 32u), r7);
-+    if (EQ) goto L_800C10A4;
-+    r6 = r6 | 0x10u;
-+L_800C10A4:
-+    r0 = LD16((r5 + 84u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 34u), r0);
-+    if (EQ) goto L_800C10B8;
-+    r6 = r6 | 0x80000u;
-+L_800C10B8:
-+    r7 = LD16((r5 + 84u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 86u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 36u), r7);
-+    if (EQ) goto L_800C10E8;
-+    r6 = r6 | 0x100000u;
-+L_800C10E8:
-+    r0 = LD16((r5 + 96u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 38u), r0);
-+    if (EQ) goto L_800C10FC;
-+    r6 = r6 | 0x1000000u;
-+L_800C10FC:
-+    r7 = LD16((r5 + 96u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 98u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r7 = Rotl(r0, 1) & 0x00000001u;
-+    r7 = r0 + r7;
-+    r0 = r7 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 40u), r7);
-+    if (EQ) goto L_800C112C;
-+    r6 = r6 | 0x2000000u;
-+L_800C112C:
-+    r0 = LD16((r5 + 108u));
-+    CMPS(r0, 0);
-+    ST16((r3 + 42u), r0);
-+    if (EQ) goto L_800C1140;
-+    r6 = r6 | 0x20000000u;
-+L_800C1140:
-+    r7 = LD16((r5 + 108u));
-+    r8 = (r31 - 21845u);
-+    r0 = LD16((r5 + 110u));
-+    r0 = r0 - r7;
-+    r0 = Mulhw(r8, r0);
-+    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
-+    r5 = Rotl(r0, 1) & 0x00000001u;
-+    r5 = r0 + r5;
-+    r0 = r5 & 0x0000ffffu;
-+    CMPS(r0, 0);
-+    ST16((r3 + 44u), r5);
-+    if (EQ) goto L_800C1170;
-+    r6 = r6 | 0x40000000u;
-+L_800C1170:
-+    ST32((r4 + 52u), r6);
-+    r0 = LD32((r4 + 28u));
-+    r0 = r0 | 0x12u;
-+    ST32((r4 + 28u), r0);
-+L_800C1180:
-+    r3 = r26;
-+    lr = 0x800c1188u;
-+    STRAM32((r1 - 16u), r1); r1 = (r1 - 16u);
-+    r0 = lr;
-+    STRAM32((r1 + 20u), r0);
-+    r0 = r3 * 0x44u;
-+    STRAM32((r1 + 12u), r31);
-+    STRAM32((r1 + 8u), r30);
-+    r30 = r4;
-+    r3 = LD32((r13 - 27096u));
-+    r31 = r3 + r0;
-+    pfRt = r3;
-+    r3 = LD32(r3 + r0);
-+    r0 = r3 & 0xc0000000u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_c1_800C1688;
-+    r0 = r3 & 0x80000000u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_c1_800C12E8;
-+    r0 = LD16((r31 + 38u));
-+    ST16((r31 + 36u), r0);
-+    r0 = LD16((r31 + 42u));
-+    ST16((r31 + 40u), r0);
-+    r0 = LD16((r31 + 46u));
-+    ST16((r31 + 44u), r0);
-+    r0 = LD16((r31 + 50u));
-+    ST16((r31 + 48u), r0);
-+    r0 = LD16((r31 + 54u));
-+    ST16((r31 + 52u), r0);
-+    r0 = LD16((r31 + 58u));
-+    ST16((r31 + 56u), r0);
-+    r0 = LD16((r31 + 62u));
-+    ST16((r31 + 60u), r0);
-+    r0 = LD16((r31 + 66u));
-+    ST16((r31 + 64u), r0);
-+    r0 = LD32((r31 + 0u));
-+    r0 = r0 & 0x7fffffffu;
-+    ST32((r31 + 0u), r0);
-+L_c1_800C12E8:
-+    r0 = LD32((r31 + 0u));
-+    r0 = r0 & 0x40000000u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_c1_800C13F4;
-+    r3 = LD32((r31 + 4u));
-+    lr = 0x800c12fcu;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c2_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret2;
-+L_c1_c2_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c2_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret2;
-+L_c1_c2_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret2;
-+L_c1_ret2:;
-+    ST16((r31 + 38u), r3);
-+    r3 = LD32((r31 + 8u));
-+    lr = 0x800c1308u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c3_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret3;
-+L_c1_c3_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c3_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret3;
-+L_c1_c3_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret3;
-+L_c1_ret3:;
-+    ST16((r31 + 46u), r3);
-+    r3 = LD32((r31 + 12u));
-+    lr = 0x800c1314u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c4_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret4;
-+L_c1_c4_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c4_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret4;
-+L_c1_c4_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret4;
-+L_c1_ret4:;
-+    ST16((r31 + 54u), r3);
-+    r3 = LD32((r31 + 16u));
-+    lr = 0x800c1320u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c5_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret5;
-+L_c1_c5_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c5_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret5;
-+L_c1_c5_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret5;
-+L_c1_ret5:;
-+    ST16((r31 + 62u), r3);
-+    r0 = LD32((r31 + 0u));
-+    r0 = r0 & 0x00000001u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_c1_800C1340;
-+    r3 = LD32((r31 + 20u));
-+    lr = 0x800c1338u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c6_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret6;
-+L_c1_c6_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c6_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret6;
-+L_c1_c6_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret6;
-+L_c1_ret6:;
-+    ST16((r31 + 42u), r3);
-+    goto L_c1_800C1354;
-+L_c1_800C1340:
-+    r3 = LD32((r31 + 4u));
-+    r0 = LD32((r31 + 20u));
-+    r3 = r3 + r0;
-+    lr = 0x800c1350u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c7_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret7;
-+L_c1_c7_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c7_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret7;
-+L_c1_c7_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret7;
-+L_c1_ret7:;
-+    ST16((r31 + 42u), r3);
-+L_c1_800C1354:
-+    r0 = LD32((r31 + 0u));
-+    r0 = r0 & 0x00000002u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_c1_800C1370;
-+    r3 = LD32((r31 + 24u));
-+    lr = 0x800c1368u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c8_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret8;
-+L_c1_c8_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c8_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret8;
-+L_c1_c8_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret8;
-+L_c1_ret8:;
-+    ST16((r31 + 50u), r3);
-+    goto L_c1_800C1384;
-+L_c1_800C1370:
-+    r3 = LD32((r31 + 8u));
-+    r0 = LD32((r31 + 24u));
-+    r3 = r3 + r0;
-+    lr = 0x800c1380u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c9_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret9;
-+L_c1_c9_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c9_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret9;
-+L_c1_c9_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret9;
-+L_c1_ret9:;
-+    ST16((r31 + 50u), r3);
-+L_c1_800C1384:
-+    r0 = LD32((r31 + 0u));
-+    r0 = r0 & 0x00000004u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_c1_800C13A0;
-+    r3 = LD32((r31 + 28u));
-+    lr = 0x800c1398u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c10_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret10;
-+L_c1_c10_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c10_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret10;
-+L_c1_c10_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret10;
-+L_c1_ret10:;
-+    ST16((r31 + 58u), r3);
-+    goto L_c1_800C13B4;
-+L_c1_800C13A0:
-+    r3 = LD32((r31 + 12u));
-+    r0 = LD32((r31 + 28u));
-+    r3 = r3 + r0;
-+    lr = 0x800c13b0u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c11_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret11;
-+L_c1_c11_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c11_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret11;
-+L_c1_c11_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret11;
-+L_c1_ret11:;
-+    ST16((r31 + 58u), r3);
-+L_c1_800C13B4:
-+    r0 = LD32((r31 + 0u));
-+    r0 = r0 & 0x00000008u;
-+    CMPS(r0, 0);
-+    if (EQ) goto L_c1_800C13D0;
-+    r3 = LD32((r31 + 32u));
-+    lr = 0x800c13c8u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c12_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret12;
-+L_c1_c12_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c12_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret12;
-+L_c1_c12_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret12;
-+L_c1_ret12:;
-+    ST16((r31 + 66u), r3);
-+    goto L_c1_800C13E4;
-+L_c1_800C13D0:
-+    r3 = LD32((r31 + 16u));
-+    r0 = LD32((r31 + 32u));
-+    r3 = r3 + r0;
-+    lr = 0x800c13e0u;
-+    CMPS(r3, -904);
-+    if (GT) goto L_c1_c13_800BE0A8;
-+    r3 = 0x0u;
-+    goto L_c1_ret13;
-+L_c1_c13_800BE0A8:
-+    CMPS(r3, 60);
-+    if (LT) goto L_c1_c13_800BE0BC;
-+    r3 = (0x10000u);
-+    r3 = (r3 - 156u);
-+    goto L_c1_ret13;
-+L_c1_c13_800BE0BC:
-+    r0 = (r3 + 904u);
-+    r3 = (0x80230000u);
-+    r0 = Rotl(r0, 1) & 0xfffffffeu;
-+    r3 = (r3 - 30304u);
-+    r3 = LD16(r3 + r0);
-+    goto L_c1_ret13;
-+L_c1_ret13:;
-+    ST16((r31 + 66u), r3);
-+L_c1_800C13E4:
-+    r0 = LD32((r31 + 0u));
-+    r0 = r0 & 0xbfffffffu;
-+    r0 = r0 | 0x80000000u;
-+    ST32((r31 + 0u), r0);
-+L_c1_800C13F4:
-+    r4 = LD16((r31 + 36u));
-+    r3 = (r30 + 260u);
-+    r0 = 0x0u;
-+    CMPS(r4, 0);
-+    ST16((r30 + 258u), r4);
-+    if (EQ) goto L_c1_800C1410;
-+    r0 = r0 | 0x1u;
-+L_c1_800C1410:
-+    r6 = LD16((r31 + 36u));
-+    r4 = (0x38e40000u);
-+    r5 = LD16((r31 + 38u));
-+    r7 = (r4 - 29127u);
-+    r4 = r5 - r6;
-+    r4 = Mulhw(r7, r4);
-+    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
-+    r5 = Rotl(r4, 1) & 0x00000001u;
-+    r5 = r4 + r5;
-+    r4 = r5 & 0x0000ffffu;
-+    CMPS(r4, 0);
-+    g0 = MemoryInline::ResolveRangeHost(r3, 0, 30u, false, true);
-+    STG16(g0, 0u, (r3 + 0u), r5);
-+    if (EQ) goto L_c1_800C1448;
-+    r0 = r0 | 0x2u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C1448:
-+    r4 = LD16((r31 + 40u));
-+    CMPS(r4, 0);
-+    STG16(g0, 2u, (r3 + 2u), r4);
-+    if (EQ) goto L_c1_800C1460;
-+    r0 = r0 | 0x4u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C1460:
-+    r6 = LD16((r31 + 40u));
-+    r4 = (0x38e40000u);
-+    r5 = LD16((r31 + 42u));
-+    r7 = (r4 - 29127u);
-+    r4 = r5 - r6;
-+    r4 = Mulhw(r7, r4);
-+    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
-+    r5 = Rotl(r4, 1) & 0x00000001u;
-+    r5 = r4 + r5;
-+    r4 = r5 & 0x0000ffffu;
-+    CMPS(r4, 0);
-+    STG16(g0, 4u, (r3 + 4u), r5);
-+    if (EQ) goto L_c1_800C1498;
-+    r0 = r0 | 0x8u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C1498:
-+    r4 = LD16((r31 + 44u));
-+    CMPS(r4, 0);
-+    STG16(g0, 6u, (r3 + 6u), r4);
-+    if (EQ) goto L_c1_800C14B0;
-+    r0 = r0 | 0x10u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C14B0:
-+    r6 = LD16((r31 + 44u));
-+    r4 = (0x38e40000u);
-+    r5 = LD16((r31 + 46u));
-+    r7 = (r4 - 29127u);
-+    r4 = r5 - r6;
-+    r4 = Mulhw(r7, r4);
-+    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
-+    r5 = Rotl(r4, 1) & 0x00000001u;
-+    r5 = r4 + r5;
-+    r4 = r5 & 0x0000ffffu;
-+    CMPS(r4, 0);
-+    STG16(g0, 8u, (r3 + 8u), r5);
-+    if (EQ) goto L_c1_800C14E8;
-+    r0 = r0 | 0x20u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C14E8:
-+    r4 = LD16((r31 + 48u));
-+    CMPS(r4, 0);
-+    STG16(g0, 10u, (r3 + 10u), r4);
-+    if (EQ) goto L_c1_800C1500;
-+    r0 = r0 | 0x40u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C1500:
-+    r6 = LD16((r31 + 48u));
-+    r4 = (0x38e40000u);
-+    r5 = LD16((r31 + 50u));
-+    r7 = (r4 - 29127u);
-+    r4 = r5 - r6;
-+    r4 = Mulhw(r7, r4);
-+    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
-+    r5 = Rotl(r4, 1) & 0x00000001u;
-+    r5 = r4 + r5;
-+    r4 = r5 & 0x0000ffffu;
-+    CMPS(r4, 0);
-+    STG16(g0, 12u, (r3 + 12u), r5);
-+    if (EQ) goto L_c1_800C1538;
-+    r0 = r0 | 0x80u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C1538:
-+    r4 = LD16((r31 + 52u));
-+    CMPS(r4, 0);
-+    STG16(g0, 14u, (r3 + 14u), r4);
-+    if (EQ) goto L_c1_800C1550;
-+    r0 = r0 | 0x100u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C1550:
-+    r6 = LD16((r31 + 52u));
-+    r4 = (0x38e40000u);
-+    r5 = LD16((r31 + 54u));
-+    r7 = (r4 - 29127u);
-+    r4 = r5 - r6;
-+    r4 = Mulhw(r7, r4);
-+    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
-+    r5 = Rotl(r4, 1) & 0x00000001u;
-+    r5 = r4 + r5;
-+    r4 = r5 & 0x0000ffffu;
-+    CMPS(r4, 0);
-+    STG16(g0, 16u, (r3 + 16u), r5);
-+    if (EQ) goto L_c1_800C1588;
-+    r0 = r0 | 0x200u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C1588:
-+    r4 = LD16((r31 + 56u));
-+    CMPS(r4, 0);
-+    STG16(g0, 18u, (r3 + 18u), r4);
-+    if (EQ) goto L_c1_800C15A0;
-+    r0 = r0 | 0x400u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C15A0:
-+    r6 = LD16((r31 + 56u));
-+    r4 = (0x38e40000u);
-+    r5 = LD16((r31 + 58u));
-+    r7 = (r4 - 29127u);
-+    r4 = r5 - r6;
-+    r4 = Mulhw(r7, r4);
-+    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
-+    r5 = Rotl(r4, 1) & 0x00000001u;
-+    r5 = r4 + r5;
-+    r4 = r5 & 0x0000ffffu;
-+    CMPS(r4, 0);
-+    STG16(g0, 20u, (r3 + 20u), r5);
-+    if (EQ) goto L_c1_800C15D8;
-+    r0 = r0 | 0x800u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C15D8:
-+    r4 = LD16((r31 + 60u));
-+    CMPS(r4, 0);
-+    STG16(g0, 22u, (r3 + 22u), r4);
-+    if (EQ) goto L_c1_800C15F0;
-+    r0 = r0 | 0x1000u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C15F0:
-+    r6 = LD16((r31 + 60u));
-+    r4 = (0x38e40000u);
-+    r5 = LD16((r31 + 62u));
-+    r7 = (r4 - 29127u);
-+    r4 = r5 - r6;
-+    r4 = Mulhw(r7, r4);
-+    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
-+    r5 = Rotl(r4, 1) & 0x00000001u;
-+    r5 = r4 + r5;
-+    r4 = r5 & 0x0000ffffu;
-+    CMPS(r4, 0);
-+    STG16(g0, 24u, (r3 + 24u), r5);
-+    if (EQ) goto L_c1_800C1628;
-+    r0 = r0 | 0x2000u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C1628:
-+    r4 = LD16((r31 + 64u));
-+    CMPS(r4, 0);
-+    STG16(g0, 26u, (r3 + 26u), r4);
-+    if (EQ) goto L_c1_800C1640;
-+    r0 = r0 | 0x4000u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C1640:
-+    r6 = LD16((r31 + 64u));
-+    r4 = (0x38e40000u);
-+    r5 = LD16((r31 + 66u));
-+    r7 = (r4 - 29127u);
-+    r4 = r5 - r6;
-+    r4 = Mulhw(r7, r4);
-+    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
-+    r5 = Rotl(r4, 1) & 0x00000001u;
-+    r5 = r4 + r5;
-+    r4 = r5 & 0x0000ffffu;
-+    CMPS(r4, 0);
-+    STG16(g0, 28u, (r3 + 28u), r5);
-+    if (EQ) goto L_c1_800C1678;
-+    r0 = r0 | 0x8000u;
-+    r0 = r0 & 0x0000ffffu;
-+L_c1_800C1678:
-+    r3 = LD32((r30 + 28u));
-+    ST16((r30 + 256u), r0);
-+    r0 = r3 | 0x3000000u;
-+    ST32((r30 + 28u), r0);
-+L_c1_800C1688:
-+    r0 = LD32((r1 + 20u));
-+    r31 = LD32((r1 + 12u));
-+    r30 = LD32((r1 + 8u));
-+    lr = r0;
-+    r1 = (r1 + 16u);
-+    goto L_ret1;
-+L_ret1:;
-+L_800C1188:
-+    r27 = (r27 + 112u);
-+    r26 = (r26 + 1u);
-+L_800C1190:
-+    r0 = LD32((r13 - 27104u));
-+    CMPU(r26, r0);
-+    if (LT) goto L_800BFB64;
-+L_800C119C:
-+    MIX_EPILOGUE_AND_RETURN();
-+
-+L_ret:
-+#undef LD32
-+#undef LD16
-+#undef ST32
-+#undef ST16
-+#undef STRAM32
-+#undef STG16
-+#undef CMPS
-+#undef CMPU
-+#undef LT
-+#undef GT
-+#undef EQ
-+#undef VOL
-+#undef PF
-+#undef MIX_PROLOGUE
-+#undef MIX_EPILOGUE_AND_RETURN
-+    R.r0 = r0; R.r1 = r1; R.r3 = r3; R.r4 = r4; R.r5 = r5; R.r6 = r6; R.r7 = r7; R.r8 = r8; R.r9 = r9;
-+    R.r11 = r11; R.r26 = r26; R.r27 = r27; R.r28 = r28; R.r29 = r29; R.r30 = r30; R.r31 = r31;
-+    R.lr = lr;
-+    R.cr = (R.cr & 0x0FFFFFFFu) | (lt ? 0x80000000u : 0u) | (gt ? 0x40000000u : 0u) | (eq ? 0x20000000u : 0u) |
-+           ((R.xer >> 3) & 0x10000000u);
-+    R.xer = (R.xer & ~0x20000000u) | (ca << 29);
-+}
-+
-+[[gnu::noinline, gnu::cold]] void Translated(CpuContext& context) { func_800BFB24(&context); }
-+
-+}  // namespace mlb_mix
-+
-+extern "C" void MLB_MIXUpdateSettings_800BFB24(CpuContext* ctx) {
-+    if (GuestFlat::RequiresCheckedAccess()) [[unlikely]] {
-+        mlb_mix::Translated(*ctx);
-+        return;
-+    }
-+    mlb_mix::Regs regs;
-+    regs.r0 = ctx->gpr[0];
-+    regs.r1 = ctx->gpr[1];
-+    regs.r3 = ctx->gpr[3];
-+    regs.r4 = ctx->gpr[4];
-+    regs.r5 = ctx->gpr[5];
-+    regs.r6 = ctx->gpr[6];
-+    regs.r7 = ctx->gpr[7];
-+    regs.r8 = ctx->gpr[8];
-+    regs.r9 = ctx->gpr[9];
-+    regs.r11 = 0;
-+    regs.r13 = ctx->gpr[13];
-+    regs.r26 = ctx->gpr[26];
-+    regs.r27 = ctx->gpr[27];
-+    regs.r28 = ctx->gpr[28];
-+    regs.r29 = ctx->gpr[29];
-+    regs.r30 = ctx->gpr[30];
-+    regs.r31 = ctx->gpr[31];
-+    regs.cr = ctx->cr;
-+    regs.xer = ctx->xer;
-+    regs.lr = ctx->lr;
-+    mlb_mix::UpdateSettingsFlat(regs);
-+    ctx->gpr[0] = regs.r0;
-+    ctx->gpr[1] = regs.r1;
-+    ctx->gpr[3] = regs.r3;
-+    ctx->gpr[4] = regs.r4;
-+    ctx->gpr[5] = regs.r5;
-+    ctx->gpr[6] = regs.r6;
-+    ctx->gpr[7] = regs.r7;
-+    ctx->gpr[8] = regs.r8;
-+    ctx->gpr[9] = regs.r9;
-+    ctx->gpr[11] = regs.r11;
-+    ctx->gpr[26] = regs.r26;
-+    ctx->gpr[27] = regs.r27;
-+    ctx->gpr[28] = regs.r28;
-+    ctx->gpr[29] = regs.r29;
-+    ctx->gpr[30] = regs.r30;
-+    ctx->gpr[31] = regs.r31;
-+    ctx->cr = regs.cr;
-+    ctx->xer = regs.xer;
-+    ctx->lr = regs.lr;
-+}
-+REGISTER_NATIVE_FUNCTION_AS(0x800BFB24, MLB_MIXUpdateSettings_800BFB24, "MIXUpdateSettings");
-+#endif
-diff --git a/runtime/src/hle/mlb/msl_natives.cpp b/runtime/src/hle/mlb/msl_natives.cpp
-new file mode 100644
-index 0000000..0c55151
---- /dev/null
-+++ b/runtime/src/hle/mlb/msl_natives.cpp
-@@ -0,0 +1,209 @@
-+// MLB Power Pros 2008 (RL8E54): native leaves for two MSL routines the match spends ~8% of the
-+// Switch main thread in (profile 1).
-+//
-+// __ieee754_sqrt (0x80126AE8, reached through sqrt at 0x80128FD0) is fdlibm's bit-by-bit loop:
-+// 54 iterations of integer work plus its frame stores. Its rounding test compares the constant
-+// 1.0 (r2-28672) with itself, so it always rounds to nearest, whatever FPSCR[RN] says, and fdlibm
-+// rounded to nearest is the correctly rounded root for every positive input, subnormals
-+// included: fsqrt in round-to-nearest gives the same bits.
-+//
-+// __fill_mem (0x80006508, under memset at 0x800065BC) stores byte by byte up to a word boundary,
-+// then words, then bytes. All of its stores to plain RAM land as one memset; a range touching
-+// anything else keeps the original store sequence.
-+//
-+// Both leave the result, every guest store and the FP registers as the originals do; the scratch
-+// integer registers (r0, r3-r12), cr0/cr1 and XER[CA] keep their entry values (volatile in the
-+// EABI: nothing reads them after the call). The registered bodies touch the CpuContext only
-+// through constant indexes and pass it nowhere, which gives the translator a precise contract.
-+#if defined(__SWITCH__)
-+#include <algorithm>
-+#include <cstdint>
-+#include <cstring>
-+
-+#include "abi_bridge.h"
-+#include "memory.h"
-+
-+namespace mlb_msl {
-+
-+constexpr uint64_t kFraction = 0x000FFFFFFFFFFFFFull, kImplicit = 1ull << 52;
-+
-+uint64_t Bits(double value) {
-+    uint64_t bits;
-+    std::memcpy(&bits, &value, sizeof bits);
-+    return bits;
-+}
-+
-+double FromBits(uint64_t bits) {
-+    double value;
-+    std::memcpy(&value, &bits, sizeof value);
-+    return value;
-+}
-+
-+// One instruction each: the runtime builds with -ffast-math, which may contract, reassociate or
-+// approximate host FP; the translated code they stand for builds with -fno-fast-math.
-+double Mul(double a, double b) {
-+    double result;
-+    __asm__("fmul %d0, %d1, %d2" : "=w"(result) : "w"(a), "w"(b));
-+    return result;
-+}
-+
-+double Add(double a, double b) {
-+    double result;
-+    __asm__("fadd %d0, %d1, %d2" : "=w"(result) : "w"(a), "w"(b));
-+    return result;
-+}
-+
-+double Widen(float value) {
-+    double result;
-+    __asm__("fcvt %d0, %s1" : "=w"(result) : "w"(value));
-+    return result;
-+}
-+
-+double ToDouble(uint64_t value) {  // exact below 2^53
-+    double result;
-+    __asm__("ucvtf %d0, %x1" : "=w"(result) : "r"(value));
-+    return result;
-+}
-+
-+// fsqrt rounded to nearest. The runtime never changes FPCR.RMode (only FZ), so the second branch
-+// is a guarantee, not a path.
-+double SqrtNearest(double value) {
-+    uint64_t fpcr;
-+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
-+    double result;
-+    if ((fpcr & (3ull << 22)) == 0) [[likely]] {
-+        __asm__("fsqrt %d0, %d1" : "=w"(result) : "w"(value));
-+        return result;
-+    }
-+    __asm__ __volatile__("msr fpcr, %1\n\tfsqrt %d0, %d2\n\tmsr fpcr, %3"
-+                         : "=&w"(result) : "r"(fpcr & ~(3ull << 22)), "w"(value), "r"(fpcr) : "memory");
-+    return result;
-+}
-+
-+// The correctly rounded root of a positive, finite, nonzero double, and whether it is exact.
-+// fdlibm's remainder is zero exactly then: an odd root of 54 significant bits squares to more
-+// than the 53 a double holds.
-+uint64_t PositiveSqrt(uint64_t x, bool& exact) {
-+    uint64_t root, mantissa;
-+    int exponent;  // x = mantissa * 2^exponent
-+    if ((x >> 52) == 0) {
-+        // Subnormal x = m * 2^-1074: sqrt(m) * 2^-537, m converted exactly and the scale applied to
-+        // the exponent field (the root stays normal), so FPCR.FZ never meets a subnormal.
-+        root = Bits(SqrtNearest(ToDouble(x))) - (537ull << 52);
-+        mantissa = x;
-+        exponent = -1074;
-+    } else {
-+        root = Bits(SqrtNearest(FromBits(x)));
-+        mantissa = (x & kFraction) | kImplicit;
-+        exponent = static_cast<int>(x >> 52) - 1075;
-+    }
-+    // root^2 == x  <=>  rootMantissa^2 == mantissa << shift
-+    const uint64_t rootMantissa = (root & kFraction) | kImplicit;
-+    const int shift = exponent - 2 * (static_cast<int>(root >> 52) - 1075);
-+    const unsigned __int128 square = static_cast<unsigned __int128>(rootMantissa) * rootMantissa;
-+    exact = shift >= 0 && shift < 128 && (square >> shift) == mantissa &&
-+            (square & ((static_cast<unsigned __int128>(1) << shift) - 1u)) == 0;
-+    return root;
-+}
-+
-+// Host bytes for guest [address, address + length), inside one 1 MiB page, when every
-+// __fill_mem store there takes the plain-RAM path; nullptr otherwise.
-+uint8_t* PlainRam(uint32_t address, uint32_t length) {
-+    if (uint8_t* host = MemoryInline::ResolveRangeHost(address, 0, length, false, true)) return host;
-+    if (!GuestFlat::RequiresCheckedAccess()) return nullptr;
-+    // Checked access (Horizon): Memory::Write8/Write32 store through the page's writable bias when
-+    // it has one (TryWriteGuestScalar; the word stores are aligned, so none crosses the page).
-+    const uintptr_t bias = MemoryInline::g_fullWritablePageBias[address >> MemoryInline::kPageShift];
-+    return bias != 0 ? reinterpret_cast<uint8_t*>((bias - 1u) + address) : nullptr;
-+}
-+
-+// All or nothing: one special page keeps the whole original store sequence.
-+bool FillPlainRam(uint32_t dst, uint8_t value, uint32_t count) {
-+    if (count - 1u > UINT32_MAX - dst) return false;  // wraps around the address space
-+    const uint32_t last = dst + (count - 1u);
-+    for (uint32_t at = dst;;) {
-+        const uint32_t end = std::min(last, at | MemoryInline::kPageMask);
-+        if (PlainRam(at, end - at + 1u) == nullptr) return false;
-+        if (end == last) break;
-+        at = end + 1u;
-+    }
-+    for (uint32_t at = dst;;) {
-+        const uint32_t end = std::min(last, at | MemoryInline::kPageMask);
-+        std::memset(PlainRam(at, end - at + 1u), value, end - at + 1u);
-+        if (end == last) break;
-+        at = end + 1u;
-+    }
-+    return true;
-+}
-+
-+// __fill_mem's own stores, in its order and widths.
-+void FillStores(uint32_t dst, uint8_t value, uint32_t count) {
-+    uint32_t last = dst - 1u;  // r6: the last byte stored
-+    if (count >= 32) {
-+        uint32_t align = (0u - dst) & 3u;
-+        count -= align;
-+        for (; align != 0; --align) MemoryInline::FlatWrite8(++last, value);
-+        const uint32_t word = value * 0x01010101u;
-+        uint32_t base = last - 3u;  // r3: words go to base + 4
-+        for (uint32_t blocks = count >> 5; blocks != 0; --blocks) {
-+            for (uint32_t offset = 4; offset <= 32; offset += 4) MemoryInline::FlatWrite32(base + offset, word);
-+            base += 32;
-+        }
-+        for (uint32_t words = (count >> 2) & 7u; words != 0; --words) {
-+            MemoryInline::FlatWrite32(base + 4, word);
-+            base += 4;
-+        }
-+        last = base + 3u;
-+        count &= 3u;
-+    }
-+    for (; count != 0; --count) MemoryInline::FlatWrite8(++last, value);
-+}
-+
-+}  // namespace mlb_msl
-+
-+// double __ieee754_sqrt(double x): f1 in, f1 out; errno (r13-26456) = EDOM for NaN, infinities
-+// and negatives.
-+extern "C" void MLB_Sqrt_80126AE8(CpuContext* ctx) {
-+    HleTraceCall("MLB_Sqrt_80126AE8");
-+    const uint32_t frame = ctx->gpr[1] - 32u;
-+    const double x = ctx->fpr[1].d;
-+    const uint64_t bits = mlb_msl::Bits(x);
-+    const uint32_t high = static_cast<uint32_t>(bits >> 32);
-+    // The original's frame (back chain, x), below the stack pointer: the stack keeps its bytes.
-+    MemoryInline::FlatWriteRam32(frame, ctx->gpr[1]);
-+    MemoryInline::FlatWriteRamFloat64(frame + 8u, x);
-+    if ((high & 0x7FF00000u) == 0x7FF00000u) {  // NaN or infinity: x*x + x
-+        const double square = mlb_msl::Mul(x, x);
-+        MemoryInline::FlatWrite32(ctx->gpr[13] - 26456u, 33u);
-+        ctx->fpr[0].d = square;
-+        ctx->fpr[1].d = mlb_msl::Add(x, square);
-+        return;
-+    }
-+    if (static_cast<int32_t>(high) <= 0) {
-+        if ((bits << 1) == 0) return;  // +-0
-+        if (static_cast<int32_t>(high) < 0) {  // negative: the float NaN at 0x8031AA10 (lfs)
-+            MemoryInline::FlatWrite32(ctx->gpr[13] - 26456u, 33u);
-+            ctx->fpr[1].d = mlb_msl::Widen(MemoryInline::FlatReadFloat32(0x8031AA10u));
-+            return;
-+        }
-+    }
-+    bool exact = false;
-+    const uint64_t root = mlb_msl::PositiveSqrt(bits, exact);
-+    if (!exact) ctx->fpr[0].d = MemoryInline::FlatReadFloat64(ctx->gpr[2] - 28672u);  // its rounding test's 1.0
-+    MemoryInline::FlatWriteRam32(frame + 20u, static_cast<uint32_t>(root));
-+    MemoryInline::FlatWriteRam32(frame + 16u, static_cast<uint32_t>(root >> 32));
-+    ctx->fpr[1].d = mlb_msl::FromBits(root);
-+}
-+REGISTER_NATIVE_FUNCTION(0x80126AE8, MLB_Sqrt_80126AE8);
-+
-+// void __fill_mem(void* dst, int value, unsigned long count)
-+extern "C" void MLB_FillMem_80006508(CpuContext* ctx) {
-+    HleTraceCall("MLB_FillMem_80006508");
-+    const uint32_t dst = ctx->gpr[3];
-+    const uint8_t value = static_cast<uint8_t>(ctx->gpr[4]);
-+    const uint32_t count = ctx->gpr[5];
-+    if (count == 0) return;
-+    if (!mlb_msl::FillPlainRam(dst, value, count)) mlb_msl::FillStores(dst, value, count);
-+}
-+REGISTER_NATIVE_FUNCTION(0x80006508, MLB_FillMem_80006508);
-+#endif
-diff --git a/runtime/src/hle/mlb/mtx_natives.cpp b/runtime/src/hle/mlb/mtx_natives.cpp
-new file mode 100644
-index 0000000..f12eddc
---- /dev/null
-+++ b/runtime/src/hle/mlb/mtx_natives.cpp
-@@ -0,0 +1,240 @@
-+// MLB Power Pros 2008 (RL8E54): a native leaf for PSMTXConcat (0x800A890C), 1.6% of the Switch
-+// main thread in the stock match profile (42 translated call sites, bone and model matrices).
-+//
-+// void PSMTXConcat(const Mtx a, const Mtx b, Mtx ab): ab = a * b for 3x4 single matrices, 18
-+// paired-single multiplies / fused multiply-adds over 13 psq_l pairs (a, b and the {0, 1} pair at
-+// 0x8031A608) and 6 psq_st pairs, all with GQR0.
-+//
-+// The translation computes each pair with one NEON fmul/fmla (ppc_isa_float.h) and resolves NaN
-+// lanes afterwards; loads quiet NaN lanes, stores flush single subnormals to their sign and quiet
-+// NaN lanes. Every loaded lane flows into some stored lane, and a NaN lane propagates through
-+// every later fmla of its chain, so a result with no NaN lane means no NaN was loaded or produced:
-+// the resolver never acted and the load quieting changed nothing. The fast path below does the same
-+// 18 instructions on that premise and, when any stored lane is NaN, discards its work (nothing was
-+// stored yet) and runs the exact sequence of the translation (Exact), whose helpers it shares.
-+// Exact also covers what the fast path does not: the checked access mode (no flat view), a GQR0
-+// other than 0 (quantized psq), a destination range that touches the MMIO window or wraps, and
-+// source ranges that wrap the 32-bit space.
-+//
-+// Kept exactly: every guest store (the back chain at r1-64, the 48 bytes of ab), r6 (the address
-+// of the {0, 1} pair) and f0-f13 as the translation leaves them; f14, f15 and f31 are restored by
-+// the original. r1 is unchanged. No CR, XER, LR or CTR access.
-+//
-+// This file builds like the translated code (-O2 -fno-fast-math -ffp-contract=off, outside the
-+// unity build: runtime/CMakeLists.txt, next to MKW_PPC_SEMANTIC_RUNTIME_SOURCES): the helpers it
-+// shares with the translation must compile to the same arithmetic, and -ffinite-math-only would
-+// fold the NaN tests away.
-+//
-+// One call with ordinary matrices (qemu-aarch64 trace, the shard's flags): 742 instructions
-+// translated (6 of its out-of-line PpcStorePairPsqFloatFastInline calls included), 152 here.
-+#if defined(__SWITCH__)
-+#include <arm_neon.h>
-+#include <cstdint>
-+#include <cstring>
-+
-+#include "abi_bridge.h"
-+#include "memory.h"
-+#include "ppc_runtime.h"
-+
-+namespace mlb_mtx {
-+
-+constexpr uint32_t kUnit01 = 0x8031A608u;  // r6 = 0x80320000 - 23032: {0.0f, 1.0f}
-+
-+// One pair as the translation holds it: packed double, low word ps1, high word ps0.
-+inline uint64_t Raw(double value) {
-+    uint64_t raw;
-+    std::memcpy(&raw, &value, sizeof raw);
-+    return raw;
-+}
-+
-+struct Outputs {
-+    uint64_t f[14];  // f0-f13 as the translation leaves them
-+};
-+
-+// The translation's sequence, helper for helper and in its order (loads, stores and the MMIO
-+// policy of each store included).
-+[[gnu::noinline, gnu::cold]] void Exact(uint32_t gqr, uint32_t a, uint32_t b, uint32_t ab, Outputs& out) {
-+    double f0 = PPC_PsqLGqrInline<0u, 0u>(gqr, a);
-+    const double f6 = PPC_PsqLGqrInline<0u, 0u>(gqr, b);
-+    const double f7 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 8u);
-+    const double f8 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 16u);
-+    double f12 = PPC_PsMuls0Inline(f6, f0);
-+    double f2 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 16u);
-+    double f13 = PPC_PsMuls0Inline(f7, f0);
-+    const double f31 = PPC_PsqLGqrInline<0u, 0u>(gqr, kUnit01);
-+    double f14 = PPC_PsMuls0Inline(f6, f2);
-+    const double f9 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 24u);
-+    double f15 = PPC_PsMuls0Inline(f7, f2);
-+    const double f1 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 8u);
-+    f12 = PPC_PsMadds1Inline(f8, f0, f12);
-+    const double f3 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 24u);
-+    f14 = PPC_PsMadds1Inline(f8, f2, f14);
-+    const double f10 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 32u);
-+    f13 = PPC_PsMadds1Inline(f9, f0, f13);
-+    const double f11 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 40u);
-+    f15 = PPC_PsMadds1Inline(f9, f2, f15);
-+    const double f4 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 32u);
-+    const double f5 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 40u);
-+    f12 = PPC_PsMadds0Inline(f10, f1, f12);
-+    f13 = PPC_PsMadds0Inline(f11, f1, f13);
-+    f14 = PPC_PsMadds0Inline(f10, f3, f14);
-+    f15 = PPC_PsMadds0Inline(f11, f3, f15);
-+    PPC_PsqStGqrInline<0u, 0u>(gqr, ab, f12);
-+    f2 = PPC_PsMuls0Inline(f6, f4);
-+    f13 = PPC_PsMadds1Inline(f31, f1, f13);
-+    f0 = PPC_PsMuls0Inline(f7, f4);
-+    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 16u, f14);
-+    f15 = PPC_PsMadds1Inline(f31, f3, f15);
-+    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 8u, f13);
-+    f2 = PPC_PsMadds1Inline(f8, f4, f2);
-+    f0 = PPC_PsMadds1Inline(f9, f4, f0);
-+    f2 = PPC_PsMadds0Inline(f10, f5, f2);
-+    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 24u, f15);
-+    f0 = PPC_PsMadds0Inline(f11, f5, f0);
-+    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 32u, f2);
-+    f0 = PPC_PsMadds1Inline(f31, f5, f0);
-+    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 40u, f0);
-+    const double regs[14] = {f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13};
-+    for (int i = 0; i < 14; ++i) out.f[i] = Raw(regs[i]);
-+}
-+
-+inline uint64_t Raw(float32x2_t pair) { return vget_lane_u64(vreinterpret_u64_f32(pair), 0); }
-+
-+// 16 guest bytes as two pairs in the packed layout: each 8-byte half byte-reversed, so the low
-+// word of a pair is its second (ps1) float, exactly PpcLoadPairPsqFloatFromHostInline's bswap64.
-+inline float32x4_t LoadPairs(const uint8_t* host) {
-+    return vreinterpretq_f32_u8(vrev64q_u8(vld1q_u8(host)));
-+}
-+
-+// psq_st's single narrowing of two pairs (PpcStorePsqFloatBitsInline per lane, NaN lanes excluded
-+// by the caller): a subnormal or zero keeps only its sign. Then back to guest byte order.
-+inline void StorePairs(uint8_t* host, float32x4_t pairs) {
-+    const uint32x4_t bits = vreinterpretq_u32_f32(pairs);
-+    const uint32x4_t tiny = vcltq_u32(vandq_u32(bits, vdupq_n_u32(0x7FFFFFFFu)), vdupq_n_u32(0x00800000u));
-+    const uint32x4_t stored = vbslq_u32(tiny, vandq_u32(bits, vdupq_n_u32(0x80000000u)), bits);
-+    vst1q_u8(host, vrev64q_u8(vreinterpretq_u8_u32(stored)));
-+}
-+
-+inline bool Wraps(uint32_t address, uint32_t length) { return address > UINT32_MAX - (length - 1u); }
-+
-+// No store of ab[0..47] takes MemoryInline's policy path (each psq_st checks its first and last
-+// byte against 0xCC000000-0xCDFFFFFF; the range test implies all twelve).
-+inline bool PlainDestination(uint32_t ab) {
-+    return !Wraps(ab, 48u) && (ab + 47u < 0xCC000000u || ab >= 0xCE000000u);
-+}
-+
-+// False when a stored lane would be NaN: nothing is stored then and Exact runs instead.
-+[[gnu::always_inline]] inline bool Fast(uint32_t a, uint32_t b, uint32_t ab, Outputs& out) {
-+    uint8_t* const base = MKW_FLAT_GUEST_BASE;
-+    const float32x4_t a01 = LoadPairs(base + a), a23 = LoadPairs(base + a + 16u),
-+                      a45 = LoadPairs(base + a + 32u);
-+    const float32x4_t b01 = LoadPairs(base + b), b23 = LoadPairs(base + b + 16u),
-+                      b45 = LoadPairs(base + b + 32u);
-+    uint64_t unitRaw;
-+    std::memcpy(&unitRaw, base + kUnit01, sizeof unitRaw);
-+    const float32x2_t f31 = vreinterpret_f32_u64(vdup_n_u64(__builtin_bswap64(unitRaw)));
-+    const float32x2_t f0 = vget_low_f32(a01), f1 = vget_high_f32(a01), f2 = vget_low_f32(a23),
-+                      f3 = vget_high_f32(a23), f4 = vget_low_f32(a45), f5 = vget_high_f32(a45);
-+    const float32x2_t f6 = vget_low_f32(b01), f7 = vget_high_f32(b01), f8 = vget_low_f32(b23),
-+                      f9 = vget_high_f32(b23), f10 = vget_low_f32(b45), f11 = vget_high_f32(b45);
-+    // ps0 is lane 1, ps1 lane 0. ps_muls0 d,a,c = a * c.ps0; ps_madds1 d,a,c,b = fma(a, c.ps1, b).
-+    float32x2_t r0 = vmul_lane_f32(f6, f0, 1);    // f12: ab row 0, columns 0-1
-+    float32x2_t r1 = vmul_lane_f32(f7, f0, 1);    // f13: row 0, columns 2-3
-+    float32x2_t r2 = vmul_lane_f32(f6, f2, 1);    // f14: row 1, columns 0-1
-+    float32x2_t r3 = vmul_lane_f32(f7, f2, 1);    // f15: row 1, columns 2-3
-+    float32x2_t r4 = vmul_lane_f32(f6, f4, 1);    // f2:  row 2, columns 0-1
-+    float32x2_t r5 = vmul_lane_f32(f7, f4, 1);    // f0:  row 2, columns 2-3
-+    r0 = vfma_lane_f32(r0, f8, f0, 0);
-+    r1 = vfma_lane_f32(r1, f9, f0, 0);
-+    r2 = vfma_lane_f32(r2, f8, f2, 0);
-+    r3 = vfma_lane_f32(r3, f9, f2, 0);
-+    r4 = vfma_lane_f32(r4, f8, f4, 0);
-+    r5 = vfma_lane_f32(r5, f9, f4, 0);
-+    r0 = vfma_lane_f32(r0, f10, f1, 1);
-+    r1 = vfma_lane_f32(r1, f11, f1, 1);
-+    r2 = vfma_lane_f32(r2, f10, f3, 1);
-+    r3 = vfma_lane_f32(r3, f11, f3, 1);
-+    r4 = vfma_lane_f32(r4, f10, f5, 1);
-+    r5 = vfma_lane_f32(r5, f11, f5, 1);
-+    r1 = vfma_lane_f32(r1, f31, f1, 0);
-+    r3 = vfma_lane_f32(r3, f31, f3, 0);
-+    r5 = vfma_lane_f32(r5, f31, f5, 0);
-+    const float32x4_t row0 = vcombine_f32(r0, r1), row1 = vcombine_f32(r2, r3), row2 = vcombine_f32(r4, r5);
-+    const uint32x4_t ordered = vandq_u32(vandq_u32(vceqq_f32(row0, row0), vceqq_f32(row1, row1)),
-+                                         vceqq_f32(row2, row2));
-+    if (vminvq_u32(ordered) == 0) [[unlikely]] return false;
-+    StorePairs(base + ab, row0);
-+    StorePairs(base + ab + 16u, row1);
-+    StorePairs(base + ab + 32u, row2);
-+    out.f[0] = Raw(r5);
-+    out.f[1] = Raw(f1);
-+    out.f[2] = Raw(r4);
-+    out.f[3] = Raw(f3);
-+    out.f[4] = Raw(f4);
-+    out.f[5] = Raw(f5);
-+    out.f[6] = Raw(f6);
-+    out.f[7] = Raw(f7);
-+    out.f[8] = Raw(f8);
-+    out.f[9] = Raw(f9);
-+    out.f[10] = Raw(f10);
-+    out.f[11] = Raw(f11);
-+    out.f[12] = Raw(r0);
-+    out.f[13] = Raw(r1);
-+    return true;
-+}
-+
-+}  // namespace mlb_mtx
-+
-+// GQR0 is read as (*ctx).gqr: the translator's contract analysis knows gpr/fpr/cr/xer/ctr/lr only
-+// and would make any other member a complete-context boundary, but no translated function holds a
-+// GQR across a call (mtspr stores to ctx->gqr, every function reloads its copy after each call),
-+// so this read needs no register sync.
-+extern "C" void MLB_PSMTXConcat_800A890C(CpuContext* ctx) {
-+    HleTraceCall("MLB_PSMTXConcat_800A890C");
-+    const uint32_t sp = ctx->gpr[1];
-+    const uint32_t a = ctx->gpr[3], b = ctx->gpr[4], ab = ctx->gpr[5];
-+    const uint32_t gqr = (*ctx).gqr[0];
-+    MemoryInline::FlatWriteRam32(sp - 64u, sp);  // stwu r1, -64(r1)
-+    ctx->gpr[6] = mlb_mtx::kUnit01;
-+    // Two blocks writing the same registers: the fast one's results stay in vector registers,
-+    // which a single Outputs passed to the out-of-line Exact as well would not allow.
-+    if (!GuestFlat::RequiresCheckedAccess() && gqr == 0 && !mlb_mtx::Wraps(a, 48u) && !mlb_mtx::Wraps(b, 48u) &&
-+        mlb_mtx::PlainDestination(ab)) [[likely]] {
-+        mlb_mtx::Outputs out;
-+        if (mlb_mtx::Fast(a, b, ab, out)) [[likely]] {
-+            ctx->fpr[0].raw = out.f[0];
-+            ctx->fpr[1].raw = out.f[1];
-+            ctx->fpr[2].raw = out.f[2];
-+            ctx->fpr[3].raw = out.f[3];
-+            ctx->fpr[4].raw = out.f[4];
-+            ctx->fpr[5].raw = out.f[5];
-+            ctx->fpr[6].raw = out.f[6];
-+            ctx->fpr[7].raw = out.f[7];
-+            ctx->fpr[8].raw = out.f[8];
-+            ctx->fpr[9].raw = out.f[9];
-+            ctx->fpr[10].raw = out.f[10];
-+            ctx->fpr[11].raw = out.f[11];
-+            ctx->fpr[12].raw = out.f[12];
-+            ctx->fpr[13].raw = out.f[13];
-+            return;
-+        }
-+    }
-+    mlb_mtx::Outputs out;
-+    mlb_mtx::Exact(gqr, a, b, ab, out);
-+    ctx->fpr[0].raw = out.f[0];
-+    ctx->fpr[1].raw = out.f[1];
-+    ctx->fpr[2].raw = out.f[2];
-+    ctx->fpr[3].raw = out.f[3];
-+    ctx->fpr[4].raw = out.f[4];
-+    ctx->fpr[5].raw = out.f[5];
-+    ctx->fpr[6].raw = out.f[6];
-+    ctx->fpr[7].raw = out.f[7];
-+    ctx->fpr[8].raw = out.f[8];
-+    ctx->fpr[9].raw = out.f[9];
-+    ctx->fpr[10].raw = out.f[10];
-+    ctx->fpr[11].raw = out.f[11];
-+    ctx->fpr[12].raw = out.f[12];
-+    ctx->fpr[13].raw = out.f[13];
-+}
-+REGISTER_NATIVE_FUNCTION(0x800A890C, MLB_PSMTXConcat_800A890C);
 +#endif

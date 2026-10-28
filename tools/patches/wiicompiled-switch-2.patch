@@ -1,3 +1,2112 @@
+diff --git a/runtime/src/hle/mlb/mix_natives.cpp b/runtime/src/hle/mlb/mix_natives.cpp
+new file mode 100644
+index 0000000..f3daee6
+--- /dev/null
++++ b/runtime/src/hle/mlb/mix_natives.cpp
+@@ -0,0 +1,1637 @@
++// MLB Power Pros 2008 (RL8E54): a native MIXUpdateSettings (0x800BFB24, the AX MIX library),
++// 1.8% of the Switch main thread in the stock match profile (run 3), plus the 1.1% of its
++// per-voice callee __MIXRmtUpdateSettings (0x800C1264).
++//
++// Who calls it: the game's sound engine thread (0x80027A54), woken every 5 ms by its ticker
++// thread (0x80027BF8, OSSleepTicks), walks its 55 channels (0x8002D768) and calls
++// MIXUpdateSettings once per channel that starts or fades, after each MIXSetFader; every call
++// walks all AX voices (r13-27104) and calls __MIXRmtUpdateSettings for each one that has a
++// voice. The AX user frame callback (0x80027BF4) is an empty blr. All of it is guest-thread code
++// (fibers on the main thread), as the single Broadway core ran it on the Wii: the per-frame
++// cost is the game's own, not an HLE artefact.
++//
++// The translation spends most of that time on the call boundary: one InvokeDirectCpu with a
++// full register sync, a guest stack frame and the spills around it per voice, and CR0/XER
++// bookkeeping at every compare. This is the same instruction sequence with __MIXRmtUpdateSettings
++// and its __MIXGetVolume calls (0x800BE098) inlined, guest registers as locals, CR0 kept as the
++// last compare's three flags and XER[CA] as one bit.
++//
++// Kept exactly, also for the volatile registers (cross-checked against the translation in
++// qemu-aarch64, see below): every guest load and store in program order (stack frames included,
++// the epilogues read r26-r31, r30/r31 and LR back from the stack as the original does), the
++// MMIO write policy of each store (the translation's one ResolveRangeHost group, the 15 remote
++// speaker halfwords at AXVPB+0x104, is resolved the same way), r0 r1 r3-r9 r11 r26-r31, CR0,
++// XER[CA] and LR as the translation leaves them; r10, r12, CR1-7, CTR and the FPRs untouched.
++// The checked access mode (no flat view) runs the translation itself, which
++// REGISTER_NATIVE_FUNCTION_AS keeps in the build.
++//
++// The body below is the guest code instruction for instruction (each `VOL(x)` is the inlined
++// __MIXGetVolume: x <= -904 -> 0, x >= 60 -> 0xFF64, else the table at 0x802290B0 indexed by x).
++// The registered function reads and writes the CpuContext only through constant indexes; it
++// hands the context to nothing but the checked-mode fallback, which takes it by reference so
++// the translator's contract analysis sees exactly the registers the translation itself uses.
++#if defined(__SWITCH__)
++#include <cstdint>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "memory.h"
++
++extern "C" void func_800BFB24(CpuContext* ctx);  // the translation (kept: _AS registration)
++
++namespace mlb_mix {
++
++struct Regs {
++    uint32_t r0, r1, r3, r4, r5, r6, r7, r8, r9, r11, r13, r26, r27, r28, r29, r30, r31;
++    uint32_t cr, xer, lr;
++};
++
++[[gnu::always_inline]] inline uint32_t Rotl(uint32_t v, unsigned s) { return (v << s) | (v >> ((32u - s) & 31u)); }
++[[gnu::always_inline]] inline uint32_t Mulhw(uint32_t a, uint32_t b) {
++    return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int32_t>(b)) >> 32);
++}
++[[gnu::always_inline]] inline uint32_t SrawiCarry(uint32_t v, unsigned sh) {
++    return (static_cast<int32_t>(v) < 0 && (v & ((1u << sh) - 1u)) != 0) ? 1u : 0u;
++}
++[[gnu::always_inline]] inline uint32_t Load32(uint8_t* base, uint32_t a) {
++    uint32_t v; std::memcpy(&v, base + a, 4); return __builtin_bswap32(v);
++}
++[[gnu::always_inline]] inline uint32_t Load16(uint8_t* base, uint32_t a) {
++    uint16_t v; std::memcpy(&v, base + a, 2); return __builtin_bswap16(v);
++}
++[[gnu::always_inline]] inline void Store32(uint8_t* base, uint32_t a, uint32_t v) {
++    v = __builtin_bswap32(v); std::memcpy(base + a, &v, 4);
++}
++[[gnu::always_inline]] inline void Store16(uint8_t* base, uint32_t a, uint32_t v) {
++    const uint16_t h = __builtin_bswap16(static_cast<uint16_t>(v)); std::memcpy(base + a, &h, 2);
++}
++// MemoryInline::FlatWrite16/32 with the flat view active: the MMIO window takes the slow path.
++[[gnu::always_inline]] inline void Write32(uint8_t* base, uint32_t a, uint32_t v) {
++    if (MemoryInline::FlatWriteNeedsPolicy(a)) [[unlikely]] { MemoryInline::Write32Slow(a, v); return; }
++    Store32(base, a, v);
++}
++[[gnu::always_inline]] inline void Write16(uint8_t* base, uint32_t a, uint32_t v) {
++    if (MemoryInline::FlatWriteNeedsPolicy(a)) [[unlikely]] { MemoryInline::Write16Slow(a, static_cast<uint16_t>(v)); return; }
++    Store16(base, a, v);
++}
++
++// The flat view only (GuestFlat::RequiresCheckedAccess() false).
++[[gnu::noinline]] void UpdateSettingsFlat(Regs& R) {
++    uint8_t* const base = MKW_FLAT_GUEST_BASE;
++    uint32_t r0 = R.r0, r1 = R.r1, r3 = R.r3, r4 = R.r4, r5 = R.r5, r6 = R.r6, r7 = R.r7, r8 = R.r8, r9 = R.r9;
++    uint32_t r11 = R.r11, r13 = R.r13, r26 = R.r26, r27 = R.r27, r28 = R.r28, r29 = R.r29, r30 = R.r30, r31 = R.r31;
++    uint32_t lr = R.lr;
++    uint32_t ca = (R.xer >> 29) & 1u;
++    bool lt = false, gt = false, eq = false;  // CR0 of the last compare (SO is XER[SO], unchanged)
++    uint8_t* g0 = nullptr;
++    uint32_t pfRt = 0;  // the remote table base (r13-27096) as the last __MIXRmtUpdateSettings read it
++
++#define LD32(a) Load32(base, (a))
++#define LD16(a) Load16(base, (a))
++#define ST32(a, v) Write32(base, (a), (v))
++#define ST16(a, v) Write16(base, (a), (v))
++#define STRAM32(a, v) Store32(base, (a), (v))
++#define STG16(g, off, a, v) MemoryInline::WriteResolved16((g), (off), (a), static_cast<uint16_t>(v))
++#define CMPS(a, b) do { const int32_t x_ = static_cast<int32_t>(a), y_ = static_cast<int32_t>(b); lt = x_ < y_; gt = x_ > y_; eq = x_ == y_; } while (false)
++#define CMPU(a, b) do { const uint32_t x_ = (a), y_ = (b); lt = x_ < y_; gt = x_ > y_; eq = x_ == y_; } while (false)
++#define LT lt
++#define GT gt
++#define EQ eq
++// A cache hint only (PRFM: no fault, no guest-visible effect): the walk is bound by the load latency of
++// the channel (0x70) and remote (0x44) entries, one new line per voice; ask for voice i+2's now.
++#define PF(a) __builtin_prefetch(base + static_cast<uint32_t>(a), 0, 3)
++#define VOL(x) do { CMPS((x), -904); if (!gt) { r0 = 0u; break; } CMPS((x), 60); if (!lt) { r0 = r29 - 156u; break; } \
++        r0 = (x) << 1; r7 = r30 + r0; r0 = LD16(r7 + 0x710u); } while (false)
++    // stwu r1,-32(r1); mflr r0; stw r0,36(r1); addi r11,r1,32; _savegpr_26 (one resolved range, as the translation)
++#define MIX_PROLOGUE() do { \
++        g0 = MemoryInline::ResolveRangeHost(r1 - 32u, 0, 40u, false, true); \
++        MemoryInline::WriteResolved32(g0, 0u, r1 - 32u, r1); \
++        r1 = r1 - 32u; \
++        r0 = lr; \
++        MemoryInline::WriteResolved32(g0, 36u, r1 + 36u, r0); \
++        r11 = r1 + 32u; \
++        if (!MemoryInline::WriteResolvedPair32(g0, 8u, (static_cast<uint64_t>(r26) << 32) | r27)) { \
++            MemoryInline::WriteResolved32(g0, 8u, r11 - 24u, r26); MemoryInline::WriteResolved32(g0, 12u, r11 - 20u, r27); } \
++        if (!MemoryInline::WriteResolvedPair32(g0, 16u, (static_cast<uint64_t>(r28) << 32) | r29)) { \
++            MemoryInline::WriteResolved32(g0, 16u, r11 - 16u, r28); MemoryInline::WriteResolved32(g0, 20u, r11 - 12u, r29); } \
++        if (!MemoryInline::WriteResolvedPair32(g0, 24u, (static_cast<uint64_t>(r30) << 32) | r31)) { \
++            MemoryInline::WriteResolved32(g0, 24u, r11 - 8u, r30); MemoryInline::WriteResolved32(g0, 28u, r11 - 4u, r31); } \
++    } while (false)
++    // addi r11,r1,32; _restgpr_26; lwz r0,36(r1); mtlr r0; addi r1,r1,32; blr
++#define MIX_EPILOGUE_AND_RETURN() do { \
++        r11 = r1 + 32u; \
++        r26 = LD32(r11 - 24u); r27 = LD32(r11 - 20u); r28 = LD32(r11 - 16u); \
++        r29 = LD32(r11 - 12u); r30 = LD32(r11 - 8u); r31 = LD32(r11 - 4u); \
++        r0 = LD32(r1 + 36u); lr = r0; r1 = r1 + 32u; \
++        goto L_ret; \
++    } while (false)
++
++    MIX_PROLOGUE();
++    r0 = LD32((r13 - 27108u));
++    CMPS(r0, 0);
++    if (EQ) goto L_800C119C;
++    r3 = (0x80230000u);
++    r26 = 0x0u;
++    r27 = 0x0u;
++    r29 = (0x10000u);
++    r30 = (r3 - 30304u);
++    r28 = 0x0u;
++    r31 = (0x2aab0000u);
++    goto L_800C1190;
++L_800BFB64:
++    r4 = LD32((r13 - 27112u));
++    r3 = 0x0u;
++    r0 = 0x0u;
++    r5 = r4 + r27;
++    PF(r5 + 0xE0u); PF(r5 + 0x120u); PF(r5 + 0x14Fu);
++    if (pfRt != 0u) { PF(pfRt + (r26 + 2u) * 0x44u); PF(pfRt + (r26 + 2u) * 0x44u + 0x43u); }
++    r4 = LD32(r4 + r27);
++    CMPS(r4, 0);
++    if (EQ) goto L_800C1188;
++    r7 = LD32((r5 + 4u));
++    r6 = 0x0u;
++    r7 = r7 & 0x20000000u;
++    CMPS(r7, 0);
++    if (EQ) goto L_800BFBA8;
++    r7 = LD16((r5 + 62u));
++    r3 = 0x1u;
++    ST16((r5 + 60u), r7);
++    r7 = LD32((r5 + 4u));
++    r7 = r7 & 0xdfffffffu;
++    ST32((r5 + 4u), r7);
++L_800BFBA8:
++    r8 = LD32((r5 + 4u));
++    r7 = r8 & 0x10000000u;
++    CMPS(r7, 0);
++    if (EQ) goto L_800BFC0C;
++    r3 = r8 & 0x00000008u;
++    CMPS(r3, 0);
++    if (EQ) goto L_800BFBC4;
++    ST16((r5 + 62u), r28);
++    goto L_800BFBF8;
++L_800BFBC4:
++    r3 = LD32((r5 + 8u));
++    CMPS(r3, -904);
++    if (GT) goto L_800BFBD8;
++    r3 = 0x0u;
++    goto L_800BFBF4;
++L_800BFBD8:
++    CMPS(r3, 60);
++    if (LT) goto L_800BFBE8;
++    r3 = (r29 - 156u);
++    goto L_800BFBF4;
++L_800BFBE8:
++    r3 = Rotl(r3, 1) & 0xfffffffeu;
++    r3 = r30 + r3;
++    r3 = LD16((r3 + 1808u));
++L_800BFBF4:
++    ST16((r5 + 62u), r3);
++L_800BFBF8:
++    r7 = LD32((r5 + 4u));
++    r3 = 0x1u;
++    r7 = r7 & 0xefffffffu;
++    r7 = r7 | 0x20000000u;
++    ST32((r5 + 4u), r7);
++L_800BFC0C:
++    r7 = LD32((r5 + 4u));
++    r7 = r7 & 0x80000000u;
++    CMPS(r7, 0);
++    if (EQ) goto L_800BFC88;
++    r7 = LD16((r5 + 66u));
++    r0 = 0x1u;
++    ST16((r5 + 64u), r7);
++    r7 = LD16((r5 + 70u));
++    ST16((r5 + 68u), r7);
++    r7 = LD16((r5 + 74u));
++    ST16((r5 + 72u), r7);
++    r7 = LD16((r5 + 78u));
++    ST16((r5 + 76u), r7);
++    r7 = LD16((r5 + 82u));
++    ST16((r5 + 80u), r7);
++    r7 = LD16((r5 + 86u));
++    ST16((r5 + 84u), r7);
++    r7 = LD16((r5 + 90u));
++    ST16((r5 + 88u), r7);
++    r7 = LD16((r5 + 94u));
++    ST16((r5 + 92u), r7);
++    r7 = LD16((r5 + 98u));
++    ST16((r5 + 96u), r7);
++    r7 = LD16((r5 + 102u));
++    ST16((r5 + 100u), r7);
++    r7 = LD16((r5 + 106u));
++    ST16((r5 + 104u), r7);
++    r7 = LD16((r5 + 110u));
++    ST16((r5 + 108u), r7);
++    r7 = LD32((r5 + 4u));
++    r7 = r7 & 0x7fffffffu;
++    ST32((r5 + 4u), r7);
++L_800BFC88:
++    r7 = LD32((r5 + 4u));
++    r7 = r7 & 0x40000000u;
++    CMPS(r7, 0);
++    if (EQ) goto L_800C0DF4;
++    r0 = LD32((r13 - 27100u));
++    CMPS(r0, 3);
++    if (EQ) goto L_800C082C;
++    if (!LT) goto L_800C0DE0;
++    CMPS(r0, 0);
++    if (EQ) goto L_800BFCB4;
++    if (!LT) goto L_800C0238;
++    goto L_800C0DE0;
++L_800BFCB4:
++    r7 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 66u), r0);
++    r7 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 70u), r0);
++    r7 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 74u), r0);
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000001u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800BFE34;
++    r7 = LD32((r5 + 12u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r7 = LD32((r5 + 12u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r7 = LD32((r5 + 12u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 86u), r0);
++    goto L_800BFF04;
++L_800BFE34:
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 12u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 12u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 86u), r0);
++L_800BFF04:
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000002u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800BFFCC;
++    r7 = LD32((r5 + 16u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r7 = LD32((r5 + 16u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r7 = LD32((r5 + 16u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 98u), r0);
++    goto L_800C009C;
++L_800BFFCC:
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 16u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 16u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 98u), r0);
++L_800C009C:
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000004u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C0164;
++    r7 = LD32((r5 + 20u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 102u), r0);
++    r7 = LD32((r5 + 20u));
++    r0 = LD32((r5 + 44u));
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++    r7 = LD32((r5 + 20u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 110u), r0);
++    goto L_800C0DE0;
++L_800C0164:
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 20u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 102u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 20u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 20u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 110u), r0);
++    goto L_800C0DE0;
++L_800C0238:
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 66u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 70u), r0);
++    r7 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 74u), r0);
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000001u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C03D8;
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r7 = LD32((r5 + 12u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 86u), r0);
++    goto L_800C04B8;
++L_800C03D8:
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 36u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 40u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 86u), r0);
++L_800C04B8:
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000002u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C0590;
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r7 = LD32((r5 + 16u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 98u), r0);
++    goto L_800C0670;
++L_800C0590:
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 36u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 40u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 98u), r0);
++L_800C0670:
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000004u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C0748;
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 20u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 102u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 20u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++    r7 = LD32((r5 + 20u));
++    r0 = LD32((r5 + 48u));
++    r7 = r7 + r0;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 110u), r0);
++    goto L_800C0DE0;
++L_800C0748:
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 36u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 20u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 102u), r0);
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 40u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 20u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 20u));
++    r7 = LD32((r5 + 48u));
++    r0 = r8 + r0;
++    r7 = r0 + r7;
++    r7 = (r7 - 30u);
++    VOL(r7);
++    ST16((r5 + 110u), r0);
++    goto L_800C0DE0;
++L_800C082C:
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 66u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 70u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 52u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 74u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 32u));
++    r7 = LD32((r5 + 56u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 102u), r0);
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000001u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C0A5C;
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 52u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 86u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 12u));
++    r7 = LD32((r5 + 56u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++    goto L_800C0B8C;
++L_800C0A5C:
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 36u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 78u), r0);
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 40u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 82u), r0);
++    r9 = LD32((r5 + 48u));
++    r7 = LD32((r5 + 52u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 86u), r0);
++    r9 = LD32((r5 + 48u));
++    r7 = LD32((r5 + 56u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 12u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 106u), r0);
++L_800C0B8C:
++    r0 = LD32((r5 + 4u));
++    r0 = r0 & 0x00000002u;
++    CMPS(r0, 0);
++    if (EQ) goto L_800C0CAC;
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 36u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r8 = LD32((r5 + 44u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 40u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 52u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 98u), r0);
++    r8 = LD32((r5 + 48u));
++    r0 = LD32((r5 + 16u));
++    r7 = LD32((r5 + 56u));
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 110u), r0);
++    goto L_800C0DDC;
++L_800C0CAC:
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 36u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 90u), r0);
++    r9 = LD32((r5 + 44u));
++    r7 = LD32((r5 + 40u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 94u), r0);
++    r9 = LD32((r5 + 48u));
++    r7 = LD32((r5 + 52u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 98u), r0);
++    r9 = LD32((r5 + 48u));
++    r7 = LD32((r5 + 56u));
++    r8 = LD32((r5 + 32u));
++    r0 = LD32((r5 + 16u));
++    r7 = r9 + r7;
++    r0 = r8 + r0;
++    r0 = r7 + r0;
++    VOL(r0);
++    ST16((r5 + 110u), r0);
++L_800C0DDC:
++    r6 = r6 | 0x80000000u;
++L_800C0DE0:
++    r7 = LD32((r5 + 4u));
++    r0 = 0x1u;
++    r7 = r7 & 0xbfffffffu;
++    r7 = r7 | 0x80000000u;
++    ST32((r5 + 4u), r7);
++L_800C0DF4:
++    CMPS(r3, 0);
++    if (EQ) goto L_800C0E34;
++    r3 = LD16((r5 + 60u));
++    r8 = (r31 - 21845u);
++    ST16((r4 + 146u), r3);
++    r7 = LD16((r5 + 60u));
++    r3 = LD16((r5 + 62u));
++    r3 = r3 - r7;
++    r3 = Mulhw(r8, r3);
++    ca = SrawiCarry(r3, 4); r3 = uint32_t(int32_t(r3) >> 4);
++    r7 = Rotl(r3, 1) & 0x00000001u;
++    r3 = r3 + r7;
++    ST16((r4 + 148u), r3);
++    r3 = LD32((r4 + 28u));
++    r3 = r3 | 0x100u;
++    ST32((r4 + 28u), r3);
++L_800C0E34:
++    CMPS(r0, 0);
++    if (EQ) goto L_800C1180;
++    r0 = LD16((r5 + 64u));
++    r3 = (r4 + 62u);
++    CMPS(r0, 0);
++    ST16((r4 + 60u), r0);
++    if (EQ) goto L_800C0E54;
++    r6 = r6 | 0x1u;
++L_800C0E54:
++    r7 = LD16((r5 + 64u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 66u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 0u), r7);
++    if (EQ) goto L_800C0E84;
++    r6 = r6 | 0x4u;
++L_800C0E84:
++    r0 = LD16((r5 + 68u));
++    CMPS(r0, 0);
++    ST16((r3 + 2u), r0);
++    if (EQ) goto L_800C0E98;
++    r6 = r6 | 0x2u;
++L_800C0E98:
++    r7 = LD16((r5 + 68u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 70u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 4u), r7);
++    if (EQ) goto L_800C0EC8;
++    r6 = r6 | 0x4u;
++L_800C0EC8:
++    r0 = LD16((r5 + 76u));
++    CMPS(r0, 0);
++    ST16((r3 + 6u), r0);
++    if (EQ) goto L_800C0EDC;
++    r6 = r6 | 0x10000u;
++L_800C0EDC:
++    r7 = LD16((r5 + 76u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 78u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 8u), r7);
++    if (EQ) goto L_800C0F0C;
++    r6 = r6 | 0x40000u;
++L_800C0F0C:
++    r0 = LD16((r5 + 80u));
++    CMPS(r0, 0);
++    ST16((r3 + 10u), r0);
++    if (EQ) goto L_800C0F20;
++    r6 = r6 | 0x20000u;
++L_800C0F20:
++    r7 = LD16((r5 + 80u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 82u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 12u), r7);
++    if (EQ) goto L_800C0F50;
++    r6 = r6 | 0x40000u;
++L_800C0F50:
++    r0 = LD16((r5 + 88u));
++    CMPS(r0, 0);
++    ST16((r3 + 14u), r0);
++    if (EQ) goto L_800C0F64;
++    r6 = r6 | 0x200000u;
++L_800C0F64:
++    r7 = LD16((r5 + 88u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 90u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 16u), r7);
++    if (EQ) goto L_800C0F94;
++    r6 = r6 | 0x800000u;
++L_800C0F94:
++    r0 = LD16((r5 + 92u));
++    CMPS(r0, 0);
++    ST16((r3 + 18u), r0);
++    if (EQ) goto L_800C0FA8;
++    r6 = r6 | 0x400000u;
++L_800C0FA8:
++    r7 = LD16((r5 + 92u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 94u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 20u), r7);
++    if (EQ) goto L_800C0FD8;
++    r6 = r6 | 0x800000u;
++L_800C0FD8:
++    r0 = LD16((r5 + 100u));
++    CMPS(r0, 0);
++    ST16((r3 + 22u), r0);
++    if (EQ) goto L_800C0FEC;
++    r6 = r6 | 0x4000000u;
++L_800C0FEC:
++    r7 = LD16((r5 + 100u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 102u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 24u), r7);
++    if (EQ) goto L_800C101C;
++    r6 = r6 | 0x10000000u;
++L_800C101C:
++    r0 = LD16((r5 + 104u));
++    CMPS(r0, 0);
++    ST16((r3 + 26u), r0);
++    if (EQ) goto L_800C1030;
++    r6 = r6 | 0x8000000u;
++L_800C1030:
++    r7 = LD16((r5 + 104u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 106u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 28u), r7);
++    if (EQ) goto L_800C1060;
++    r6 = r6 | 0x10000000u;
++L_800C1060:
++    r0 = LD16((r5 + 72u));
++    CMPS(r0, 0);
++    ST16((r3 + 30u), r0);
++    if (EQ) goto L_800C1074;
++    r6 = r6 | 0x8u;
++L_800C1074:
++    r7 = LD16((r5 + 72u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 74u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 32u), r7);
++    if (EQ) goto L_800C10A4;
++    r6 = r6 | 0x10u;
++L_800C10A4:
++    r0 = LD16((r5 + 84u));
++    CMPS(r0, 0);
++    ST16((r3 + 34u), r0);
++    if (EQ) goto L_800C10B8;
++    r6 = r6 | 0x80000u;
++L_800C10B8:
++    r7 = LD16((r5 + 84u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 86u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 36u), r7);
++    if (EQ) goto L_800C10E8;
++    r6 = r6 | 0x100000u;
++L_800C10E8:
++    r0 = LD16((r5 + 96u));
++    CMPS(r0, 0);
++    ST16((r3 + 38u), r0);
++    if (EQ) goto L_800C10FC;
++    r6 = r6 | 0x1000000u;
++L_800C10FC:
++    r7 = LD16((r5 + 96u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 98u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r7 = Rotl(r0, 1) & 0x00000001u;
++    r7 = r0 + r7;
++    r0 = r7 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 40u), r7);
++    if (EQ) goto L_800C112C;
++    r6 = r6 | 0x2000000u;
++L_800C112C:
++    r0 = LD16((r5 + 108u));
++    CMPS(r0, 0);
++    ST16((r3 + 42u), r0);
++    if (EQ) goto L_800C1140;
++    r6 = r6 | 0x20000000u;
++L_800C1140:
++    r7 = LD16((r5 + 108u));
++    r8 = (r31 - 21845u);
++    r0 = LD16((r5 + 110u));
++    r0 = r0 - r7;
++    r0 = Mulhw(r8, r0);
++    ca = SrawiCarry(r0, 4); r0 = uint32_t(int32_t(r0) >> 4);
++    r5 = Rotl(r0, 1) & 0x00000001u;
++    r5 = r0 + r5;
++    r0 = r5 & 0x0000ffffu;
++    CMPS(r0, 0);
++    ST16((r3 + 44u), r5);
++    if (EQ) goto L_800C1170;
++    r6 = r6 | 0x40000000u;
++L_800C1170:
++    ST32((r4 + 52u), r6);
++    r0 = LD32((r4 + 28u));
++    r0 = r0 | 0x12u;
++    ST32((r4 + 28u), r0);
++L_800C1180:
++    r3 = r26;
++    lr = 0x800c1188u;
++    STRAM32((r1 - 16u), r1); r1 = (r1 - 16u);
++    r0 = lr;
++    STRAM32((r1 + 20u), r0);
++    r0 = r3 * 0x44u;
++    STRAM32((r1 + 12u), r31);
++    STRAM32((r1 + 8u), r30);
++    r30 = r4;
++    r3 = LD32((r13 - 27096u));
++    r31 = r3 + r0;
++    pfRt = r3;
++    r3 = LD32(r3 + r0);
++    r0 = r3 & 0xc0000000u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C1688;
++    r0 = r3 & 0x80000000u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C12E8;
++    r0 = LD16((r31 + 38u));
++    ST16((r31 + 36u), r0);
++    r0 = LD16((r31 + 42u));
++    ST16((r31 + 40u), r0);
++    r0 = LD16((r31 + 46u));
++    ST16((r31 + 44u), r0);
++    r0 = LD16((r31 + 50u));
++    ST16((r31 + 48u), r0);
++    r0 = LD16((r31 + 54u));
++    ST16((r31 + 52u), r0);
++    r0 = LD16((r31 + 58u));
++    ST16((r31 + 56u), r0);
++    r0 = LD16((r31 + 62u));
++    ST16((r31 + 60u), r0);
++    r0 = LD16((r31 + 66u));
++    ST16((r31 + 64u), r0);
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x7fffffffu;
++    ST32((r31 + 0u), r0);
++L_c1_800C12E8:
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x40000000u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C13F4;
++    r3 = LD32((r31 + 4u));
++    lr = 0x800c12fcu;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c2_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret2;
++L_c1_c2_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c2_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret2;
++L_c1_c2_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret2;
++L_c1_ret2:;
++    ST16((r31 + 38u), r3);
++    r3 = LD32((r31 + 8u));
++    lr = 0x800c1308u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c3_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret3;
++L_c1_c3_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c3_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret3;
++L_c1_c3_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret3;
++L_c1_ret3:;
++    ST16((r31 + 46u), r3);
++    r3 = LD32((r31 + 12u));
++    lr = 0x800c1314u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c4_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret4;
++L_c1_c4_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c4_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret4;
++L_c1_c4_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret4;
++L_c1_ret4:;
++    ST16((r31 + 54u), r3);
++    r3 = LD32((r31 + 16u));
++    lr = 0x800c1320u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c5_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret5;
++L_c1_c5_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c5_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret5;
++L_c1_c5_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret5;
++L_c1_ret5:;
++    ST16((r31 + 62u), r3);
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x00000001u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C1340;
++    r3 = LD32((r31 + 20u));
++    lr = 0x800c1338u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c6_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret6;
++L_c1_c6_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c6_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret6;
++L_c1_c6_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret6;
++L_c1_ret6:;
++    ST16((r31 + 42u), r3);
++    goto L_c1_800C1354;
++L_c1_800C1340:
++    r3 = LD32((r31 + 4u));
++    r0 = LD32((r31 + 20u));
++    r3 = r3 + r0;
++    lr = 0x800c1350u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c7_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret7;
++L_c1_c7_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c7_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret7;
++L_c1_c7_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret7;
++L_c1_ret7:;
++    ST16((r31 + 42u), r3);
++L_c1_800C1354:
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x00000002u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C1370;
++    r3 = LD32((r31 + 24u));
++    lr = 0x800c1368u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c8_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret8;
++L_c1_c8_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c8_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret8;
++L_c1_c8_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret8;
++L_c1_ret8:;
++    ST16((r31 + 50u), r3);
++    goto L_c1_800C1384;
++L_c1_800C1370:
++    r3 = LD32((r31 + 8u));
++    r0 = LD32((r31 + 24u));
++    r3 = r3 + r0;
++    lr = 0x800c1380u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c9_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret9;
++L_c1_c9_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c9_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret9;
++L_c1_c9_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret9;
++L_c1_ret9:;
++    ST16((r31 + 50u), r3);
++L_c1_800C1384:
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x00000004u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C13A0;
++    r3 = LD32((r31 + 28u));
++    lr = 0x800c1398u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c10_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret10;
++L_c1_c10_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c10_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret10;
++L_c1_c10_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret10;
++L_c1_ret10:;
++    ST16((r31 + 58u), r3);
++    goto L_c1_800C13B4;
++L_c1_800C13A0:
++    r3 = LD32((r31 + 12u));
++    r0 = LD32((r31 + 28u));
++    r3 = r3 + r0;
++    lr = 0x800c13b0u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c11_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret11;
++L_c1_c11_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c11_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret11;
++L_c1_c11_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret11;
++L_c1_ret11:;
++    ST16((r31 + 58u), r3);
++L_c1_800C13B4:
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0x00000008u;
++    CMPS(r0, 0);
++    if (EQ) goto L_c1_800C13D0;
++    r3 = LD32((r31 + 32u));
++    lr = 0x800c13c8u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c12_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret12;
++L_c1_c12_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c12_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret12;
++L_c1_c12_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret12;
++L_c1_ret12:;
++    ST16((r31 + 66u), r3);
++    goto L_c1_800C13E4;
++L_c1_800C13D0:
++    r3 = LD32((r31 + 16u));
++    r0 = LD32((r31 + 32u));
++    r3 = r3 + r0;
++    lr = 0x800c13e0u;
++    CMPS(r3, -904);
++    if (GT) goto L_c1_c13_800BE0A8;
++    r3 = 0x0u;
++    goto L_c1_ret13;
++L_c1_c13_800BE0A8:
++    CMPS(r3, 60);
++    if (LT) goto L_c1_c13_800BE0BC;
++    r3 = (0x10000u);
++    r3 = (r3 - 156u);
++    goto L_c1_ret13;
++L_c1_c13_800BE0BC:
++    r0 = (r3 + 904u);
++    r3 = (0x80230000u);
++    r0 = Rotl(r0, 1) & 0xfffffffeu;
++    r3 = (r3 - 30304u);
++    r3 = LD16(r3 + r0);
++    goto L_c1_ret13;
++L_c1_ret13:;
++    ST16((r31 + 66u), r3);
++L_c1_800C13E4:
++    r0 = LD32((r31 + 0u));
++    r0 = r0 & 0xbfffffffu;
++    r0 = r0 | 0x80000000u;
++    ST32((r31 + 0u), r0);
++L_c1_800C13F4:
++    r4 = LD16((r31 + 36u));
++    r3 = (r30 + 260u);
++    r0 = 0x0u;
++    CMPS(r4, 0);
++    ST16((r30 + 258u), r4);
++    if (EQ) goto L_c1_800C1410;
++    r0 = r0 | 0x1u;
++L_c1_800C1410:
++    r6 = LD16((r31 + 36u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 38u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    g0 = MemoryInline::ResolveRangeHost(r3, 0, 30u, false, true);
++    STG16(g0, 0u, (r3 + 0u), r5);
++    if (EQ) goto L_c1_800C1448;
++    r0 = r0 | 0x2u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1448:
++    r4 = LD16((r31 + 40u));
++    CMPS(r4, 0);
++    STG16(g0, 2u, (r3 + 2u), r4);
++    if (EQ) goto L_c1_800C1460;
++    r0 = r0 | 0x4u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1460:
++    r6 = LD16((r31 + 40u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 42u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 4u, (r3 + 4u), r5);
++    if (EQ) goto L_c1_800C1498;
++    r0 = r0 | 0x8u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1498:
++    r4 = LD16((r31 + 44u));
++    CMPS(r4, 0);
++    STG16(g0, 6u, (r3 + 6u), r4);
++    if (EQ) goto L_c1_800C14B0;
++    r0 = r0 | 0x10u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C14B0:
++    r6 = LD16((r31 + 44u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 46u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 8u, (r3 + 8u), r5);
++    if (EQ) goto L_c1_800C14E8;
++    r0 = r0 | 0x20u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C14E8:
++    r4 = LD16((r31 + 48u));
++    CMPS(r4, 0);
++    STG16(g0, 10u, (r3 + 10u), r4);
++    if (EQ) goto L_c1_800C1500;
++    r0 = r0 | 0x40u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1500:
++    r6 = LD16((r31 + 48u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 50u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 12u, (r3 + 12u), r5);
++    if (EQ) goto L_c1_800C1538;
++    r0 = r0 | 0x80u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1538:
++    r4 = LD16((r31 + 52u));
++    CMPS(r4, 0);
++    STG16(g0, 14u, (r3 + 14u), r4);
++    if (EQ) goto L_c1_800C1550;
++    r0 = r0 | 0x100u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1550:
++    r6 = LD16((r31 + 52u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 54u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 16u, (r3 + 16u), r5);
++    if (EQ) goto L_c1_800C1588;
++    r0 = r0 | 0x200u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1588:
++    r4 = LD16((r31 + 56u));
++    CMPS(r4, 0);
++    STG16(g0, 18u, (r3 + 18u), r4);
++    if (EQ) goto L_c1_800C15A0;
++    r0 = r0 | 0x400u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C15A0:
++    r6 = LD16((r31 + 56u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 58u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 20u, (r3 + 20u), r5);
++    if (EQ) goto L_c1_800C15D8;
++    r0 = r0 | 0x800u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C15D8:
++    r4 = LD16((r31 + 60u));
++    CMPS(r4, 0);
++    STG16(g0, 22u, (r3 + 22u), r4);
++    if (EQ) goto L_c1_800C15F0;
++    r0 = r0 | 0x1000u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C15F0:
++    r6 = LD16((r31 + 60u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 62u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 24u, (r3 + 24u), r5);
++    if (EQ) goto L_c1_800C1628;
++    r0 = r0 | 0x2000u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1628:
++    r4 = LD16((r31 + 64u));
++    CMPS(r4, 0);
++    STG16(g0, 26u, (r3 + 26u), r4);
++    if (EQ) goto L_c1_800C1640;
++    r0 = r0 | 0x4000u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1640:
++    r6 = LD16((r31 + 64u));
++    r4 = (0x38e40000u);
++    r5 = LD16((r31 + 66u));
++    r7 = (r4 - 29127u);
++    r4 = r5 - r6;
++    r4 = Mulhw(r7, r4);
++    ca = SrawiCarry(r4, 2); r4 = uint32_t(int32_t(r4) >> 2);
++    r5 = Rotl(r4, 1) & 0x00000001u;
++    r5 = r4 + r5;
++    r4 = r5 & 0x0000ffffu;
++    CMPS(r4, 0);
++    STG16(g0, 28u, (r3 + 28u), r5);
++    if (EQ) goto L_c1_800C1678;
++    r0 = r0 | 0x8000u;
++    r0 = r0 & 0x0000ffffu;
++L_c1_800C1678:
++    r3 = LD32((r30 + 28u));
++    ST16((r30 + 256u), r0);
++    r0 = r3 | 0x3000000u;
++    ST32((r30 + 28u), r0);
++L_c1_800C1688:
++    r0 = LD32((r1 + 20u));
++    r31 = LD32((r1 + 12u));
++    r30 = LD32((r1 + 8u));
++    lr = r0;
++    r1 = (r1 + 16u);
++    goto L_ret1;
++L_ret1:;
++L_800C1188:
++    r27 = (r27 + 112u);
++    r26 = (r26 + 1u);
++L_800C1190:
++    r0 = LD32((r13 - 27104u));
++    CMPU(r26, r0);
++    if (LT) goto L_800BFB64;
++L_800C119C:
++    MIX_EPILOGUE_AND_RETURN();
++
++L_ret:
++#undef LD32
++#undef LD16
++#undef ST32
++#undef ST16
++#undef STRAM32
++#undef STG16
++#undef CMPS
++#undef CMPU
++#undef LT
++#undef GT
++#undef EQ
++#undef VOL
++#undef PF
++#undef MIX_PROLOGUE
++#undef MIX_EPILOGUE_AND_RETURN
++    R.r0 = r0; R.r1 = r1; R.r3 = r3; R.r4 = r4; R.r5 = r5; R.r6 = r6; R.r7 = r7; R.r8 = r8; R.r9 = r9;
++    R.r11 = r11; R.r26 = r26; R.r27 = r27; R.r28 = r28; R.r29 = r29; R.r30 = r30; R.r31 = r31;
++    R.lr = lr;
++    R.cr = (R.cr & 0x0FFFFFFFu) | (lt ? 0x80000000u : 0u) | (gt ? 0x40000000u : 0u) | (eq ? 0x20000000u : 0u) |
++           ((R.xer >> 3) & 0x10000000u);
++    R.xer = (R.xer & ~0x20000000u) | (ca << 29);
++}
++
++[[gnu::noinline, gnu::cold]] void Translated(CpuContext& context) { func_800BFB24(&context); }
++
++}  // namespace mlb_mix
++
++extern "C" void MLB_MIXUpdateSettings_800BFB24(CpuContext* ctx) {
++    if (GuestFlat::RequiresCheckedAccess()) [[unlikely]] {
++        mlb_mix::Translated(*ctx);
++        return;
++    }
++    mlb_mix::Regs regs;
++    regs.r0 = ctx->gpr[0];
++    regs.r1 = ctx->gpr[1];
++    regs.r3 = ctx->gpr[3];
++    regs.r4 = ctx->gpr[4];
++    regs.r5 = ctx->gpr[5];
++    regs.r6 = ctx->gpr[6];
++    regs.r7 = ctx->gpr[7];
++    regs.r8 = ctx->gpr[8];
++    regs.r9 = ctx->gpr[9];
++    regs.r11 = 0;
++    regs.r13 = ctx->gpr[13];
++    regs.r26 = ctx->gpr[26];
++    regs.r27 = ctx->gpr[27];
++    regs.r28 = ctx->gpr[28];
++    regs.r29 = ctx->gpr[29];
++    regs.r30 = ctx->gpr[30];
++    regs.r31 = ctx->gpr[31];
++    regs.cr = ctx->cr;
++    regs.xer = ctx->xer;
++    regs.lr = ctx->lr;
++    mlb_mix::UpdateSettingsFlat(regs);
++    ctx->gpr[0] = regs.r0;
++    ctx->gpr[1] = regs.r1;
++    ctx->gpr[3] = regs.r3;
++    ctx->gpr[4] = regs.r4;
++    ctx->gpr[5] = regs.r5;
++    ctx->gpr[6] = regs.r6;
++    ctx->gpr[7] = regs.r7;
++    ctx->gpr[8] = regs.r8;
++    ctx->gpr[9] = regs.r9;
++    ctx->gpr[11] = regs.r11;
++    ctx->gpr[26] = regs.r26;
++    ctx->gpr[27] = regs.r27;
++    ctx->gpr[28] = regs.r28;
++    ctx->gpr[29] = regs.r29;
++    ctx->gpr[30] = regs.r30;
++    ctx->gpr[31] = regs.r31;
++    ctx->cr = regs.cr;
++    ctx->xer = regs.xer;
++    ctx->lr = regs.lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x800BFB24, MLB_MIXUpdateSettings_800BFB24, "MIXUpdateSettings");
++#endif
+diff --git a/runtime/src/hle/mlb/msl_natives.cpp b/runtime/src/hle/mlb/msl_natives.cpp
+new file mode 100644
+index 0000000..c0e589b
+--- /dev/null
++++ b/runtime/src/hle/mlb/msl_natives.cpp
+@@ -0,0 +1,212 @@
++// MLB Power Pros 2008 (RL8E54): native leaves for two MSL routines the match spends ~8% of the
++// Switch main thread in (profile 1).
++//
++// __ieee754_sqrt (0x80126AE8, reached through sqrt at 0x80128FD0) is fdlibm's bit-by-bit loop:
++// 54 iterations of integer work plus its frame stores. Its rounding test compares the constant
++// 1.0 (r2-28672) with itself, so it always rounds to nearest, whatever FPSCR[RN] says, and fdlibm
++// rounded to nearest is the correctly rounded root for every positive input, subnormals
++// included: fsqrt in round-to-nearest gives the same bits.
++//
++// __fill_mem (0x80006508, under memset at 0x800065BC) stores byte by byte up to a word boundary,
++// then words, then bytes. All of its stores to plain RAM land as one memset; a range touching
++// anything else keeps the original store sequence.
++//
++// Both leave the result, every guest store and the FP registers as the originals do; the scratch
++// integer registers (r0, r3-r12), cr0/cr1 and XER[CA] keep their entry values (volatile in the
++// EABI: nothing reads them after the call). The registered bodies touch the CpuContext only
++// through constant indexes and pass it nowhere, which gives the translator a precise contract.
++#if defined(__SWITCH__)
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "compute_preempt.h"
++#include "memory.h"
++
++namespace mlb_msl {
++
++constexpr uint64_t kFraction = 0x000FFFFFFFFFFFFFull, kImplicit = 1ull << 52;
++
++uint64_t Bits(double value) {
++    uint64_t bits;
++    std::memcpy(&bits, &value, sizeof bits);
++    return bits;
++}
++
++double FromBits(uint64_t bits) {
++    double value;
++    std::memcpy(&value, &bits, sizeof value);
++    return value;
++}
++
++// One instruction each: the runtime builds with -ffast-math, which may contract, reassociate or
++// approximate host FP; the translated code they stand for builds with -fno-fast-math.
++double Mul(double a, double b) {
++    double result;
++    __asm__("fmul %d0, %d1, %d2" : "=w"(result) : "w"(a), "w"(b));
++    return result;
++}
++
++double Add(double a, double b) {
++    double result;
++    __asm__("fadd %d0, %d1, %d2" : "=w"(result) : "w"(a), "w"(b));
++    return result;
++}
++
++double Widen(float value) {
++    double result;
++    __asm__("fcvt %d0, %s1" : "=w"(result) : "w"(value));
++    return result;
++}
++
++double ToDouble(uint64_t value) {  // exact below 2^53
++    double result;
++    __asm__("ucvtf %d0, %x1" : "=w"(result) : "r"(value));
++    return result;
++}
++
++// fsqrt rounded to nearest. The runtime never changes FPCR.RMode (only FZ), so the second branch
++// is a guarantee, not a path.
++double SqrtNearest(double value) {
++    uint64_t fpcr;
++    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
++    double result;
++    if ((fpcr & (3ull << 22)) == 0) [[likely]] {
++        __asm__("fsqrt %d0, %d1" : "=w"(result) : "w"(value));
++        return result;
++    }
++    __asm__ __volatile__("msr fpcr, %1\n\tfsqrt %d0, %d2\n\tmsr fpcr, %3"
++                         : "=&w"(result) : "r"(fpcr & ~(3ull << 22)), "w"(value), "r"(fpcr) : "memory");
++    return result;
++}
++
++// The correctly rounded root of a positive, finite, nonzero double, and whether it is exact.
++// fdlibm's remainder is zero exactly then: an odd root of 54 significant bits squares to more
++// than the 53 a double holds.
++uint64_t PositiveSqrt(uint64_t x, bool& exact) {
++    uint64_t root, mantissa;
++    int exponent;  // x = mantissa * 2^exponent
++    if ((x >> 52) == 0) {
++        // Subnormal x = m * 2^-1074: sqrt(m) * 2^-537, m converted exactly and the scale applied to
++        // the exponent field (the root stays normal), so FPCR.FZ never meets a subnormal.
++        root = Bits(SqrtNearest(ToDouble(x))) - (537ull << 52);
++        mantissa = x;
++        exponent = -1074;
++    } else {
++        root = Bits(SqrtNearest(FromBits(x)));
++        mantissa = (x & kFraction) | kImplicit;
++        exponent = static_cast<int>(x >> 52) - 1075;
++    }
++    // root^2 == x  <=>  rootMantissa^2 == mantissa << shift
++    const uint64_t rootMantissa = (root & kFraction) | kImplicit;
++    const int shift = exponent - 2 * (static_cast<int>(root >> 52) - 1075);
++    const unsigned __int128 square = static_cast<unsigned __int128>(rootMantissa) * rootMantissa;
++    exact = shift >= 0 && shift < 128 && (square >> shift) == mantissa &&
++            (square & ((static_cast<unsigned __int128>(1) << shift) - 1u)) == 0;
++    return root;
++}
++
++// Host bytes for guest [address, address + length), inside one 1 MiB page, when every
++// __fill_mem store there takes the plain-RAM path; nullptr otherwise.
++uint8_t* PlainRam(uint32_t address, uint32_t length) {
++    if (uint8_t* host = MemoryInline::ResolveRangeHost(address, 0, length, false, true)) return host;
++    if (!GuestFlat::RequiresCheckedAccess()) return nullptr;
++    // Checked access (Horizon): Memory::Write8/Write32 store through the page's writable bias when
++    // it has one (TryWriteGuestScalar; the word stores are aligned, so none crosses the page).
++    const uintptr_t bias = MemoryInline::g_fullWritablePageBias[address >> MemoryInline::kPageShift];
++    return bias != 0 ? reinterpret_cast<uint8_t*>((bias - 1u) + address) : nullptr;
++}
++
++// All or nothing: one special page keeps the whole original store sequence.
++bool FillPlainRam(uint32_t dst, uint8_t value, uint32_t count) {
++    if (count - 1u > UINT32_MAX - dst) return false;  // wraps around the address space
++    const uint32_t last = dst + (count - 1u);
++    for (uint32_t at = dst;;) {
++        const uint32_t end = std::min(last, at | MemoryInline::kPageMask);
++        if (PlainRam(at, end - at + 1u) == nullptr) return false;
++        if (end == last) break;
++        at = end + 1u;
++    }
++    for (uint32_t at = dst;;) {
++        const uint32_t end = std::min(last, at | MemoryInline::kPageMask);
++        std::memset(PlainRam(at, end - at + 1u), value, end - at + 1u);
++        if (end == last) break;
++        at = end + 1u;
++    }
++    return true;
++}
++
++// __fill_mem's own stores, in its order and widths.
++void FillStores(uint32_t dst, uint8_t value, uint32_t count) {
++    uint32_t last = dst - 1u;  // r6: the last byte stored
++    if (count >= 32) {
++        uint32_t align = (0u - dst) & 3u;
++        count -= align;
++        for (; align != 0; --align) MemoryInline::FlatWrite8(++last, value);
++        const uint32_t word = value * 0x01010101u;
++        uint32_t base = last - 3u;  // r3: words go to base + 4
++        for (uint32_t blocks = count >> 5; blocks != 0; --blocks) {
++            for (uint32_t offset = 4; offset <= 32; offset += 4) MemoryInline::FlatWrite32(base + offset, word);
++            base += 32;
++        }
++        for (uint32_t words = (count >> 2) & 7u; words != 0; --words) {
++            MemoryInline::FlatWrite32(base + 4, word);
++            base += 4;
++        }
++        last = base + 3u;
++        count &= 3u;
++    }
++    for (; count != 0; --count) MemoryInline::FlatWrite8(++last, value);
++}
++
++}  // namespace mlb_msl
++
++// double __ieee754_sqrt(double x): f1 in, f1 out; errno (r13-26456) = EDOM for NaN, infinities
++// and negatives.
++extern "C" void MLB_Sqrt_80126AE8(CpuContext* ctx) {
++    HleTraceCall("MLB_Sqrt_80126AE8");
++    MkwComputePreemptPoll();  // T8 (switch phase 51): a compute preemption point (compute_preempt.h)
++    const uint32_t frame = ctx->gpr[1] - 32u;
++    const double x = ctx->fpr[1].d;
++    const uint64_t bits = mlb_msl::Bits(x);
++    const uint32_t high = static_cast<uint32_t>(bits >> 32);
++    // The original's frame (back chain, x), below the stack pointer: the stack keeps its bytes.
++    MemoryInline::FlatWriteRam32(frame, ctx->gpr[1]);
++    MemoryInline::FlatWriteRamFloat64(frame + 8u, x);
++    if ((high & 0x7FF00000u) == 0x7FF00000u) {  // NaN or infinity: x*x + x
++        const double square = mlb_msl::Mul(x, x);
++        MemoryInline::FlatWrite32(ctx->gpr[13] - 26456u, 33u);
++        ctx->fpr[0].d = square;
++        ctx->fpr[1].d = mlb_msl::Add(x, square);
++        return;
++    }
++    if (static_cast<int32_t>(high) <= 0) {
++        if ((bits << 1) == 0) return;  // +-0
++        if (static_cast<int32_t>(high) < 0) {  // negative: the float NaN at 0x8031AA10 (lfs)
++            MemoryInline::FlatWrite32(ctx->gpr[13] - 26456u, 33u);
++            ctx->fpr[1].d = mlb_msl::Widen(MemoryInline::FlatReadFloat32(0x8031AA10u));
++            return;
++        }
++    }
++    bool exact = false;
++    const uint64_t root = mlb_msl::PositiveSqrt(bits, exact);
++    if (!exact) ctx->fpr[0].d = MemoryInline::FlatReadFloat64(ctx->gpr[2] - 28672u);  // its rounding test's 1.0
++    MemoryInline::FlatWriteRam32(frame + 20u, static_cast<uint32_t>(root));
++    MemoryInline::FlatWriteRam32(frame + 16u, static_cast<uint32_t>(root >> 32));
++    ctx->fpr[1].d = mlb_msl::FromBits(root);
++}
++REGISTER_NATIVE_FUNCTION(0x80126AE8, MLB_Sqrt_80126AE8);
++
++// void __fill_mem(void* dst, int value, unsigned long count)
++extern "C" void MLB_FillMem_80006508(CpuContext* ctx) {
++    HleTraceCall("MLB_FillMem_80006508");
++    MkwComputePreemptPoll();  // T8 (switch phase 51): a compute preemption point (compute_preempt.h)
++    const uint32_t dst = ctx->gpr[3];
++    const uint8_t value = static_cast<uint8_t>(ctx->gpr[4]);
++    const uint32_t count = ctx->gpr[5];
++    if (count == 0) return;
++    if (!mlb_msl::FillPlainRam(dst, value, count)) mlb_msl::FillStores(dst, value, count);
++}
++REGISTER_NATIVE_FUNCTION(0x80006508, MLB_FillMem_80006508);
++#endif
+diff --git a/runtime/src/hle/mlb/mtx_natives.cpp b/runtime/src/hle/mlb/mtx_natives.cpp
+new file mode 100644
+index 0000000..13d29b8
+--- /dev/null
++++ b/runtime/src/hle/mlb/mtx_natives.cpp
+@@ -0,0 +1,242 @@
++// MLB Power Pros 2008 (RL8E54): a native leaf for PSMTXConcat (0x800A890C), 1.6% of the Switch
++// main thread in the stock match profile (42 translated call sites, bone and model matrices).
++//
++// void PSMTXConcat(const Mtx a, const Mtx b, Mtx ab): ab = a * b for 3x4 single matrices, 18
++// paired-single multiplies / fused multiply-adds over 13 psq_l pairs (a, b and the {0, 1} pair at
++// 0x8031A608) and 6 psq_st pairs, all with GQR0.
++//
++// The translation computes each pair with one NEON fmul/fmla (ppc_isa_float.h) and resolves NaN
++// lanes afterwards; loads quiet NaN lanes, stores flush single subnormals to their sign and quiet
++// NaN lanes. Every loaded lane flows into some stored lane, and a NaN lane propagates through
++// every later fmla of its chain, so a result with no NaN lane means no NaN was loaded or produced:
++// the resolver never acted and the load quieting changed nothing. The fast path below does the same
++// 18 instructions on that premise and, when any stored lane is NaN, discards its work (nothing was
++// stored yet) and runs the exact sequence of the translation (Exact), whose helpers it shares.
++// Exact also covers what the fast path does not: the checked access mode (no flat view), a GQR0
++// other than 0 (quantized psq), a destination range that touches the MMIO window or wraps, and
++// source ranges that wrap the 32-bit space.
++//
++// Kept exactly: every guest store (the back chain at r1-64, the 48 bytes of ab), r6 (the address
++// of the {0, 1} pair) and f0-f13 as the translation leaves them; f14, f15 and f31 are restored by
++// the original. r1 is unchanged. No CR, XER, LR or CTR access.
++//
++// This file builds like the translated code (-O2 -fno-fast-math -ffp-contract=off, outside the
++// unity build: runtime/CMakeLists.txt, next to MKW_PPC_SEMANTIC_RUNTIME_SOURCES): the helpers it
++// shares with the translation must compile to the same arithmetic, and -ffinite-math-only would
++// fold the NaN tests away.
++//
++// One call with ordinary matrices (qemu-aarch64 trace, the shard's flags): 742 instructions
++// translated (6 of its out-of-line PpcStorePairPsqFloatFastInline calls included), 152 here.
++#if defined(__SWITCH__)
++#include <arm_neon.h>
++#include <cstdint>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "compute_preempt.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++
++namespace mlb_mtx {
++
++constexpr uint32_t kUnit01 = 0x8031A608u;  // r6 = 0x80320000 - 23032: {0.0f, 1.0f}
++
++// One pair as the translation holds it: packed double, low word ps1, high word ps0.
++inline uint64_t Raw(double value) {
++    uint64_t raw;
++    std::memcpy(&raw, &value, sizeof raw);
++    return raw;
++}
++
++struct Outputs {
++    uint64_t f[14];  // f0-f13 as the translation leaves them
++};
++
++// The translation's sequence, helper for helper and in its order (loads, stores and the MMIO
++// policy of each store included).
++[[gnu::noinline, gnu::cold]] void Exact(uint32_t gqr, uint32_t a, uint32_t b, uint32_t ab, Outputs& out) {
++    double f0 = PPC_PsqLGqrInline<0u, 0u>(gqr, a);
++    const double f6 = PPC_PsqLGqrInline<0u, 0u>(gqr, b);
++    const double f7 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 8u);
++    const double f8 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 16u);
++    double f12 = PPC_PsMuls0Inline(f6, f0);
++    double f2 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 16u);
++    double f13 = PPC_PsMuls0Inline(f7, f0);
++    const double f31 = PPC_PsqLGqrInline<0u, 0u>(gqr, kUnit01);
++    double f14 = PPC_PsMuls0Inline(f6, f2);
++    const double f9 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 24u);
++    double f15 = PPC_PsMuls0Inline(f7, f2);
++    const double f1 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 8u);
++    f12 = PPC_PsMadds1Inline(f8, f0, f12);
++    const double f3 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 24u);
++    f14 = PPC_PsMadds1Inline(f8, f2, f14);
++    const double f10 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 32u);
++    f13 = PPC_PsMadds1Inline(f9, f0, f13);
++    const double f11 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 40u);
++    f15 = PPC_PsMadds1Inline(f9, f2, f15);
++    const double f4 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 32u);
++    const double f5 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 40u);
++    f12 = PPC_PsMadds0Inline(f10, f1, f12);
++    f13 = PPC_PsMadds0Inline(f11, f1, f13);
++    f14 = PPC_PsMadds0Inline(f10, f3, f14);
++    f15 = PPC_PsMadds0Inline(f11, f3, f15);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab, f12);
++    f2 = PPC_PsMuls0Inline(f6, f4);
++    f13 = PPC_PsMadds1Inline(f31, f1, f13);
++    f0 = PPC_PsMuls0Inline(f7, f4);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 16u, f14);
++    f15 = PPC_PsMadds1Inline(f31, f3, f15);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 8u, f13);
++    f2 = PPC_PsMadds1Inline(f8, f4, f2);
++    f0 = PPC_PsMadds1Inline(f9, f4, f0);
++    f2 = PPC_PsMadds0Inline(f10, f5, f2);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 24u, f15);
++    f0 = PPC_PsMadds0Inline(f11, f5, f0);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 32u, f2);
++    f0 = PPC_PsMadds1Inline(f31, f5, f0);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 40u, f0);
++    const double regs[14] = {f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13};
++    for (int i = 0; i < 14; ++i) out.f[i] = Raw(regs[i]);
++}
++
++inline uint64_t Raw(float32x2_t pair) { return vget_lane_u64(vreinterpret_u64_f32(pair), 0); }
++
++// 16 guest bytes as two pairs in the packed layout: each 8-byte half byte-reversed, so the low
++// word of a pair is its second (ps1) float, exactly PpcLoadPairPsqFloatFromHostInline's bswap64.
++inline float32x4_t LoadPairs(const uint8_t* host) {
++    return vreinterpretq_f32_u8(vrev64q_u8(vld1q_u8(host)));
++}
++
++// psq_st's single narrowing of two pairs (PpcStorePsqFloatBitsInline per lane, NaN lanes excluded
++// by the caller): a subnormal or zero keeps only its sign. Then back to guest byte order.
++inline void StorePairs(uint8_t* host, float32x4_t pairs) {
++    const uint32x4_t bits = vreinterpretq_u32_f32(pairs);
++    const uint32x4_t tiny = vcltq_u32(vandq_u32(bits, vdupq_n_u32(0x7FFFFFFFu)), vdupq_n_u32(0x00800000u));
++    const uint32x4_t stored = vbslq_u32(tiny, vandq_u32(bits, vdupq_n_u32(0x80000000u)), bits);
++    vst1q_u8(host, vrev64q_u8(vreinterpretq_u8_u32(stored)));
++}
++
++inline bool Wraps(uint32_t address, uint32_t length) { return address > UINT32_MAX - (length - 1u); }
++
++// No store of ab[0..47] takes MemoryInline's policy path (each psq_st checks its first and last
++// byte against 0xCC000000-0xCDFFFFFF; the range test implies all twelve).
++inline bool PlainDestination(uint32_t ab) {
++    return !Wraps(ab, 48u) && (ab + 47u < 0xCC000000u || ab >= 0xCE000000u);
++}
++
++// False when a stored lane would be NaN: nothing is stored then and Exact runs instead.
++[[gnu::always_inline]] inline bool Fast(uint32_t a, uint32_t b, uint32_t ab, Outputs& out) {
++    uint8_t* const base = MKW_FLAT_GUEST_BASE;
++    const float32x4_t a01 = LoadPairs(base + a), a23 = LoadPairs(base + a + 16u),
++                      a45 = LoadPairs(base + a + 32u);
++    const float32x4_t b01 = LoadPairs(base + b), b23 = LoadPairs(base + b + 16u),
++                      b45 = LoadPairs(base + b + 32u);
++    uint64_t unitRaw;
++    std::memcpy(&unitRaw, base + kUnit01, sizeof unitRaw);
++    const float32x2_t f31 = vreinterpret_f32_u64(vdup_n_u64(__builtin_bswap64(unitRaw)));
++    const float32x2_t f0 = vget_low_f32(a01), f1 = vget_high_f32(a01), f2 = vget_low_f32(a23),
++                      f3 = vget_high_f32(a23), f4 = vget_low_f32(a45), f5 = vget_high_f32(a45);
++    const float32x2_t f6 = vget_low_f32(b01), f7 = vget_high_f32(b01), f8 = vget_low_f32(b23),
++                      f9 = vget_high_f32(b23), f10 = vget_low_f32(b45), f11 = vget_high_f32(b45);
++    // ps0 is lane 1, ps1 lane 0. ps_muls0 d,a,c = a * c.ps0; ps_madds1 d,a,c,b = fma(a, c.ps1, b).
++    float32x2_t r0 = vmul_lane_f32(f6, f0, 1);    // f12: ab row 0, columns 0-1
++    float32x2_t r1 = vmul_lane_f32(f7, f0, 1);    // f13: row 0, columns 2-3
++    float32x2_t r2 = vmul_lane_f32(f6, f2, 1);    // f14: row 1, columns 0-1
++    float32x2_t r3 = vmul_lane_f32(f7, f2, 1);    // f15: row 1, columns 2-3
++    float32x2_t r4 = vmul_lane_f32(f6, f4, 1);    // f2:  row 2, columns 0-1
++    float32x2_t r5 = vmul_lane_f32(f7, f4, 1);    // f0:  row 2, columns 2-3
++    r0 = vfma_lane_f32(r0, f8, f0, 0);
++    r1 = vfma_lane_f32(r1, f9, f0, 0);
++    r2 = vfma_lane_f32(r2, f8, f2, 0);
++    r3 = vfma_lane_f32(r3, f9, f2, 0);
++    r4 = vfma_lane_f32(r4, f8, f4, 0);
++    r5 = vfma_lane_f32(r5, f9, f4, 0);
++    r0 = vfma_lane_f32(r0, f10, f1, 1);
++    r1 = vfma_lane_f32(r1, f11, f1, 1);
++    r2 = vfma_lane_f32(r2, f10, f3, 1);
++    r3 = vfma_lane_f32(r3, f11, f3, 1);
++    r4 = vfma_lane_f32(r4, f10, f5, 1);
++    r5 = vfma_lane_f32(r5, f11, f5, 1);
++    r1 = vfma_lane_f32(r1, f31, f1, 0);
++    r3 = vfma_lane_f32(r3, f31, f3, 0);
++    r5 = vfma_lane_f32(r5, f31, f5, 0);
++    const float32x4_t row0 = vcombine_f32(r0, r1), row1 = vcombine_f32(r2, r3), row2 = vcombine_f32(r4, r5);
++    const uint32x4_t ordered = vandq_u32(vandq_u32(vceqq_f32(row0, row0), vceqq_f32(row1, row1)),
++                                         vceqq_f32(row2, row2));
++    if (vminvq_u32(ordered) == 0) [[unlikely]] return false;
++    StorePairs(base + ab, row0);
++    StorePairs(base + ab + 16u, row1);
++    StorePairs(base + ab + 32u, row2);
++    out.f[0] = Raw(r5);
++    out.f[1] = Raw(f1);
++    out.f[2] = Raw(r4);
++    out.f[3] = Raw(f3);
++    out.f[4] = Raw(f4);
++    out.f[5] = Raw(f5);
++    out.f[6] = Raw(f6);
++    out.f[7] = Raw(f7);
++    out.f[8] = Raw(f8);
++    out.f[9] = Raw(f9);
++    out.f[10] = Raw(f10);
++    out.f[11] = Raw(f11);
++    out.f[12] = Raw(r0);
++    out.f[13] = Raw(r1);
++    return true;
++}
++
++}  // namespace mlb_mtx
++
++// GQR0 is read as (*ctx).gqr: the translator's contract analysis knows gpr/fpr/cr/xer/ctr/lr only
++// and would make any other member a complete-context boundary, but no translated function holds a
++// GQR across a call (mtspr stores to ctx->gqr, every function reloads its copy after each call),
++// so this read needs no register sync.
++extern "C" void MLB_PSMTXConcat_800A890C(CpuContext* ctx) {
++    HleTraceCall("MLB_PSMTXConcat_800A890C");
++    MkwComputePreemptPoll();  // T8 (switch phase 51): a compute preemption point (compute_preempt.h)
++    const uint32_t sp = ctx->gpr[1];
++    const uint32_t a = ctx->gpr[3], b = ctx->gpr[4], ab = ctx->gpr[5];
++    const uint32_t gqr = (*ctx).gqr[0];
++    MemoryInline::FlatWriteRam32(sp - 64u, sp);  // stwu r1, -64(r1)
++    ctx->gpr[6] = mlb_mtx::kUnit01;
++    // Two blocks writing the same registers: the fast one's results stay in vector registers,
++    // which a single Outputs passed to the out-of-line Exact as well would not allow.
++    if (!GuestFlat::RequiresCheckedAccess() && gqr == 0 && !mlb_mtx::Wraps(a, 48u) && !mlb_mtx::Wraps(b, 48u) &&
++        mlb_mtx::PlainDestination(ab)) [[likely]] {
++        mlb_mtx::Outputs out;
++        if (mlb_mtx::Fast(a, b, ab, out)) [[likely]] {
++            ctx->fpr[0].raw = out.f[0];
++            ctx->fpr[1].raw = out.f[1];
++            ctx->fpr[2].raw = out.f[2];
++            ctx->fpr[3].raw = out.f[3];
++            ctx->fpr[4].raw = out.f[4];
++            ctx->fpr[5].raw = out.f[5];
++            ctx->fpr[6].raw = out.f[6];
++            ctx->fpr[7].raw = out.f[7];
++            ctx->fpr[8].raw = out.f[8];
++            ctx->fpr[9].raw = out.f[9];
++            ctx->fpr[10].raw = out.f[10];
++            ctx->fpr[11].raw = out.f[11];
++            ctx->fpr[12].raw = out.f[12];
++            ctx->fpr[13].raw = out.f[13];
++            return;
++        }
++    }
++    mlb_mtx::Outputs out;
++    mlb_mtx::Exact(gqr, a, b, ab, out);
++    ctx->fpr[0].raw = out.f[0];
++    ctx->fpr[1].raw = out.f[1];
++    ctx->fpr[2].raw = out.f[2];
++    ctx->fpr[3].raw = out.f[3];
++    ctx->fpr[4].raw = out.f[4];
++    ctx->fpr[5].raw = out.f[5];
++    ctx->fpr[6].raw = out.f[6];
++    ctx->fpr[7].raw = out.f[7];
++    ctx->fpr[8].raw = out.f[8];
++    ctx->fpr[9].raw = out.f[9];
++    ctx->fpr[10].raw = out.f[10];
++    ctx->fpr[11].raw = out.f[11];
++    ctx->fpr[12].raw = out.f[12];
++    ctx->fpr[13].raw = out.f[13];
++}
++REGISTER_NATIVE_FUNCTION(0x800A890C, MLB_PSMTXConcat_800A890C);
++#endif
 diff --git a/runtime/src/hle/mlb/reverb_natives.cpp b/runtime/src/hle/mlb/reverb_natives.cpp
 new file mode 100644
 index 0000000..1840a0d
@@ -481,28 +2590,48 @@ index 83faaac..15fb008 100644
      g_titleBackup.resize(kTitleW * kTitleH);
      g_buttonBackup.resize(kButtonW * kButtonH);
 diff --git a/runtime/src/hle/os/os_internal.h b/runtime/src/hle/os/os_internal.h
-index a5ae604..801b9da 100644
+index a5ae604..34c478d 100644
 --- a/runtime/src/hle/os/os_internal.h
 +++ b/runtime/src/hle/os/os_internal.h
-@@ -132,6 +132,13 @@ void CancelSleepTimer(uint32_t threadPtr);
+@@ -132,6 +132,21 @@ void CancelSleepTimer(uint32_t threadPtr);
  void ClearOutstandingPark(uint32_t threadPtr);
  bool ProcessSleepTimers(CpuContext* cpu);
  bool SleepTimerOverdue();
 +#if defined(__SWITCH__)
 +// Where a sleep timer fires from, for WIICOMPILED_SOUND_TICK_STATS: the scheduler (a blocking
-+// switch or an interrupt-return preemption point), the idle loop, or a host pacing wait. A one-shot
++// switch or an interrupt-return preemption point), the idle loop, a host pacing wait, or a compute
++// preemption point (T8, phase 51: compute_preempt.h). A one-shot
 +// tag: the next ProcessSleepTimers call takes it and resets it (no scope may span a fiber switch).
-+enum class SleepFireSite : uint8_t { Scheduler, Idle, Pace };
++enum class SleepFireSite : uint8_t { Scheduler, Idle, Pace, Compute };
 +void SetNextSleepFireSite(SleepFireSite site);
++#endif
++
++#if defined(__SWITCH__)
++// T8 (switch phase 51): the earliest sleep deadline as a CNTPCT value for the compute preemption
++// points (os_scheduler.cpp, compute_preempt.h). deadline: steady_clock ticks, max = none pending.
++void PublishSleepDueTick(std::chrono::steady_clock::rep deadline);
++void RepublishSleepDueTick();  // os_sleep.cpp: publishes gEarliestSleepDeadline
 +#endif
  
  // Defined in os_alarm.cpp.
  bool ProcessAlarmQueue(CpuContext* cpu, int maxToProcess);
 diff --git a/runtime/src/hle/os/os_scheduler.cpp b/runtime/src/hle/os/os_scheduler.cpp
-index d1384fc..0e7f5dc 100644
+index d1384fc..0e16b98 100644
 --- a/runtime/src/hle/os/os_scheduler.cpp
 +++ b/runtime/src/hle/os/os_scheduler.cpp
-@@ -195,6 +195,33 @@ extern "C" void OS_HLE_PreemptionPoint()
+@@ -10,6 +10,11 @@
+ #include "fiber_manager.h"
+ #include "runtime_log.h"
+ #include "os_internal.h"
++#if defined(__SWITCH__)
++#include "compute_preempt.h"
++#include <cstdlib>
++#include <limits>
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -195,10 +200,199 @@ extern "C" void OS_HLE_PreemptionPoint()
      cpu->gpr[3] = savedR3;
  }
  
@@ -533,10 +2662,176 @@ index d1384fc..0e7f5dc 100644
 +}
 +#endif
 +
++#if defined(__SWITCH__)
++// T8 (switch phase 51): compute preemption points (compute_preempt.h). WIICOMPILED_COMPUTE_PREEMPT=1
++// turns them on; read at the first slow poll after SelectThread has run, long after main() set the
++// environment from the nxlink arguments.
++//
++// Why T7b's bctrl point (run 17b) corrupted a thread: OS_HLE_PreemptionPoint was written for calls
++// into OS functions (OSRestoreInterrupts, GXCopyDisp), where the EABI lets the callee clobber r0,
++// r4-r12, f0-f13, CR, CTR, LR and XER; it keeps only r3. On its way to the switch the scheduler
++// writes into the shared CpuContext before SwitchToThread snapshots it: TryInvokeSwitchCallback sets
++// r3 = old thread, r4 = new thread and calls the guest switch callback, ProcessSleepTimers sets
++// r3 = the woken sleeper. Resumed, the preempted thread got that file back (r3 restored). At a bctrl
++// entry r4-r10 and f1-f8 are the live arguments of the call: in run 17b the call at 0x80068820
++// (func_80068434, object list walk, r4 = *(*(r25 + 752) + 36), r5 = 0) reached its callee with
++// r4 = 0x80242ba0, the ticker thread it had just switched to, and the callee's virtual call through
++// it jumped to 0 (pc 0, ctr 0, r3 = 0x80242ba0, lr = 0x80068824 still the caller's). Here the whole
++// register file is saved before and put back after, as the hardware's interrupt does.
++// Run 17's points inside GXBegin/GXCallDisplayList let the idle loop's retrace service (Aurora frame
++// work) run in the middle of a primitive or list: these points are never inside a GX call.
++uint32_t g_mkwComputePreemptCountdown = 1;
++uint32_t g_mkwComputePreemptHold = 0;
++
++extern "C" bool GX_HLE_MidCommand();  // hle/gx/gx_fifo.cpp
++
++namespace {
++thread_local char tSchedulerHostThreadMarker;
++std::atomic<const char*> gSchedulerHostThread{nullptr};
++
++constexpr uint32_t kComputePreemptInterval = 8;
++constexpr int64_t kSystemTickHz = 19200000;
++constexpr int64_t kComputePreemptRetryTicks = kSystemTickHz / 50000;  // 20 us
++enum : uint8_t { kComputePreemptUnresolved, kComputePreemptOff, kComputePreemptOn };
++uint8_t gComputePreemptState = kComputePreemptUnresolved;
++// CNTPCT of the earliest OSSleepTicks deadline; 0 until resolved (the first slow poll resolves).
++int64_t gComputePreemptDueTick = 0;
++
++struct ComputePreemptStats {
++    uint64_t taken = 0;
++    uint64_t refused[9] = {};
++    int64_t windowStart = 0;
++} gComputePreemptStats;
++
++inline int64_t SwitchSystemTick() {
++    int64_t tick;
++    asm volatile("mrs %0, cntpct_el0" : "=r"(tick));
++    return tick;
++}
++
++void ReportComputePreemptStats(int64_t now) {
++    ComputePreemptStats& s = gComputePreemptStats;
++    if (s.windowStart == 0) {
++        s.windowStart = now;
++        return;
++    }
++    if (now - s.windowStart < 5 * kSystemTickHz) {
++        return;
++    }
++    RT_LOGF(RT_TAG_OS,
++            "[compute-preempt] %.1f s: taken %llu; refused: held %llu, private context %llu, interrupts off "
++            "%llu, scheduler disabled %llu, retrace %llu, GX mid-command %llu, not running %llu\n",
++            static_cast<double>(now - s.windowStart) / kSystemTickHz, (unsigned long long)s.taken,
++            (unsigned long long)s.refused[2], (unsigned long long)s.refused[3], (unsigned long long)s.refused[4],
++            (unsigned long long)s.refused[5], (unsigned long long)s.refused[6], (unsigned long long)s.refused[7], (unsigned long long)s.refused[8]);
++    s = ComputePreemptStats{};
++    s.windowStart = now;
++}
++} // namespace
++
++// Callers: os_sleep.cpp NoteSleepDeadline / RefreshEarliestSleepDeadline (under gSleepTimerMutex)
++// and the slow poll. The steady_clock deadline goes over as the remaining time (no epoch assumed).
++void OsHleInternal::PublishSleepDueTick(std::chrono::steady_clock::rep deadline)
++{
++    if (gComputePreemptState != kComputePreemptOn) {
++        return;
++    }
++    int64_t tick = INT64_MAX;
++    if (deadline != std::numeric_limits<std::chrono::steady_clock::rep>::max()) {
++        const int64_t remainingNs = static_cast<int64_t>(
++            std::chrono::nanoseconds(std::chrono::steady_clock::duration(
++                                         deadline - std::chrono::steady_clock::now().time_since_epoch().count()))
++                .count());
++        tick = SwitchSystemTick() + remainingNs * 12 / 625;  // ns -> 19.2 MHz ticks
++    }
++    __atomic_store_n(&gComputePreemptDueTick, tick, __ATOMIC_RELAXED);
++}
++
++extern "C" void MkwComputePreemptSlow()
++{
++    __atomic_store_n(&g_mkwComputePreemptCountdown, kComputePreemptInterval, __ATOMIC_RELAXED);
++    const int64_t now = SwitchSystemTick();
++    if (now < __atomic_load_n(&gComputePreemptDueTick, __ATOMIC_RELAXED)) [[likely]] {
++        return;
++    }
++    // Guest threads run on the scheduler's host thread only; a poll anywhere else does nothing.
++    if (gSchedulerHostThread.load(std::memory_order_relaxed) != &tSchedulerHostThreadMarker) {
++        return;
++    }
++    if (gComputePreemptState != kComputePreemptOn) {
++        if (gComputePreemptState == kComputePreemptUnresolved) {
++            const char* v = std::getenv("WIICOMPILED_COMPUTE_PREEMPT");
++            gComputePreemptState = v != nullptr && v[0] == '0' ? kComputePreemptOff : kComputePreemptOn;  // on unless =0 (run 21: 200 wakes/s, 0 resets, no crash)
++        }
++        if (gComputePreemptState == kComputePreemptOff) {
++            __atomic_store_n(&gComputePreemptDueTick, INT64_MAX, __ATOMIC_RELAXED);
++            __atomic_store_n(&g_mkwComputePreemptCountdown, UINT32_MAX, __ATOMIC_RELAXED);
++            return;
++        }
++        RT_LOG(RT_TAG_OS) << "compute preemption points on (WIICOMPILED_COMPUTE_PREEMPT=0 turns them off)" << std::endl;
++        RepublishSleepDueTick();
++        return;
++    }
++    ReportComputePreemptStats(now);
++    if (!SleepTimerOverdue()) {
++        RepublishSleepDueTick();  // the tick conversion rounded early, or a cancelled timer
++        return;
++    }
++
++    CpuContext* cpu = TryGetCpuContext();
++    MkwComputePreemptState state{};
++    state.schedulerThread = true;
++    state.hold = __atomic_load_n(&g_mkwComputePreemptHold, __ATOMIC_RELAXED);
++    state.sharedContext = cpu != nullptr && cpu == &GetPersistentCpuContext();
++    state.interruptsEnabled = OS_HLE_InterruptsEnabled();
++    state.schedulerDisableCount = ::Memory::Read32(kSchedulerIdleFlagAddr);
++    state.inRetrace = VI_HLE_IsAdvancingRetrace();
++    state.gxMidCommand = GX_HLE_MidCommand();
++    state.runningThread = ::Memory::Read32(kOSRunningContextAddr);
++    state.currentContext = ::Memory::Read32(kOSCurrentContextAddr);
++    state.runningState = state.runningThread != 0 ? ::Memory::Read16(state.runningThread + kThreadStateOffset) : 0;
++    const MkwComputePreemptVerdict verdict = MkwComputePreemptDecide(state);
++    if (verdict != MkwComputePreemptVerdict::Take) {
++        ++gComputePreemptStats.refused[static_cast<uint8_t>(verdict)];
++        __atomic_store_n(&gComputePreemptDueTick, now + kComputePreemptRetryTicks, __ATOMIC_RELAXED);
++        return;
++    }
++
++    // The alarm interrupt, taken between two guest instructions with MSR[EE] set: the register file
++    // is saved, the scheduler runs (due sleepers resumed, an outranking thread switched to; this one
++    // resumes when they block), and the register file and MSR[EE] come back. Guest memory is shared.
++    ++gComputePreemptStats.taken;
++    const uint32_t self = state.runningThread;
++    const CpuContext saved = *cpu;
++    SetNextSleepFireSite(SleepFireSite::Compute);  // SelectThread's first step is ProcessSleepTimers
++    OS_HLE_PreemptionPoint();
++    const bool fpscrChanged = cpu->fpscr != saved.fpscr;
++    *cpu = saved;
++    if (fpscrChanged) {
++        MkwApplyHostNiMode(cpu->fpscr);
++    }
++    // Back as the scheduled thread (not the fiber manager's resume-without-schedule fallback): the
++    // thread that switched back may have left guest interrupts off; this one was interrupted with them on.
++    if (::Memory::Read32(kOSRunningContextAddr) == self && ::Memory::Read32(kOSCurrentContextAddr) == self &&
++        !OS_HLE_InterruptsEnabled()) {
++        OS__RestoreInterrupts_801a65d4(1);
++    }
++}
++#endif
++
  extern "C" void SelectThread_801a9c08(CpuContext* ctx)
  {
      CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
-@@ -295,6 +322,9 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
+     const uint32_t forceSwitch = cpu->gpr[3];
++#if defined(__SWITCH__)
++    if (gSchedulerHostThread.load(std::memory_order_relaxed) == nullptr) [[unlikely]] {
++        gSchedulerHostThread.store(&tSchedulerHostThreadMarker, std::memory_order_relaxed);
++    }
++#endif
+ 
+     ProcessSleepTimers(cpu);
+ 
+@@ -295,6 +489,9 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
              OS__EnableInterrupts_801a65c0();
  
              while (::Memory::Read32(kSchedulerPendingFlagAddr) == 0) {
@@ -547,7 +2842,7 @@ index d1384fc..0e7f5dc 100644
                  // Dolphin models DSP audio DMA as an independent 4 kHz timing
                  // event.  Poll it from the guest scheduler instead of batching
 diff --git a/runtime/src/hle/os/os_sleep.cpp b/runtime/src/hle/os/os_sleep.cpp
-index b155a20..dae498a 100644
+index b155a20..244abc5 100644
 --- a/runtime/src/hle/os/os_sleep.cpp
 +++ b/runtime/src/hle/os/os_sleep.cpp
 @@ -4,7 +4,10 @@
@@ -561,7 +2856,7 @@ index b155a20..dae498a 100644
  #include <limits>
  #include <mutex>
  #include <unordered_map>
-@@ -29,6 +32,195 @@ std::vector<SleepTimerEntry> gSleepTimers;
+@@ -29,12 +32,206 @@ std::vector<SleepTimerEntry> gSleepTimers;
  std::atomic<std::chrono::steady_clock::rep> gEarliestSleepDeadline{
      std::numeric_limits<std::chrono::steady_clock::rep>::max()};
  
@@ -597,7 +2892,7 @@ index b155a20..dae498a 100644
 +    uint64_t wakes = 0, catchUps = 0, resets = 0;
 +    double lostMs = 0, lateSumMs = 0, lateMaxMs = 0, debtMaxMs = 0;
 +    uint64_t lateHist[6] = {};  // < 0.5, < 1, < 2, < 4, < 8, >= 8 ms
-+    uint64_t dueInPace = 0, firedPace = 0, firedIdle = 0, firedOther = 0;
++    uint64_t dueInPace = 0, firedPace = 0, firedIdle = 0, firedCompute = 0, firedOther = 0;
 +};
 +std::mutex gTickStatsMutex;
 +std::unordered_map<uint32_t, TickStats> gTickStats;
@@ -671,6 +2966,7 @@ index b155a20..dae498a 100644
 +        switch (site) {
 +        case SleepFireSite::Pace: ++s.firedPace; break;
 +        case SleepFireSite::Idle: ++s.firedIdle; break;
++        case SleepFireSite::Compute: ++s.firedCompute; break;
 +        default: ++s.firedOther; break;
 +        }
 +    }
@@ -689,7 +2985,7 @@ index b155a20..dae498a 100644
 +                    "[sound-tick] %.1f s thread 0x%08x period %.3f ms: %llu wakes = %.1f/s (ideal %.1f/s); late ms "
 +                    "mean %.2f max %.2f [<0.5 %llu | <1 %llu | <2 %llu | <4 %llu | <8 %llu | >=8 %llu]; debt max %.2f ms, "
 +                    "catch-ups %llu, resets %llu (lost %.1f ms); deadline in host pace %llu; fired: pace %llu idle %llu "
-+                    "other %llu\n",
++                    "compute %llu other %llu\n",
 +                    windowS, thread, periodMs, (unsigned long long)s.wakes, s.wakes / windowS,
 +                    periodMs > 0 ? 1000.0 / periodMs : 0.0, s.lateSumMs / s.wakes, s.lateMaxMs,
 +                    (unsigned long long)s.lateHist[0], (unsigned long long)s.lateHist[1],
@@ -697,7 +2993,8 @@ index b155a20..dae498a 100644
 +                    (unsigned long long)s.lateHist[4], (unsigned long long)s.lateHist[5], s.debtMaxMs,
 +                    (unsigned long long)s.catchUps, (unsigned long long)s.resets, s.lostMs,
 +                    (unsigned long long)s.dueInPace, (unsigned long long)s.firedPace,
-+                    (unsigned long long)s.firedIdle, (unsigned long long)s.firedOther);
++                    (unsigned long long)s.firedIdle, (unsigned long long)s.firedCompute,
++                    (unsigned long long)s.firedOther);
 +        }
 +        const bool pending = s.pending;
 +        const auto armed = s.armed, ideal = s.ideal;
@@ -757,7 +3054,35 @@ index b155a20..dae498a 100644
  // Callers hold gSleepTimerMutex.
  void NoteSleepDeadline(std::chrono::steady_clock::time_point deadline)
  {
-@@ -125,7 +317,11 @@ void ScheduleSleepTimer(uint32_t threadPtr, uint64_t ticks)
+     const auto value = deadline.time_since_epoch().count();
+     if (value < gEarliestSleepDeadline.load(std::memory_order_relaxed)) {
+         gEarliestSleepDeadline.store(value, std::memory_order_relaxed);
++#if defined(__SWITCH__)
++        PublishSleepDueTick(value);  // T8: compute preemption points (os_scheduler.cpp)
++#endif
+     }
+ }
+ 
+@@ -45,8 +242,18 @@ void RefreshEarliestSleepDeadline()
+         earliest = std::min(earliest, entry.deadline.time_since_epoch().count());
+     }
+     gEarliestSleepDeadline.store(earliest, std::memory_order_relaxed);
++#if defined(__SWITCH__)
++    PublishSleepDueTick(earliest);  // T8: compute preemption points (os_scheduler.cpp)
++#endif
+ }
+ 
++#if defined(__SWITCH__)
++void RepublishSleepDueTick()
++{
++    PublishSleepDueTick(gEarliestSleepDeadline.load(std::memory_order_relaxed));
++}
++#endif
++
+ bool SleepTimerOverdue()
+ {
+     return std::chrono::steady_clock::now().time_since_epoch().count() >=
+@@ -125,7 +332,11 @@ void ScheduleSleepTimer(uint32_t threadPtr, uint64_t ticks)
      // a different length or long after the last deadline starts from now, as in the SDK.
      struct LastSleep { uint64_t ticks; Clock::time_point deadline; };
      static std::unordered_map<uint32_t, LastSleep> lastSleeps;
@@ -769,7 +3094,7 @@ index b155a20..dae498a 100644
  
      std::lock_guard<std::mutex> lock(gSleepTimerMutex);
      LastSleep& last = lastSleeps[threadPtr];
-@@ -136,6 +332,13 @@ void ScheduleSleepTimer(uint32_t threadPtr, uint64_t ticks)
+@@ -136,6 +347,13 @@ void ScheduleSleepTimer(uint32_t threadPtr, uint64_t ticks)
          // finishes parking. The anchor keeps the full debt so it is still caught up later.
          deadline = std::max(anchor, now + duration / 4);
      }
@@ -783,7 +3108,7 @@ index b155a20..dae498a 100644
      last = {ticks, anchor};
      std::erase_if(gSleepTimers, [threadPtr](const SleepTimerEntry& entry) {
          return entry.threadPtr == threadPtr;
-@@ -156,6 +359,10 @@ bool ProcessSleepTimers(CpuContext* cpu)
+@@ -156,6 +374,10 @@ bool ProcessSleepTimers(CpuContext* cpu)
      // 100ms late, followed by a "sleep-timer stale" drop when this fiber finally resumes.
      // Leaving unprocessed timers in the table keeps them visible to every other pump (idle
      // loop, other threads' SelectThread) while this one is switched away.
@@ -794,7 +3119,7 @@ index b155a20..dae498a 100644
      bool processedAny = false;
      constexpr size_t kMaxTimersPerCall = 64;
      size_t processedCount = 0;
-@@ -220,6 +427,11 @@ bool ProcessSleepTimers(CpuContext* cpu)
+@@ -220,6 +442,11 @@ bool ProcessSleepTimers(CpuContext* cpu)
          }
  
          ClearOutstandingPark(threadPtr);
@@ -807,10 +3132,40 @@ index b155a20..dae498a 100644
          OSResumeThread_HLE_801aa58c(cpu);
  
 diff --git a/runtime/src/hle/storage/dvd.cpp b/runtime/src/hle/storage/dvd.cpp
-index 8f4c9b4..238a064 100644
+index 8f4c9b4..7e67abc 100644
 --- a/runtime/src/hle/storage/dvd.cpp
 +++ b/runtime/src/hle/storage/dvd.cpp
-@@ -501,10 +501,17 @@ static void ScanDirectory(const fs::path& root, const std::string& virtualPrefix
+@@ -15,6 +15,9 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size);
+ #include "runtime_config.h"
+ #include "runtime_log.h"
+ #include "runtime_product.h"
++#if defined(__SWITCH__)
++#include "compute_preempt.h"
++#endif
+ 
+ #include <cstdint>
+ #include <cstdlib>
+@@ -191,6 +194,9 @@ static void InvokeDvdCallback(uint32_t callbackPtr, int32_t result, uint32_t fil
+     auto& cpu = GetPersistentCpuContext();
+     cpu.gpr[3] = static_cast<uint32_t>(result);
+     cpu.gpr[4] = fileInfoPtr;
++#if defined(__SWITCH__)
++    MkwComputePreemptHoldScope interruptLevel;  // T8: the DI interrupt's callback
++#endif
+     InvokeIndirectCpu(callbackPtr, &cpu);
+ }
+ 
+@@ -205,6 +211,9 @@ static void InvokeDvdLowCallback(uint32_t callbackPtr, int32_t result) {
+     }
+     auto& cpu = GetPersistentCpuContext();
+     cpu.gpr[3] = static_cast<uint32_t>(result);
++#if defined(__SWITCH__)
++    MkwComputePreemptHoldScope interruptLevel;  // T8: the DI interrupt's callback
++#endif
+     InvokeIndirectCpu(callbackPtr, &cpu);
+ }
+ 
+@@ -501,10 +510,17 @@ static void ScanDirectory(const fs::path& root, const std::string& virtualPrefix
              return;
          }
  
