@@ -787,7 +787,7 @@ index dfa305b..f77455d 100644
      *left = g_gxState.boundingBox[0];
    }
 diff --git a/aurora-main/lib/dolphin/gx/GXGeometry.cpp b/aurora-main/lib/dolphin/gx/GXGeometry.cpp
-index 2e54e10..b7c578b 100644
+index 2e54e10..6bf30da 100644
 --- a/aurora-main/lib/dolphin/gx/GXGeometry.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXGeometry.cpp
 @@ -3,6 +3,32 @@
@@ -974,7 +974,7 @@ index 2e54e10..b7c578b 100644
    // Write array base
    GX_WRITE_AURORA(GX_LOAD_AURORA_ARRAYBASE | cpIdx);
    GX_WRITE_U64(reinterpret_cast<u64>(data));
-@@ -290,7 +411,92 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
+@@ -290,7 +411,104 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
  
    // Write array stride
    GX_WRITE_CP_REG(CP_REG_ARRAYSTRIDE_ID | cpIdx, stride);
@@ -996,7 +996,8 @@ index 2e54e10..b7c578b 100644
 +      return;
 +    }
 +  auto* const gx = __gx;
-+  for (u32 i = 0; i < count; ++i) {
++  u32 i = 0;
++  for (; i < count && (gx->dirtyState & 8) == 0; ++i) {
 +    const GXAttr attr = list[i].attr;
 +    const GXAttrType type = list[i].type;
 +    const u32 oldVcdLo = gx->vcdLo;
@@ -1024,6 +1025,17 @@ index 2e54e10..b7c578b 100644
 +      gx->dirtyState |= 8;
 +    }
 +  }
++  if (i == count) {
++    return;
++  }
++  // P11: a forced VCD queues no probes; only the final normal bits can reach the decoder.
++  for (; i < count; ++i) {
++    SETVCDATTR(list[i].attr, list[i].type);
++    if (list[i].attr >= GX_VA_PNMTXIDX && list[i].attr < GX_VA_MAX_ATTR) {
++      ++aurora_gx_a3_counters[aurora::gx::fifo::kA3VtxProbesElided];
++    }
++  }
++  SET_REG_FIELD(0, gx->vcdLo, 2, 11, (gx->hasNrms || gx->hasBiNrms) ? gx->nrmType : 0);
 +}
 +
 +void GXSetVtxAttrFmtRun(GXVtxFmt vtxfmt, const GXVtxAttrFmtList* list, u32 count) {
@@ -2970,10 +2982,10 @@ index b01ea45..8d7f5fc 100644
 +#endif
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 new file mode 100644
-index 0000000..33fef05
+index 0000000..e619f3e
 --- /dev/null
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -0,0 +1,1169 @@
+@@ -0,0 +1,1171 @@
 +// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
 +// at the end of fifo.cpp.
 +//
@@ -3226,7 +3238,7 @@ index 0000000..33fef05
 +  alignas(64) std::atomic<uint64_t> pushed{0};
 +  alignas(64) std::atomic<uint64_t> processed{0};
 +  alignas(64) std::atomic<bool> workerSleeping{false};
-+  alignas(64) std::atomic<bool> mainWaiting{false};
++  alignas(64) std::atomic<uint64_t> mainWaitTarget{0};
 +  alignas(64) std::mutex mutex;
 +  std::condition_variable workerCv;
 +  std::condition_variable mainCv;
@@ -3535,7 +3547,9 @@ index 0000000..33fef05
 +      run_segment(shared.ring[done % kRingSize]);
 +      ++done;
 +      shared.processed.store(done, std::memory_order_seq_cst);
-+      if (shared.mainWaiting.load(std::memory_order_seq_cst)) {
++      // P11: only reaching the requested segment can satisfy the producer's predicate.
++      const uint64_t target = shared.mainWaitTarget.load(std::memory_order_seq_cst);
++      if (target != 0 && done >= target) {
 +        std::lock_guard lock(shared.mutex);
 +        shared.mainCv.notify_all();
 +      }
@@ -3627,11 +3641,11 @@ index 0000000..33fef05
 +    bool reached;
 +    {
 +      std::unique_lock lock(shared.mutex);
-+      shared.mainWaiting.store(true, std::memory_order_seq_cst);
++      shared.mainWaitTarget.store(target, std::memory_order_seq_cst);
 +      reached = shared.mainCv.wait_for(lock, std::chrono::milliseconds(1), [&] {
 +        return shared.processed.load(std::memory_order_seq_cst) >= target;
 +      });
-+      shared.mainWaiting.store(false, std::memory_order_relaxed);
++      shared.mainWaitTarget.store(0, std::memory_order_relaxed);
 +    }
 +    if (!reached) {
 +      // As the frame-worker waits do: keep the guest's VI/alarm/audio timing alive. This thread
@@ -5226,7 +5240,7 @@ index 2514913..4b52f5b 100644
  extern bool g_requiresCheckedAccess;
  inline bool RequiresCheckedAccess() noexcept { return g_requiresCheckedAccess; }
 diff --git a/runtime/include/hle/dvd_contract.h b/runtime/include/hle/dvd_contract.h
-index 9cb9576..d4cc49f 100644
+index 9cb9576..3f5eb4d 100644
 --- a/runtime/include/hle/dvd_contract.h
 +++ b/runtime/include/hle/dvd_contract.h
 @@ -16,6 +16,10 @@
@@ -5240,7 +5254,7 @@ index 9cb9576..d4cc49f 100644
  
  namespace DvdFstContract {
  
-@@ -287,6 +291,63 @@ inline constexpr const char* Describe(HostReadFailure failure) noexcept {
+@@ -287,6 +291,65 @@ inline constexpr const char* Describe(HostReadFailure failure) noexcept {
  // Read into private storage first and publish it only after the complete host
  // range has been obtained. Callers can therefore leave a guest DMA destination
  // untouched for every failure, including a host file truncated after indexing.
@@ -5272,6 +5286,8 @@ index 9cb9576..d4cc49f 100644
 +            failure = HostReadFailure::MissingFile;
 +            return false;
 +        }
++        // ReadExact stages complete ranges; avoid newlib's seek refill and split fread.
++        (void)std::setvbuf(file, nullptr, _IONBF, 0);
 +        slot = std::min_element(std::begin(open), std::end(open),
 +                                [](const OpenFile& a, const OpenFile& b) { return a.used < b.used; });
 +        if (slot->file) std::fclose(slot->file);
@@ -5304,7 +5320,7 @@ index 9cb9576..d4cc49f 100644
  inline bool ReadExact(const std::filesystem::path& hostPath,
                        uint64_t offset,
                        uint32_t length,
-@@ -334,5 +395,6 @@ inline bool ReadExact(const std::filesystem::path& hostPath,
+@@ -334,5 +397,6 @@ inline bool ReadExact(const std::filesystem::path& hostPath,
      destination = std::move(staged);
      return true;
  }

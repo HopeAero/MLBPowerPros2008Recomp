@@ -1039,6 +1039,19 @@ Sources: `wiicompiled-season-probe.patch`, `tools/season_save.py`, dumps in `loc
 
 Sources: `config/wiicompiled/rl8e54-data.csv`, `docs/en/wiicompiled-feasibility.md`, `wiicompiled-aurora-partial-efb-copy.patch`, `wiicompiled-tlut-reinit-cache.patch`.
 
+### Switch fielding spikes: models, GX and disc I/O
+
+Investigation dated October 28, 2026, `RL8E54`. Private sources: `nxlink-run23.txt` and matching symbols (frames > 5000 only), `nxlink-run12.txt`, runtime code and translation; reproducible analysis in `local/tmp/cpu/P11-profile*`.
+
+- **The largest wait is GX:** across 39 captured spikes (30.2–48.7 ms), 333 of 1,270 samples (26.2%) include `wait_processed` in the GX end-frame drain. These are wall-time samples, not CPU utilization. Producer GX accounts for another 20.9% of self samples and translated code 26.5%. Neither capture counts players, bones or vertices, so ms/player cannot be established. Run23 also lacks clock telemetry; run12 confirms CPU1020/GPU307 MHz at both ends.
+- **What the producer waits for:** `shared.processed >= target` in `aurora-main/lib/gx/fifo_async.inc`. Previously the worker locked and notified after every segment while the producer waited, even with many segments left before its target. Phase 56 publishes that target and notifies when it is reached, retaining the sequentially consistent handshake, mutex and 1 ms timer-service timeout. The actual-source concurrency check covers data ordering/visibility, sleep/wake races and nested callback waits; console benefit still needs measurement.
+- **Decode time is not CPU time:** run12's 11.026 ms/frame `gx_fifo_decode_ms` includes worker waits and blocking. `end_frame` waits for the presentation worker to finish before the observed drain; the main-thread profile cannot identify why GX work remained queued. Inclusive views of the same wait must not be added together.
+- **Vertex publication:** once `GXSetVtxDescRun` has forced VCD publication (bit 8), remaining entries need neither old-state comparisons nor decoder probes. Phase 57 keeps attribute changes and computes the final normal bits once at the end. Actual code versus individual calls: 200,000 ordinary sequences and 500,000 including empty lists/repeated attributes, with identical state, ordered probes and counters. Existing G6/A3 switches remain applicable.
+- **A small native's ceiling:** `0x806EEDF4` multiplies the four-float quaternion at `r3` in place by the one at `r4`; `0x806E8760`, `0x806E8DC4`, `0x806EE574` and `0x806EE99C` call it when composing skeletal transforms. A private prototype passed 200,000 qemu comparisons of the complete context, memory and accesses, but its whole run12 self budget is only ~0.077 ms/frame. It was left out: fewer instructions per call do not establish sufficient improvement to the spikes.
+- **Disc I/O:** run23 totals 36.73 ms of main-thread opens/reads in 14 of those 39 spikes; some sampled IPC belongs to nxlink logging. Run14 voice files show groups of 4 reads/66 KiB. Installed `newlib` confirms that buffered `fseeko` can refill 1 KiB and `fread` can split the final read. Phase 58 uses unbuffered stdio for `ReadExact`'s existing eight handles; physical reads stay synchronous and DMA/callback order is preserved. All 1,067 range/error/handle-eviction/truncation checks pass. Audio is unchanged and no voice-byte cache is added.
+
+Phases 56–58 are reproduced by the Switch patches, with changes to earlier generated text folded into phases 22, 45 and 41 respectively. Local correctness checks do not replace a console comparison from the same saved state at stock clocks.
+
 ### Match camera
 
 Found on 18 October 2026 for the stadium preview (`runtime/src/hle/mlb/game_camera.cpp`, patch `wiicompiled-stadium-viewer`). Methods: MEM1 dumps every 3 s (`WIICOMPILED_DEBUG_MEM1`) searched for plausible eye/target pairs; a write watchpoint on the eye (`WIICOMPILED_DEBUG_WATCH`) resolved with `llvm-nm`; temporary wrappers in the shards.
