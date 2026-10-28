@@ -147,6 +147,15 @@ msys=()
 # plain -O2 build) and MLB_SWITCH_HOT_ORDER (a linker section-ordering file; unset = link order).
 [[ -v MLB_SWITCH_SHARD_FLAGS ]] && msys+=(-DMLB_SWITCH_SHARD_FLAGS="$MLB_SWITCH_SHARD_FLAGS")
 msys+=(-DMLB_SWITCH_HOT_ORDER="${MLB_SWITCH_HOT_ORDER:-}")
+# ccache when installed (MSYS2: pacman -S ccache): a header change and its revert, or a rebuild of an
+# earlier state, comes back from the cache instead of recompiling the translated shards.
+# MLB_SWITCH_CCACHE=0 leaves it out of a new build tree (one configured with it keeps it until
+# --fresh: passing an empty launcher would change every compile rule and rebuild everything).
+if [[ ${MLB_SWITCH_CCACHE:-1} != 0 ]] && command -v ccache > /dev/null; then
+    export CCACHE_DIR=${CCACHE_DIR:-$root/local/switch/ccache}
+    ccache --max-size=25G > /dev/null
+    msys+=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+fi
 cmake -S "$src/runtime" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release "${msys[@]}" \
     -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON \
     -DCMAKE_UNITY_BUILD_RELOCATABLE=ON \

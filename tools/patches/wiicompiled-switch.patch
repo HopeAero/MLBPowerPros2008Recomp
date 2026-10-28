@@ -4132,10 +4132,16 @@ index 9b1571e..cb97b88 100644
    return build_pipeline(config, {}, shader, "GX Pipeline");
  }
 diff --git a/aurora-main/lib/gx/pipeline.hpp b/aurora-main/lib/gx/pipeline.hpp
-index a6752b8..aaf93b1 100644
+index a6752b8..1b48327 100644
 --- a/aurora-main/lib/gx/pipeline.hpp
 +++ b/aurora-main/lib/gx/pipeline.hpp
-@@ -62,6 +62,18 @@ inline bool valid_pipeline_config(const PipelineConfig& config) noexcept {
+@@ -58,10 +58,23 @@ inline bool valid_pipeline_config(const PipelineConfig& config) noexcept {
+          in_range(config.blendMode, GX_BM_SUBTRACT) &&
+          in_range(config.blendFacSrc, GX_BL_INVDSTALPHA) &&
+          in_range(config.blendFacDst, GX_BL_INVDSTALPHA) &&
+-         in_range(config.blendOp, GX_LO_SET) && in_range(config.pixelFmt, GX_PF_YUV420);
++         in_range(config.blendOp, GX_LO_SET) && in_range(config.pixelFmt, GX_PF_YUV420) &&
++         config.shaderConfig.attrs[GX_VA_POS].attrType != GX_NONE;
  }
  
  wgpu::RenderPipeline create_pipeline([[maybe_unused]] const PipelineConfig& config);
@@ -4906,10 +4912,10 @@ index 6b76fa6..4de26b3 100644
  template <typename Signature>
  class AbiTrampoline;
 diff --git a/runtime/include/audio_backend.h b/runtime/include/audio_backend.h
-index b13a196..4d04f6a 100644
+index b13a196..3efd579 100644
 --- a/runtime/include/audio_backend.h
 +++ b/runtime/include/audio_backend.h
-@@ -3,7 +3,14 @@
+@@ -3,8 +3,18 @@
  #include <cstddef>
  #include <cstdint>
  #include <mutex>
@@ -4922,9 +4928,36 @@ index b13a196..4d04f6a 100644
 +#include <thread>
 +#endif
  
++#if defined(__SWITCH__)
++#include <condition_variable>
++#endif
  #include <SDL3/SDL_audio.h>
  
-@@ -29,7 +36,11 @@ public:
+ class AudioBackend {
+@@ -21,7 +31,21 @@ public:
+ 
+     // Applied to the final host output, covering both AX and direct AI DMA.
+     // Local diagnostics (WIICOMPILED_AUDIO_STATS=1): counters since the last call.
+-    struct Stats { uint64_t pushes = 0, drops = 0, starved = 0, bytes = 0; int minQueued = 1 << 30, maxQueued = 0; float ratio = 1.0f; };
++    struct Stats {
++        uint64_t pushes = 0, drops = 0, starved = 0, bytes = 0; int minQueued = 1 << 30, maxQueued = 0; float ratio = 1.0f;
++#if defined(__SWITCH__)
++        // SDL's device thread (the stream's get callback): buffers it pulled, pulls the stream could not
++        // fill (silence padded: an audible gap) and the bytes missing, the stream's level at a pull, the
++        // longest time between two pulls and the pulls later than 1.5 device buffers (the device thread
++        // itself was late: audren played its last buffer out). Feeder: longest push -> SDL delay, deepest
++        // ring. Drop runs: overflow episodes (each one splice in the stream).
++        uint64_t pulls = 0, underruns = 0, shortBytes = 0, latePulls = 0, dropRuns = 0;
++        int minAtPull = 1 << 30;
++        double maxPullGapMs = 0, pullMs = 0, maxFeedLagMs = 0;
++        uint32_t maxRingDepth = 0;
++        bool feeder = false;
++#endif
++    };
+     Stats TakeStats();
+ 
+     void SetMasterVolume(float volume);
+@@ -29,7 +53,11 @@ public:
  
  private:
      AudioBackend() = default;
@@ -4936,7 +4969,7 @@ index b13a196..4d04f6a 100644
      AudioBackend(const AudioBackend&) = delete;
      AudioBackend& operator=(const AudioBackend&) = delete;
  
-@@ -51,7 +62,31 @@ private:
+@@ -51,7 +79,52 @@ private:
      bool m_muted = false;
      bool m_reportedDroppedBlock = false;
      bool m_playing = false;  // device paused until the queue holds the target latency
@@ -4962,6 +4995,27 @@ index b13a196..4d04f6a 100644
      float m_ratio = 1.0f;
      std::vector<int16_t> m_convertBuffer;
      Stats m_stats;
++#if defined(__SWITCH__)
++    // The feeder sleeps until a push signals it (no polling).
++    std::mutex m_feedMutex;
++    std::condition_variable m_feedCv;
++    bool m_feedPending = false;                       // under m_feedMutex
++    uint64_t m_ringStampNs[kRingSlots] = {};          // push time per slot (WIICOMPILED_AUDIO_STATS=1)
++    bool m_dropUntilTarget = false;                   // overflow: drop until the queue is back at the target
++    // SDL's device thread, through the stream's get callback (OnDevicePull).
++    static void SDLCALL DevicePullThunk(void* userdata, SDL_AudioStream* stream, int additional, int total);
++    void OnDevicePull(int additional, int total);
++    void WatchDeviceLocked(SDL_AudioStream* stream);
++    static bool StatsOn();
++    std::atomic<bool> m_deviceThreadSetUp{false};
++    std::atomic<uint32_t> m_devEpoch{0};              // bumped at every pause/resume/new stream
++    std::atomic<uint32_t> m_devBytesPerSec{0};
++    std::atomic<uint64_t> m_devPulls{0}, m_devUnderruns{0}, m_devShortBytes{0}, m_devLatePulls{0};
++    std::atomic<uint64_t> m_devMaxGapNs{0}, m_devPullNs{0};
++    std::atomic<int> m_devMinAtPull{1 << 30};
++    uint64_t m_devLastPullNs = 0;                     // device thread only
++    uint32_t m_devLastEpoch = 0;                      // device thread only
++#endif
 +#if defined(__SWITCH__)
 +    // Init runs for every 3 ms AI DMA block (Audio_HLE_Tick) and only checks: once the stream is
 +    // open, its answer without the mutex. Bit 63 set, channels in bits 32-62, sample rate below.
@@ -5994,10 +6048,10 @@ index 4ef3b2b..239d784 100644
      const bool frozen = RegistryFrozen().load(std::memory_order_acquire);
      if (!frozen) {
 diff --git a/runtime/src/audio_backend.cpp b/runtime/src/audio_backend.cpp
-index e65ecfb..999ae1a 100644
+index e65ecfb..540e8a2 100644
 --- a/runtime/src/audio_backend.cpp
 +++ b/runtime/src/audio_backend.cpp
-@@ -8,6 +8,12 @@
+@@ -8,14 +8,36 @@
  #include <cstdint>
  #include <cstdlib>
  #include <iostream>
@@ -6009,14 +6063,22 @@ index e65ecfb..999ae1a 100644
 +#endif
  
  #include <SDL3/SDL_init.h>
++#if defined(__SWITCH__)
++#include <SDL3/SDL_hints.h>
++#endif
  
-@@ -16,6 +22,15 @@ AudioBackend& AudioBackend::Instance() {
+ AudioBackend& AudioBackend::Instance() {
+     static AudioBackend instance;
      return instance;
  }
  
 +#if defined(__SWITCH__)
 +AudioBackend::~AudioBackend() {
-+    m_feederStop.store(true, std::memory_order_release);
++    {
++        std::lock_guard<std::mutex> lock(m_feedMutex);
++        m_feederStop.store(true, std::memory_order_release);
++    }
++    m_feedCv.notify_one();
 +    if (m_feeder.joinable()) {
 +        m_feeder.join();
 +    }
@@ -6026,7 +6088,7 @@ index e65ecfb..999ae1a 100644
  float AudioBackend::EffectiveGainLocked() const {
      return m_muted ? 0.0f : m_masterVolume;
  }
-@@ -42,11 +57,18 @@ bool AudioBackend::EnsureInitializedLocked(uint32_t sampleRate, uint32_t channel
+@@ -42,11 +64,18 @@ bool AudioBackend::EnsureInitializedLocked(uint32_t sampleRate, uint32_t channel
      if (m_initialized && m_sampleRate == sampleRate && m_channels == channels) {
          return true;
      }
@@ -6045,7 +6107,29 @@ index e65ecfb..999ae1a 100644
  
      if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
          RT_LOG(RT_TAG_AUDIO) << "SDL_InitSubSystem(SDL_INIT_AUDIO) failed: " << SDL_GetError() << std::endl;
-@@ -77,16 +99,31 @@ bool AudioBackend::EnsureInitializedLocked(uint32_t sampleRate, uint32_t channel
+@@ -58,6 +87,13 @@ bool AudioBackend::EnsureInitializedLocked(uint32_t sampleRate, uint32_t channel
+     spec.channels = static_cast<int>(channels);
+     spec.freq = static_cast<int>(sampleRate);
+ 
++#if defined(__SWITCH__)
++    // A/B knob: SDL's device buffer in sample frames (default 1024 = 23 ms at 44.1 kHz). The Switch
++    // driver double-buffers through audren, so SDL's device thread has one buffer of slack.
++    if (const char* frames = std::getenv("WIICOMPILED_AUDIO_DEVICE_FRAMES"); frames && std::atoi(frames) > 0) {
++        SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames);
++    }
++#endif
+     SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+     if (!stream) {
+         RT_LOG(RT_TAG_AUDIO) << "SDL_OpenAudioDeviceStream failed: " << SDL_GetError() << std::endl;
+@@ -72,21 +108,39 @@ bool AudioBackend::EnsureInitializedLocked(uint32_t sampleRate, uint32_t channel
+ 
+     m_stream = stream;
+     m_spec = spec;
++#if defined(__SWITCH__)
++    WatchDeviceLocked(stream);
++#endif
+     m_sampleRate = sampleRate;
+     m_channels = channels;
      m_initialized = true;
      m_playing = false;
      m_ratio = 1.0f;
@@ -6077,7 +6161,7 @@ index e65ecfb..999ae1a 100644
      if (m_stream) {
          SDL_DestroyAudioStream(m_stream);
          m_stream = nullptr;
-@@ -101,6 +138,9 @@ void AudioBackend::Shutdown() {
+@@ -101,6 +155,9 @@ void AudioBackend::Shutdown() {
      m_playing = false;
      m_ratio = 1.0f;
      m_convertBuffer.clear();
@@ -6087,17 +6171,165 @@ index e65ecfb..999ae1a 100644
  }
  
  // The guest produces audio on its own thread and stalls for up to ~100 ms (loading, busy
-@@ -147,6 +187,9 @@ AudioBackend::Stats AudioBackend::TakeStats() {
+@@ -133,6 +190,9 @@ void AudioBackend::RegulateLocked() {
+     if (!m_playing) {
+         if (static_cast<uint32_t>(queued) >= target && SDL_ResumeAudioStreamDevice(m_stream)) {
+             m_playing = true;
++#if defined(__SWITCH__)
++            m_devEpoch.fetch_add(1, std::memory_order_release);  // the paused time is not a late pull
++#endif
+         }
+         return;
+     }
+@@ -143,10 +203,106 @@ void AudioBackend::RegulateLocked() {
+     }
+ }
+ 
++#if defined(__SWITCH__)
++bool AudioBackend::StatsOn() {
++    static const bool on = [] { const char* v = std::getenv("WIICOMPILED_AUDIO_STATS"); return v && *v == '1'; }();
++    return on;
++}
++
++namespace {
++uint64_t AudioBackendNowNs() {
++    return static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++template <typename T>
++void AudioBackendAtomicMax(std::atomic<T>& a, T v) {
++    T cur = a.load(std::memory_order_relaxed);
++    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
++    }
++}
++template <typename T>
++void AudioBackendAtomicMin(std::atomic<T>& a, T v) {
++    T cur = a.load(std::memory_order_relaxed);
++    while (v < cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
++    }
++}
++}  // namespace
++
++// Called with a new stream, before SDL's device thread can pull from it: the get callback below runs
++// on that thread for every device buffer (it only counts; it never adds data).
++void AudioBackend::WatchDeviceLocked(SDL_AudioStream* stream) {
++    m_dropUntilTarget = false;
++    m_deviceThreadSetUp.store(false, std::memory_order_relaxed);
++    m_devBytesPerSec.store(static_cast<uint32_t>(m_spec.freq) * static_cast<uint32_t>(m_spec.channels) * 2u,
++                           std::memory_order_relaxed);
++    m_devEpoch.fetch_add(1, std::memory_order_release);
++    if (!SDL_SetAudioStreamGetCallback(stream, &AudioBackend::DevicePullThunk, this)) {
++        RT_LOG(RT_TAG_AUDIO) << "SDL_SetAudioStreamGetCallback failed: " << SDL_GetError() << std::endl;
++    }
++    SDL_AudioSpec device{};
++    int frames = 0;
++    if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &device, &frames) && device.freq > 0) {
++        RT_LOGF(RT_TAG_AUDIO, "output device: %d Hz, %d channels, %d frames per buffer (%.1f ms; audren double-buffers)\n",
++                device.freq, device.channels, frames, frames * 1000.0 / device.freq);
++    }
++}
++
++void SDLCALL AudioBackend::DevicePullThunk(void* userdata, SDL_AudioStream*, int additional, int total) {
++    static_cast<AudioBackend*>(userdata)->OnDevicePull(additional, total);
++}
++
++// SDL's device thread starts at libnx's 0x3B (the lowest of the audio chain, below the mixer, the
++// feeder and the frame worker) with a deadline of one device buffer. On its first pull it moves to
++// core 2 at 0x2C, where it takes ~0.2 ms per 23 ms (WIICOMPILED_AUDIO_DEVICE_BOOST=0 leaves it).
++// `additional` is what the stream lacks for this buffer (input bytes; the resampler's rounding can
++// ask for one frame more than it needs, hence the 8-byte slack).
++void AudioBackend::OnDevicePull(int additional, int total) {
++    if (!m_deviceThreadSetUp.exchange(true, std::memory_order_relaxed)) {
++        const char* boost = std::getenv("WIICOMPILED_AUDIO_DEVICE_BOOST");
++        if (!(boost && *boost == '0')) {
++            SwitchPinCurrentThread(2, 0x2C);
++        }
++    }
++    m_devPulls.fetch_add(1, std::memory_order_relaxed);
++    if (additional > 8) {
++        m_devUnderruns.fetch_add(1, std::memory_order_relaxed);
++        m_devShortBytes.fetch_add(static_cast<uint64_t>(additional), std::memory_order_relaxed);
++    }
++    AudioBackendAtomicMin(m_devMinAtPull, std::max(total - additional, 0));
++    const uint64_t now = AudioBackendNowNs();
++    const uint32_t epoch = m_devEpoch.load(std::memory_order_acquire);
++    const uint32_t bytesPerSec = m_devBytesPerSec.load(std::memory_order_relaxed);
++    if (m_devLastPullNs != 0 && epoch == m_devLastEpoch && bytesPerSec != 0 && total > 0) {
++        const uint64_t gap = now - m_devLastPullNs;
++        const uint64_t pullNs = static_cast<uint64_t>(total) * 1000000000ull / bytesPerSec;
++        m_devPullNs.store(pullNs, std::memory_order_relaxed);
++        AudioBackendAtomicMax(m_devMaxGapNs, gap);
++        if (gap * 2 > pullNs * 3) {
++            m_devLatePulls.fetch_add(1, std::memory_order_relaxed);
++        }
++    }
++    m_devLastPullNs = now;
++    m_devLastEpoch = epoch;
++}
++#endif
++
+ AudioBackend::Stats AudioBackend::TakeStats() {
      std::lock_guard<std::mutex> lock(m_mutex);
      Stats s = m_stats;
      s.ratio = m_ratio;
 +#if defined(__SWITCH__)
 +    s.drops += m_ringDrops.exchange(0, std::memory_order_relaxed);
 +#endif
++#if defined(__SWITCH__)
++    s.pulls = m_devPulls.exchange(0, std::memory_order_relaxed);
++    s.underruns = m_devUnderruns.exchange(0, std::memory_order_relaxed);
++    s.shortBytes = m_devShortBytes.exchange(0, std::memory_order_relaxed);
++    s.latePulls = m_devLatePulls.exchange(0, std::memory_order_relaxed);
++    s.minAtPull = m_devMinAtPull.exchange(1 << 30, std::memory_order_relaxed);
++    s.maxPullGapMs = m_devMaxGapNs.exchange(0, std::memory_order_relaxed) / 1e6;
++    s.pullMs = m_devPullNs.load(std::memory_order_relaxed) / 1e6;
++    s.feeder = m_feeder.joinable() && !m_noFeeder;
++#endif
      m_stats = {};
      return s;
  }
-@@ -189,6 +232,119 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
+@@ -164,6 +320,9 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
+         if (m_playing) {
+             SDL_PauseAudioStreamDevice(m_stream);
+             m_playing = false;
++#if defined(__SWITCH__)
++            m_devEpoch.fetch_add(1, std::memory_order_release);
++#endif
+         }
+     }
+     m_stats.minQueued = std::min(m_stats.minQueued, queued);
+@@ -172,6 +331,19 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
+         return true;
+     }
+     const uint32_t maxQueued = QueueLimitBytesLocked();
++#if defined(__SWITCH__)
++    // An overflow is the catch-up after a stall (the blocks owed for it arrive on top of a queue that
++    // already restarted at the target). Dropping only the blocks that do not fit leaves a splice in the
++    // stream at every device pull (~23 ms) while it lasts; dropping until the queue is back at the
++    // target leaves one.
++    if (m_dropUntilTarget) {
++        if (static_cast<uint32_t>(queued) > BytesForMsLocked(kTargetMs)) {
++            ++m_stats.drops;
++            return false;
++        }
++        m_dropUntilTarget = false;
++    }
++#endif
+     if (static_cast<uint64_t>(queued) + static_cast<uint64_t>(std::max(incomingBytes, 0)) > maxQueued) {
+         // Match Dolphin's FIFO overflow behavior: preserve the continuous audio
+         // already queued and discard the new block.  Clearing SDL's entire
+@@ -179,6 +351,10 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
+         // VI-batched DMA briefly outran playback).
+         // A drop is audible; report the first one so it is not invisible.
+         ++m_stats.drops;
++#if defined(__SWITCH__)
++        m_dropUntilTarget = true;
++        ++m_stats.dropRuns;
++#endif
+         if (!m_reportedDroppedBlock) {
+             m_reportedDroppedBlock = true;
+             RT_LOG(RT_TAG_AUDIO) << "output queue full (" << queued << "/" << maxQueued
+@@ -189,6 +365,152 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
      return true;
  }
  
@@ -6118,11 +6350,17 @@ index e65ecfb..999ae1a 100644
 +        return false;  // a put failed since the last block: reported (and the block dropped) one block late
 +    }
 +    if (!m_feeder.joinable() && !m_noFeeder) {
-+        try {
-+            m_feeder = std::thread([this] { FeederMain(); });
-+        } catch (const std::system_error&) {
++        const char* feeder = std::getenv("WIICOMPILED_AUDIO_FEEDER");
++        if (feeder && *feeder == '0') {
 +            m_noFeeder = true;
-+            RT_LOG(RT_TAG_AUDIO) << "could not start the audio feeder thread; pushing on the game thread" << std::endl;
++            RT_LOG(RT_TAG_AUDIO) << "audio feeder off (WIICOMPILED_AUDIO_FEEDER=0): pushing on the game thread" << std::endl;
++        } else {
++            try {
++                m_feeder = std::thread([this] { FeederMain(); });
++            } catch (const std::system_error&) {
++                m_noFeeder = true;
++                RT_LOG(RT_TAG_AUDIO) << "could not start the audio feeder thread; pushing on the game thread" << std::endl;
++            }
 +        }
 +    }
 +    if (m_noFeeder) {  // the synchronous push
@@ -6141,24 +6379,43 @@ index e65ecfb..999ae1a 100644
 +        m_ringDrops.fetch_add(1, std::memory_order_relaxed);  // feeder 384 ms behind: drop, keep continuity
 +        return true;
 +    }
++    const uint64_t stamp = StatsOn() ? AudioBackendNowNs() : 0;
 +    for (size_t offset = 0; offset < bytes; offset += kRingSlotBytes) {  // whole stereo frames per slot
 +        RingSlot& slot = m_ring[head % kRingSlots];
 +        slot.bytes = static_cast<uint32_t>(std::min<size_t>(kRingSlotBytes, bytes - offset));
 +        std::memcpy(slot.data, data + offset, slot.bytes);
++        m_ringStampNs[head % kRingSlots] = stamp;
 +        ++head;
 +    }
 +    m_ringHead.store(head, std::memory_order_release);
++    {
++        std::lock_guard<std::mutex> lock(m_feedMutex);
++        m_feedPending = true;
++    }
++    m_feedCv.notify_one();
 +    return true;
 +}
 +
-+// Core 2 under the mixer, frame worker and presenter (0x2B/0x2C), above the 0x3B pool where SDL's
-+// own device thread runs: a few microseconds every 2 ms.
++// Woken by each push (no polling). Core 2 at 0x2C (WIICOMPILED_AUDIO_FEEDER_PRIO): below the AX mixer
++// (0x2B) the game thread joins, equal to the frame worker (so at most one of its ~2 ms records ahead),
++// above SDL's device thread; ~20 us per 3 ms block.
 +void AudioBackend::FeederMain() {
-+    SwitchPinCurrentThread(2, 0x2D);
-+    while (!m_feederStop.load(std::memory_order_acquire)) {
-+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-+        if (m_ringTail.load(std::memory_order_relaxed) == m_ringHead.load(std::memory_order_acquire)) {
-+            continue;
++    int priority = 0x2C;
++    if (const char* text = std::getenv("WIICOMPILED_AUDIO_FEEDER_PRIO")) {
++        const long value = std::strtol(text, nullptr, 0);
++        if (value >= 0x1C && value <= 0x3B) {
++            priority = static_cast<int>(value);
++        }
++    }
++    SwitchPinCurrentThread(2, priority);
++    for (;;) {
++        {
++            std::unique_lock<std::mutex> lock(m_feedMutex);
++            m_feedCv.wait(lock, [this] { return m_feedPending || m_feederStop.load(std::memory_order_acquire); });
++            if (m_feederStop.load(std::memory_order_acquire)) {
++                return;
++            }
++            m_feedPending = false;
 +        }
 +        std::lock_guard<std::mutex> lock(m_mutex);
 +        DrainRingLocked();
@@ -6167,8 +6424,16 @@ index e65ecfb..999ae1a 100644
 +
 +void AudioBackend::DrainRingLocked() {
 +    const uint32_t head = m_ringHead.load(std::memory_order_acquire);
++    const uint64_t now = StatsOn() ? AudioBackendNowNs() : 0;
 +    for (uint32_t tail = m_ringTail.load(std::memory_order_relaxed); tail != head; ++tail) {
 +        const RingSlot& slot = m_ring[tail % kRingSlots];
++        if (now != 0) {
++            const uint64_t stamp = m_ringStampNs[tail % kRingSlots];
++            if (stamp != 0 && now > stamp) {
++                m_stats.maxFeedLagMs = std::max(m_stats.maxFeedLagMs, (now - stamp) / 1e6);
++            }
++            m_stats.maxRingDepth = std::max(m_stats.maxRingDepth, head - tail);
++        }
 +        if (m_initialized && m_stream) {
 +            ConvertAndQueueLocked(slot.data, slot.bytes);
 +        }
@@ -6217,7 +6482,7 @@ index e65ecfb..999ae1a 100644
  bool AudioBackend::PushWiiAiSamplesBE16(const uint8_t* data, size_t bytes) {
      if (!data || bytes == 0) {
          return false;
-@@ -238,6 +394,7 @@ bool AudioBackend::PushWiiAiSamplesBE16(const uint8_t* data, size_t bytes) {
+@@ -238,6 +560,7 @@ bool AudioBackend::PushWiiAiSamplesBE16(const uint8_t* data, size_t bytes) {
  
      return true;
  }
@@ -6225,7 +6490,7 @@ index e65ecfb..999ae1a 100644
  
  bool AudioBackend::PushSamplesLE16(const int16_t* samples, size_t sampleCount) {
      if (!samples || sampleCount == 0) {
-@@ -249,6 +406,9 @@ bool AudioBackend::PushSamplesLE16(const int16_t* samples, size_t sampleCount) {
+@@ -249,6 +572,9 @@ bool AudioBackend::PushSamplesLE16(const int16_t* samples, size_t sampleCount) {
          return false;
      }
  
@@ -6646,7 +6911,7 @@ index 9504488..019f48f 100644
      // PAGE_READONLY read window that returned zero turned missing devices into silent hangs instead.
      if (!CommitPlaceholder(g_base + 0xCC000000u, 0x02000000u, kProtNone)) {
 diff --git a/runtime/src/hle/audio/audio.cpp b/runtime/src/hle/audio/audio.cpp
-index a276446..b54553c 100644
+index a276446..b321ee5 100644
 --- a/runtime/src/hle/audio/audio.cpp
 +++ b/runtime/src/hle/audio/audio.cpp
 @@ -387,6 +387,20 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
@@ -6670,7 +6935,7 @@ index a276446..b54553c 100644
      if (stats) {
          const auto now = std::chrono::steady_clock::now();
          statMaxGapMs = std::max(statMaxGapMs, std::chrono::duration<double, std::milli>(now - lastTick).count());
-@@ -401,6 +415,17 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -401,6 +415,29 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
                      statBlocks * (length / (sampleRate * 4.0)) * 1000.0, (unsigned long long)statCapped, statMaxGapMs,
                      statMaxBacklogMs, (unsigned long long)b.pushes, (unsigned long long)b.drops,
                      (unsigned long long)b.starved, b.minQueued == (1 << 30) ? 0 : b.minQueued, b.maxQueued, b.ratio);
@@ -6685,10 +6950,22 @@ index a276446..b54553c 100644
 +            statJoinMs = statPushMs = statCallbackMs = statMaxJoinMs = statMaxTickMs = 0;
 +            for (auto& count : statTicksByBlocks) count = 0;
 +#endif
++#if defined(__SWITCH__)
++            // The output side: underruns = device pulls the SDL stream could not fill (silence, a gap);
++            // late pulls = SDL's device thread more than 1.5 buffers after the previous pull (audren ran
++            // out); drops in runs (each run one splice); the feeder's longest push -> SDL delay.
++            RT_LOGF(RT_TAG_AUDIO,
++                    "[audio-stats] output: pulls=%llu (%.1f ms each, max gap %.1f ms, late %llu) underruns=%llu "
++                    "(%.1f ms short) minAtPull=%d bytes | drops=%llu in %llu runs | %s maxLag=%.2fms maxRing=%u\n",
++                    (unsigned long long)b.pulls, b.pullMs, b.maxPullGapMs, (unsigned long long)b.latePulls,
++                    (unsigned long long)b.underruns, b.shortBytes / (sampleRate * 4.0) * 1000.0,
++                    b.minAtPull == (1 << 30) ? -1 : b.minAtPull, (unsigned long long)b.drops,
++                    (unsigned long long)b.dropRuns, b.feeder ? "feeder" : "sync", b.maxFeedLagMs, b.maxRingDepth);
++#endif
              statsStart = now;
              statTicks = statBlocks = statCapped = 0;
              statMaxGapMs = statMaxBacklogMs = 0;
-@@ -447,7 +472,22 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -447,7 +484,22 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
          // that reads its PB write-back and aux buffers (__AXOutNewFrame via the AI DMA
          // callback), so the mix worker must finish first; the join also publishes its
          // aux-out shadow.
@@ -6711,7 +6988,7 @@ index a276446..b54553c 100644
  
          if (!EnsureAudioBackend(sampleRate)) {
              std::lock_guard<std::mutex> lock(g_ai.mutex);
-@@ -468,6 +508,13 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -468,6 +520,13 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
              }
          }
  
@@ -6725,7 +7002,7 @@ index a276446..b54553c 100644
          if (callback != 0) {
              // Pointer lookup avoids copying the registry record per audio block.
              const auto* info = TranslatedFunctionRegistry::FindByAddressPtr(callback);
-@@ -484,6 +531,11 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -484,6 +543,11 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
                  AxDspHle::ServiceDeferredCallbacks();
              }
          }
@@ -6737,7 +7014,7 @@ index a276446..b54553c 100644
  
          {
              std::lock_guard<std::mutex> lock(g_ai.mutex);
-@@ -513,6 +565,12 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
+@@ -513,6 +577,12 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
          g_ai.tickActive = false;
          activeTickReset.armed = false;
      }

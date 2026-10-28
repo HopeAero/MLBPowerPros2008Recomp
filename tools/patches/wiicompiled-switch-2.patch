@@ -480,6 +480,332 @@ index 83faaac..15fb008 100644
      g_texels = texels;
      g_titleBackup.resize(kTitleW * kTitleH);
      g_buttonBackup.resize(kButtonW * kButtonH);
+diff --git a/runtime/src/hle/os/os_internal.h b/runtime/src/hle/os/os_internal.h
+index a5ae604..801b9da 100644
+--- a/runtime/src/hle/os/os_internal.h
++++ b/runtime/src/hle/os/os_internal.h
+@@ -132,6 +132,13 @@ void CancelSleepTimer(uint32_t threadPtr);
+ void ClearOutstandingPark(uint32_t threadPtr);
+ bool ProcessSleepTimers(CpuContext* cpu);
+ bool SleepTimerOverdue();
++#if defined(__SWITCH__)
++// Where a sleep timer fires from, for WIICOMPILED_SOUND_TICK_STATS: the scheduler (a blocking
++// switch or an interrupt-return preemption point), the idle loop, or a host pacing wait. A one-shot
++// tag: the next ProcessSleepTimers call takes it and resets it (no scope may span a fiber switch).
++enum class SleepFireSite : uint8_t { Scheduler, Idle, Pace };
++void SetNextSleepFireSite(SleepFireSite site);
++#endif
+ 
+ // Defined in os_alarm.cpp.
+ bool ProcessAlarmQueue(CpuContext* cpu, int maxToProcess);
+diff --git a/runtime/src/hle/os/os_scheduler.cpp b/runtime/src/hle/os/os_scheduler.cpp
+index d1384fc..0e7f5dc 100644
+--- a/runtime/src/hle/os/os_scheduler.cpp
++++ b/runtime/src/hle/os/os_scheduler.cpp
+@@ -195,6 +195,33 @@ extern "C" void OS_HLE_PreemptionPoint()
+     cpu->gpr[3] = savedR3;
+ }
+ 
++#if defined(__SWITCH__)
++extern "C" void OS_HLE_NoteHostPaceService();
++
++// The host pacing wait in GXCopyDisp (vi.cpp PaceToRetraceBoundary) stands in for the guest's
++// VIWaitForRetrace: the main thread's frame loop (0x800472B4) only blocks when no retrace elapsed,
++// and the pacer delivers that retrace itself. On hardware the 5 ms sound ticker's alarm interrupt
++// fires on time while the main thread waits; here the guest threads are fibers on this host thread,
++// so a sleep that came due during the wait only ran at the preemption point after it, up to a whole
++// display period late (the anchored catch-up in ScheduleSleepTimer then repaid the debt later from the
++// main thread's compute). The pacer calls this when an OSSleepTicks deadline is due: exactly the
++// interrupt-return preemption of OS_HLE_PreemptionPoint (due sleepers resumed, a higher-priority READY
++// thread switched to, the main thread resumed once they block again). Returns false when the
++// preemption point is not allowed (interrupts off, scheduler disabled, inside a retrace), so the
++// pacer stops trying for this wait.
++extern "C" bool OS_HLE_PaceRunDueSleepers()
++{
++    if (!OS_HLE_InterruptsEnabled() || ::Memory::Read32(kSchedulerIdleFlagAddr) != 0 ||
++        VI_HLE_IsAdvancingRetrace()) {
++        return false;
++    }
++    OS_HLE_NoteHostPaceService();
++    SetNextSleepFireSite(SleepFireSite::Pace);  // SelectThread's first step is ProcessSleepTimers
++    OS_HLE_PreemptionPoint();
++    return true;
++}
++#endif
++
+ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
+ {
+     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+@@ -295,6 +322,9 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
+             OS__EnableInterrupts_801a65c0();
+ 
+             while (::Memory::Read32(kSchedulerPendingFlagAddr) == 0) {
++#if defined(__SWITCH__)
++                SetNextSleepFireSite(SleepFireSite::Idle);
++#endif
+                 ProcessSleepTimers(cpu);
+                 // Dolphin models DSP audio DMA as an independent 4 kHz timing
+                 // event.  Poll it from the guest scheduler instead of batching
+diff --git a/runtime/src/hle/os/os_sleep.cpp b/runtime/src/hle/os/os_sleep.cpp
+index b155a20..dae498a 100644
+--- a/runtime/src/hle/os/os_sleep.cpp
++++ b/runtime/src/hle/os/os_sleep.cpp
+@@ -4,7 +4,10 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <iostream>
++#include <iterator>
+ #include <limits>
+ #include <mutex>
+ #include <unordered_map>
+@@ -29,6 +32,195 @@ std::vector<SleepTimerEntry> gSleepTimers;
+ std::atomic<std::chrono::steady_clock::rep> gEarliestSleepDeadline{
+     std::numeric_limits<std::chrono::steady_clock::rep>::max()};
+ 
++#if defined(__SWITCH__)
++// WIICOMPILED_SOUND_TICK_STATS=1: cadence of every short OSSleepTicks loop (MLB's 5 ms sound ticker
++// 0x80027BF8 above all: each wake is one sound pass, +5 on the commentary phrase clocks), printed
++// every 5 s per sleeping thread: wakes/s against the ideal 1/period, how late each wake fired past
++// the deadline OSSleepTicks armed (mean, max, histogram), the debt against the hardware alarm grid
++// (anchor), catch-up sleeps and the debt dropped by the 50 ms cap (resets, lost ms), how many of
++// those deadlines fell inside a host pacing wait (vi.cpp PaceToRetraceBoundary) and where the wake
++// fired from (pace wait, idle loop, other scheduler passes).
++thread_local SleepFireSite tSleepFireSite = SleepFireSite::Scheduler;
++void SetNextSleepFireSite(SleepFireSite site) { tSleepFireSite = site; }
++
++namespace {
++using TickClock = std::chrono::steady_clock;
++
++bool SoundTickStatsEnabled()
++{
++    static const bool enabled = [] {
++        const char* v = std::getenv("WIICOMPILED_SOUND_TICK_STATS");
++        return v != nullptr && *v == '1';
++    }();
++    return enabled;
++}
++
++struct TickStats {
++    uint64_t ticks = 0;
++    TickClock::duration period{};
++    TickClock::time_point armed{};   // the timer deadline the last OSSleepTicks set
++    TickClock::time_point ideal{};   // where the hardware alarm grid puts that wake (anchor)
++    bool pending = false;
++    uint64_t wakes = 0, catchUps = 0, resets = 0;
++    double lostMs = 0, lateSumMs = 0, lateMaxMs = 0, debtMaxMs = 0;
++    uint64_t lateHist[6] = {};  // < 0.5, < 1, < 2, < 4, < 8, >= 8 ms
++    uint64_t dueInPace = 0, firedPace = 0, firedIdle = 0, firedOther = 0;
++};
++std::mutex gTickStatsMutex;
++std::unordered_map<uint32_t, TickStats> gTickStats;
++TickClock::time_point gTickStatsStart{};
++struct PaceWindow { TickClock::time_point begin, end; };
++PaceWindow gPaceWindows[16] = {};
++unsigned gPaceNext = 0;
++bool gPaceActive = false;
++TickClock::time_point gPaceBegin{};
++uint64_t gPaceWaits = 0, gPaceServices = 0;
++double gPaceMs = 0;
++
++bool DeadlineInPace(TickClock::time_point deadline)
++{
++    if (gPaceActive && deadline >= gPaceBegin) {
++        return true;
++    }
++    for (const PaceWindow& w : gPaceWindows) {
++        if (deadline >= w.begin && deadline < w.end) {
++            return true;
++        }
++    }
++    return false;
++}
++
++constexpr auto kTickStatsMaxPeriod = std::chrono::milliseconds(20);
++
++// Called from ScheduleSleepTimer under gSleepTimerMutex (lock order: timers, then stats).
++void NoteTickScheduled(uint32_t threadPtr, uint64_t ticks, TickClock::duration period, TickClock::time_point now,
++                       TickClock::time_point anchor, TickClock::time_point deadline, bool reset,
++                       TickClock::duration lost)
++{
++    if (period > kTickStatsMaxPeriod) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(gTickStatsMutex);
++    TickStats& s = gTickStats[threadPtr];
++    s.ticks = ticks;
++    s.period = period;
++    s.armed = deadline;
++    s.ideal = anchor;
++    s.pending = true;
++    if (anchor < now + period) {
++        ++s.catchUps;
++    }
++    if (reset) {
++        ++s.resets;
++        s.lostMs += std::chrono::duration<double, std::milli>(lost).count();
++    }
++}
++
++void NoteTickFired(uint32_t threadPtr, SleepFireSite site)
++{
++    const auto now = TickClock::now();
++    std::lock_guard<std::mutex> lock(gTickStatsMutex);
++    const auto it = gTickStats.find(threadPtr);
++    if (it != gTickStats.end() && it->second.pending) {
++        TickStats& s = it->second;
++        s.pending = false;
++        ++s.wakes;
++        const double lateMs = std::chrono::duration<double, std::milli>(now - s.armed).count();
++        const double debtMs = std::chrono::duration<double, std::milli>(now - s.ideal).count();
++        s.lateSumMs += lateMs;
++        s.lateMaxMs = std::max(s.lateMaxMs, lateMs);
++        s.debtMaxMs = std::max(s.debtMaxMs, debtMs);
++        const int bucket = lateMs < 0.5 ? 0 : lateMs < 1 ? 1 : lateMs < 2 ? 2 : lateMs < 4 ? 3 : lateMs < 8 ? 4 : 5;
++        ++s.lateHist[bucket];
++        if (DeadlineInPace(s.armed)) {
++            ++s.dueInPace;
++        }
++        switch (site) {
++        case SleepFireSite::Pace: ++s.firedPace; break;
++        case SleepFireSite::Idle: ++s.firedIdle; break;
++        default: ++s.firedOther; break;
++        }
++    }
++    if (gTickStatsStart == TickClock::time_point{}) {
++        gTickStatsStart = now;
++        return;
++    }
++    const double windowS = std::chrono::duration<double>(now - gTickStatsStart).count();
++    if (windowS < 5.0) {
++        return;
++    }
++    for (auto& [thread, s] : gTickStats) {
++        if (s.wakes != 0) {
++            const double periodMs = std::chrono::duration<double, std::milli>(s.period).count();
++            RT_LOGF(RT_TAG_OS,
++                    "[sound-tick] %.1f s thread 0x%08x period %.3f ms: %llu wakes = %.1f/s (ideal %.1f/s); late ms "
++                    "mean %.2f max %.2f [<0.5 %llu | <1 %llu | <2 %llu | <4 %llu | <8 %llu | >=8 %llu]; debt max %.2f ms, "
++                    "catch-ups %llu, resets %llu (lost %.1f ms); deadline in host pace %llu; fired: pace %llu idle %llu "
++                    "other %llu\n",
++                    windowS, thread, periodMs, (unsigned long long)s.wakes, s.wakes / windowS,
++                    periodMs > 0 ? 1000.0 / periodMs : 0.0, s.lateSumMs / s.wakes, s.lateMaxMs,
++                    (unsigned long long)s.lateHist[0], (unsigned long long)s.lateHist[1],
++                    (unsigned long long)s.lateHist[2], (unsigned long long)s.lateHist[3],
++                    (unsigned long long)s.lateHist[4], (unsigned long long)s.lateHist[5], s.debtMaxMs,
++                    (unsigned long long)s.catchUps, (unsigned long long)s.resets, s.lostMs,
++                    (unsigned long long)s.dueInPace, (unsigned long long)s.firedPace,
++                    (unsigned long long)s.firedIdle, (unsigned long long)s.firedOther);
++        }
++        const bool pending = s.pending;
++        const auto armed = s.armed, ideal = s.ideal;
++        const auto ticks = s.ticks;
++        const auto period = s.period;
++        s = TickStats{};
++        s.ticks = ticks, s.period = period, s.armed = armed, s.ideal = ideal, s.pending = pending;
++    }
++    RT_LOGF(RT_TAG_OS, "[sound-tick] host pace waits %llu, %.1f ms (%.1f%%), guest-timer services in pace %llu\n",
++            (unsigned long long)gPaceWaits, gPaceMs, gPaceMs / (windowS * 10.0),
++            (unsigned long long)gPaceServices);
++    gPaceWaits = gPaceServices = 0;
++    gPaceMs = 0;
++    gTickStatsStart = now;
++}
++} // namespace
++
++// vi.cpp: a host pacing wait (PaceToRetraceBoundary) begins or ends; a guest-timer service ran in it.
++extern "C" void OS_HLE_NoteHostPace(bool begin)
++{
++    if (!SoundTickStatsEnabled()) {
++        return;
++    }
++    const auto now = TickClock::now();
++    std::lock_guard<std::mutex> lock(gTickStatsMutex);
++    if (begin) {
++        gPaceActive = true;
++        gPaceBegin = now;
++        return;
++    }
++    if (!gPaceActive) {
++        return;
++    }
++    gPaceActive = false;
++    gPaceWindows[gPaceNext++ % std::size(gPaceWindows)] = {gPaceBegin, now};
++    ++gPaceWaits;
++    gPaceMs += std::chrono::duration<double, std::milli>(now - gPaceBegin).count();
++}
++
++extern "C" void OS_HLE_NoteHostPaceService()
++{
++    if (!SoundTickStatsEnabled()) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(gTickStatsMutex);
++    ++gPaceServices;
++}
++
++// Earliest pending OSSleepTicks deadline (steady_clock ticks; never later than the real one, may be
++// stale early: a scheduler pass refreshes it). Max when none is pending.
++extern "C" int64_t OS_HLE_EarliestSleepDeadline()
++{
++    return static_cast<int64_t>(gEarliestSleepDeadline.load(std::memory_order_relaxed));
++}
++#endif
++
+ // Callers hold gSleepTimerMutex.
+ void NoteSleepDeadline(std::chrono::steady_clock::time_point deadline)
+ {
+@@ -125,7 +317,11 @@ void ScheduleSleepTimer(uint32_t threadPtr, uint64_t ticks)
+     // a different length or long after the last deadline starts from now, as in the SDK.
+     struct LastSleep { uint64_t ticks; Clock::time_point deadline; };
+     static std::unordered_map<uint32_t, LastSleep> lastSleeps;
++#if defined(__SWITCH__)
++    constexpr auto kMaxCatchUp = std::chrono::milliseconds(250);
++#else
+     constexpr auto kMaxCatchUp = std::chrono::milliseconds(50);
++#endif
+ 
+     std::lock_guard<std::mutex> lock(gSleepTimerMutex);
+     LastSleep& last = lastSleeps[threadPtr];
+@@ -136,6 +332,13 @@ void ScheduleSleepTimer(uint32_t threadPtr, uint64_t ticks)
+         // finishes parking. The anchor keeps the full debt so it is still caught up later.
+         deadline = std::max(anchor, now + duration / 4);
+     }
++#if defined(__SWITCH__)
++    if (SoundTickStatsEnabled()) {
++        const bool reset = last.ticks == ticks && last.deadline <= now && now - last.deadline > kMaxCatchUp;
++        NoteTickScheduled(threadPtr, ticks, duration, now, anchor, deadline, reset,
++                          reset ? now - last.deadline : Clock::duration{});
++    }
++#endif
+     last = {ticks, anchor};
+     std::erase_if(gSleepTimers, [threadPtr](const SleepTimerEntry& entry) {
+         return entry.threadPtr == threadPtr;
+@@ -156,6 +359,10 @@ bool ProcessSleepTimers(CpuContext* cpu)
+     // 100ms late, followed by a "sleep-timer stale" drop when this fiber finally resumes.
+     // Leaving unprocessed timers in the table keeps them visible to every other pump (idle
+     // loop, other threads' SelectThread) while this one is switched away.
++#if defined(__SWITCH__)
++    const SleepFireSite fireSite = tSleepFireSite;
++    tSleepFireSite = SleepFireSite::Scheduler;
++#endif
+     bool processedAny = false;
+     constexpr size_t kMaxTimersPerCall = 64;
+     size_t processedCount = 0;
+@@ -220,6 +427,11 @@ bool ProcessSleepTimers(CpuContext* cpu)
+         }
+ 
+         ClearOutstandingPark(threadPtr);
++#if defined(__SWITCH__)
++        if (SoundTickStatsEnabled()) {
++            NoteTickFired(threadPtr, fireSite);
++        }
++#endif
+         cpu->gpr[3] = threadPtr;
+         OSResumeThread_HLE_801aa58c(cpu);
+ 
 diff --git a/runtime/src/hle/storage/dvd.cpp b/runtime/src/hle/storage/dvd.cpp
 index 8f4c9b4..238a064 100644
 --- a/runtime/src/hle/storage/dvd.cpp
@@ -503,10 +829,18 @@ index 8f4c9b4..238a064 100644
          std::string prefix = virtualPrefix.empty() ? "/" : virtualPrefix;
          if (prefix.back() != '/' && prefix.back() != '\\') {
 diff --git a/runtime/src/hle/vi.cpp b/runtime/src/hle/vi.cpp
-index b1feb54..ee71ab7 100644
+index b1feb54..3eeccb8 100644
 --- a/runtime/src/hle/vi.cpp
 +++ b/runtime/src/hle/vi.cpp
-@@ -31,6 +31,10 @@
+@@ -18,6 +18,7 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <iostream>
+ #include <mutex>
+ #include <thread>
+@@ -31,6 +32,10 @@
  
  #include <aurora/aurora.h>
  
@@ -517,7 +851,106 @@ index b1feb54..ee71ab7 100644
  // Forward declaration for OSWakeupThread - used to wake threads on VI retrace queue
  extern "C" void OSWakeupThread_HLE_801aaaa4(CpuContext* ctx);
  
-@@ -752,6 +756,7 @@ extern "C" void VIConfigure_HLE_801b9f6c(CpuContext* ctx)
+@@ -454,6 +459,28 @@ void VI_HLE_ProcessRetracesDeferred(int maxToProcess) {
+     OS_HLE_EndDeferredGuestCallbacks();
+ }
+ 
++#if defined(__SWITCH__)
++// hle/os: guest sleep timers during host waits (os_scheduler.cpp OS_HLE_PaceRunDueSleepers explains).
++extern "C" bool OS_HLE_PaceRunDueSleepers();
++extern "C" int64_t OS_HLE_EarliestSleepDeadline();
++extern "C" void OS_HLE_NoteHostPace(bool begin);
++
++namespace {
++// WIICOMPILED_PACE_GUEST_TIMERS=0 restores the waits below that ignore guest OSSleepTicks deadlines.
++bool PaceGuestTimersEnabled() {
++    static const bool enabled = [] {
++        const char* v = std::getenv("WIICOMPILED_PACE_GUEST_TIMERS");
++        return !(v != nullptr && *v == '0');
++    }();
++    return enabled;
++}
++
++Clock::time_point EarliestGuestSleepDeadline() {
++    return Clock::time_point{Clock::duration{OS_HLE_EarliestSleepDeadline()}};
++}
++} // namespace
++#endif
++
+ void VI_HLE_WaitForNextRetracePoll() {
+     Clock::time_point retraceDeadline;
+     {
+@@ -466,6 +493,19 @@ void VI_HLE_WaitForNextRetracePoll() {
+     if (now >= retraceDeadline) {
+         return;
+     }
++#if defined(__SWITCH__)
++    // The idle loop fires sleep timers on every pass: end this wait at the next OSSleepTicks
++    // deadline instead of up to 1 ms past it (the 5 ms sound ticker's wakes).
++    if (PaceGuestTimersEnabled()) {
++        const auto guestDue = EarliestGuestSleepDeadline();
++        if (guestDue < retraceDeadline && guestDue < now + 1ms) {
++            if (guestDue > now) {
++                SleepPreciselyUntil(guestDue);
++            }
++            return;
++        }
++    }
++#endif
+     // Audio DMA and alarm queues still need regular service even when the VI
+     // deadline is farther away. The high-resolution wait removes the 1 ms
+     // scheduler overshoot when retrace is the next event.
+@@ -490,11 +530,39 @@ uint64_t s_lastPresentAnchorNanos = 0;
+ // DMA and timers keep running, then delivers that retrace so guest logic starts exactly on the grid.
+ void PaceToRetraceBoundary(Clock::time_point deadline) {
+     constexpr auto kServiceSlice = 1ms;
++#if defined(__SWITCH__)
++    OS_HLE_NoteHostPace(true);
++    // This wait is the main thread's VIWaitForRetrace (os_scheduler.cpp OS_HLE_PaceRunDueSleepers):
++    // a guest OSSleepTicks deadline that falls in it (the 5 ms sound ticker, 3-4 per frame) is woken
++    // at that deadline, as the alarm interrupt does on hardware, instead of after the wait. Deadlines
++    // in the final spin window are left to the preemption point after the present. Bounded: at most
++    // 64 services per wait, and none after the preemption point refuses.
++    int guestTimerServices = PaceGuestTimersEnabled() ? 64 : 0;
++#endif
+     for (;;) {
+         const auto now = Clock::now();
+         if (now >= deadline) {
+             break;
+         }
++#if defined(__SWITCH__)
++        if (guestTimerServices > 0) {
++            const auto guestDue = EarliestGuestSleepDeadline();
++            if (guestDue < deadline - kFinalSpinWindow) {
++                if (guestDue > now) {
++                    SleepPreciselyUntil(std::min(guestDue, now + kServiceSlice));
++                }
++                OS_HLE_ProcessAlarmsDeferred(8);
++                Audio_HLE_PollDeferred();
++                if (Clock::now() >= guestDue) {
++                    --guestTimerServices;
++                    if (!OS_HLE_PaceRunDueSleepers()) {
++                        guestTimerServices = 0;
++                    }
++                }
++                continue;
++            }
++        }
++#endif
+         if (deadline - now > kServiceSlice + kFinalSpinWindow) {
+             SleepPreciselyUntil(now + kServiceSlice);
+             OS_HLE_ProcessAlarmsDeferred(8);
+@@ -508,6 +576,9 @@ void PaceToRetraceBoundary(Clock::time_point deadline) {
+         SleepPreciselyUntil(deadline, true, kFinalSpinWindow);
+         break;
+     }
++#if defined(__SWITCH__)
++    OS_HLE_NoteHostPace(false);
++#endif
+     VI_HLE_ProcessRetracesDeferred(1);
+ }
+ 
+@@ -752,6 +823,7 @@ extern "C" void VIConfigure_HLE_801b9f6c(CpuContext* ctx)
              renderMode.xfbHeight != 0 ? renderMode.xfbHeight : renderMode.efbHeight;
      }
  
