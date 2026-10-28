@@ -27,6 +27,7 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
 - Benchmark 90 s stock portátil (1020/307/1331): 59,42 fps, p95 18,22, p99 22,63; **0 picos >30 ms** (base 4, P11 1). Entró en la misma escena final pesada que la base: 193 frames tardíos frente a 231. Esa escena está **limitada por GPU** (73 frames con GPU >16 ms, p99 GPU 20 ms): siguiente frente si se quiere p99 limpio.
 - Falta: prueba jugando (fildeo, toma inicial) con `WIICOMPILED_SWITCH_SPIKES=30 WIICOMPILED_SWITCH_SPIKES_MAX=256 WIICOMPILED_SWITCH_TEXSTATS=1`. Vigilar en el log dk `descriptors: all N image slots in use` (el pool ocupa descriptores).
 - NRO: `local/switch/build/P13-candidate.nro`; anterior `P12-baseline.nro`.
+- **Jugando (P13):** picos >30 ms por ventana frente a run23: menús 62→8, toma inicial 46→31, juego 2/6/4→1/1/3. Lo que queda de la toma inicial es **GPU** (p50 15,75, p95 20,75 ms). P14: barreras descartadas (≤0,25 ms aun sin ninguna). Siguiente: `WIICOMPILED_DK_PASS_TIMES=60 WIICOMPILED_DK_DRAW_TIMES=1 WIICOMPILED_DK_DRAW_PIXELS=2` en la toma inicial para ver qué dibujos/shaders pesan (vértices o píxeles) en las pasadas 0, 57, 58 y las de 188×128.
 
 ## Siguiente paso: comparar desde el mismo estado
 
