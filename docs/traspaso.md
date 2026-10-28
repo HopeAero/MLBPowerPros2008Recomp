@@ -29,27 +29,28 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
 - NRO: `local/switch/build/P13-candidate.nro`; anterior `P12-baseline.nro`.
 - **Jugando (P13):** picos >30 ms por ventana frente a run23: menús 62→8, toma inicial 46→31, juego 2/6/4→1/1/3. Lo que queda de la toma inicial es **GPU** (p50 15,75, p95 20,75 ms). P14: barreras descartadas (≤0,25 ms aun sin ninguna). Siguiente: `WIICOMPILED_DK_PASS_TIMES=60 WIICOMPILED_DK_DRAW_TIMES=1 WIICOMPILED_DK_DRAW_PIXELS=2` en la toma inicial para ver qué dibujos/shaders pesan (vértices o píxeles) en las pasadas 0, 57, 58 y las de 188×128.
 
-## Siguiente paso: comparar desde el mismo estado
+## Tandas P15–P19 (2026-10-28, Claude con subagentes Sonnet)
 
-**Medir el efecto de P11 en los picos de fildeo y la toma inicial**, comparando el mismo estado y controles, a reloj stock. Primero benchmark de 90 s con picos; luego probe breve de fildeo. Si la espera GX sigue dominando, muestrear también el worker de core 1 antes de alterar barreras (propuesta en `P11-profile-fifo-review.md`). Datos anteriores:
+- **Fase 62:** `WIICOMPILED_SWITCH_PROFILE_WINDOW=<s>` (con `WIICOMPILED_SWITCH_SPIKES=30` y `WIICOMPILED_SWITCH_PROFILE=1`) imprime cada `<s>` segundos de una partida jugada los histogramas PC/LR del hilo principal (`[pwin]`). Analizador: `python local/tmp/cpu/P15-windows.py <elf-syms> <log> [top]` (ventanas, ms ocupados por frame, crecimiento entre ventanas ligeras y pesadas).
+- **Fase 63:** nativas NEON de las IDCT del video THP (`thp_natives.cpp`): la intro pasa de 10,8 a 2,25 ms/frame. **No era el fildeo** (solo aparece en la intro).
+- **Fases 64–65:** front-end GX más ligero (`WIICOMPILED_GX_P17=0` lo apaga) y objetos de textura host perezosos (`WIICOMPILED_GX_TEXMEMO=0`). ~0,2–0,3 ms/frame medido (participación GX del hilo principal −4,5%).
+- **Descartado:** barreras deko3d (P14, ≤0,25 ms aun sin barreras); nativas de estado gráfico/esqueleto P18 (0,05 ms; crashean al arrancar: `Generated indirect dispatch profile 'base' omits translated winner 0x80045bcc`), código en `local/tmp/cpu/P18-*`.
+- **Estado del hilo principal jugando** (perfil por ventanas, stock 1020 MHz): 13–15 ms ocupados de 16,6; código del juego traducido ~5,7–6 ms (plano: 1.132 funciones, la más cara 0,19 ms), **HLE GX + aurora front-end ~4,2–4,7 ms** (repartido en ~100 funciones: display lists 0,94, setters 0,99, texturas 0,95, TLUT 0,32, vtx desc 0,80, stream inmediato 0,58, publicación FIFO 0,27), runtime/llamadas ~2,4, audio ~0,9 (no tocar), nativas ~0,4. Libre: 0,2–0,7 ms.
+- **El usuario probó con overclock de CPU a 1224 MHz y aún tiene bajones al fildear.** Por tanto no es solo CPU bruta del hilo principal: sospechar esperas/sincronización entre el hilo del juego y el worker GX (core 1, ~11 ms/frame de decodificación) o el GPU (toma inicial: GPU 20 ms). Medir esto primero.
+- Logs: `nxlink-MLBPowerPros2008-20261028-143009.log` (antes, símbolos `elf-syms-P16.txt`) y `-163615.log` (fases 64–65, `elf-syms-P18b.txt`).
 
-- **Picos del usuario jugando:** `local/switch/logs/nxlink-run23.txt` (los del partido son los frames > 5000; símbolos en `elf-syms-run23.txt`). Analizar con:
-  `python local/tmp/cpu/S8-test/prof_spikes.py local/switch/logs/elf-syms-run23.txt local/switch/logs/nxlink-run23.txt [--frames a,b] [--quiet]`
-- **Perfil completo del benchmark:** `local/switch/logs/nxlink-run12.txt` (símbolos `elf-syms-run12.txt`). El script `prof2.py` (copia en el scratchpad de la sesión; también está `local/tmp/cpu/S8-test/prof_spikes.py`) acepta el argumento `late` para ver solo los frames que pasan de 17 ms.
+## Siguiente paso: sacar el GX entero del hilo del juego (decisión del usuario)
 
-Candidatos por jugador:
-- matrices de huesos (`PSMTXConcat`, ya nativa);
-- UV del reflejo por vértice `0x8000D770` (ya nativa, pero escala con los modelos);
-- listas de dibujo y texturas por parte del modelo;
-- IA y física de los fildeadores (código del juego: ingeniería inversa puntual + nativa bit-exacta, como `envmap_natives.cpp` y `reverb_natives.cpp`).
+Objetivo: el mayor ahorro posible en el hilo principal (core 0) moviendo la capa HLE GX (lo que hoy hace el juego al llamar a la API GX: setters, display lists, texturas/TLUT, vtx desc, stream inmediato) a otro núcleo, como hacía la Wii con su FIFO por hardware. El juego solo debe encolar registros compactos; un worker (core 2, casi ocioso, o core 1 si cabe) ejecuta la HLE. Ahorro potencial ~3–4 ms/frame.
 
-Otras palancas medidas:
-- **Lecturas del disco en pleno juego:** voces del narrador, `sound/voiceN.bin`, de 2–3 ms cada una en el hilo del juego. Se podrían leer en trozos o en otro hilo.
-- **Espera al hilo GX:** core 1, ~15% del tiempo de los picos.
+1. **Factibilidad primero:** qué estado GX lee el juego de vuelta de forma síncrona (`GXGet*`, sombra `__gx`, `GXGetVtxDesc`, escaneo de display lists que necesita el estado actual, `GXReadDrawSync`/tokens, callbacks, `GXDrawDone`, copias EFB que el juego lee, DCFlush/DMA de texturas y TLUT), y qué escrituras guest hace la HLE (objetos `GXTexObj`/`GXTlutObj` en memoria guest). Esas partes deben quedarse síncronas o resolverse con una sombra en el hilo principal; el resto se encola.
+2. **Medir antes:** con 1224 MHz siguen los bajones; capturar con `WIICOMPILED_SWITCH_PROFILE_GX=1` (fase 59) y picos a 20 ms cuánto espera el hilo principal al worker GX en los frames de fildeo.
+3. Implementar por partes detrás de interruptores, con pruebas diferenciales de host (como `local/tmp/cpu/P17-test/`, `P19-test/`) que comparen los bytes de FIFO/estado aurora generados, y A/B en consola con el perfil por ventanas.
+4. Fidelidad intacta: mismo orden de comandos y mismo resultado en pantalla; audio sin tocar.
 
 ## Cómo se trabaja (flujo probado)
 
-- **Patch de Switch:** se genera desde `local/tmp/switch_edit.py`, con fases 1–59 de `sub()` / `write()` y folds de los cambios al texto de fases anteriores.
+- **Patch de Switch:** se genera desde `local/tmp/switch_edit.py`, con fases 1–65 de `sub()` / `write()` y folds de los cambios al texto de fases anteriores.
   - `bash local/tmp/mkswitch.sh` (desde MSYS2) regenera `tools/patches/wiicompiled-switch.patch` y `-2.patch` (dos archivos por el límite de 512 KiB del repo) y valida la cadena sobre un árbol limpio con rebind.
   - `bash local/tmp/treecheck.sh` + `diff -rq local/switch/work/treecheck/runtime local/switch/work/mlb/src/runtime`: el árbol de build debe coincidir 100% con el que generan los patches. Hacerlo antes de cada commit.
 - **Agentes:** el brief compartido está en `local/tmp/cpu/BRIEF.md`.
