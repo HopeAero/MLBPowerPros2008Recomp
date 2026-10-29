@@ -70,7 +70,7 @@ diff --git a/runtime/src/hle/gx/gx_internal.h b/runtime/src/hle/gx/gx_internal.h
      std::atomic<bool> held{false};
 -    [[gnu::always_inline]] void lock() noexcept {
 +    [[gnu::always_inline]] void lock() {
-+        GX_HLE_OffloadEnter();
++        // These maps stay on the producer; GX calls inside the lock fence themselves when needed.
          if (g_gxG7LockMode < 0) [[unlikely]] {
              GxG7ResolveLockMode();
          }
@@ -83,27 +83,16 @@ diff --git a/runtime/src/hle/gx/gx_internal.h b/runtime/src/hle/gx/gx_internal.h
          if (g_gxG7LockMode < 0) [[unlikely]] {
              GxG7ResolveLockMode();
          }
-@@ -587,14 +590,19 @@
+@@ -587,7 +590,8 @@
              lock();
              return true;
          }
 -        return !held.exchange(true, std::memory_order_acquire);
-+        GX_HLE_OffloadEnter();
 +        if (!held.exchange(true, std::memory_order_acquire)) return true;
-+        GX_HLE_OffloadLeave();
 +        return false;
      }
      [[gnu::always_inline]] void unlock() noexcept {
          if (g_gxG7LockMode > 0) [[likely]] {
-             held.store(false, std::memory_order_relaxed);
-+            GX_HLE_OffloadLeave();
-             return;
-         }
-         held.store(false, std::memory_order_release);
-+        GX_HLE_OffloadLeave();
-     }
- };
- #else
 diff --git a/runtime/src/hle/gx/gx_offload.cpp b/runtime/src/hle/gx/gx_offload.cpp
 new file mode 100644
 --- /dev/null
@@ -248,7 +237,7 @@ diff --git a/runtime/src/hle/gx/gx_offload.h b/runtime/src/hle/gx/gx_offload.h
 new file mode 100644
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload.h
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,150 @@
 +#pragma once
 +
 +#include "gx_offload_queue.h"
@@ -265,6 +254,10 @@ new file mode 100644
 +
 +extern "C" void GXLoadPosMtxImmBE(const void*, u32);
 +extern "C" void GXLoadLightObjImmBE(const void*, GXLightID);
++extern "C" void GXLoadNrmMtxImmBE(const void*, u32, u32);
++extern "C" void GXSetVtxDescRun(const GXVtxDescList*, u32);
++extern "C" void GXSetVtxAttrFmtRun(GXVtxFmt, const GXVtxAttrFmtList*, u32);
++extern "C" void GXCallDisplayListRef(const void*, u32);
 +
 +namespace hle::gx::offload {
 +
@@ -384,6 +377,10 @@ new file mode 100644
 +}
 +
 +#include "gx_offload_snapshots.h"
++#include "gx_offload_array.h"
++#include "gx_offload_nrm_snapshot.h"
++#include "gx_offload_run_snapshots.h"
++#include "gx_offload_display_list.h"
 +
 +} // namespace hle::gx::offload
 +
@@ -391,13 +388,99 @@ new file mode 100644
 +extern "C" void GX_HLE_OffloadEnter() noexcept;
 +extern "C" void GX_HLE_OffloadLeave() noexcept;
 +extern "C" void GX_HLE_OffloadStop();
+diff --git a/runtime/src/hle/gx/gx_offload_array.h b/runtime/src/hle/gx/gx_offload_array.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_array.h
+@@ -0,0 +1,28 @@
++#pragma once
++
++// GXSetArray emits an address and layout; Aurora reads vertex bytes later in FIFO order.
++namespace array_detail {
++using FunctionType = void (*)(GXAttr, const void*, u32, u8, bool);
++struct Command {
++    GXAttr attr;
++    const void* data;
++    u32 size;
++    u8 stride;
++    bool le;
++};
++static_assert(sizeof(Command) <= GxOffloadQueue::kMaxPayloadBytes);
++
++template <auto Function> void Run(const void* bytes) {
++    Command command;
++    std::memcpy(&command, bytes, sizeof(command));
++    Function(command.attr, command.data, command.size, command.stride, command.le);
++}
++} // namespace array_detail
++
++template <> struct Dispatch<static_cast<array_detail::FunctionType>(&::GXSetArray)> {
++    template <auto Function> static void Invoke(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
++        if (!Intercept() || Synchronous()) return Function(attr, data, size, stride, le);
++        const array_detail::Command command{attr, data, size, stride, le};
++        queue.Submit(&array_detail::Run<Function>, command);
++    }
++};
+diff --git a/runtime/src/hle/gx/gx_offload_display_list.h b/runtime/src/hle/gx/gx_offload_display_list.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_display_list.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++template <auto Function> struct DisplayListCommand {
++    u32 nbytes;
++    uint8_t bytes[GxOffloadQueue::kMaxPayloadBytes - sizeof(u32)];
++    static void Execute(const void* payload) {
++        const auto& command = *static_cast<const DisplayListCommand*>(payload);
++        Function(command.bytes, command.nbytes);
++    }
++};
++
++template <> struct Dispatch<&::GXCallDisplayList> {
++    template <auto Function = &::GXCallDisplayList>
++    static void Invoke(const void* list, u32 nbytes) {
++        if (!Intercept() || Synchronous()) return Function(list, nbytes);
++        if (list == nullptr || nbytes == 0 ||
++            nbytes > GxOffloadQueue::kMaxPayloadBytes - sizeof(u32)) {
++            SynchronousScope scope;
++            return Function(list, nbytes);
++        }
++        using Command = DisplayListCommand<Function>;
++        static_assert(sizeof(Command) == GxOffloadQueue::kMaxPayloadBytes);
++        Command command;
++        command.nbytes = nbytes;
++        std::memcpy(command.bytes, list, nbytes);
++        queue.Submit(&Command::Execute, &command, sizeof(u32) + nbytes);
++    }
++};
++
++template <auto Function> struct DisplayListRefCommand {
++    const void* list;
++    u32 nbytes;
++    static void Execute(const void* bytes) {
++        const auto& command = *static_cast<const DisplayListRefCommand*>(bytes);
++        Function(command.list, command.nbytes);
++    }
++};
++
++template <> struct Dispatch<&::GXCallDisplayListRef> {
++    template <auto Function = &::GXCallDisplayListRef>
++    static void Invoke(const void* list, u32 nbytes) {
++        if (!Intercept() || Synchronous()) return Function(list, nbytes);
++        // G6 keeps reference streams alive until the completed end-of-frame drain.
++        using Command = DisplayListRefCommand<Function>;
++        queue.Submit(&Command::Execute, Command{list, nbytes});
++    }
++};
 diff --git a/runtime/src/hle/gx/gx_offload_async.inc b/runtime/src/hle/gx/gx_offload_async.inc
 new file mode 100644
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload_async.inc
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,92 @@
 +// Audited scalar Aurora entry points; generated by GX-Q66-wrap.py.
 +template <> inline constexpr bool AsyncOperation<&::GXBegin> = true;
++template <> inline constexpr bool AsyncOperation<&::GXClearVtxDesc> = true;
 +template <> inline constexpr bool AsyncOperation<&::GXColor3u8> = true;
 +template <> inline constexpr bool AsyncOperation<&::GXColor4u8> = true;
 +template <> inline constexpr bool AsyncOperation<&::GXEnd> = true;
@@ -647,7 +730,7 @@ diff --git a/runtime/src/hle/gx/gx_offload_queue.cpp b/runtime/src/hle/gx/gx_off
 new file mode 100644
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload_queue.cpp
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,350 @@
 +#include "gx_offload_queue.h"
 +
 +#include <cstdlib>
@@ -791,13 +874,14 @@ new file mode 100644
 +
 +    Slot& slot = slots_[static_cast<size_t>(write & (kCapacity - 1))];
 +    slot.execute = execute;
-+    slot.payload_size = static_cast<uint8_t>(payload_size);
++    slot.payload_size = static_cast<uint16_t>(payload_size);
 +    if (payload_size != 0) std::memcpy(slot.payload.data(), payload, payload_size);
 +#if defined(GX_OFFLOAD_QUEUE_TEST)
 +    if (test_hook_) test_hook_(test_context_, TestPoint::BeforeSubmitPublish);
 +#endif
 +    const Sequence sequence = write + 1;
-+    write_position_.store(sequence, std::memory_order_release);
++    // Pairs with the worker's sleep flag and predicate to avoid a lost wake.
++    write_position_.store(sequence, std::memory_order_seq_cst);
 +    SignalWorker();
 +    return sequence;
 +}
@@ -841,7 +925,7 @@ new file mode 100644
 +    }
 +
 +    if (worker_started_) {
-+        stop_requested_.store(true, std::memory_order_release);
++        stop_requested_.store(true, std::memory_order_seq_cst);
 +        SignalWorker();
 +#if defined(__SWITCH__)
 +        const Result wait_result = threadWaitForExit(&worker_thread_);
@@ -897,6 +981,7 @@ new file mode 100644
 +}
 +
 +void Queue::SignalWorker() noexcept {
++    if (!worker_asleep_.load(std::memory_order_seq_cst)) return;
 +    std::lock_guard<std::mutex> lock(wait_mutex_);
 +    if (worker_asleep_.load(std::memory_order_relaxed)) worker_cv_.notify_one();
 +}
@@ -1000,7 +1085,7 @@ diff --git a/runtime/src/hle/gx/gx_offload_queue.h b/runtime/src/hle/gx/gx_offlo
 new file mode 100644
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload_queue.h
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,132 @@
 +#pragma once
 +
 +#include <array>
@@ -1025,7 +1110,7 @@ new file mode 100644
 +#else
 +constexpr size_t kCapacity = 16384;
 +#endif
-+constexpr size_t kMaxPayloadBytes = 128;
++constexpr size_t kMaxPayloadBytes = 320;
 +using Sequence = uint64_t;
 +using Execute = void (*)(const void*);
 +// Called by the producer before a bounded wait to pump timers; it holds no queue lock.
@@ -1043,7 +1128,8 @@ new file mode 100644
 +
 +    // The worker is opt-in through WIICOMPILED_GX_HLE_WORKER=1; otherwise jobs run inline.
 +    bool Start(WaitService wait_service = nullptr, void* wait_context = nullptr);
-+    // Execute runs on the worker; use copied host data only, no guest callbacks/memory or queue re-entry.
++    // Execute runs on the worker; referenced host data must outlive the next drain.
++    // Guest callbacks, guest memory and queue re-entry remain producer-only.
 +    Sequence Submit(Execute execute, const void* payload, size_t payload_size);
 +
 +    template <typename Payload>
@@ -1081,7 +1167,7 @@ new file mode 100644
 +private:
 +    struct Slot {
 +        Execute execute{};
-+        uint8_t payload_size{};
++        uint16_t payload_size{};
 +        alignas(std::max_align_t) std::array<std::byte, kMaxPayloadBytes> payload{};
 +    };
 +
@@ -1132,6 +1218,141 @@ new file mode 100644
 +};
 +
 +} // namespace hle::gx::GxOffloadQueue
+diff --git a/runtime/src/hle/gx/gx_offload_nrm_snapshot.h b/runtime/src/hle/gx/gx_offload_nrm_snapshot.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_nrm_snapshot.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++// Included by gx_offload.h inside hle::gx::offload, after CallReal is declared.
++namespace nrm_snapshot_detail {
++
++struct NrmMtxImmBE {
++    u32 id;
++    u32 rowStride;
++    unsigned char words[12 * sizeof(u32)];
++};
++
++static_assert(sizeof(NrmMtxImmBE) <= GxOffloadQueue::kMaxPayloadBytes);
++
++template <auto Function> void RunNrmMtxImmBE(const void* bytes) {
++    NrmMtxImmBE command;
++    std::memcpy(&command, bytes, sizeof(command));
++    Function(command.words, command.id, command.rowStride);
++}
++
++} // namespace nrm_snapshot_detail
++
++template <> struct Dispatch<&::GXLoadNrmMtxImmBE> {
++    template <auto Function = &::GXLoadNrmMtxImmBE>
++    static void Invoke(const void* matrix, u32 id, u32 rowStride) {
++        if (!Intercept() || Synchronous()) return Function(matrix, id, rowStride);
++        if (!matrix || (rowStride != 3 && rowStride != 4)) {
++            SynchronousScope scope;
++            return Function(matrix, id, rowStride);
++        }
++
++        nrm_snapshot_detail::NrmMtxImmBE command{};
++        command.id = id;
++        command.rowStride = rowStride;
++        const size_t byte_count = static_cast<size_t>(3 * rowStride) * sizeof(u32);
++        std::memcpy(command.words, matrix, byte_count);
++        queue.Submit(&nrm_snapshot_detail::RunNrmMtxImmBE<Function>, command);
++    }
++};
+diff --git a/runtime/src/hle/gx/gx_offload_run_snapshots.h b/runtime/src/hle/gx/gx_offload_run_snapshots.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_run_snapshots.h
+@@ -0,0 +1,87 @@
++#pragma once
++
++// Included by gx_offload.h inside hle::gx::offload after global GX Run declarations.
++namespace run_snapshot_detail {
++
++constexpr u32 kVtxDescRunCapacity =
++    (GxOffloadQueue::kMaxPayloadBytes - sizeof(u32)) / sizeof(GXVtxDescList);
++constexpr u32 kVtxAttrFmtRunCapacity =
++    (GxOffloadQueue::kMaxPayloadBytes - 2 * sizeof(u32)) / sizeof(GXVtxAttrFmtList);
++
++struct VtxDescRun {
++    u32 count;
++    GXVtxDescList entries[kVtxDescRunCapacity];
++};
++
++struct VtxAttrFmtRun {
++    GXVtxFmt vtxfmt;
++    u32 count;
++    GXVtxAttrFmtList entries[kVtxAttrFmtRunCapacity];
++};
++
++static_assert(std::is_trivially_copyable_v<GXVtxDescList>);
++static_assert(std::is_trivially_copyable_v<GXVtxAttrFmtList>);
++static_assert(sizeof(VtxDescRun) <= GxOffloadQueue::kMaxPayloadBytes);
++static_assert(sizeof(VtxAttrFmtRun) <= GxOffloadQueue::kMaxPayloadBytes);
++
++template <auto Function> void RunVtxDesc(const void* bytes) {
++    VtxDescRun command{};
++    std::memcpy(&command, bytes, sizeof(command));
++    Function(command.entries, command.count);
++}
++
++template <auto Function> void RunVtxAttrFmt(const void* bytes) {
++    VtxAttrFmtRun command{};
++    std::memcpy(&command, bytes, sizeof(command));
++    Function(command.vtxfmt, command.entries, command.count);
++}
++
++} // namespace run_snapshot_detail
++
++template <> struct Dispatch<&::GXSetVtxDescRun> {
++    template <auto Function = &::GXSetVtxDescRun>
++    static void Invoke(const GXVtxDescList* list, u32 count) {
++        if (!Intercept() || Synchronous()) return Function(list, count);
++
++        bool valid = list != nullptr && count <= run_snapshot_detail::kVtxDescRunCapacity;
++        for (u32 i = 0; valid && i < count; ++i) {
++            const u32 attr = static_cast<u32>(list[i].attr);
++            valid = attr >= static_cast<u32>(GX_VA_PNMTXIDX) && attr < static_cast<u32>(GX_VA_MAX_ATTR);
++        }
++        if (!valid) {
++            SynchronousScope scope;
++            return Function(list, count);
++        }
++
++        run_snapshot_detail::VtxDescRun command{};
++        command.count = count;
++        if (count != 0) std::memcpy(command.entries, list, count * sizeof(*list));
++        queue.Submit(&run_snapshot_detail::RunVtxDesc<Function>, command);
++        for (u32 i = 0; i < count; ++i) SetVtxDescShadow(command.entries[i].attr, command.entries[i].type);
++    }
++};
++
++template <> struct Dispatch<&::GXSetVtxAttrFmtRun> {
++    template <auto Function = &::GXSetVtxAttrFmtRun>
++    static void Invoke(GXVtxFmt vtxfmt, const GXVtxAttrFmtList* list, u32 count) {
++        if (!Intercept() || Synchronous()) return Function(vtxfmt, list, count);
++
++        const u32 fmt = static_cast<u32>(vtxfmt);
++        bool valid = list != nullptr && count <= run_snapshot_detail::kVtxAttrFmtRunCapacity &&
++                     fmt >= static_cast<u32>(GX_VTXFMT0) && fmt < static_cast<u32>(GX_MAX_VTXFMT);
++        for (u32 i = 0; valid && i < count; ++i) {
++            const u32 attr = static_cast<u32>(list[i].attr);
++            valid = attr >= static_cast<u32>(GX_VA_POS) && attr < static_cast<u32>(GX_VA_MAX_ATTR);
++        }
++        if (!valid) {
++            SynchronousScope scope;
++            return Function(vtxfmt, list, count);
++        }
++
++        run_snapshot_detail::VtxAttrFmtRun command{};
++        command.vtxfmt = vtxfmt;
++        command.count = count;
++        if (count != 0) std::memcpy(command.entries, list, count * sizeof(*list));
++        queue.Submit(&run_snapshot_detail::RunVtxAttrFmt<Function>, command);
++    }
++};
 diff --git a/runtime/src/hle/gx/gx_offload_snapshots.h b/runtime/src/hle/gx/gx_offload_snapshots.h
 new file mode 100644
 --- /dev/null

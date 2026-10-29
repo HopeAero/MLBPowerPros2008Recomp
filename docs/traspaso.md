@@ -161,3 +161,14 @@ Además: `WIICOMPILED_SWITCH_RENDERER=vulkan` vuelve a Dawn/Vulkan, y `WIICOMPIL
 - **Subagentes:** un subagente ejecutó `switch_edit.py` contra el árbol de build por accidente. `treecheck.sh` lo detecta.
 - **Revertir un header global:** tarda 30 min sin ccache; con ccache, minutos.
 - **Shell de verificación en esta PC:** MSYS2 no tiene `diff`; usar el de `C:/Program Files/Git/usr/bin` en el PATH, después de `/usr/bin:/bin` de MSYS2. Sin ese prefijo, `bash` puede resolver al de WSL. `local/tmp/P11-verify.sh` ejecuta `treecheck.sh` y los dos `diff -rq` con fallo real si hay diferencias.
+
+## GX HLE worker experimental, fase 73
+
+`WIICOMPILED_GX_HLE_WORKER=1` sigue siendo optativo y debe quedar apagado para
+jugar. La medición de 90 s en Switch dio 45,52 fps frente a 58,86 fps con el
+worker apagado, con los mismos relojes 1020/307/1331 MHz y diagnóstico activo.
+La NRO Q73 y los logs son privados bajo `local/switch/`; el parche reproducible
+está en `tools/patches/wiicompiled-gx-offload-source.patch`. Los tests de cola,
+despertar, capturas de matrices/listas, arrays y wrappers pasaron. La equivalencia
+visual de un partido completo y 60 fps estables no están demostradas. Análisis,
+tabla A/B y siguiente arquitectura en `docs/gx-offload-feasibility.md`.

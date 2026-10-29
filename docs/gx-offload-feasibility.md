@@ -288,7 +288,51 @@ el NRO Vulkan de 119.314.629 bytes, SHA-256
 El NRO previo está en `local/switch/build/GX-Q66-baseline.nro` con SHA-256
 `6d0b1ab24d2082cba079fe13b1577b52fa449a8c03ef9ee1d707f79008e597f2`.
 
-Pendiente: A/B en la Switch con worker=0/1, mismos relojes y secuencias comparables;
-medir coste del principal, esperas, carga de core 2, p95/p99 y GPU. Solo esa prueba
-permite decidir cuánto más GX migrar. Ni el build ni los tests host garantizan 60 fps
-estables o fidelidad visual/audio durante un partido completo.
+## A/B en Switch: fases 66, 70 y 71
+
+Pruebas de 90 s en modo portátil con deko3d y relojes 1020/307/1331 MHz,
+`WIICOMPILED_SWITCH_PROFILE=1`, perfil GX, picos de 20 ms y cinco hilos. El
+autoplay arranca igual, pero no reproduce controles bit a bit; estas cifras son
+comparables para orientar el trabajo, no una garantía de rendimiento por escena.
+
+| Candidata | Worker | Frames | FPS | Host p50 / p95 / p99 ms | Muestras `Queue::Flush` |
+|---|---:|---:|---:|---:|---:|
+| Q66 | 0 | 5298 | 58,8581 | 16,6708 / 19,4966 / 22,9446 | — |
+| Q66 | 1 | 4045 | 44,9406 | 22,2776 / 26,4727 / 29,2799 | 30674 |
+| Q70 | 1 | 3797 | 42,1858 | 23,9092 / 27,4993 / 30,2607 | 22995 |
+| Q71 | 1 | 3861 | 42,8976 | 23,5293 / 27,2125 / 29,9159 | 17012 |
+| Q72 | 1 | 3895 | 43,2696 | 23,2970 / 27,1137 / 29,7971 | 12559 |
+| Q73 | 1 | 4097 | 45,5171 | 21,9824 / 26,2879 / 29,4295 | 14592 |
+
+Logs privados: `nxlink-MLBPowerPros2008-20261028-224749.log`,
+`-225120.log`, `nxlink-MLBPowerPros2008-20261029-001201.log` y
+`nxlink-GX-Q71-display-ref-20261029-003259.log` y
+`nxlink-GX-Q72-small-list-20261029-004832.log` y
+`nxlink-GX-Q73-signal-20261029-005743.log` bajo `local/switch/logs/`.
+Ninguna ejecución registró errores de decode GX. Q70 amplió capturas exactas
+de matrices normales, runs y `GXSetArray`; Q71 encoló listas G6 por referencia.
+Las muestras de espera bajaron, pero el rendimiento no se recuperó. El perfil de
+Q71 mantiene esperas en listas no referenciadas y locks de objetos. Q72 hizo
+copias exactas de listas pequeñas y quitó el fence del lock de mapas G7, que
+solo usa el productor. Así redujo `Queue::Flush` a 12559 muestras, pero agregó
+coste de entrega por comando. El worker
+HLE consumió aproximadamente 5 % de un núcleo en el último intervalo de 5 s,
+frente a 88 % del principal: mover llamadas Aurora pequeñas tras cada barrera
+añade más coordinación que trabajo útil desplazado.
+
+**Decisión:** `WIICOMPILED_GX_HLE_WORKER` sigue desactivado por defecto. Estas
+fases todavía no sacan el GX HLE entero del hilo principal ni aseguran 60 fps.
+Q73 evita tomar el mutex del worker cuando está despierto. Pasó el test de
+despertar al borde de la condición y el test de cola; en consola subió a 45,52
+fps y mantuvo cero errores de decode GX. `Queue::Flush` todavía ocupó 14592 de
+87573 muestras y `Queue::Submit` 12554. La suma de pequeños trabajos, copias y
+fronteras de observación sigue perdiendo frente al camino anterior.
+
+**Conclusión de esta línea de trabajo:** no activar el worker. La evidencia
+rechaza una cola por llamada GX como vía a 60 fps estables. La unidad siguiente
+debe ser un bloque de comandos HLE ya analizado con sus bytes y objetos propios,
+publicado una vez y consumido en orden; antes hay que identificar las escrituras
+guest, consultas, callbacks y copias que obligan a devolver resultados al
+principal. El decoder FIFO existente sigue en otro hilo, así que este rediseño
+debe evitar duplicar su trabajo o crear otro punto de espera. Aun liberando CPU,
+la ventana GPU p99 de la sonda stock supera 16,67 ms; habrá que medirla aparte.

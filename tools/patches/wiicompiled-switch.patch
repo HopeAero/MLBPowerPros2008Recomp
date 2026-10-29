@@ -10108,7 +10108,7 @@ index a77e96e..189f97b 100644
  bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
                       uint32_t vertexBytes);
 diff --git a/runtime/src/hle/gx/gx_internal.h b/runtime/src/hle/gx/gx_internal.h
-index 8656dba..6cf1418 100644
+index 8656dba..88cf22d 100644
 --- a/runtime/src/hle/gx/gx_internal.h
 +++ b/runtime/src/hle/gx/gx_internal.h
 @@ -108,6 +108,26 @@ struct HleTexObj {
@@ -10299,7 +10299,7 @@ index 8656dba..6cf1418 100644
  void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size);
  // Invalidates GPU-only GXCopyTex results when guest CPU writes are made visible
  // over their destination. This is the allocation-reuse generation boundary
-@@ -386,8 +532,84 @@ extern bool g_alphaCompareValid;
+@@ -386,8 +532,80 @@ extern bool g_alphaCompareValid;
  extern std::array<BoundTexInfo, 8> g_boundTexMaps;
  extern TexCopyState g_texCopyState;
  
@@ -10333,7 +10333,7 @@ index 8656dba..6cf1418 100644
 +struct GxObjMutex {
 +    std::atomic<bool> held{false};
 +    [[gnu::always_inline]] void lock() {
-+        GX_HLE_OffloadEnter();
++        // These maps stay on the producer; GX calls inside the lock fence themselves when needed.
 +        if (g_gxG7LockMode < 0) [[unlikely]] {
 +            GxG7ResolveLockMode();
 +        }
@@ -10363,19 +10363,15 @@ index 8656dba..6cf1418 100644
 +            lock();
 +            return true;
 +        }
-+        GX_HLE_OffloadEnter();
 +        if (!held.exchange(true, std::memory_order_acquire)) return true;
-+        GX_HLE_OffloadLeave();
 +        return false;
 +    }
 +    [[gnu::always_inline]] void unlock() noexcept {
 +        if (g_gxG7LockMode > 0) [[likely]] {
 +            held.store(false, std::memory_order_relaxed);
-+            GX_HLE_OffloadLeave();
 +            return;
 +        }
 +        held.store(false, std::memory_order_release);
-+        GX_HLE_OffloadLeave();
 +    }
 +};
 +#else
