@@ -172,3 +172,44 @@ está en `tools/patches/wiicompiled-gx-offload-source.patch`. Los tests de cola,
 despertar, capturas de matrices/listas, arrays y wrappers pasaron. La equivalencia
 visual de un partido completo y 60 fps estables no están demostradas. Análisis,
 tabla A/B y siguiente arquitectura en `docs/gx-offload-feasibility.md`.
+
+### Q75: bloque BP optativo (2026-10-29)
+
+La candidata agrupa solo ráfagas BP completas de 2–79 registros con cola HLE
+vacía; el resto sigue por Q73. `WIICOMPILED_GX_BP_BURST=0` permite A/B con
+worker activo, y `WIICOMPILED_GX_BP_BURST_PROFILE=1` cuenta el uso cada cinco segundos.
+El worker global continúa apagado por defecto. Cinco de los 51 sitios generados
+construyen BP puro; todavía no hay frecuencia dinámica ni ahorro acreditado.
+
+Pasaron los dos harness host (cola/captura y orden BP→draw con cuerpos reales
+extraídos) y `P11-verify.sh`: runtime y Aurora reconstruidos coinciden exactamente
+con el árbol compilado. El test negativo detecta un draw que adelanta al BP si se
+omite la barrera existente. Los informes y pruebas están bajo
+`local/tmp/cpu/GX-Q75-*`; las auditorías de bloques, guest epoch y el prototipo
+Q76 también son privados. Los subagentes Luna/max
+agotaron su cuota durante la revisión; el líder terminó los checks locales.
+La NRO Q75 compiló (48.223 archivos traducidos sin cambios), SHA-256
+`91a30aecf6828ce60830963565959256c8529a57f87ee7a0bc79af1331f7543d`,
+guardada como `local/switch/build/GX-Q75-bp.nro`. La captura stock de 90 s dio
+45,54 fps, p50/p95/p99 21,97/26,06/28,94 ms, cero errores de decode: sin mejora
+apreciable frente a 45,52 fps de Q73. No es un replay bit a bit. Log privado
+`nxlink-GX-Q75-bp-20261029-111618.log`. Los contadores iniciales no salieron porque
+el benchmark usa `_Exit`; se corrigió el reporte periódico para la siguiente NRO.
+
+### Q76: publicar varios comandos por aviso al worker
+
+La candidata `WIICOMPILED_GX_HLE_BATCH=1` agrupa hasta 16 slots existentes por
+publicación. Default off; `WIICOMPILED_GX_HLE_BATCH_PROFILE=1` imprime slots y
+publicaciones cada cinco segundos. No usa el primer prototipo de payload combinado:
+mantiene el orden de Submit/reentrada y publica antes de esperar una cola llena.
+Watermark/Idle incluyen staged; worker y predicado de sueño solo ven published.
+Flush/FlushAll/Stop publican también tails parciales y trabajo de callbacks.
+
+Pasó `GX-Q76-publish-test/run.ps1` con capacidades 16/64 y entorno batch on/off,
+Q66 original y Q75-diff normal/`--staged-bp`. Las dos revisiones Luna/max no
+encontraron un hueco de orden pendiente en esos casos. El build Switch y
+`P11-verify.sh` pasaron; 48.223 archivos traducidos sin cambios. NRO privada
+`local/switch/build/GX-Q76-publish.nro`, SHA-256
+`444044c9717d02a9f1bd65bf10ec85660dd3fff462d34df6f5aa92e1fa71cf75`.
+Falta A/B Switch; esta agrupación aún deja el scan HLE, objetos y RAM guest en
+el principal.

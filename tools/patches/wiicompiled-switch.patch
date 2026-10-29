@@ -10087,10 +10087,22 @@ index 818478d..74decd2 100644
  
                  SyncAppliedVtxStateFromHleReal();
 diff --git a/runtime/src/hle/gx/gx_fifo.cpp b/runtime/src/hle/gx/gx_fifo.cpp
-index a77e96e..189f97b 100644
+index a77e96e..899e281 100644
 --- a/runtime/src/hle/gx/gx_fifo.cpp
 +++ b/runtime/src/hle/gx/gx_fifo.cpp
-@@ -10,6 +10,16 @@ using namespace GxStream;
+@@ -2,6 +2,11 @@
+ #include "gx_stream_common.h"
+ #include "gx_cp_decode.h"
+ #include "isa/big_endian.h"
++#if defined(__SWITCH__)
++#include "gx_offload.h"
++#include <cstdio>
++#include <cstdlib>
++#endif
+ 
+ // Opcode constants and the stream helpers this file shares with gx_dl.cpp /
+ // gx_vertex.cpp; see gx_stream_common.h.
+@@ -10,6 +15,16 @@ using namespace GxStream;
  
  HleGxState g_hleGxState;
  
@@ -10107,6 +10119,181 @@ index a77e96e..189f97b 100644
  namespace aurora::gx::fifo {
  bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
                       uint32_t vertexBytes);
+@@ -671,6 +686,161 @@ static void HleFifoWriteBurstChunked(const uint8_t* data, uint32_t sizeBytes) {
+     }
+ }
+ 
++#if defined(__SWITCH__)
++namespace {
++struct BpBurstStats {
++    uint64_t calls = 0;
++    uint64_t disabled = 0;
++    uint64_t worker_off = 0;
++    uint64_t state_fallback = 0;
++    uint64_t queue_busy = 0;
++    uint64_t invalid_burst = 0;
++    uint64_t single_packet = 0;
++    uint64_t mixed_opcode = 0;
++    uint64_t candidates = 0;
++    uint64_t submitted = 0;
++    uint64_t submitted_words = 0;
++};
++
++BpBurstStats g_bpBurstStats;
++
++void ReportBpBurstStats() {
++    const auto u = [](uint64_t value) { return static_cast<unsigned long long>(value); };
++    std::fprintf(stderr,
++                 "[gx-hle] bp_burst calls=%llu disabled=%llu worker_off=%llu state_fallback=%llu queue_busy=%llu "
++                 "invalid=%llu single=%llu mixed=%llu "
++                 "candidates=%llu submitted=%llu words=%llu\n",
++                 u(g_bpBurstStats.calls), u(g_bpBurstStats.disabled), u(g_bpBurstStats.worker_off),
++                 u(g_bpBurstStats.state_fallback), u(g_bpBurstStats.queue_busy),
++                 u(g_bpBurstStats.invalid_burst), u(g_bpBurstStats.single_packet), u(g_bpBurstStats.mixed_opcode),
++                 u(g_bpBurstStats.candidates), u(g_bpBurstStats.submitted), u(g_bpBurstStats.submitted_words));
++}
++
++void MaybeReportBpBurstStats() {
++    // This is called by the producer before incrementing the next call's counters, so each
++    // periodic line is a coherent cumulative snapshot. Keep the timer on the existing Switch
++    // tick API and avoid adding work when profiling is disabled.
++    static uint64_t lastReportTick = armGetSystemTick();
++    const uint64_t now = armGetSystemTick();
++    if (armTicksToNs(now - lastReportTick) < 5'000'000'000ull) return;
++
++    ReportBpBurstStats();
++    lastReportTick = now;
++}
++
++bool BpBurstProfileEnabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("WIICOMPILED_GX_BP_BURST_PROFILE");
++        if (value == nullptr || value[0] != '1' || value[1] != '\0') return false;
++        std::atexit(&ReportBpBurstStats);
++        return true;
++    }();
++    return enabled;
++}
++
++bool BpBurstBatchEnabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("WIICOMPILED_GX_BP_BURST");
++        return value == nullptr || value[0] != '0' || value[1] != '\0';
++    }();
++    return enabled;
++}
++} // namespace
++#endif
++
++#if defined(__SWITCH__) || defined(GX_Q75_BP_HOST_TEST)
++// GX-Q75 BP burst helper begin
++constexpr size_t kBpBurstMaxWords =
++    (hle::gx::GxOffloadQueue::kMaxPayloadBytes - sizeof(uint32_t)) / sizeof(uint32_t);
++struct BpBurstPayload {
++    uint32_t count;
++    uint32_t words[kBpBurstMaxWords];
++};
++static_assert(sizeof(BpBurstPayload) <= hle::gx::GxOffloadQueue::kMaxPayloadBytes);
++
++static void ExecuteBpBurst(const void* bytes) {
++    const auto& burst = *static_cast<const BpBurstPayload*>(bytes);
++    for (uint32_t i = 0; i < burst.count; ++i) {
++        const uint32_t word = burst.words[i];
++        GXApplyBPReg(static_cast<uint8_t>(word >> 24), word & 0x00FFFFFFu);
++    }
++}
++
++static bool TryQueueBpOnlyBurst(const uint8_t* data, uint32_t sizeBytes) {
++#if defined(__SWITCH__) || defined(GX_Q75_BP_HOST_TEST)
++    const bool profile = BpBurstProfileEnabled();
++#if defined(__SWITCH__)
++    if (profile) MaybeReportBpBurstStats();
++#endif
++    if (profile) ++g_bpBurstStats.calls;
++    if (!BpBurstBatchEnabled()) {
++        if (profile) ++g_bpBurstStats.disabled;
++        return false;
++    }
++    if (!hle::gx::offload::Intercept()) {
++        if (profile) ++g_bpBurstStats.worker_off;
++        return false;
++    }
++    if (hle::gx::offload::Synchronous() || IsDisplayListActive() || g_hleGxState.inBegin ||
++        g_hleGxState.fifoByteCount != 0) {
++        if (profile) ++g_bpBurstStats.state_fallback;
++        return false;
++    }
++    if (data == nullptr || sizeBytes == 0 || sizeBytes % 5u != 0) {
++        if (profile) ++g_bpBurstStats.invalid_burst;
++        return false;
++    }
++
++    const uint32_t count = sizeBytes / 5u;
++    if (count == 1) {
++        if (profile) ++g_bpBurstStats.single_packet;
++        return false;
++    }
++    if (count < 2 || count > kBpBurstMaxWords) {
++        if (profile) ++g_bpBurstStats.invalid_burst;
++        return false;
++    }
++
++    for (uint32_t i = 0; i < count; ++i) {
++        const uint8_t* packet = data + i * 5u;
++        if (packet[0] != GX_LOAD_BP_REG_CMD) {
++            if (profile) ++g_bpBurstStats.mixed_opcode;
++            return false;
++        }
++    }
++
++    // The original per-register wrapper drains the queue before reading later packets. Requiring
++    // an idle queue makes that drain immediate, so wait-service reentry cannot invalidate this
++    // owned snapshot or change parser state between words.
++    if (!hle::gx::offload::queue.Idle()) {
++        if (profile) ++g_bpBurstStats.queue_busy;
++        return false;
++    }
++
++    BpBurstPayload payload{};
++    payload.count = count;
++    for (uint32_t i = 0; i < count; ++i)
++        payload.words[i] = ReadBE32(data + i * 5u + 1u);
++    if (profile) ++g_bpBurstStats.candidates;
++
++    // No guest callback or other producer callout occurs between Idle(), the owned snapshot, and
++    // Submit; one queue slot is enough regardless of the number of BP words in this payload.
++    const size_t payloadSize = offsetof(BpBurstPayload, words) + count * sizeof(uint32_t);
++    hle::gx::offload::queue.Submit(&ExecuteBpBurst, &payload, payloadSize);
++    if (profile) {
++        ++g_bpBurstStats.submitted;
++        g_bpBurstStats.submitted_words += count;
++    }
++    return true;
++#else
++    (void)data;
++    (void)sizeBytes;
++    return false;
++#endif
++}
++// GX-Q75 BP burst helper end
++#endif
++
+ // Applies complete register-load packets straight to the parser's own entry points, skipping the
+ // serialize/ring/re-parse round trip; returns bytes consumed, caller hands the rest to
+ // HleFifoWriteBurstChunked. Safe (per gd_fifo_hle.cpp's GdCanApplyDirect) only on a packet
+@@ -780,6 +950,12 @@ extern "C" void GX_HLE_FIFO_WriteBurst(const uint8_t* data, uint32_t sizeBytes)
+         return;
+     }
+ 
++#if defined(__SWITCH__)
++    if (TryQueueBpOnlyBurst(data, sizeBytes)) {
++        return;
++    }
++#endif
++
+     if (IsDisplayListActive() && WriteDisplayListBurst(data, sizeBytes)) {
+         return;
+     }
 diff --git a/runtime/src/hle/gx/gx_internal.h b/runtime/src/hle/gx/gx_internal.h
 index 8656dba..88cf22d 100644
 --- a/runtime/src/hle/gx/gx_internal.h

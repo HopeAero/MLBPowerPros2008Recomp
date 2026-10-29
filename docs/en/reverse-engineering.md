@@ -1211,3 +1211,19 @@ Section sources: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_status.cpp`,
   - names of the REL functions (43,088 unnamed)
 
 When adding something to this document, state where it comes from (disassembly, runtime or observation) and the version `RL8E54`.
+
+## 16. Translator GX bursts (RL8E54, source audit 2026-10-29)
+
+The current generated tree contains 51 calls to `GX_HLE_FIFO_WriteBurst` in 33
+functions. Inspecting their buffer construction identifies five pure BP sites:
+`0x800C7114` (2 registers), `0x800C7DC0` (3), and three paths in `0x800C745C`
+(16 each). A length divisible by five is insufficient: other sites contain draw
+attributes. This is static evidence, with no per-frame execution count. The port
+only batches packets whose opcode is exactly `0x61` and retains the fallback.
+
+The runtime audit found ordinary RAM stores that do not notify the
+`GxGuestWrite` epoch; DCFlush/DMA alone do not cover every writer. That epoch
+cannot establish that a guest list stays immutable during a concurrent read.
+Sources: `runtime/include/memory_access.h`, `memory.cpp`, `gx_guest_write.h`,
+and `gx_dl.cpp` in the pinned Switch tree; private report
+`local/tmp/cpu/GX-Q74-guest-epoch.md`.

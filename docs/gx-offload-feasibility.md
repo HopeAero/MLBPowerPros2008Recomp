@@ -336,3 +336,79 @@ guest, consultas, callbacks y copias que obligan a devolver resultados al
 principal. El decoder FIFO existente sigue en otro hilo, así que este rediseño
 debe evitar duplicar su trabajo o crear otro punto de espera. Aun liberando CPU,
 la ventana GPU p99 de la sonda stock supera 16,67 ms; habrá que medirla aparte.
+
+## Q75: primer bloque BP, rendimiento sin mejora apreciable
+
+El parche agrupa ráfagas FIFO de 2–79 paquetes BP completos (`0x61`) en un
+payload propio de hasta 320 bytes y una publicación HLE. Solo se admite con el
+worker activo, fuera de Begin, grabación y FIFO parcial, y con todos los trabajos
+HLE ya terminados. Si hay trabajo pendiente se conserva el parser anterior: su
+primera llamada BP puede atender callbacks antes de leer el paquete siguiente;
+copiar la ráfaga antes de esa espera cambiaría los bytes observados.
+
+`WIICOMPILED_GX_BP_BURST=0` restaura el camino Q73 con el worker activo.
+`WIICOMPILED_GX_BP_BURST_PROFILE=1` imprime contadores acumulados cada cinco segundos
+cuando llega una nueva ráfaga, además del reporte al salir normalmente. El worker global
+sigue apagado por defecto. De 51 sitios de ráfaga en 33 funciones generadas,
+cinco construyen BP puro (2, 3 y tres casos de 16 registros). Es un inventario
+estático; su frecuencia por frame sigue sin medir.
+
+La revisión confirmó que CP directo solo cambia la sombra HLE; las siguientes
+salidas Aurora usan wrappers síncronos, la misma cola HLE o `HleProducerScope`
+en raw draw. El diferencial host extrae los cuerpos reales del helper, las
+barreras y los emisores BP de Aurora. Coinciden bytes BP y estado modelado; quitar
+la barrera de draw en el control negativo invierte el orden y la prueba lo detecta.
+El test de cola cubre copia propia, límite de 79 palabras, filtros y fallback con
+callback que modifica el segundo paquete. Pruebas privadas en
+`local/tmp/cpu/GX-Q75-bp-test/` y `GX-Q75-diff/`; no sustituyen el decoder completo
+ni una comprobación de imagen en Switch.
+
+La NRO Q75 inicial dio **45,5421 fps**, 4.099 frames en 90,0047 s a
+1020/307/1331 MHz, con p50/p95/p99 de 21,9698/26,063/28,9355 ms y cero errores
+de decode GX. `Queue::Flush` recibió 14.464 muestras y `Queue::Submit` 12.312 de
+87.595. Q73 dio 45,5171 fps: esta captura no muestra una mejora apreciable. Se usó
+el mismo arranque sembrado y perfil, pero no un replay desde estado idéntico; Q75
+limitó picos a 40 frente a 256 en Q73. No atribuir la diferencia al bloque BP.
+El contador inicial solo usaba `atexit` y el benchmark llama `_Exit`, por lo que
+no produjo datos de frecuencia; se corrigió a reporte periódico para la siguiente
+NRO. Log privado: `nxlink-GX-Q75-bp-20261029-111618.log`.
+
+Las auditorías de bloques mayores están en `local/tmp/cpu/GX-Q74-*.md` y
+`GX-Q76-scalar-batching.md`. El epoch actual no cubre todos los stores RAM guest,
+por lo que no autoriza lecturas concurrentes de listas o arrays. El primer
+prototipo Q76 con payload combinado pasó cuatro pruebas, pero se sustituyó por
+una publicación agrupada de los slots existentes, descrita abajo.
+
+## Q76: publicación agrupada, candidata optativa
+
+`WIICOMPILED_GX_HLE_BATCH=1` copia los mismos registros a la cola existente y
+los publica al worker cada 16 slots o al llegar a una barrera. Permanece apagado
+por defecto. El watermark público incluye todos los slots enviados, incluso el
+tail aún no publicado; el worker observa solo la frontera publicada. `Idle()`
+considera ambos, por lo que Q75 rechaza también un tail sin publicar.
+
+`Flush(target)` publica hasta target, `FlushAll` vuelve a consultar el watermark
+si los callbacks agregaron trabajo, y `Stop` publica el tail incluso cuando una
+excepción de servicio interrumpe el drenaje. Con el ring lleno se publica el
+prefijo antes de esperar; la llamada exterior relee los índices después de una
+posible reentrada. No se suspende el servicio guest ni se agrega otro formato de
+payload. Se conserva el protocolo de despertar de Q73 sobre la frontera publicada.
+`WIICOMPILED_GX_HLE_BATCH_PROFILE=1` registra publicaciones y slots acumulados
+cada cinco segundos para medir el tamaño real de los bloques.
+
+El harness de la cola real pasó con capacidades de 16 y 64 slots: umbral de 16,
+tail de 1–15, despertar forzado en el borde de sueño, Flush parcial, ring lleno
+con reentrada y sombra VCD, FlushAll con tail añadido por callback, Stop con
+callback que lanza, fallo del worker, fallback inline y configuración por entorno.
+También pasaron Q66 y el diferencial Q75 en ambos modos, incluyendo rechazo de
+staged tail y lectura posterior de BP2 mutado. Tests privados en
+`local/tmp/cpu/GX-Q76-publish-test/`. Dos revisiones de código y el líder no
+encontraron una inversión de orden en esos contratos; falta medir la candidata
+en Switch. Este cambio agrupa la entrega de llamadas Aurora ya admitidas por
+Q73: el escaneo HLE de listas, las escrituras guest y las texturas/TLUT todavía
+permanecen en el principal. No se ha sacado el GX entero ni garantizado 60 fps.
+
+El build Switch Q76 terminó con 48.223 archivos traducidos sin cambios y la
+reconstrucción de runtime/Aurora coincidió exactamente. NRO privada
+`local/switch/build/GX-Q76-publish.nro`, SHA-256
+`444044c9717d02a9f1bd65bf10ec85660dd3fff462d34df6f5aa92e1fa71cf75`.

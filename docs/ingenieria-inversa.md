@@ -1212,3 +1212,20 @@ Fuentes de la sección: `wiicompiled-mlb-nand-es.patch`, `hle/mlb/sc_check_statu
   - nombres de las funciones del REL (43.088 sin nombre)
 
 Al añadir algo a este documento, indica de dónde sale (desensamblado, ejecución u observación) y la versión `RL8E54`.
+
+## 16. Ráfagas GX del traductor (RL8E54, auditoría 2026-10-29)
+
+El árbol generado actual contiene 51 llamadas a `GX_HLE_FIFO_WriteBurst` en 33
+funciones. La inspección de la construcción de sus buffers identifica cinco
+sitios BP puros: `0x800C7114` (2 registros), `0x800C7DC0` (3) y tres caminos de
+`0x800C745C` (16 cada uno). Un tamaño múltiplo de cinco no basta para reconocer
+BP: otros sitios contienen atributos de draw. Es evidencia estática, sin conteo
+de ejecución por frame. El port solo agrupa paquetes cuyo opcode sea exactamente
+`0x61` y conserva el fallback para los demás.
+
+La auditoría del runtime encontró stores RAM ordinarios que no notifican el epoch
+de `GxGuestWrite`; DCFlush/DMA no cubren por sí solos todos los escritores. Ese
+epoch no demuestra que una lista guest permanezca inmutable mientras otro hilo
+la lee. Fuentes: `runtime/include/memory_access.h`, `memory.cpp`,
+`gx_guest_write.h` y `gx_dl.cpp` del árbol Switch fijado; informe privado
+`local/tmp/cpu/GX-Q74-guest-epoch.md`.
