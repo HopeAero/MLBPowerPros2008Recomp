@@ -1268,10 +1268,10 @@ index 0000000..d087722
 +};
 diff --git a/runtime/src/hle/gx/gx_offload_queue.cpp b/runtime/src/hle/gx/gx_offload_queue.cpp
 new file mode 100644
-index 0000000..771e7b0
+index 0000000..5f397bc
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload_queue.cpp
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,422 @@
 +#include "gx_offload_queue.h"
 +
 +#include <cstdlib>
@@ -1460,11 +1460,13 @@ index 0000000..771e7b0
 +    return staged_position_.load(std::memory_order_acquire);
 +}
 +
++#if defined(GX_OFFLOAD_QUEUE_TEST)
 +bool Queue::Idle() const noexcept {
 +    const Sequence staged = staged_position_.load(std::memory_order_acquire);
 +    const Sequence completed = completed_sequence_.load(std::memory_order_acquire);
 +    return Reached(completed, staged);
 +}
++#endif
 +
 +void Queue::PublishThrough(Sequence watermark) noexcept {
 +    const Sequence published = published_position_.load(std::memory_order_relaxed);
@@ -1694,10 +1696,10 @@ index 0000000..771e7b0
 +} // namespace hle::gx::GxOffloadQueue
 diff --git a/runtime/src/hle/gx/gx_offload_queue.h b/runtime/src/hle/gx/gx_offload_queue.h
 new file mode 100644
-index 0000000..0545651
+index 0000000..715e19b
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload_queue.h
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,154 @@
 +#pragma once
 +
 +#include <array>
@@ -1763,8 +1765,6 @@ index 0000000..0545651
 +
 +    // Highest submitted sequence, including slots not yet visible to the worker.
 +    Sequence Watermark() const noexcept;
-+    // True when every submitted/staged job has completed; the queue is single-producer.
-+    bool Idle() const noexcept;
 +    void Flush(Sequence watermark);
 +    void FlushAll();
 +    void Stop();
@@ -1773,6 +1773,7 @@ index 0000000..0545651
 +    bool OnWorkerThread() const noexcept;
 +
 +#if defined(GX_OFFLOAD_QUEUE_TEST)
++    bool Idle() const noexcept;
 +    enum class TestPoint : uint8_t { BeforeSubmitPublish, AfterWorkerPredicateFalse };
 +    using TestHook = void (*)(void*, TestPoint);
 +

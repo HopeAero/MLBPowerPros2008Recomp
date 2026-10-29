@@ -1220,8 +1220,11 @@ funciones. La inspección de la construcción de sus buffers identifica cinco
 sitios BP puros: `0x800C7114` (2 registros), `0x800C7DC0` (3) y tres caminos de
 `0x800C745C` (16 cada uno). Un tamaño múltiplo de cinco no basta para reconocer
 BP: otros sitios contienen atributos de draw. Es evidencia estática, sin conteo
-de ejecución por frame. El port solo agrupa paquetes cuyo opcode sea exactamente
-`0x61` y conserva el fallback para los demás.
+de ejecución por frame. Q75 intentó agrupar paquetes `0x61`, pero se retiró:
+el dispatch Switch selecciona nativos HLE para esos tres targets, antes de sus
+cuerpos generados. En 17 intervalos completos de la prueba Q76 hubo cero
+candidatos y cero bloques BP enviados. Fuentes: `native_cpu_calls.inc`,
+`abi_bridge.h`, `hle_stubs.h` y la captura privada Q76.
 
 La auditoría del runtime encontró stores RAM ordinarios que no notifican el epoch
 de `GxGuestWrite`; DCFlush/DMA no cubren por sí solos todos los escritores. Ese

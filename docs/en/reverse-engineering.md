@@ -1218,8 +1218,11 @@ The current generated tree contains 51 calls to `GX_HLE_FIFO_WriteBurst` in 33
 functions. Inspecting their buffer construction identifies five pure BP sites:
 `0x800C7114` (2 registers), `0x800C7DC0` (3), and three paths in `0x800C745C`
 (16 each). A length divisible by five is insufficient: other sites contain draw
-attributes. This is static evidence, with no per-frame execution count. The port
-only batches packets whose opcode is exactly `0x61` and retains the fallback.
+attributes. This is static evidence. Q75 attempted to batch `0x61` packets, but
+was removed: Switch dispatch selects HLE natives for those three targets before
+their generated bodies. Across 17 complete intervals of the Q76 run there were
+zero BP candidates and submitted blocks. Sources: `native_cpu_calls.inc`,
+`abi_bridge.h`, `hle_stubs.h`, and the private Q76 capture.
 
 The runtime audit found ordinary RAM stores that do not notify the
 `GxGuestWrite` epoch; DCFlush/DMA alone do not cover every writer. That epoch

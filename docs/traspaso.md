@@ -173,13 +173,13 @@ despertar, capturas de matrices/listas, arrays y wrappers pasaron. La equivalenc
 visual de un partido completo y 60 fps estables no están demostradas. Análisis,
 tabla A/B y siguiente arquitectura en `docs/gx-offload-feasibility.md`.
 
-### Q75: bloque BP optativo (2026-10-29)
+### Q75: bloque BP retirado (2026-10-29)
 
-La candidata agrupa solo ráfagas BP completas de 2–79 registros con cola HLE
-vacía; el resto sigue por Q73. `WIICOMPILED_GX_BP_BURST=0` permite A/B con
-worker activo, y `WIICOMPILED_GX_BP_BURST_PROFILE=1` cuenta el uso cada cinco segundos.
-El worker global continúa apagado por defecto. Cinco de los 51 sitios generados
-construyen BP puro; todavía no hay frecuencia dinámica ni ahorro acreditado.
+La candidata agrupaba ráfagas BP completas de 2–79 registros con cola HLE vacía.
+Se retiraron helper/toggle/diagnóstico: en Q76 no ejecutó ningún bloque. Los
+cinco sitios estáticos BP puros están en tres funciones que el dispatch Switch
+sustituye por HLE (`GXInvalidateTexAll`, `__GXSetTmemConfig`, `GXSetTevColor`).
+`gx_fifo.cpp` volvió exactamente al baseline Q73/phase65; se verificó con diff.
 
 Pasaron los dos harness host (cola/captura y orden BP→draw con cuerpos reales
 extraídos) y `P11-verify.sh`: runtime y Aurora reconstruidos coinciden exactamente
@@ -202,7 +202,7 @@ La candidata `WIICOMPILED_GX_HLE_BATCH=1` agrupa hasta 16 slots existentes por
 publicación. Default off; `WIICOMPILED_GX_HLE_BATCH_PROFILE=1` imprime slots y
 publicaciones cada cinco segundos. No usa el primer prototipo de payload combinado:
 mantiene el orden de Submit/reentrada y publica antes de esperar una cola llena.
-Watermark/Idle incluyen staged; worker y predicado de sueño solo ven published.
+Watermark incluye staged; worker y predicado de sueño solo ven published.
 Flush/FlushAll/Stop publican también tails parciales y trabajo de callbacks.
 
 Pasó `GX-Q76-publish-test/run.ps1` con capacidades 16/64 y entorno batch on/off,
@@ -211,5 +211,17 @@ encontraron un hueco de orden pendiente en esos casos. El build Switch y
 `P11-verify.sh` pasaron; 48.223 archivos traducidos sin cambios. NRO privada
 `local/switch/build/GX-Q76-publish.nro`, SHA-256
 `444044c9717d02a9f1bd65bf10ec85660dd3fff462d34df6f5aa92e1fa71cf75`.
-Falta A/B Switch; esta agrupación aún deja el scan HLE, objetos y RAM guest en
-el principal.
+Batch-on en stock dio 45,9614 fps (4.137 frames/90,0103 s), p50/p95/p99
+21,85/26,11/28,43 ms y cero errores GX. Se midieron 12,371 comandos por
+publicación en 17 deltas completos dentro de grabación. `Flush` pasó a 18.792
+muestras, `Submit` 12.566 de 88.483. Falta batch-off con la misma NRO y flags;
+la mejora frente a Q75 es pequeña y no se atribuye causalidad. Log privado
+`nxlink-GX-Q76-publish-20261029-113957.log`. Esta agrupación aún deja el scan
+HLE, objetos y RAM guest en el principal. La NRO medida conserva el experimento
+BP inactivo; el código final lo elimina e incluye `Idle()` solo en tests.
+La limpieza recompiló y pasó Q66/Q76 y `P11-verify.sh`. NRO privada
+`local/switch/build/GX-Q76-clean.nro`, SHA-256
+`0493c0e5327528016e89c17fb9fb6f0ea1eb89ab74eb194ed5041f2f0b37ae8e`.
+No se ha lanzado esa limpieza en Switch. Para completar el A/B usar la NRO
+original `GX-Q76-publish.nro` con exactamente los mismos argumentos de la
+captura on, cambiando solo `WIICOMPILED_GX_HLE_BATCH=0`; netloader pendiente.

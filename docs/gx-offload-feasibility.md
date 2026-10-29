@@ -337,21 +337,27 @@ principal. El decoder FIFO existente sigue en otro hilo, así que este rediseño
 debe evitar duplicar su trabajo o crear otro punto de espera. Aun liberando CPU,
 la ventana GPU p99 de la sonda stock supera 16,67 ms; habrá que medirla aparte.
 
-## Q75: primer bloque BP, rendimiento sin mejora apreciable
+## Q75: bloque BP retirado, sin ejecución real en Switch
 
-El parche agrupa ráfagas FIFO de 2–79 paquetes BP completos (`0x61`) en un
-payload propio de hasta 320 bytes y una publicación HLE. Solo se admite con el
+La candidata agrupaba ráfagas FIFO de 2–79 paquetes BP completos (`0x61`) en un
+payload propio de hasta 320 bytes y una publicación HLE. Solo se admitía con el
 worker activo, fuera de Begin, grabación y FIFO parcial, y con todos los trabajos
-HLE ya terminados. Si hay trabajo pendiente se conserva el parser anterior: su
+HLE ya terminados. Con trabajo pendiente conservaba el parser anterior: su
 primera llamada BP puede atender callbacks antes de leer el paquete siguiente;
 copiar la ráfaga antes de esa espera cambiaría los bytes observados.
 
-`WIICOMPILED_GX_BP_BURST=0` restaura el camino Q73 con el worker activo.
-`WIICOMPILED_GX_BP_BURST_PROFILE=1` imprime contadores acumulados cada cinco segundos
-cuando llega una nueva ráfaga, además del reporte al salir normalmente. El worker global
-sigue apagado por defecto. De 51 sitios de ráfaga en 33 funciones generadas,
-cinco construyen BP puro (2, 3 y tres casos de 16 registros). Es un inventario
-estático; su frecuencia por frame sigue sin medir.
+Sus variables `WIICOMPILED_GX_BP_BURST` y `WIICOMPILED_GX_BP_BURST_PROFILE`
+solo aplican a las NRO experimentales conservadas. Se retiraron helper,
+diagnóstico e interceptación después de observar cero candidatos y cero envíos
+durante los 17 intervalos completos de juego de Q76.
+
+Los cinco sitios BP puros del inventario estático están en cuerpos generados de
+`GXInvalidateTexAll` (`0x800C7114`), `__GXSetTmemConfig` (`0x800C745C`, tres
+sitios) y `GXSetTevColor` (`0x800C7DC0`). El dispatch Switch selecciona nativos
+HLE para esos tres targets antes del cuerpo traducido, tanto por la ruta directa
+como por la prioridad del registry indirecto. No se encontró una llamada C++
+directa que saltara esos reemplazos. El inventario de 51 sitios no probaba que
+los cinco elegibles se ejecutaran. Evidencia: `GX-Q75-dead-sites.md` privado.
 
 La revisión confirmó que CP directo solo cambia la sombra HLE; las siguientes
 salidas Aurora usan wrappers síncronos, la misma cola HLE o `HleProducerScope`
@@ -361,7 +367,8 @@ la barrera de draw en el control negativo invierte el orden y la prueba lo detec
 El test de cola cubre copia propia, límite de 79 palabras, filtros y fallback con
 callback que modifica el segundo paquete. Pruebas privadas en
 `local/tmp/cpu/GX-Q75-bp-test/` y `GX-Q75-diff/`; no sustituyen el decoder completo
-ni una comprobación de imagen en Switch.
+ni una comprobación de imagen en Switch. Son pruebas históricas de Q75; su
+extractor necesita el árbol anterior a la retirada (commit `56778de`).
 
 La NRO Q75 inicial dio **45,5421 fps**, 4.099 frames en 90,0047 s a
 1020/307/1331 MHz, con p50/p95/p99 de 21,9698/26,063/28,9355 ms y cero errores
@@ -384,8 +391,8 @@ una publicación agrupada de los slots existentes, descrita abajo.
 `WIICOMPILED_GX_HLE_BATCH=1` copia los mismos registros a la cola existente y
 los publica al worker cada 16 slots o al llegar a una barrera. Permanece apagado
 por defecto. El watermark público incluye todos los slots enviados, incluso el
-tail aún no publicado; el worker observa solo la frontera publicada. `Idle()`
-considera ambos, por lo que Q75 rechaza también un tail sin publicar.
+tail aún no publicado; el worker observa solo la frontera publicada. El helper
+`Idle()` quedó solo en las pruebas tras retirar Q75.
 
 `Flush(target)` publica hasta target, `FlushAll` vuelve a consultar el watermark
 si los callbacks agregaron trabajo, y `Stop` publica el tail incluso cuando una
@@ -403,8 +410,8 @@ callback que lanza, fallo del worker, fallback inline y configuración por entor
 También pasaron Q66 y el diferencial Q75 en ambos modos, incluyendo rechazo de
 staged tail y lectura posterior de BP2 mutado. Tests privados en
 `local/tmp/cpu/GX-Q76-publish-test/`. Dos revisiones de código y el líder no
-encontraron una inversión de orden en esos contratos; falta medir la candidata
-en Switch. Este cambio agrupa la entrega de llamadas Aurora ya admitidas por
+encontraron una inversión de orden en esos contratos. Este cambio agrupa la
+entrega de llamadas Aurora ya admitidas por
 Q73: el escaneo HLE de listas, las escrituras guest y las texturas/TLUT todavía
 permanecen en el principal. No se ha sacado el GX entero ni garantizado 60 fps.
 
@@ -412,3 +419,23 @@ El build Switch Q76 terminó con 48.223 archivos traducidos sin cambios y la
 reconstrucción de runtime/Aurora coincidió exactamente. NRO privada
 `local/switch/build/GX-Q76-publish.nro`, SHA-256
 `444044c9717d02a9f1bd65bf10ec85660dd3fff462d34df6f5aa92e1fa71cf75`.
+
+La captura con batch activado dio **45,9614 fps**, 4.137 frames en 90,0103 s,
+stock portátil 1020/307/1331 MHz, p50/p95/p99 21,8487/26,1113/28,4295 ms y cero
+errores de decode. En 17 intervalos completos dentro de la grabación (~85 s),
+53.769.953 slots / 4.346.444 publicaciones = **12,371 comandos por publicación**;
+se excluyeron startup y el delta que cruzaba el inicio de grabación. No equivale
+a un ahorro de CPU o FPS del mismo porcentaje. `Flush` recibió 18.792 de 88.483
+muestras (21,2%), `Submit` 12.566 (14,2%) y `PublishThrough` 469 (0,53%).
+Las muestras de `Flush` aumentaron frente a Q75 aunque bajaron las de mutex.
+La comparación con Q75 es pequeña y mixta; falta el control batch-off con la
+misma NRO y los mismos diagnósticos. Log privado
+`nxlink-GX-Q76-publish-20261029-113957.log`; análisis `GX-Q76-console-on.md`.
+
+Después se retiró Q75 y `Idle()` quedó bajo `GX_OFFLOAD_QUEUE_TEST`. El diff de
+`gx_fifo.cpp` contra phase65/Q73 es vacío. Q66, Q76 con capacidades 16/64 y
+configuración batch on/off volvieron a pasar; la reconstrucción del parche y el
+build Switch también. NRO limpia privada `local/switch/build/GX-Q76-clean.nro`,
+SHA-256 `0493c0e5327528016e89c17fb9fb6f0ea1eb89ab74eb194ed5041f2f0b37ae8e`.
+Esta limpieza no se ha ejecutado en consola; el control batch-off pendiente usa
+la NRO original `GX-Q76-publish.nro` para conservar el mismo binario.
