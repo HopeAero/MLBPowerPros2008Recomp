@@ -1286,3 +1286,20 @@ incrementa `80044B7C` está en `gfx+8592`; `80044B54` lo reinicia y
 `gfx+8588`. En `80053464`, `gfx+8283 != 0` selecciona filtros lineales; si es
 cero selecciona nearest. El campo de precarga `slot+124` se solapa con el `+4`
 del siguiente slot; el código solo consulta su signo.
+
+## 18. FIFO de geometría y listas cacheadas (RL8E54, 2026-10-29)
+
+Fuentes: `gx_fifo.cpp`, `gx_stream_common.h`, `gx_dl.cpp` y el código traducido
+de los quads/matrices descritos en P21; diferenciales host en
+`local/tmp/cpu/GX-batch2-test/`. F32 se convierte mediante copia de bits sin
+escalado por `frac`. El parser consume componentes antes de `SubmitAttribute`,
+dejando el último word en el scratch del ring; al terminar un vértice actualiza
+los flags antes de llamar a `GXEnd`. Un atajo debe conservar también esos
+estados observables en los puntos de llamada, no solo los valores finales.
+
+En XF, el parser no despacha hasta tener `5 + 4*(countWords+1)` bytes. La
+última palabra debe conservar el orden `GXCallDisplayList`, `GXMarkFrameWork`
+y consumo. Los registros de scan de listas simples ya contienen los límites
+de índices y formatos requeridos para preparar arrays. Se pueden consultar
+directamente en el recorrido síncrono sin CP/flatten; el worker HLE mantiene
+el recorrido con copias por sus callbacks de espera. Véase [GX batch2](gx-batch2.md).

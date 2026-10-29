@@ -319,3 +319,22 @@ En cubetas comunes 240–479, CPU ocupada muestreada estandarizada 9,541 →
 ni garantía de ahorro causal. No hay errores GX registrados. El usuario nota
 una mejoría leve, pero el fildeo sigue sin 60 fps estables. Detalle y límites en
 [la actualización del informe](hle-model-round1.md#medición-de-la-revisión-posterior-a-0918d42).
+
+## GX batch2: listas y FIFO, fases 74–76
+
+Implementados y compilados tres atajos: F32 DIRECT escalar/por ráfagas, append de
+payload XF incompleto y uso de tablas de scan por referencia para listas simples
+cacheadas. Mantienen llamadas/orden, scratch del parser y fallbacks; no se
+registran nativas nuevas ni se modifica audio o código generado.
+
+`WIICOMPILED_GX_BATCH_FIFO=0` y `WIICOMPILED_GX_BATCH_DL=0` los apagan por separado;
+`WIICOMPILED_GX_BATCH_PROFILE=1` habilita los contadores opcionales `[gx-batch]`.
+Detalles y evidencia en [GX batch2](gx-batch2.md). Pasaron diferenciales on/off,
+siete controles negativos, regeneración del parche, P11 y build con cuatro jobs.
+NRO privada `local/switch/build/GX-batch2.nro`, SHA-256
+`4f5031436d6331bc671a4764a78a08b300b9d0d903b58051402b86fe0926fe7c`;
+símbolos `local/switch/logs/elf-syms-GX-batch2.txt`.
+
+Pendiente de medición en consola; usar como referencia HLE1-round2 y su log
+`nxlink-HLE1-round2-20261029-182140.log`. No se ha enviado esta candidata a la
+consola. Mantener las sondas cortas y no repetir partidos para avanzar marcador.

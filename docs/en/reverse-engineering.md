@@ -1280,3 +1280,19 @@ at `gfx+8592`; `80044B54` resets it, and `GXSetNumTexGens` receives its low eigh
 bits. `800613BC` also clears `gfx+8588`. In `80053464`, `gfx+8283 != 0` selects
 linear filtering; zero selects nearest. The preload field at `slot+124` overlaps
 the following slot's `+4`; only its sign is tested.
+
+## 18. Geometry FIFO and cached lists (RL8E54, 2026-10-29)
+
+Sources: `gx_fifo.cpp`, `gx_stream_common.h`, `gx_dl.cpp`, the translated
+quad/matrix routines described in P21, and host differentials under
+`local/tmp/cpu/GX-batch2-test/`. F32 conversion copies bits without applying
+`frac`. Components are consumed before `SubmitAttribute`, leaving the last word
+in ring scratch; vertex completion updates flags before `GXEnd`. Shortcuts must
+preserve those call-boundary states as well as final values.
+
+XF dispatch waits for `5 + 4*(countWords+1)` bytes. The final word must preserve
+the order of `GXCallDisplayList`, `GXMarkFrameWork`, then consumption. Simple-list
+scan records already hold the index bounds and formats required for array
+preparation. The synchronous path without CP writes or flattening can read these
+tables directly; the HLE worker retains the copy-based path because its waits
+can service callbacks. See the [Spanish GX batch2 report](../gx-batch2.md).

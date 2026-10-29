@@ -1,3 +1,303 @@
+diff --git a/runtime/src/hle/gx/gx_internal.h b/runtime/src/hle/gx/gx_internal.h
+index 8656dba..88cf22d 100644
+--- a/runtime/src/hle/gx/gx_internal.h
++++ b/runtime/src/hle/gx/gx_internal.h
+@@ -108,6 +108,26 @@ struct HleTexObj {
+     alignas(GXTexObj) std::byte storage[sizeof(GXTexObj)]{};
+     bool storageLive = false;
+     bool constructed = false;
++#if defined(__SWITCH__)
++    // P19 (local/tmp/cpu/P19-texmemo.py, gx_objects.cpp): GXInitTexObj/CI (+ GXInitTexObjLOD) on this object
++    // are recorded here instead of run while `lazy` is set; `storage` is then not the aurora object yet.
++    // P19Materialize runs the recorded calls in order (same arguments: the same object bar its texObjId); a
++    // GXLoadTexObj that re-initialises the object in place drops them. Whatever hands the object out or reads
++    // it builds it first.
++    bool lazy = false;
++    bool lazyCi = false;
++    bool lazyLod = false;
++    bool initSeen = false; // `init` holds the arguments of the last GXInitTexObj/CI (kept after the build)
++    struct LazyInit {
++        const void* data = nullptr;
++        uint32_t w = 0, h = 0, f = 0, ws = 0, wt = 0, m = 0, tl = 0;
++        bool ci = false;
++    } init;
++    struct LazyLod {
++        uint32_t mif = 0, maf = 0, bc = 0, el = 0, ma = 0;
++        float mil = 0.0f, mal = 0.0f, lb = 0.0f;
++    } lod;
++#endif
+ 
+     HleTexObj() = default;
+     ~HleTexObj() { Destroy(); }
+@@ -122,6 +142,10 @@ struct HleTexObj {
+     }
+ 
+     void Destroy() {
++#if defined(__SWITCH__)
++        lazy = false;
++        lazyLod = false;
++#endif
+         if (storageLive) {
+             GXDestroyTexObj(PublicPtr());
+             std::memset(storage, 0, sizeof(storage));
+@@ -159,6 +183,19 @@ struct TexObjSlot : TexObjMeta {
+     uint32_t indexedSize = 0;
+     bool inIntervalIndex = false;
+     bool pendingIntervalUpdate = false;
++#if defined(__SWITCH__)
++    // G7 (gx_objects.cpp G7FindLoadReadySlot): set by a GXLoadTexObj that completed its full path,
++    // cleared by every metadata write (GetTexObjMeta, the TryGetOrExtractTexObjMeta re-decode) and by
++    // CreateHostTexObj. While set, the fields above are the sanitized metadata that load wrote back,
++    // with `g7LoadSize` the texture size it validated.
++    bool g7LoadReady = false;
++    uint32_t g7LoadSize = 0;
++    // G7: the last ExtractTexObjMetaFromGuest of this slot and the 32 guest bytes it decoded (it reads
++    // nothing else), so the same bytes again are served without the decode.
++    bool g7ExtractValid = false;
++    uint64_t g7ExtractShadow[4] = {0, 0, 0, 0};
++    TexObjMeta g7Extracted{};
++#endif
+ };
+ 
+ struct TlutObjMeta {
+@@ -255,9 +292,34 @@ struct HleGxState {
+     size_t fifoReadOffset = 0;
+     size_t fifoByteCount = 0;
+ 
++#if defined(__SWITCH__)
++    // A3 (gx_dl.cpp's HashScanLayoutState): each vtxAttrFmt row is hashed on its own and the layout
++    // hash covers vtxDesc plus the eight row hashes, so a vtxDesc-only change (GXClearVtxDesc and
++    // GXSetVtxDesc before every mesh) no longer rehashes all 2.6 KB. Bit f set: rowHash[f] is stale.
++    uint8_t vtxAttrFmtRowsDirty = 0xFF;
++    uint64_t vtxAttrFmtRowHash[8]{};
++    // A vtxDesc-only mutation: every row hash stays valid.
++    void InvalidateVtxDescHash() noexcept {
++        vtxLayoutHashDirty = true;
++        ++vtxStateGeneration;
++    }
++    // A mutation of vtxAttrFmt[fmt] only.
++    void InvalidateVtxAttrFmtRowHash(uint32_t fmt) noexcept {
++        vtxLayoutHashDirty = true;
++        vtxAttrFmtRowsDirty = static_cast<uint8_t>(vtxAttrFmtRowsDirty | (fmt < 8 ? (1u << fmt) : 0xFFu));
++        ++vtxStateGeneration;
++    }
++#else
++    void InvalidateVtxDescHash() noexcept { InvalidateVtxLayoutHash(); }
++    void InvalidateVtxAttrFmtRowHash(uint32_t) noexcept { InvalidateVtxLayoutHash(); }
++#endif
+     void ResetVertex();
++    // Any vertex-layout mutation (every row hash goes stale too).
+     void InvalidateVtxLayoutHash() noexcept {
+         vtxLayoutHashDirty = true;
++#if defined(__SWITCH__)
++        vtxAttrFmtRowsDirty = 0xFF;
++#endif
+         ++vtxStateGeneration;
+     }
+     GXAttr NextEnabledAttr(int startAttr);
+@@ -343,10 +405,94 @@ TexObjMeta& GetTexObjMeta(uint32_t addr);
+ TexObjMeta ExtractTexObjMetaFromGuest(uint32_t addr);
+ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta);
+ TlutObjMeta& GetTlutObjMeta(uint32_t addr);
++#if defined(__SWITCH__)
++// gx_objects.cpp: GXInitTlutObj's metadata write (GetTlutObjMeta plus the field stores), keeping the
++// DCStoreRange TLUT bounds without a full recompute when the palette stays inside them; and the
++// g_TlutObjMeta lookup behind a small address cache.
++TlutObjMeta& SetTlutObjMeta(uint32_t addr, uint32_t dataAddr, uint32_t format, uint16_t entries);
++TlutObjMeta* FindTlutObjMeta(uint32_t addr);
++// The g_TexObjMeta slot of `addr`, as g_TexObjMeta.find (nullptr when absent).
++TexObjSlot* FindTexObjSlotForLoad(uint32_t addr);
++#endif
+ GXTexObj* GetHostTexObj(uint32_t addr);
+ GXTexObj* TryGetHostTexObj(uint32_t addr);
++#if defined(__SWITCH__)
++// G7 (local/tmp/cpu/G7-tex.py; WIICOMPILED_GX_G7=0 turns it off), gx_objects.cpp.
++extern "C" uint64_t aurora_gx_g7_counters[];
++extern int g_gxG7Enabled; // -1 until GxG7Resolve
++extern int g_gxG7Check;
++[[gnu::cold, gnu::noinline]] void GxG7Resolve() noexcept;
++inline bool GxG7Enabled() noexcept {
++    if (g_gxG7Enabled < 0) [[unlikely]] {
++        GxG7Resolve();
++    }
++    return g_gxG7Enabled != 0;
++}
++// WIICOMPILED_GX_G7_CHECK=1: run the full paths and compare
++inline bool GxG7Check() noexcept {
++    if (g_gxG7Check < 0) [[unlikely]] {
++        GxG7Resolve();
++    }
++    return g_gxG7Check != 0;
++}
++inline void GxG7Count(uint32_t counter, uint64_t n = 1) noexcept { aurora_gx_g7_counters[counter] += n; }
++// aurora fifo.hpp's G7Counter (gx_g7_per_frame in the gx_fifo summary).
++constexpr uint32_t kG7LoadsFast = 0;        // GXLoadTexObj served by the load-ready path
++constexpr uint32_t kG7LoadsFull = 1;        // GXLoadTexObj that ran the full path
++constexpr uint32_t kG7ExtractMemoHits = 2;  // guest GXTexObj re-decodes served from the slot's memo
++constexpr uint32_t kG7Extracts = 3;         // guest GXTexObj re-decodes run
++constexpr uint32_t kG7ImageWrites = 4;      // WriteGuestTexObj as one 32-byte store
++constexpr uint32_t kG7CheckMismatches = 5;  // WIICOMPILED_GX_G7_CHECK=1: shortcut != full path
++// The slot of `addr` when GXLoadTexObj's full path would end exactly where the last one left it:
++// the slot is load-ready (TexObjSlot::g7LoadReady), needs no upload, its host object is constructed,
++// the guest bytes still equal its shadow (so TryGetOrExtractTexObjMeta would hand back the slot as
++// is) and its texture range is still mapped. nullptr otherwise. Caller holds g_texObjMutex.
++TexObjSlot* G7FindLoadReadySlot(uint32_t addr);
++// After a full GXLoadTexObj path wrote its metadata back (and got a host pointer for the data).
++void G7NoteLoadDone(uint32_t addr, uint32_t size);
++// Every TexObjMeta field equal (floats by bits); the check mode's compare.
++bool G7SameTexObjMeta(const TexObjMeta& a, const TexObjMeta& b) noexcept;
++// Host pointer of the 32-byte guest GXTexObj at `addr` when every Memory::Write* of WriteGuestTexObj
++// would take the coarse writable-page path to it (all 32 bytes in one full writable page).
++uint8_t* G7GuestTexObjHost(uint32_t addr) noexcept;
++#endif
+ GXTexObj* CreateHostTexObj(uint32_t addr);
+ void MarkHostTexObjConstructed(uint32_t addr);
++#if defined(__SWITCH__)
++// P19 (local/tmp/cpu/P19-texmemo.py; WIICOMPILED_GX_TEXMEMO=0 turns it off), gx_objects.cpp: lazy aurora
++// host objects for GXInitTexObj/CI + GXInitTexObjLOD (see HleTexObj::lazy).
++extern "C" uint64_t aurora_gx_p19_counters[];
++extern "C" int aurora_gx_p19_enabled(void);
++extern int g_gxP19Enabled; // -1 until GxP19Resolve
++[[gnu::cold, gnu::noinline]] void GxP19Resolve() noexcept;
++inline bool GxP19Enabled() noexcept {
++    if (g_gxP19Enabled < 0) [[unlikely]] {
++        GxP19Resolve();
++    }
++    return g_gxP19Enabled != 0;
++}
++inline void GxP19Count(uint32_t counter, uint64_t n = 1) noexcept { aurora_gx_p19_counters[counter] += n; }
++constexpr uint32_t kP19LazyInits = 0;      // GXInitTexObj/CI whose aurora object was deferred
++constexpr uint32_t kP19LazyDiscarded = 1;  // ... dropped by the GXLoadTexObj that re-initialised the object
++constexpr uint32_t kP19LazyBuilt = 2;      // ... built later (the old cost, paid late)
++constexpr uint32_t kP19LodDeferred = 3;    // GXInitTexObjLOD recorded instead of run
++constexpr uint32_t kP19InitSame = 4;       // Init arguments equal the previous Init of the same object
++constexpr uint32_t kP19InitDiffData = 5;   // ... differ in the data pointer
++constexpr uint32_t kP19InitDiffOther = 6;  // ... differ elsewhere
++constexpr uint32_t kP19SlotsCreated = 7;   // new g_TexObjMeta slots
++// GX__InitTexObj / GX__InitTexObjCI up to the guest-memory write: what CreateHostTexObj, GetTexObjMeta, the
++// metadata stores, GXInitTexObj[CI] and MarkHostTexObjConstructed did, with the aurora object recorded.
++void P19InitTexObj(uint32_t oa, uint32_t da, uint32_t canonicalDataAddr, uint32_t w, uint32_t h, uint32_t f,
++                   uint32_t ws, uint32_t wt, uint32_t m, bool ci, uint32_t tl);
++// The host object of `addr` when it is constructed, still recorded and has no recorded LOD; else nullptr.
++HleTexObj* P19PendingHostForLod(uint32_t addr);
++void P19RecordLod(HleTexObj& host, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc,
++                  uint32_t el, uint32_t ma);
++// TryGetHostTexObj without building the object: `pending` is the host when it is still recorded.
++GXTexObj* P19TryGetHostTexObjForLoad(uint32_t addr, HleTexObj*& pending);
++// Runs the recorded GXInitTexObj[CI] / GXInitTexObjLOD on the storage.
++void P19Materialize(HleTexObj& host);
++#endif
+ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size);
+ // Invalidates GPU-only GXCopyTex results when guest CPU writes are made visible
+ // over their destination. This is the allocation-reuse generation boundary
+@@ -386,8 +532,80 @@ extern bool g_alphaCompareValid;
+ extern std::array<BoundTexInfo, 8> g_boundTexMaps;
+ extern TexCopyState g_texCopyState;
+ 
+-extern std::mutex g_texObjMutex;
+-extern std::mutex g_tlutObjMutex;
++#if defined(__SWITCH__)
++// g_texObjMutex/g_tlutObjMutex guard maps that only guest code touches: the HLE GX calls and the
++// DC-range/DMA notifications all run on the main thread's fibers. std::mutex went through newlib's
++// pthread layer to libnx's mutexLock/mutexUnlock on every GXLoadTexObj/GXInitTlutObj/GXLoadTlut
++// (~1% of the main thread, profile-stock1). A test-and-set lock keeps the exclusion, should another
++// thread ever take one, for an uncontended exchange and a release store.
++struct GxObjMutex;
++// G7 (local/tmp/cpu/G7-tex.py): the lock is taken on one thread only, so with G7 it checks that instead
++// of paying for cross-thread ordering. Run 13b, whole match: the exchange and the release store were
++// ~1% of the main thread (the stlrb waits for every store before it, FIFO packet and guest stores
++// included: 181 of GX__LoadTexObj's 931 samples sit right after it). Owner-checked mode keeps the
++// lock word (re-entry and a second thread abort with a log line instead of racing); mode 0 is the
++// test-and-set lock below. WIICOMPILED_GX_G7=0 or WIICOMPILED_GX_G7_LOCK=0 select mode 0. Resolved
++// once, at the first lock, and never changed after.
++extern int g_gxG7LockMode;                       // -1 unresolved, 0 test-and-set, 1 owner-checked
++extern "C" void GX_HLE_OffloadEnter() noexcept;
++extern "C" void GX_HLE_OffloadLeave() noexcept;
++extern std::atomic<uintptr_t> g_gxG7LockOwner;   // thread (TPIDRRO_EL0) of the first lock
++void GxG7ResolveLockMode() noexcept;
++[[gnu::cold, gnu::noinline]] void GxG7LockSlow(GxObjMutex& mutex, uintptr_t self) noexcept;
++inline uintptr_t GxG7ThreadId() noexcept {
++    uintptr_t self;
++    __asm__("mrs %0, tpidrro_el0" : "=r"(self));
++    return self;
++}
++struct GxObjMutex {
++    std::atomic<bool> held{false};
++    [[gnu::always_inline]] void lock() {
++        // These maps stay on the producer; GX calls inside the lock fence themselves when needed.
++        if (g_gxG7LockMode < 0) [[unlikely]] {
++            GxG7ResolveLockMode();
++        }
++        if (g_gxG7LockMode > 0) [[likely]] {
++            const uintptr_t self = GxG7ThreadId();
++            if (self != g_gxG7LockOwner.load(std::memory_order_relaxed) ||
++                held.load(std::memory_order_relaxed)) [[unlikely]] {
++                GxG7LockSlow(*this, self);
++            }
++            held.store(true, std::memory_order_relaxed);
++            return;
++        }
++        while (held.exchange(true, std::memory_order_acquire)) {
++            while (held.load(std::memory_order_relaxed)) {
++                std::this_thread::sleep_for(std::chrono::microseconds(1));
++            }
++        }
++    }
++    bool try_lock() {
++        if (g_gxG7LockMode < 0) [[unlikely]] {
++            GxG7ResolveLockMode();
++        }
++        if (g_gxG7LockMode > 0) {
++            if (held.load(std::memory_order_relaxed)) {
++                return false;
++            }
++            lock();
++            return true;
++        }
++        if (!held.exchange(true, std::memory_order_acquire)) return true;
++        return false;
++    }
++    [[gnu::always_inline]] void unlock() noexcept {
++        if (g_gxG7LockMode > 0) [[likely]] {
++            held.store(false, std::memory_order_relaxed);
++            return;
++        }
++        held.store(false, std::memory_order_release);
++    }
++};
++#else
++using GxObjMutex = std::mutex;
++#endif
++extern GxObjMutex g_texObjMutex;
++extern GxObjMutex g_tlutObjMutex;
+ // Guest GXTexObj address -> decoded metadata + host object. std::unordered_map
+ // rather than absl::flat_hash_map because the runtime target does not link
+ // absl, and because callers (gx_texture.cpp) hold an iterator across an insert
+diff --git a/runtime/src/hle/gx/gx_lighting.cpp b/runtime/src/hle/gx/gx_lighting.cpp
+index 1b1d392..8a03ec3 100644
+--- a/runtime/src/hle/gx/gx_lighting.cpp
++++ b/runtime/src/hle/gx/gx_lighting.cpp
+@@ -62,8 +62,20 @@ void InitializeHostLightFromGuest(GXLightObj& host, uint32_t guestAddr) {
+ // Light Object Load
+ // ============================================================================
+ 
++#if defined(__SWITCH__)
++// aurora GXLighting.cpp: the 13 XF light words at kColorOffset as they are (InitializeHostLightFromGuest
++// is a bitwise copy of them: the color repacks to its word, the direction is negated twice).
++extern "C" void GXLoadLightObjImmBE(const void* xfWordsBe, GXLightID id);
++#endif
++
+ extern "C" void GX__LoadLightObjImm_80170320(uint32_t la, uint32_t lid) {
+     if (!ValidateGuestLightObj(la, "GXLoadLightObjImm")) return;
++#if defined(__SWITCH__)
++    if (const void* words = GuestToHostPtr(la + kColorOffset, kLightObjSize - kColorOffset)) {
++        GXLoadLightObjImmBE(words, static_cast<GXLightID>(lid));
++        return;
++    }
++#endif
+     GXLightObj host{};
+     InitializeHostLightFromGuest(host, la);
+     GXLoadLightObjImm(&host, static_cast<GXLightID>(lid));
 diff --git a/runtime/src/hle/gx/gx_objects.cpp b/runtime/src/hle/gx/gx_objects.cpp
 index ec98605..3858692 100644
 --- a/runtime/src/hle/gx/gx_objects.cpp
