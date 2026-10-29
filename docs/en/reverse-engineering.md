@@ -1230,3 +1230,45 @@ cannot establish that a guest list stays immutable during a concurrent read.
 Sources: `runtime/include/memory_access.h`, `memory.cpp`, `gx_guest_write.h`,
 and `gx_dl.cpp` in the pinned Switch tree; private report
 `local/tmp/cpu/GX-Q74-guest-epoch.md`.
+
+## 17. Material presets and GX descriptors (RL8E54, HLE1, 2026-10-29)
+
+Sources: inspection of translated `800452E4`, `80044B7C`, `80053464` and the
+pinned runtime/Aurora sources; private differential host tests under
+`local/tmp/cpu/HLE1-test/`. These are source and host-test observations, not GPU
+image validation.
+
+The textured `800452E4` preset applies `GXSetTevOp(GX_MODULATE)` to one stage
+and sets another stage's inputs and operations individually. Aurora's
+`GXSetTevOp` emits four BP registers in color/alpha/color/alpha order. If the
+live `tevc` and `teva` registers already match that preset's result, each
+intermediate value equals its final value. Reusing the result and combining the
+four writes preserves every FIFO byte and `bpSent=1`. Remembering only the last
+argument is insufficient: intervening setters can modify those registers.
+Display-list recording retains the original path and its partial writes on
+overflow. Combined `COLOR0A0/1A1` channels emit two identical XF control words;
+computing the word once preserves both writes and `bpSent=0`.
+
+Guest `GXTexObj` decoding depends only on its 32 bytes. The user-data word at
+`+16` can be excluded from the descriptor key and returned separately using its
+current value; invalid metadata still returns zero. HLE1 compares all remaining
+descriptor bytes, without relying on generations to establish equality. Direct
+snapshots require a fully writable RAM page; page crossings and other mappings
+retain the original scalar accesses. No texel contents, host-object identities
+or load results are reused: P19/G7, upload flags and DCFlush/DMA invalidation
+still govern those operations.
+
+Aurora's TLUT identity depends on data pointer, format and entry count; its
+version changes with the digest. A3 permits skipping the digest under a matching
+tracked generation. HLE1 remembers the last answer by value under that same
+contract. It keeps no pointers into the relocating Abseil map. At 4096 identities
+the original path clears the map even if the next key already exists; this must
+also defeat the shortcut. Non-A3 calls invalidate the memo because they can
+update versions without a generation notification. `GXInitTlutObj`, replacement
+registration and `GXLoadTlut` still execute.
+
+P21 map corrections confirmed by P23: `80044B7C` increments the texcoord count
+at `gfx+8592`; `80044B54` resets it, and `GXSetNumTexGens` receives its low eight
+bits. `800613BC` also clears `gfx+8588`. In `80053464`, `gfx+8283 != 0` selects
+linear filtering; zero selects nearest. The preload field at `slot+124` overlaps
+the following slot's `+4`; only its sign is tested.

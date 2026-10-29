@@ -253,3 +253,50 @@ Texturas: 100% aceptadas (1.310.720), su barrera desapareció, pero quedan 620�
 - **Nativas del juego no pagan:** P23 (bind de textura `800613BC`/`800537B4`/`80053464`, exacta en 400.000 casos qemu) ahorra 0,02–0,05 ms: ~70% de sus instrucciones son accesos a memoria guest que la exactitud conserva, las llamadas HLE ya eran directas y el registro de nativas cuesta ~150–200 instrucciones por llamada. No integrada; código en `local/tmp/cpu/P23-*`. La memoria guest ya es plana en Switch (base + bswap).
 - **Regla del perfil de dispatch indirecto** (causa del crash P18): el traductor lee los `REGISTER_NATIVE_FUNCTION[_AS]` con regex sin preprocesador; una registración bajo `#if` falso deja la tabla generada sin el ganador traducido (`omits translated winner`). Registrar siempre sin `#if`.
 - **Dónde queda el costo real:** dentro de la capa HLE GX (texturas/TLUT ~1,3 ms a 600 DL) y la toma inicial es **GPU** (~20 ms a 307 MHz).
+
+## HLE1: tanda 1 del pipeline de modelos (2026-10-29)
+
+Candidata implementada en fases 69–71 de `local/tmp/switch_edit.py`, reproducida
+en los dos parches Switch. No cambia registros nativos ni headers del traductor.
+
+- `WIICOMPILED_GX_MODEL_TEV=0` desactiva el replay de `GXSetTevOp` cuando sus
+  registros vivos ya coinciden con el resultado y la agrupación de canales
+  combinados. Conserva todos los bytes BP/XF, `bpSent` y dirty flags; no omite
+  escrituras. Grabación de listas usa el camino anterior.
+- `WIICOMPILED_GX_MODEL_TEXTURE=0` desactiva el snapshot de descriptor en RAM
+  plana y la caché de decodificación que separa el word de usuario. Compara los
+  bytes, conserva el valor actual de usuario y no reutiliza texeles ni cargas.
+  G7 apagado también desactiva este camino.
+- `WIICOMPILED_GX_MODEL_TLUT=0` desactiva el memo por valor de la última identidad
+  de paleta. Conserva el contrato A3 de generaciones, la creación de identidades
+  al vaciar el mapa de 4096 entradas y la invalidación ante llamadas sin A3.
+- `WIICOMPILED_GX_MODEL_PROFILE=1` imprime contadores opcionales de hit/miss
+  acumulados, prefijo `[model-hle]`. Worker HLE permanece apagado.
+
+Pruebas privadas en `local/tmp/cpu/HLE1-test/`; `run.ps1` compila cuerpos reales
+extraídos y ejecuta la campaña. Pasaron 250.000 pasos TEV/canales comparando
+estado y FIFO, 400.000 decodificaciones directas y 800.000 pasos de secuencias de
+textura con P19/G7 on/off y dos políticas de mapeo. Las 180.000 operaciones TLUT
+comparan identidades/versiones/digest/generación, contadores A3, objetos Aurora,
+bytes FIFO y callbacks de reemplazos; incluyen casos dirigidos de límite de
+capacidad y ruta legacy. Ocho mutantes deben fallar. Q77 pasó en capacidades
+16/64. Son pruebas con entorno host simulado; no demuestran imagen GPU idéntica.
+
+`P11-verify.sh` confirmó `runtime and aurora trees identical`. Encontró restos
+privados de P23 en el árbol compilado (archivo de nativas y opciones CMake), que
+se preservaron en `HLE1-test/unused-P23-*` y se retiraron del árbol para que el
+build corresponda al parche. La compilación Horizon pasó con cuatro jobs y
+48.223 archivos traducidos sin cambios. NRO privada:
+`local/switch/build/HLE1-model.nro`, SHA-256
+`c4734672f83a54380497b0867d8aadcec61084e8c676566f56f0359c1dac4584`.
+Símbolos: `local/switch/logs/elf-syms-HLE1.txt`.
+
+**Pendiente al redactar esta entrada:** envío por netloader y medición 4–5 min
+de fildeo/toma inicial con profile, spikes=30, spikes_max=256 y profile_dl=1.
+Se pidió al usuario preparar netloader y avisar «listo»; no enviar antes.
+Comparar las mismas cubetas con P22
+`nxlink-MLBPowerPros2008-20261029-142345.log` / `elf-syms-P22.txt` usando
+`local/tmp/cpu/P20-buckets.py`. El análisis baseline quedó en
+`local/tmp/cpu/HLE1-test/P22-buckets.txt`. Aún no hay ahorro de ms/frame ni
+equivalencia visual demostrados en consola. No declarar 60 fps ni tanda medida
+solo por los tests de host.

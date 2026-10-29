@@ -1,8 +1,15 @@
 diff --git a/runtime/src/hle/gx/gx_objects.cpp b/runtime/src/hle/gx/gx_objects.cpp
-index ec98605..3350b96 100644
+index ec98605..e88acd8 100644
 --- a/runtime/src/hle/gx/gx_objects.cpp
 +++ b/runtime/src/hle/gx/gx_objects.cpp
-@@ -66,9 +66,50 @@ struct HleTlutObj {
+@@ -1,5 +1,6 @@
+ #include "gx_internal.h"
+ #include "runtime_log.h"
++#include <dolphin/gx/GXModelHle.h>
+ 
+ #include <cstddef>
+ #include <limits>
+@@ -66,9 +67,50 @@ struct HleTlutObj {
      }
  };
  
@@ -55,7 +62,7 @@ index ec98605..3350b96 100644
  
  // The texobj table. One slot per guest GXTexObj address holds both the decoded
  // metadata and the Aurora object, so GXLoadTexObj resolves everything it needs
-@@ -85,6 +126,23 @@ namespace {
+@@ -85,6 +127,23 @@ namespace {
  uint32_t g_texObjSlotMemoAddr = 0;
  TexObjSlot* g_texObjSlotMemo = nullptr;
  
@@ -79,7 +86,80 @@ index ec98605..3350b96 100644
  constexpr size_t kTexObjTableReserve = 1024;
  
  } // namespace
-@@ -237,12 +295,23 @@ TexObjSlot* FindTexObjSlot(uint32_t addr) {
+@@ -122,18 +181,11 @@ bool g_tlutObjBoundsDirty = true;
+ // word3 data address (<<5), word4 user data, word5 texFmt, word6 tlut, byte 0x1F flags. Exact
+ // bit positions are decoded inline below.
+ 
+-TexObjMeta ExtractTexObjMetaFromGuest(uint32_t addr) {
++static TexObjMeta DecodeTexObjMetaWords(const uint32_t (&word)[8]) {
+     TexObjMeta meta{};
+-    try {
+-        uint32_t word0 = Memory::Read32(addr + 0x00);
+-        uint32_t word1 = Memory::Read32(addr + 0x04);
+-        uint32_t word2 = Memory::Read32(addr + 0x08);
+-        uint32_t word3 = Memory::Read32(addr + 0x0C);
+-        uint32_t word4 = Memory::Read32(addr + 0x10);
+-        uint32_t word5 = Memory::Read32(addr + 0x14);
+-        uint32_t word6 = Memory::Read32(addr + 0x18);
+-        uint8_t flags = Memory::Read8(addr + 0x1F);
+-        
++    const uint32_t word0=word[0], word1=word[1], word2=word[2], word3=word[3];
++    const uint32_t word4=word[4], word5=word[5], word6=word[6];
++    const uint8_t flags=static_cast<uint8_t>(word[7]);
+         meta.wrapS = word0 & 0x3;
+         meta.wrapT = (word0 >> 2) & 0x3;
+         meta.width = (word2 & 0x3FF) + 1;
+@@ -188,9 +240,47 @@ TexObjMeta ExtractTexObjMetaFromGuest(uint32_t addr) {
+             return TexObjMeta{};
+         }
+         
+-    } catch (...) {
+-        // If we can't read the guest memory, return empty meta
++    return meta;
++}
++
++TexObjMeta ExtractTexObjMetaFromGuest(uint32_t addr) {
++#if defined(__SWITCH__)
++    // Only plain, fully writable RAM: keep the scalar path (including its exception and
++    // access ordering) for page crossings, MMIO and unusual mappings. G7=0 disables this too.
++    if (gx_model_hle::texture()) {
++        if (const uint8_t* ram = G7GuestTexObjHost(addr)) {
++            uint32_t word[8];
++            std::memcpy(word, ram, sizeof(word));
++            for (auto& w : word) w = __builtin_bswap32(w);
++            // word4 is user data. Decode everything else once, then restore this field.
++            // Full descriptor equality catches ordinary guest stores without cache flushes.
++            const uint32_t userData = word[4];
++            word[4] = 0;
++            struct Entry { bool valid = false; uint32_t word[8]{}; TexObjMeta decoded{}; };
++            static Entry cache[64];
++            Entry& e = cache[((word[2] * 0x9E3779B1u) ^ word[3] ^ word[0] ^ word[6]) >> 26];
++            TexObjMeta meta;
++            if (e.valid && std::memcmp(e.word, word, sizeof(word)) == 0) {
++                gx_model_hle::count(gx_model_hle::TexHit);
++                meta = e.decoded;
++            } else {
++                gx_model_hle::count(gx_model_hle::TexMiss);
++                meta = DecodeTexObjMetaWords(word);
++                std::memcpy(e.word, word, sizeof(word)); e.decoded = meta; e.valid = true;
++            }
++            // An invalid descriptor returns the default metadata, including userData=0.
++            if (meta.width != 0) meta.userData = userData;
++            return meta;
++        }
+     }
++#endif
++    TexObjMeta meta{};
++    try {
++        const uint32_t word[8] = {Memory::Read32(addr), Memory::Read32(addr+4),
++            Memory::Read32(addr+8), Memory::Read32(addr+12), Memory::Read32(addr+16),
++            Memory::Read32(addr+20), Memory::Read32(addr+24), Memory::Read8(addr+31)};
++        meta = DecodeTexObjMetaWords(word);
++    } catch (...) {}
+     return meta;
+ }
+ 
+@@ -237,12 +327,23 @@ TexObjSlot* FindTexObjSlot(uint32_t addr) {
      if (g_texObjSlotMemo != nullptr && g_texObjSlotMemoAddr == addr) {
          return g_texObjSlotMemo;
      }
@@ -103,7 +183,7 @@ index ec98605..3350b96 100644
      return g_texObjSlotMemo;
  }
  
-@@ -257,6 +326,9 @@ TexObjSlot& FindOrCreateTexObjSlot(uint32_t addr) {
+@@ -257,6 +358,9 @@ TexObjSlot& FindOrCreateTexObjSlot(uint32_t addr) {
      slot.objAddr = addr;
      g_texObjSlotMemoAddr = addr;
      g_texObjSlotMemo = &slot;
@@ -113,7 +193,7 @@ index ec98605..3350b96 100644
      return slot;
  }
  
-@@ -419,6 +491,49 @@ void EnsureTlutObjBoundsLocked() {
+@@ -419,6 +523,49 @@ void EnsureTlutObjBoundsLocked() {
      g_tlutObjBoundsDirty = false;
  }
  
@@ -163,7 +243,7 @@ index ec98605..3350b96 100644
  bool TexObjBackingDiffers(const TexObjMeta& lhs, const TexObjMeta& rhs) {
      return CanonicalizeGxMainRamAddress(lhs.dataAddr) != CanonicalizeGxMainRamAddress(rhs.dataAddr) ||
             lhs.width != rhs.width ||
-@@ -484,6 +599,50 @@ void MarkTexObjSyncedLocked(TexObjSlot& slot) noexcept {
+@@ -484,6 +631,50 @@ void MarkTexObjSyncedLocked(TexObjSlot& slot) noexcept {
  
  } // namespace
  
@@ -214,7 +294,7 @@ index ec98605..3350b96 100644
  bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
      TexObjSlot* slot = FindTexObjSlot(addr);
      if (slot != nullptr) {
-@@ -493,6 +652,16 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+@@ -493,6 +684,16 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
              // full 32-byte compare (not a generation stamp) is what catches plain guest stores
              // over the struct that never issue a cache op; see TexObjSlot::guestShadow.
              uint64_t shadow[4];
@@ -231,7 +311,7 @@ index ec98605..3350b96 100644
              if (ReadTexObjShadow(addr, shadow) && slot->hasGuestShadow &&
                  ShadowEquals(slot->guestShadow, shadow)) {
                  outMeta = *slot;
-@@ -500,6 +669,7 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+@@ -500,6 +701,7 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
              }
  
              const TexObjMeta extracted = ExtractTexObjMetaFromGuest(addr);
@@ -239,7 +319,7 @@ index ec98605..3350b96 100644
              if (IsUsableTexObjMeta(extracted) && TexObjMetaDiffers(*slot, extracted)) {
                  // The caller writes the merged result back through
                  // GetTexObjMeta, which is what re-establishes the sync.
-@@ -517,6 +687,9 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
+@@ -517,6 +719,9 @@ bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta) {
          const bool extractedUsable = IsUsableTexObjMeta(extracted);
          if (extractedUsable) {
              QueueTexObjIntervalUpdate(*slot);
@@ -249,7 +329,7 @@ index ec98605..3350b96 100644
              static_cast<TexObjMeta&>(*slot) = extracted;
              MarkTexObjSyncedLocked(*slot);
              outMeta = extracted;
-@@ -541,16 +714,243 @@ TexObjMeta& GetTexObjMeta(uint32_t addr) {
+@@ -541,16 +746,243 @@ TexObjMeta& GetTexObjMeta(uint32_t addr) {
      TexObjSlot& slot = FindOrCreateTexObjSlot(addr);
      QueueTexObjIntervalUpdate(slot);
      MarkTexObjSyncedLocked(slot);
@@ -328,8 +408,8 @@ index ec98605..3350b96 100644
 +#else
      return g_TlutObjMeta[addr];
 +#endif
- }
- 
++}
++
 +#if defined(__SWITCH__)
 +// GXInitTlutObj's write. The bounds only filter MarkTlutObjsDirtyForRange: a range outside them
 +// skips the walk, so any superset of the valid palettes' ranges marks exactly what the exact bounds
@@ -350,8 +430,8 @@ index ec98605..3350b96 100644
 +        }
 +    }
 +    return meta;
-+}
-+
+ }
+ 
 +TlutObjMeta* FindTlutObjMeta(uint32_t addr) {
 +    TlutObjCacheEntry& entry = TlutObjCacheFor(addr);
 +    if (entry.meta == nullptr) {
@@ -493,7 +573,7 @@ index ec98605..3350b96 100644
  GXTexObj* GetHostTexObj(uint32_t addr) {
      TexObjSlot* slot = FindTexObjSlot(addr);
      if (slot == nullptr || !slot->host || !slot->host->constructed) {
-@@ -563,7 +963,11 @@ GXTexObj* GetHostTexObj(uint32_t addr) {
+@@ -563,7 +995,11 @@ GXTexObj* GetHostTexObj(uint32_t addr) {
          MarkHostTexObjConstructed(addr);
          return obj;
      }
@@ -505,7 +585,7 @@ index ec98605..3350b96 100644
  }
  
  GXTexObj* CreateHostTexObj(uint32_t addr) {
-@@ -573,6 +977,9 @@ GXTexObj* CreateHostTexObj(uint32_t addr) {
+@@ -573,6 +1009,9 @@ GXTexObj* CreateHostTexObj(uint32_t addr) {
      // The shadow captured before that rewrite mismatches afterwards, so the
      // next lookup takes exactly one guest re-decode and picks those defaults
      // (and the computed mipmap maxLod) up.
@@ -515,7 +595,7 @@ index ec98605..3350b96 100644
      if (!slot.host) {
          slot.host = std::make_unique<HleTexObj>();
      } else {
-@@ -592,7 +999,11 @@ void MarkHostTexObjConstructed(uint32_t addr) {
+@@ -592,7 +1031,11 @@ void MarkHostTexObjConstructed(uint32_t addr) {
  GXTexObj* TryGetHostTexObj(uint32_t addr) {
      TexObjSlot* slot = FindTexObjSlot(addr);
      if (slot != nullptr && slot->host && slot->host->constructed) {
@@ -527,7 +607,7 @@ index ec98605..3350b96 100644
      }
      return nullptr;
  }
-@@ -610,7 +1021,7 @@ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size) {
+@@ -610,7 +1053,7 @@ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size) {
  
      const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
      const uint64_t dirtyEnd = dirtyStart + size;
@@ -536,7 +616,7 @@ index ec98605..3350b96 100644
  
      EnsureTexObjIntervalsLocked();
      const auto lower = std::lower_bound(
-@@ -660,7 +1071,11 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size) {
+@@ -660,7 +1103,11 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size) {
  }
  
  GXTlutObj* CreateHostTlutObj(uint32_t addr) {
@@ -548,7 +628,7 @@ index ec98605..3350b96 100644
      if (!slot) {
          slot = std::make_unique<HleTlutObj>();
      } else {
-@@ -671,6 +1086,12 @@ GXTlutObj* CreateHostTlutObj(uint32_t addr) {
+@@ -671,6 +1118,12 @@ GXTlutObj* CreateHostTlutObj(uint32_t addr) {
  }
  
  void MarkHostTlutObjConstructed(uint32_t addr) {
@@ -561,7 +641,7 @@ index ec98605..3350b96 100644
      auto it = g_HostTlutObjMap.find(addr);
      if (it != g_HostTlutObjMap.end() && it->second) {
          it->second->constructed = true;
-@@ -678,6 +1099,12 @@ void MarkHostTlutObjConstructed(uint32_t addr) {
+@@ -678,6 +1131,12 @@ void MarkHostTlutObjConstructed(uint32_t addr) {
  }
  
  GXTlutObj* GetHostTlutObj(uint32_t addr) {
@@ -574,7 +654,7 @@ index ec98605..3350b96 100644
      auto it = g_HostTlutObjMap.find(addr);
      if (it == g_HostTlutObjMap.end() || !it->second || !it->second->constructed) {
          const CpuContext* cpu = TryGetCpuContext();
-@@ -699,7 +1126,7 @@ void MarkTlutObjsDirtyForRange(uint32_t addr, uint32_t size) {
+@@ -699,7 +1158,7 @@ void MarkTlutObjsDirtyForRange(uint32_t addr, uint32_t size) {
  
      const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
      const uint64_t dirtyEnd = dirtyStart + size;

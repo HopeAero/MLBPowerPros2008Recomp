@@ -52,6 +52,45 @@ index a71eb74..c6538d9 100644
  #define GXSETARRAY(attr, data, size, stride, le) GXSetArray((attr), (data), (size), (stride), (le))
  #else
  void GXSetArray(GXAttr attr, const void* data, u8 stride);
+diff --git a/aurora-main/include/dolphin/gx/GXModelHle.h b/aurora-main/include/dolphin/gx/GXModelHle.h
+new file mode 100644
+index 0000000..cd3a930
+--- /dev/null
++++ b/aurora-main/include/dolphin/gx/GXModelHle.h
+@@ -0,0 +1,33 @@
++#pragma once
++#if defined(__SWITCH__)
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++// HLE1: independent kill switches; no global runtime headers or guest ABI changes.
++namespace gx_model_hle {
++inline bool flag(const char* name, bool fallback = true) {
++  const char* v = std::getenv(name);
++  return v ? v[0] != '0' : fallback;
++}
++inline bool tev() { static const bool v = flag("WIICOMPILED_GX_MODEL_TEV"); return v; }
++inline bool texture() { static const bool v = flag("WIICOMPILED_GX_MODEL_TEXTURE"); return v; }
++inline bool tlut() { static const bool v = flag("WIICOMPILED_GX_MODEL_TLUT"); return v; }
++inline bool profile() { static const bool v = flag("WIICOMPILED_GX_MODEL_PROFILE", false); return v; }
++enum Counter { TevHit, TevMiss, TexHit, TexMiss, TlutHit, TlutMiss, Count };
++inline std::atomic<uint64_t> counters[Count]{};
++inline void count(Counter c) {
++  if (!profile()) return;
++  // Optional only. Atomics also support the experimental HLE worker, kept off by default.
++  const auto n = counters[c].fetch_add(1, std::memory_order_relaxed) + 1;
++  if ((n & 16383u) != 0) return;
++  std::fprintf(stderr, "[model-hle] tev=%llu/%llu tex=%llu/%llu tlut=%llu/%llu (hit/miss cumulative)\n",
++    (unsigned long long)counters[TevHit].load(std::memory_order_relaxed),
++    (unsigned long long)counters[TevMiss].load(std::memory_order_relaxed),
++    (unsigned long long)counters[TexHit].load(std::memory_order_relaxed),
++    (unsigned long long)counters[TexMiss].load(std::memory_order_relaxed),
++    (unsigned long long)counters[TlutHit].load(std::memory_order_relaxed),
++    (unsigned long long)counters[TlutMiss].load(std::memory_order_relaxed));
++}
++}
++#endif
 diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
 index bc80c3c..9c03ef3 100644
 --- a/aurora-main/lib/aurora.cpp
@@ -1171,10 +1210,17 @@ index ccefbbc..dbf4dee 100644
    CHECK(vcd != nullptr, "null vtx desc list");
  
 diff --git a/aurora-main/lib/dolphin/gx/GXLighting.cpp b/aurora-main/lib/dolphin/gx/GXLighting.cpp
-index f7331c6..ccc1ea1 100644
+index f7331c6..afc65b6 100644
 --- a/aurora-main/lib/dolphin/gx/GXLighting.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXLighting.cpp
-@@ -131,7 +131,11 @@ void GXInitLightColor(GXLightObj* light_, GXColor col) {
+@@ -1,5 +1,6 @@
+ #include "gx.hpp"
+ #include "__gx.h"
++#include <dolphin/gx/GXModelHle.h>
+ 
+ extern "C" {
+ void GXInitLightAttn(GXLightObj* light_, float a0, float a1, float a2, float k0, float k1, float k2) {
+@@ -131,7 +132,11 @@ void GXInitLightColor(GXLightObj* light_, GXColor col) {
  }
  
  void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
@@ -1186,7 +1232,7 @@ index f7331c6..ccc1ea1 100644
    auto* light = reinterpret_cast<const GXLightObj_*>(light_);
  
    // XF bulk write: 16 values at light base address
-@@ -143,6 +147,33 @@ void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
+@@ -143,6 +148,33 @@ void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
    u32 colorPacked = (static_cast<u32>(light->color.r) << 24) | (static_cast<u32>(light->color.g) << 16) |
                      (static_cast<u32>(light->color.b) << 8) | static_cast<u32>(light->color.a);
  
@@ -1220,7 +1266,7 @@ index f7331c6..ccc1ea1 100644
    GX_WRITE_U8(0x10);
    GX_WRITE_U32(reg);
    // Padding (3 u32s)
-@@ -169,6 +200,46 @@ void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
+@@ -169,6 +201,46 @@ void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
    GX_WRITE_F32(light->nz);
  }
  
@@ -1267,6 +1313,45 @@ index f7331c6..ccc1ea1 100644
  void GXSetChanAmbColor(GXChannelID id, GXColor color) {
    if (id == GX_COLOR0A0) {
      GXSetChanAmbColor(GX_COLOR0, color);
+@@ -262,6 +334,11 @@ void GXInitSpecularDirHA(GXLightObj* light_, float nx, float ny, float nz, float
+ 
+ void GXSetChanCtrl(GXChannelID id, bool lightingEnabled, GXColorSrc ambSrc, GXColorSrc matSrc, u32 lightState,
+                    GXDiffuseFn diffFn, GXAttnFn attnFn) {
++#if defined(__SWITCH__)
++  const bool paired = gx_model_hle::tev() && !gx_fifo_packet::direct() &&
++      (id == GX_COLOR0A0 || id == GX_COLOR1A1);
++  if (!paired)
++#endif
+   if (id == GX_COLOR0A0) {
+     GXSetChanCtrl(GX_COLOR0, lightingEnabled, ambSrc, matSrc, lightState, diffFn, attnFn);
+     GXSetChanCtrl(GX_ALPHA0, lightingEnabled, ambSrc, matSrc, lightState, diffFn, attnFn);
+@@ -271,7 +348,8 @@ void GXSetChanCtrl(GXChannelID id, bool lightingEnabled, GXColorSrc ambSrc, GXCo
+     GXSetChanCtrl(GX_ALPHA1, lightingEnabled, ambSrc, matSrc, lightState, diffFn, attnFn);
+     return;
+   }
+-  CHECK(id >= GX_COLOR0 && id <= GX_ALPHA1, "bad channel {}", static_cast<int>(id));
++  CHECK((id >= GX_COLOR0 && id <= GX_ALPHA1) || id == GX_COLOR0A0 || id == GX_COLOR1A1,
++        "bad channel {}", static_cast<int>(id));
+ 
+   // Build XF channel control register
+   u32 reg = 0;
+@@ -284,6 +362,16 @@ void GXSetChanCtrl(GXChannelID id, bool lightingEnabled, GXColorSrc ambSrc, GXCo
+   SET_REG_FIELD(0, reg, 1, 10, (attnFn != GX_AF_SPEC));  // raw XF attn bit 1
+   SET_REG_FIELD(0, reg, 4, 11, (lightState >> 4) & 0xF); // lights 4-7
+ 
++#if defined(__SWITCH__)
++  if (paired) {
++    const u32 channel = id == GX_COLOR0A0 ? GX_COLOR0 : GX_COLOR1;
++    u8 bytes[18]; gx_fifo_packet::Writer p{bytes};
++    p.u8_(0x10); p.u32_(0x100E + channel); p.u32_(reg);
++    p.u8_(0x10); p.u32_(0x1010 + channel); p.u32_(reg);
++    p.send(bytes); __gx->bpSent = 0;
++    return;
++  }
++#endif
+   // XF channel control registers: 0x100E-0x1011
+   GX_WRITE_XF_REG(0xE + id, reg);
+   __gx->bpSent = 0;
 diff --git a/aurora-main/lib/dolphin/gx/GXManage.cpp b/aurora-main/lib/dolphin/gx/GXManage.cpp
 index 80b3b92..789dc44 100644
 --- a/aurora-main/lib/dolphin/gx/GXManage.cpp
@@ -1335,11 +1420,61 @@ index 80b3b92..789dc44 100644
    }
    __gx->dirtyState = 0;
  }
+diff --git a/aurora-main/lib/dolphin/gx/GXTev.cpp b/aurora-main/lib/dolphin/gx/GXTev.cpp
+index 8b021fe..2e3580f 100644
+--- a/aurora-main/lib/dolphin/gx/GXTev.cpp
++++ b/aurora-main/lib/dolphin/gx/GXTev.cpp
+@@ -1,8 +1,28 @@
+ #include "gx.hpp"
+ #include "__gx.h"
++#include <dolphin/gx/GXModelHle.h>
+ 
+ extern "C" {
+ void GXSetTevOp(GXTevStageID id, GXTevMode mode) {
++#if defined(__SWITCH__)
++  struct Memo { bool valid = false; GXTevMode mode{}; u32 color = 0, alpha = 0; };
++  static Memo memo[GX_MAX_TEVSTAGE];
++  const bool replay = gx_model_hle::tev() && !gx_fifo_packet::direct() &&
++      static_cast<u32>(id) < GX_MAX_TEVSTAGE && static_cast<u32>(mode) <= GX_PASSCLR;
++  if (replay) {
++    const auto& m = memo[id];
++    if (m.valid && m.mode == mode && __gx->tevc[id] == m.color && __gx->teva[id] == m.alpha) {
++      // At the preset's fixed point each intermediate value equals its final value.
++      // Retain all four BP writes, their order, and bpSent; only packing/dispatch is skipped.
++      u8 bytes[20]; gx_fifo_packet::Writer p{bytes};
++      p.ras_reg(m.color); p.ras_reg(m.alpha); p.ras_reg(m.color); p.ras_reg(m.alpha);
++      p.send(bytes); __gx->bpSent = 1;
++      gx_model_hle::count(gx_model_hle::TevHit);
++      return;
++    }
++    gx_model_hle::count(gx_model_hle::TevMiss);
++  }
++#endif
+   GXTevColorArg inputColor = GX_CC_RASC;
+   GXTevAlphaArg inputAlpha = GX_CA_RASA;
+   if (id != GX_TEVSTAGE0) {
+@@ -33,6 +53,9 @@ void GXSetTevOp(GXTevStageID id, GXTevMode mode) {
+   }
+   GXSetTevColorOp(id, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+   GXSetTevAlphaOp(id, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
++#if defined(__SWITCH__)
++  if (replay) memo[id] = {true, mode, __gx->tevc[id], __gx->teva[id]};
++#endif
+ }
+ 
+ void GXSetTevColorIn(GXTevStageID stageId, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d) {
 diff --git a/aurora-main/lib/dolphin/gx/GXTexture.cpp b/aurora-main/lib/dolphin/gx/GXTexture.cpp
-index 684ba79..be8f5e4 100644
+index 684ba79..e14b1fa 100644
 --- a/aurora-main/lib/dolphin/gx/GXTexture.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXTexture.cpp
-@@ -60,6 +60,10 @@ struct TlutIdentityRecord {
+@@ -1,5 +1,6 @@
+ #include "gx.hpp"
+ #include "__gx.h"
++#include <dolphin/gx/GXModelHle.h>
+ 
+ #include "../../gfx/texture.hpp"
+ #include "../../gfx/texture_replacement.hpp"
+@@ -60,6 +61,10 @@ struct TlutIdentityRecord {
    u32 objId = 0;
    u32 dataVersion = 0;
    u64 digest = 0;
@@ -1350,7 +1485,13 @@ index 684ba79..be8f5e4 100644
  };
  
    // Limit cached palette IDs; evicted palettes are safely uploaded again.
-@@ -81,6 +85,47 @@ std::pair<u32, u32> resolve_tlut_identity(const void* data, GXTlutFmt format, u1
+@@ -76,11 +81,52 @@ u32 next_repointed_tlut_data_version() {
+   return 0x80000000u | ++sNextRepointedTlutDataVersion;
+ }
+ 
+-std::pair<u32, u32> resolve_tlut_identity(const void* data, GXTlutFmt format, u16 entries) {
++std::pair<u32, u32> resolve_tlut_identity_uncached(const void* data, GXTlutFmt format, u16 entries) {
+   if (data == nullptr || entries == 0) {
      return {next_tlut_obj_id(), 1};
    }
  
@@ -1398,7 +1539,40 @@ index 684ba79..be8f5e4 100644
    const auto digest =
        static_cast<u64>(aurora::xxh3_hash_s(data, static_cast<size_t>(entries) * sizeof(u16)));
    if (sTlutIdentities.size() >= MaxTlutIdentities) {
-@@ -174,6 +219,34 @@ void emit_loaded_tlut_metadata(const GXTlutObj_& obj, u32 idx) {
+@@ -110,6 +156,32 @@ std::pair<u32, u32> resolve_tlut_identity(const void* data, GXTlutFmt format, u1
+   return {record.objId, record.dataVersion};
+ }
+ 
++std::pair<u32, u32> resolve_tlut_identity(const void* data, GXTlutFmt format, u16 entries) {
++#if defined(__SWITCH__)
++  struct Memo { bool valid = false; TlutIdentity key{}; u64 generation = 0; std::pair<u32, u32> result{}; };
++  static Memo memo;
++  if (gx_model_hle::tlut() && aurora::gx::fifo::a3_enabled() && data && entries) {
++    const TlutIdentity key{data, static_cast<u32>(format), entries};
++    const u64 generation = aurora::guest_write_generation(data, static_cast<size_t>(entries) * sizeof(u16));
++    // At the capacity limit the old path clears the table and mints a new identity, even for a hit.
++    if (memo.valid && memo.key == key && sTlutIdentities.size() < MaxTlutIdentities &&
++        aurora::guest_write_generation_matches(memo.generation, generation)) {
++      ++aurora_gx_a3_counters[aurora::gx::fifo::kA3TlutDigestsSkipped];
++      gx_model_hle::count(gx_model_hle::TlutHit);
++      return memo.result;
++    }
++    gx_model_hle::count(gx_model_hle::TlutMiss);
++    memo.valid = false;
++    const auto result = resolve_tlut_identity_uncached(data, format, entries);
++    memo = {true, key, generation, result};
++    return result;
++  }
++  // Legacy/untracked calls can update the same record or clear the whole table.
++  memo.valid = false;
++#endif
++  return resolve_tlut_identity_uncached(data, format, entries);
++}
++
+ int __cntlzw(unsigned int val) {
+   if (val == 0)
+     return 32; // PowerPC returns 32 if the input is 0
+@@ -174,6 +246,34 @@ void emit_loaded_tlut_metadata(const GXTlutObj_& obj, u32 idx) {
    GX_WRITE_U32(obj.tlutObjId);
    GX_WRITE_U32(obj.tlutDataVersion);
  }
@@ -1433,7 +1607,7 @@ index 684ba79..be8f5e4 100644
  } // namespace
  
  extern "C" {
-@@ -211,12 +284,46 @@ void GXInitTexObjLOD(GXTexObj* obj_, GXTexFilter minFilt, GXTexFilter magFilt, f
+@@ -211,12 +311,46 @@ void GXInitTexObjLOD(GXTexObj* obj_, GXTexFilter minFilt, GXTexFilter magFilt, f
    SET_REG_FIELD(0, obj->mode1, 8, 8, static_cast<u8>(16.0f * clampedMax));
  }
  
@@ -1480,7 +1654,7 @@ index 684ba79..be8f5e4 100644
  void GXInitTexObjWrapMode(GXTexObj* obj_, GXTexWrapMode wrapS, GXTexWrapMode wrapT) {
    auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
    SET_REG_FIELD(0, obj->mode0, 2, 0, wrapS);
-@@ -278,18 +385,56 @@ void* GXGetTexObjUserData(const GXTexObj* obj_) {
+@@ -278,18 +412,56 @@ void* GXGetTexObjUserData(const GXTexObj* obj_) {
    return const_cast<void*>(obj->userData);
  }
  
@@ -1539,7 +1713,7 @@ index 684ba79..be8f5e4 100644
    GX_WRITE_RAS_REG(obj->mode0);
    GX_WRITE_RAS_REG(obj->mode1);
    GX_WRITE_RAS_REG(obj->image0);
-@@ -419,6 +564,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
+@@ -419,6 +591,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
  
  void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
    auto* obj = reinterpret_cast<const GXTlutObj_*>(obj_);

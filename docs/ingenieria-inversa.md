@@ -1232,3 +1232,48 @@ epoch no demuestra que una lista guest permanezca inmutable mientras otro hilo
 la lee. Fuentes: `runtime/include/memory_access.h`, `memory.cpp`,
 `gx_guest_write.h` y `gx_dl.cpp` del árbol Switch fijado; informe privado
 `local/tmp/cpu/GX-Q74-guest-epoch.md`.
+
+## 17. Presets de materiales y descriptores GX (RL8E54, HLE1, 2026-10-29)
+
+Fuentes: lectura del código traducido `800452E4`, `80044B7C`, `80053464` y
+del runtime/Aurora fijados; pruebas diferenciales de host privadas en
+`local/tmp/cpu/HLE1-test/`. Esto describe efectos observados en código y pruebas,
+no una validación de imagen en GPU.
+
+El preset texturado de `800452E4` aplica `GXSetTevOp(GX_MODULATE)` a una etapa
+y configura otra con setters de entradas/operaciones. En Aurora, `GXSetTevOp`
+emite cuatro registros BP en orden color/alpha/color/alpha. Cuando los registros
+vivos `tevc` y `teva` ya coinciden con el resultado del mismo preset, cada valor
+intermedio coincide con el final. Es posible reutilizar ese resultado y juntar
+las cuatro escrituras conservando exactamente sus bytes y `bpSent=1`. El último
+argumento por sí solo no demuestra equivalencia: otra llamada puede modificar
+esos registros. La grabación de listas conserva la ruta anterior para respetar
+sus escrituras parciales al desbordar. Los canales combinados `COLOR0A0/1A1`
+emiten dos controles XF iguales; se puede calcular el control una vez y conservar
+ambas escrituras y `bpSent=0`.
+
+La decodificación guest de `GXTexObj` depende solo de sus 32 bytes. El word de
+usuario en `+16` se puede separar de la clave del descriptor y devolver su valor
+actual; sigue siendo cero en metadatos inválidos. La caché de HLE1 compara el
+descriptor completo restante, sin usar generaciones para demostrar su igualdad.
+Solo toma snapshots directos en páginas RAM completamente escribibles; los
+cruces de página y las demás rutas conservan los accesos escalares originales.
+No reutiliza texeles, objetos host ni resultados de carga: P19/G7, los flags de
+upload y las invalidaciones por DCFlush/DMA siguen decidiendo esas operaciones.
+
+La identidad TLUT de Aurora depende de puntero de datos, formato y número de
+entradas; su versión cambia con el digest. A3 permite evitar el digest mientras
+coincida una generación rastreable. HLE1 recuerda por valor la última respuesta
+bajo el mismo contrato. No guarda punteros a elementos del mapa Abseil, que
+puede moverlos al crecer. Al alcanzar 4096 identidades, la ruta anterior vacía el
+mapa incluso si la siguiente clave ya existía: ese caso debe invalidar también
+el atajo. Las llamadas por la ruta sin A3 invalidan el memo, pues pueden cambiar
+versiones sin notificación de generación. `GXInitTlutObj`, el registro de
+reemplazos y `GXLoadTlut` siguen ejecutándose.
+
+Corrección del mapa P21, confirmada por P23: el contador de texcoords que
+incrementa `80044B7C` está en `gfx+8592`; `80044B54` lo reinicia y
+`GXSetNumTexGens` recibe los ocho bits bajos. `800613BC` también limpia
+`gfx+8588`. En `80053464`, `gfx+8283 != 0` selecciona filtros lineales; si es
+cero selecciona nearest. El campo de precarga `slot+124` se solapa con el `+4`
+del siguiente slot; el código solo consulta su signo.
