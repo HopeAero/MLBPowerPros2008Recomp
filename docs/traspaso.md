@@ -307,6 +307,15 @@ Pasaron diferenciales y build Horizon, sin modificar los 48.223 archivos
 traducidos. NRO privada `local/switch/build/HLE1-round2.nro`, SHA-256
 `e81cd3c0622ac1822c1124d6b316bac4163794c6692cf7e14047c210973920fa`;
 símbolos `local/switch/logs/elf-syms-HLE1-round2.txt`. No atribuirle los números
-de consola de la versión inicial: todavía no se midió esta revisión.
+de consola de la versión inicial.
 El usuario pidió priorizar más código y evitar seguir repitiendo pruebas
 manuales; se usaron los diferenciales automáticos existentes para esta revisión.
+
+**Medición posterior:** log `nxlink-HLE1-round2-20261029-182140.log`, seis
+volcados completos, cierre normal. Usuario confirmó mismos relojes sin
+overclock. Aciertos textura/TLUT: 45,9%/75,5% frente a 28,0%/13,4% iniciales.
+En cubetas comunes 240–479, CPU ocupada muestreada estandarizada 9,541 →
+8,992 ms (−0,549 ms); resultados heterogéneos entre escenas, sin replay idéntico
+ni garantía de ahorro causal. No hay errores GX registrados. El usuario nota
+una mejoría leve, pero el fildeo sigue sin 60 fps estables. Detalle y límites en
+[la actualización del informe](hle-model-round1.md#medición-de-la-revisión-posterior-a-0918d42).

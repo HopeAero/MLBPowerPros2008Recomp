@@ -54,6 +54,45 @@ y la compilación Horizon; las dos nuevas comprobaciones de lecturas de sombra
 y alternancia de ocho paletas fallaban antes del cambio. NRO privada
 `HLE1-round2.nro`, SHA-256
 `e81cd3c0622ac1822c1124d6b316bac4163794c6692cf7e14047c210973920fa`.
-Esta revisión aún no está medida en Switch. Informes, comandos, comparaciones
-y pruebas permanecen bajo `local/tmp/cpu/HLE1-test/`; ningún log ni contenido
+La medición posterior se registra a continuación. Informes, comandos,
+comparaciones y pruebas permanecen bajo `local/tmp/cpu/HLE1-test/`; ningún log ni contenido
 del juego se incluye en el repositorio.
+
+## Medición de la revisión, posterior a `0918d42`
+
+Se probó la misma NRO `HLE1-round2.nro`; log privado
+`nxlink-HLE1-round2-20261029-182140.log`, símbolos
+`elf-syms-HLE1-round2.txt`. El usuario confirmó los mismos relojes que en las
+capturas anteriores, sin overclock; es confirmación del usuario, sin telemetría
+de frecuencias en el log. Informó una mejoría leve y que el fildeo aún no sostiene
+60 fps estables. La captura cerró normalmente y contiene seis volcados `[pdl]`.
+No se pidieron más partidas para completar otra ventana.
+
+| Métrica | Primera candidata | Revisión |
+|---|---:|---:|
+| Aciertos de descriptor de textura | 28,0% | 45,9% |
+| Aciertos de identidad TLUT | 13,4% | 75,5% |
+| CPU ocupada muestreada, cubetas comunes 240–479 | 9,541 ms | 8,992 ms |
+| Grupo texturas en esas cubetas | 0,694 ms | 0,581 ms |
+| Grupo TLUT en esas cubetas | 0,308 ms | 0,284 ms |
+
+Las cubetas usadas fueron 240–279, 280–319, 320–359, 360–399 y 440–479,
+con pesos 1713/1483/871/401/257, el mínimo de frames entre ambas capturas.
+La diferencia observada es −0,549 ms (−5,75%) de CPU ocupada, no de tiempo
+completo de frame. La mejora no es uniforme: 280–319 pasó de 8,352 a 10,940 ms;
+480–519, fuera de esa estandarización, pasó de 6,400 a 9,212 ms. En 600–639
+solo hubo 49 frames, insuficientes para comparar la toma más pesada.
+
+Con los mismos criterios, las diferencias globales observadas fueron −0,283 ms
+frente al control TEV/texturas apagados y −0,799 ms frente a P22; cada comparación
+usa sus propias cubetas/pesos comunes. No son tres estimaciones independientes
+del ahorro causal. Cambian las escenas, las duraciones y la distribución dentro
+de cada cubeta; además, el perfil omite PCs con menos de tres muestras. Los
+resultados apoyan una mejoría modesta, sin demostrar un porcentaje garantizado
+ni 60 fps estables. No se registraron errores GX; sigue sin ser validación
+pixel a pixel ni un replay del mismo estado.
+
+Análisis reproducibles privados: `round2-buckets.txt`, `round2-vs-round1.txt`,
+`round2-vs-control.txt` y `round2-vs-P22.txt` en `local/tmp/cpu/HLE1-test/`.
+El perfil conserva coste en `HleFifoWrite`, preparación de listas, arrays/VCD y
+publicación FIFO; esos son candidatos posteriores a esta tanda.
