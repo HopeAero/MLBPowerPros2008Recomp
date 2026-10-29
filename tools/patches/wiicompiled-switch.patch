@@ -9172,7 +9172,7 @@ index 49fed99..2593379 100644
  }
  
 diff --git a/runtime/src/hle/gx/gx_dl.cpp b/runtime/src/hle/gx/gx_dl.cpp
-index 818478d..74decd2 100644
+index 818478d..a2fe751 100644
 --- a/runtime/src/hle/gx/gx_dl.cpp
 +++ b/runtime/src/hle/gx/gx_dl.cpp
 @@ -10,14 +10,49 @@
@@ -9935,7 +9935,19 @@ index 818478d..74decd2 100644
      }
      return ok;
  }
-@@ -1298,6 +1803,21 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1292,12 +1797,33 @@ extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
+     GxGuestWrite::NotifyWrite(addr, size);
+ }
+ 
++#if defined(__SWITCH__)
++extern "C" void SwitchProfilerCountDl();
++#endif
+ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes) {
++#if defined(__SWITCH__)
++    SwitchProfilerCountDl();  // platform/switch/switch_profiler.cpp (P20, WIICOMPILED_SWITCH_PROFILE_DL)
++#endif
+     if (nbytes == 0 || listAddr == 0) return;
+     try {
          const uint8_t* list = static_cast<const uint8_t*>(GuestToHostPtr(listAddr, nbytes));
          if (!list) return;
  
@@ -9957,7 +9969,7 @@ index 818478d..74decd2 100644
          const bool allowScanCache = nbytes <= kDlScanCacheMaxEntryBytes;
          const uint64_t scanLayoutHash = allowScanCache ? HashScanLayoutState() : 0;
          // The digest is computed lazily inside the probe: an entry whose covering
-@@ -1310,11 +1830,30 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1310,11 +1836,30 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
  
          // The scan a cached record came from already walked the list for this,
          // so only a miss pays for DisplayListMayContainDraw.
@@ -9988,7 +10000,7 @@ index 818478d..74decd2 100644
              GXCallDisplayList(list, nbytes);
              // The republish is required even for register-only lists (verified by
              // experiment: dropping it corrupts in-race geometry decode). It is
-@@ -1330,6 +1869,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1330,6 +1875,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
          bool dlHasNestedDl = false;
          bool dlHasArrayStateWrites = false;
          bool dlHasCpWrites = false;
@@ -9996,7 +10008,7 @@ index 818478d..74decd2 100644
  
          HleGxVertexStateSnapshot stateBeforeScan;
          bool haveStateBeforeScan = false;
-@@ -1339,11 +1879,34 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1339,11 +1885,34 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
          bool flattenOk = false;
          const uint8_t* auroraStream = nullptr;
          uint32_t auroraStreamBytes = 0;
@@ -10031,7 +10043,7 @@ index 818478d..74decd2 100644
              maxXfIdx = entry.maxXfIdx;
              maxXfBytes = entry.maxXfBytes;
              sawXfIdx = entry.sawXfIdx;
-@@ -1369,8 +1932,17 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1369,8 +1938,17 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                      auroraStream = list;
                      auroraStreamBytes = nbytes;
                  } else {
@@ -10051,7 +10063,7 @@ index 818478d..74decd2 100644
                  }
              }
          } else {
-@@ -1382,6 +1954,15 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1382,6 +1960,15 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              scanOk = ScanDisplayListMaxIndices(list, nbytes, maxIdx, sawIdx, maxXfIdx, maxXfBytes, sawXfIdx,
                                                 &dlVtxFmt, &dlVtxFmtMixed, &dlHasNestedDl,
                                                 &dlHasArrayStateWrites, &dlHasCpWrites, &cpWrites);
@@ -10067,7 +10079,7 @@ index 818478d..74decd2 100644
              needsFlatten = dlHasNestedDl || dlHasArrayStateWrites || dlHasCpWrites;
              bool flattenVerbatim = true;
              auto& flattened = FlattenDisplayListScratch();
-@@ -1410,6 +1991,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1410,6 +1997,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                  entry.layoutHash = scanLayoutHash;
                  entry.maxIdx = maxIdx;
                  entry.sawIdx = sawIdx;
@@ -10075,7 +10087,7 @@ index 818478d..74decd2 100644
                  entry.maxXfIdx = maxXfIdx;
                  entry.maxXfBytes = maxXfBytes;
                  entry.sawXfIdx = sawXfIdx;
-@@ -1426,10 +2008,22 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1426,10 +2014,22 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
  
                  const uint64_t contentDigest =
                      probe.digestValid ? probe.contentDigest : DlContentDigest(list, nbytes);
@@ -10099,7 +10111,7 @@ index 818478d..74decd2 100644
              }
          }
  
-@@ -1439,7 +2033,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1439,7 +2039,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                  ApplyAuroraVtxDesc();
                  ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);
                  const bool flattenArraysOk =
@@ -10108,7 +10120,7 @@ index 818478d..74decd2 100644
                  const bool flattenXfOk =
                      ApplyAuroraIndexedXFArraysForDisplayList(maxXfIdx, maxXfBytes, sawXfIdx);
                  flattenApplyOk = flattenArraysOk && flattenXfOk;
-@@ -1447,6 +2041,11 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1447,6 +2047,11 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              if (flattenApplyOk) {
                  EnsureAuroraFrameActive();
                  GXMarkFrameWork();
@@ -10120,7 +10132,7 @@ index 818478d..74decd2 100644
                  GXCallDisplayList(auroraStream, auroraStreamBytes);
                  // No flip back to GX_DIRECT here
                  SyncAppliedVtxStateFromHleReal();
-@@ -1460,13 +2059,18 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1460,13 +2065,18 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              if (scanOk) {
                  ApplyAuroraVtxDesc();
                  ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);

@@ -9804,10 +9804,10 @@ index 0000000..e01a61b
 +#endif
 diff --git a/runtime/src/platform/switch/switch_profiler.cpp b/runtime/src/platform/switch/switch_profiler.cpp
 new file mode 100644
-index 0000000..4474290
+index 0000000..9605442
 --- /dev/null
 +++ b/runtime/src/platform/switch/switch_profiler.cpp
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,548 @@
 +// Sampling profiler on Horizon: svcSetThreadActivity pauses the main thread (which runs the guest
 +// fibers), svcGetThreadContext3 reads where it is, and it resumes. Started and dumped by the match
 +// benchmark (match_benchmark_overlay.inc) when WIICOMPILED_SWITCH_PROFILE=1.
@@ -10014,6 +10014,41 @@ index 0000000..4474290
 +    ++g_gxSamples;
 +}
 +
++// WIICOMPILED_SWITCH_PROFILE_DL=1 (with a free-running spike capture): main-thread PC histograms
++// bucketed by the previous host frame's GX__CallDisplayList calls (a proxy for the models on camera:
++// players, bats, the ball), cumulative, printed every 30 s ([pdl] lines), to find the code whose
++// per-frame cost grows with the players on screen. Buckets of kDlWidth calls; the sampler fills and
++// prints the histograms, the main thread only counts and picks the bucket once per host frame.
++constexpr u32 kDlBuckets = 16, kDlWidth = 40;
++std::atomic<u32> g_dlCalls{0}, g_dlBucket{0};
++std::atomic<u32> g_dlFrames[kDlBuckets];
++std::unordered_map<u64, u32> g_dlPc[kDlBuckets];
++u64 g_dlLastPrint = 0;
++bool DlProfileOn() {
++    static const bool on = [] {
++        const char* v = std::getenv("WIICOMPILED_SWITCH_PROFILE_DL");
++        return v != nullptr && v[0] == '1';
++    }();
++    return on;
++}
++void DlMaybePrint() {
++    if (!DlProfileOn() || !g_spkFree) return;
++    const u64 now = armGetSystemTick();
++    if (!g_dlLastPrint) g_dlLastPrint = now;
++    if (armTicksToNs(now - g_dlLastPrint) < 30'000'000'000ull) return;
++    g_dlLastPrint = now;
++    std::fprintf(stderr, "[pdl] anchor=0x%lx width=%u\n", reinterpret_cast<u64>(&SwitchProfilerStart), kDlWidth);
++    for (u32 b = 0; b < kDlBuckets; ++b) {
++        const u32 frames = g_dlFrames[b].load(std::memory_order_relaxed);
++        if (!frames) continue;
++        std::fprintf(stderr, "[pdl] bucket=%u frames=%u\n", b, frames);
++        for (const auto& [pc, count] : g_dlPc[b]) {
++            if (count >= 3) std::fprintf(stderr, "[pdl] P %u %lx %u\n", b, pc, count);
++        }
++    }
++    std::fflush(stderr);
++}
++
 +void SampleOnce(Handle main) {
 +    if (R_FAILED(svcSetThreadActivity(main, ThreadActivity_Paused))) { ++g_failed; return; }
 +    ThreadContext context{};
@@ -10037,6 +10072,7 @@ index 0000000..4474290
 +    ++g_pc[context.pc.x];
 +    ++g_lr[context.lr];
 +    ++g_samples;
++    if (DlProfileOn()) ++g_dlPc[g_dlBucket.load(std::memory_order_relaxed)][context.pc.x];
 +    const u64 start = g_frameStart.load(std::memory_order_relaxed);
 +    if (start && armTicksToNs(armGetSystemTick() - start) > 17'000'000) {
 +        ++g_latePc[context.pc.x];
@@ -10089,6 +10125,7 @@ index 0000000..4474290
 +        SampleOnce(main);
 +        SpkMaybeFlush();
 +        WindowMaybeFlush();
++        DlMaybePrint();
 +    }
 +}
 +} // namespace
@@ -10219,6 +10256,11 @@ index 0000000..4474290
 +    if (!wanted) return;
 +    if (g_spkFree) {
 +        SpkMark(armGetSystemTick());
++        if (DlProfileOn()) {
++            const u32 bucket = std::min(g_dlCalls.exchange(0, std::memory_order_relaxed) / kDlWidth, kDlBuckets - 1);
++            g_dlBucket.store(bucket, std::memory_order_relaxed);
++            g_dlFrames[bucket].fetch_add(1, std::memory_order_relaxed);
++        }
 +        return;
 +    }
 +    static bool tried = false;
@@ -10294,6 +10336,9 @@ index 0000000..4474290
 +    g_spkThresholdNs = 0;
 +}
 +} // namespace
++
++// GX__CallDisplayList_80172f64 (runtime/src/hle/gx/gx_dl.cpp): one per display-list call (P20).
++extern "C" void SwitchProfilerCountDl() { g_dlCalls.fetch_add(1, std::memory_order_relaxed); }
 +
 +extern "C" void SwitchProfilerDump() {
 +    if (!g_running.exchange(false)) return;
