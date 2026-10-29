@@ -9281,6 +9281,32 @@ index 0bb8fa0..fd2c16c 100644
  };
  
  AXWii& Instance() {
+diff --git a/runtime/src/hle/gx/gx_batch_array.inc b/runtime/src/hle/gx/gx_batch_array.inc
+new file mode 100644
+index 0000000..7e2b27f
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_batch_array.inc
+@@ -0,0 +1,20 @@
++// GX preparation: full writable pages already prove a plain guest RAM mapping.
++// Resolve the requested span once instead of Contains plus GetPointer. Do not retain
++// a pointer across calls: remapping and executable-page guards stay authoritative.
++static const uint8_t* ResolveDisplayListArray(uint32_t base,uint32_t span) {
++#if defined(__SWITCH__)
++    if (GxBatch::PrepEnabled() && base && span) {
++        const uint32_t end=base+span-1u;
++        if (end>=base && (end>>MemoryInline::kPageShift)==(base>>MemoryInline::kPageShift)) {
++            const uintptr_t bias=MemoryInline::g_fullWritablePageBias[base>>MemoryInline::kPageShift];
++            if (bias) {
++                GxBatch::CountHit(GxBatch::ArrayDirect);
++                return reinterpret_cast<const uint8_t*>((bias-1u)+base);
++            }
++        }
++    }
++    GxBatch::CountHit(GxBatch::ArrayFallback);
++#endif
++    if (!Memory::Contains(base,span)) return nullptr;
++    return static_cast<const uint8_t*>(GuestToHostPtr(base,span));
++}
 diff --git a/runtime/src/hle/gx/gx_batch_dl.inc b/runtime/src/hle/gx/gx_batch_dl.inc
 new file mode 100644
 index 0000000..01d4e89
@@ -9404,10 +9430,10 @@ index 0000000..7657460
 +}
 diff --git a/runtime/src/hle/gx/gx_batch_profile.h b/runtime/src/hle/gx/gx_batch_profile.h
 new file mode 100644
-index 0000000..f09ce94
+index 0000000..120399f
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_batch_profile.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,30 @@
 +#pragma once
 +#if defined(__SWITCH__)
 +#include <atomic>
@@ -9418,19 +9444,23 @@ index 0000000..f09ce94
 +inline bool Flag(const char* name, bool fallback = true) { const char* v=std::getenv(name); return v ? v[0]!='0' : fallback; }
 +inline bool FifoEnabled() { static const bool v=Flag("WIICOMPILED_GX_BATCH_FIFO"); return v; }
 +inline bool DlEnabled() { static const bool v=Flag("WIICOMPILED_GX_BATCH_DL"); return v; }
++inline bool PrepEnabled() { static const bool v=Flag("WIICOMPILED_GX_BATCH_PREP"); return v; }
 +inline bool Profile() { static const bool v=Flag("WIICOMPILED_GX_BATCH_PROFILE",false); return v; }
-+enum Counter { ScalarWords, BurstWords, CachedDl, CacheFallback, XfWords, Count };
++enum Counter { ScalarWords, BurstWords, CachedDl, CacheFallback, XfWords, ArrayDirect, ArrayFallback, VatRow, Count };
 +inline std::atomic<uint64_t> hits[Count]{};
 +inline void CountHit(Counter c,uint64_t n=1) {
 +    if (!Profile()) return;
 +    const auto before=hits[c].fetch_add(n,std::memory_order_relaxed);
 +    if ((before>>14)==((before+n)>>14)) return;
-+    std::fprintf(stderr,"[gx-batch] scalar_words=%llu burst_words=%llu cached_dl=%llu fallback_dl=%llu xf_words=%llu\n",
++    std::fprintf(stderr,"[gx-batch] scalar_words=%llu burst_words=%llu cached_dl=%llu fallback_dl=%llu xf_words=%llu array_direct=%llu array_fallback=%llu vat_rows=%llu\n",
 +        (unsigned long long)hits[ScalarWords].load(std::memory_order_relaxed),
 +        (unsigned long long)hits[BurstWords].load(std::memory_order_relaxed),
 +        (unsigned long long)hits[CachedDl].load(std::memory_order_relaxed),
 +        (unsigned long long)hits[CacheFallback].load(std::memory_order_relaxed),
-+        (unsigned long long)hits[XfWords].load(std::memory_order_relaxed));
++        (unsigned long long)hits[XfWords].load(std::memory_order_relaxed),
++        (unsigned long long)hits[ArrayDirect].load(std::memory_order_relaxed),
++        (unsigned long long)hits[ArrayFallback].load(std::memory_order_relaxed),
++        (unsigned long long)hits[VatRow].load(std::memory_order_relaxed));
 +}
 +}
 +#endif
@@ -9544,7 +9574,7 @@ index 49fed99..2593379 100644
  }
  
 diff --git a/runtime/src/hle/gx/gx_dl.cpp b/runtime/src/hle/gx/gx_dl.cpp
-index 818478d..095d1ad 100644
+index 818478d..27700e3 100644
 --- a/runtime/src/hle/gx/gx_dl.cpp
 +++ b/runtime/src/hle/gx/gx_dl.cpp
 @@ -2,6 +2,10 @@
@@ -10216,7 +10246,25 @@ index 818478d..095d1ad 100644
  }
  
  // Size of one element of the guest array an indexed attribute reads from. An
-@@ -1174,6 +1623,9 @@ static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
+@@ -1159,6 +1608,17 @@ static uint32_t GetIndexedAttrElementSizeBytes(GXAttr attr, const VtxAttrFmt& fm
+ 
+ static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
+     const bool hadValidState = s_appliedVtxAttrFmtValid;
++#if defined(__SWITCH__)
++    // Sync's existing G6/A3 invariant proves this entire mirror row equals HLE.
++    // Descriptor-only changes bump the overall generation without changing VAT.
++    const uint8_t bit=static_cast<uint8_t>(1u<<fmt);
++    if (GxBatch::PrepEnabled() && hadValidState && GxG6() && GxA3() &&
++        (s_mirrorRowHashValid&bit) && !(g_hleGxState.vtxAttrFmtRowsDirty&bit) &&
++        s_mirrorRowHash[fmt]==g_hleGxState.vtxAttrFmtRowHash[fmt]) {
++        GxBatch::CountHit(GxBatch::VatRow);
++        return;
++    }
++#endif
+     // Rows other than `fmt` keep their contents and every write below copies
+     // g_hleGxState, so an already-matching mirror still matches. Only the rebuild
+     // from an invalidated mirror leaves the untouched rows divergent.
+@@ -1174,6 +1634,9 @@ static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
          }
          GXSetVtxAttrFmt(fmt, static_cast<GXAttr>(attr), f.cnt, f.type, f.frac);
          s_appliedVtxAttrFmt[fmt][attr] = f;
@@ -10226,7 +10274,7 @@ index 818478d..095d1ad 100644
      }
      s_appliedVtxAttrFmtValid = true;
  }
-@@ -1185,6 +1637,12 @@ static void ApplyAuroraVtxAttrFmtAll() {
+@@ -1185,6 +1648,12 @@ static void ApplyAuroraVtxAttrFmtAll() {
  }
  
  static void ApplyAuroraVtxAttrFmtForDisplayList(GXVtxFmt fmt, bool mixed) {
@@ -10239,7 +10287,7 @@ index 818478d..095d1ad 100644
      if (!mixed && fmt < GX_MAX_VTXFMT) {
          ApplyAuroraVtxAttrFmt(fmt);
          return;
-@@ -1206,17 +1664,64 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
+@@ -1206,17 +1675,66 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
      SyncAppliedVtxStateFromHleReal();
  }
  
@@ -10281,6 +10329,8 @@ index 818478d..095d1ad 100644
 +    return out;
 +}
 +
++#include "gx_batch_array.inc"
++
  static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX_ATTR>& maxIdx,
                                              const std::array<bool, GX_VA_MAX_ATTR>& sawIdx,
                                              GXVtxFmt vtxfmt,
@@ -10305,7 +10355,20 @@ index 818478d..095d1ad 100644
          const GXAttrType type = g_hleGxState.vtxDesc[attr]; if (type != GX_INDEX8 && type != GX_INDEX16) continue;
          if (!sawIdx[attr]) continue;
          const auto& arr = g_hleGxState.vtxArray[attr];
-@@ -1252,7 +1757,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
+@@ -1231,11 +1749,7 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
+         }
+         const uint32_t span = (count > 0) ? (static_cast<uint32_t>((count - 1u) * arr.stride) + elemSize) : 0u;
+         const bool needsPack = arr.stride > 0xffu;
+-        if (!Memory::Contains(arr.base, span)) {
+-            ok = false;
+-            continue;
+-        }
+-        const uint8_t* hostPtr = static_cast<const uint8_t*>(GuestToHostPtr(arr.base, span));
++        const uint8_t* hostPtr = ResolveDisplayListArray(arr.base, span);
+         if (!hostPtr) {
+             ok = false;
+             continue;
+@@ -1252,7 +1766,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
              ok = false;
              continue;
          }
@@ -10318,7 +10381,20 @@ index 818478d..095d1ad 100644
      }
      return ok;
  }
-@@ -1292,12 +1801,37 @@ extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
+@@ -1272,11 +1790,7 @@ static bool ApplyAuroraIndexedXFArraysForDisplayList(const std::array<uint32_t,
+             continue;
+         }
+         const uint32_t span = maxXfIdx[attr] * arr.stride + bytes;
+-        if (!Memory::Contains(arr.base, span)) {
+-            ok = false;
+-            continue;
+-        }
+-        const uint8_t* hostPtr = static_cast<const uint8_t*>(GuestToHostPtr(arr.base, span));
++        const uint8_t* hostPtr = ResolveDisplayListArray(arr.base, span);
+         if (!hostPtr) {
+             ok = false;
+             continue;
+@@ -1292,12 +1806,37 @@ extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
      GxGuestWrite::NotifyWrite(addr, size);
  }
  
@@ -10356,7 +10432,7 @@ index 818478d..095d1ad 100644
          const bool allowScanCache = nbytes <= kDlScanCacheMaxEntryBytes;
          const uint64_t scanLayoutHash = allowScanCache ? HashScanLayoutState() : 0;
          // The digest is computed lazily inside the probe: an entry whose covering
-@@ -1310,11 +1844,30 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1310,11 +1849,30 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
  
          // The scan a cached record came from already walked the list for this,
          // so only a miss pays for DisplayListMayContainDraw.
@@ -10387,7 +10463,7 @@ index 818478d..095d1ad 100644
              GXCallDisplayList(list, nbytes);
              // The republish is required even for register-only lists (verified by
              // experiment: dropping it corrupts in-race geometry decode). It is
-@@ -1323,6 +1876,12 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1323,6 +1881,12 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              SyncAppliedVtxStateFromHleReal();
              return;
          }
@@ -10400,7 +10476,7 @@ index 818478d..095d1ad 100644
          std::array<uint32_t, GX_VA_MAX_ATTR> maxIdx{}; std::array<bool, GX_VA_MAX_ATTR> sawIdx{};
          std::array<uint32_t, GX_VA_MAX_ATTR> maxXfIdx{}; std::array<uint32_t, GX_VA_MAX_ATTR> maxXfBytes{};
          std::array<bool, GX_VA_MAX_ATTR> sawXfIdx{};
-@@ -1330,6 +1889,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1330,6 +1894,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
          bool dlHasNestedDl = false;
          bool dlHasArrayStateWrites = false;
          bool dlHasCpWrites = false;
@@ -10408,7 +10484,7 @@ index 818478d..095d1ad 100644
  
          HleGxVertexStateSnapshot stateBeforeScan;
          bool haveStateBeforeScan = false;
-@@ -1339,11 +1899,34 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1339,11 +1904,34 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
          bool flattenOk = false;
          const uint8_t* auroraStream = nullptr;
          uint32_t auroraStreamBytes = 0;
@@ -10443,7 +10519,7 @@ index 818478d..095d1ad 100644
              maxXfIdx = entry.maxXfIdx;
              maxXfBytes = entry.maxXfBytes;
              sawXfIdx = entry.sawXfIdx;
-@@ -1369,8 +1952,17 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1369,8 +1957,17 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                      auroraStream = list;
                      auroraStreamBytes = nbytes;
                  } else {
@@ -10463,7 +10539,7 @@ index 818478d..095d1ad 100644
                  }
              }
          } else {
-@@ -1382,6 +1974,15 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1382,6 +1979,15 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              scanOk = ScanDisplayListMaxIndices(list, nbytes, maxIdx, sawIdx, maxXfIdx, maxXfBytes, sawXfIdx,
                                                 &dlVtxFmt, &dlVtxFmtMixed, &dlHasNestedDl,
                                                 &dlHasArrayStateWrites, &dlHasCpWrites, &cpWrites);
@@ -10479,7 +10555,7 @@ index 818478d..095d1ad 100644
              needsFlatten = dlHasNestedDl || dlHasArrayStateWrites || dlHasCpWrites;
              bool flattenVerbatim = true;
              auto& flattened = FlattenDisplayListScratch();
-@@ -1410,6 +2011,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1410,6 +2016,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                  entry.layoutHash = scanLayoutHash;
                  entry.maxIdx = maxIdx;
                  entry.sawIdx = sawIdx;
@@ -10487,7 +10563,7 @@ index 818478d..095d1ad 100644
                  entry.maxXfIdx = maxXfIdx;
                  entry.maxXfBytes = maxXfBytes;
                  entry.sawXfIdx = sawXfIdx;
-@@ -1426,10 +2028,22 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1426,10 +2033,22 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
  
                  const uint64_t contentDigest =
                      probe.digestValid ? probe.contentDigest : DlContentDigest(list, nbytes);
@@ -10511,7 +10587,7 @@ index 818478d..095d1ad 100644
              }
          }
  
-@@ -1439,7 +2053,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1439,7 +2058,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                  ApplyAuroraVtxDesc();
                  ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);
                  const bool flattenArraysOk =
@@ -10520,7 +10596,7 @@ index 818478d..095d1ad 100644
                  const bool flattenXfOk =
                      ApplyAuroraIndexedXFArraysForDisplayList(maxXfIdx, maxXfBytes, sawXfIdx);
                  flattenApplyOk = flattenArraysOk && flattenXfOk;
-@@ -1447,6 +2061,11 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1447,6 +2066,11 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              if (flattenApplyOk) {
                  EnsureAuroraFrameActive();
                  GXMarkFrameWork();
@@ -10532,7 +10608,7 @@ index 818478d..095d1ad 100644
                  GXCallDisplayList(auroraStream, auroraStreamBytes);
                  // No flip back to GX_DIRECT here
                  SyncAppliedVtxStateFromHleReal();
-@@ -1460,13 +2079,18 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1460,13 +2084,18 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              if (scanOk) {
                  ApplyAuroraVtxDesc();
                  ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);

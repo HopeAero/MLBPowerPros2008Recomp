@@ -70,3 +70,7 @@ la tanda anterior ni se afirma que sostenga 60 fps. La referencia más próxima 
 Para la siguiente sonda basta un tramo corto comparable; confirmar netloader
 antes de enviar y mantener los mismos relojes. Usar una lista corta de argumentos
 con profile_dl, spikes=30, spikes_max=256 y batch_profile=1.
+
+Actualización posterior: [GX batch3](gx-preparation.md) incluye estos cambios
+y optimiza arrays/VAT. El usuario pidió posponer las pruebas de consola;
+continuar con esa candidata cuando retome las sondas.

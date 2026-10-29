@@ -1296,3 +1296,19 @@ scan records already hold the index bounds and formats required for array
 preparation. The synchronous path without CP writes or flattening can read these
 tables directly; the HLE worker retains the copy-based path because its waits
 can service callbacks. See the [Spanish GX batch2 report](../gx-batch2.md).
+
+## 19. Array preparation and VAT rows (RL8E54, 2026-10-29)
+
+Sources: `gx_dl.cpp`, `gx_stream_common.h`, `memory_access.h`, and table setup
+in `memory.cpp`. A nonzero writable coarse bias proves a full RAM page without
+executable bytes. If the span stays inside that page, `(bias-1)+base` matches
+Contains/GetPointer resolution. Read the current bias on every call and retain
+general resolution otherwise, especially for crossed and partial pages. Vertex
+and XF arrays retain their different span calculations and stride handling.
+
+Vertex-state generation also changes for descriptor-only writes, while VAT
+rows may remain equal. The existing G6/A3 mirror tracks each row's hash and
+validity. Only a valid row with a clean, matching HLE hash can bypass comparisons
+without changing setter calls. Partial publication invalidates the row bit even
+though an older hash remains stored. See the [Spanish preparation report](../gx-preparation.md)
+for local evidence and limitations. No new console measurement has been made.

@@ -1303,3 +1303,20 @@ y consumo. Los registros de scan de listas simples ya contienen los límites
 de índices y formatos requeridos para preparar arrays. Se pueden consultar
 directamente en el recorrido síncrono sin CP/flatten; el worker HLE mantiene
 el recorrido con copias por sus callbacks de espera. Véase [GX batch2](gx-batch2.md).
+
+## 19. Preparación de arrays y filas VAT (RL8E54, 2026-10-29)
+
+Fuentes: `gx_dl.cpp`, `gx_stream_common.h`, `memory_access.h` y el llenado de
+tablas en `memory.cpp`. Un bias coarse writable distinto de cero prueba una
+página RAM completa sin código ejecutable. Si el span cabe dentro de ella,
+el puntero `(bias-1)+base` coincide con el obtenido por Contains/GetPointer.
+Se debe consultar el bias actual y conservar la ruta general fuera de ese
+caso, especialmente para cruces y páginas parciales. Los arrays XF y de
+vértices conservan sus cálculos distintos de span y sus reglas de stride.
+
+La generación global de estado de vértices cambia también al modificar solo
+VCD. Las filas VAT pueden seguir iguales. El mirror G6/A3 ya registra hash y
+validez por fila: solo una fila válida con hash HLE limpio e idéntico permite
+evitar sus comparaciones sin cambiar las publicaciones. Una fila parcialmente
+publicada invalida ese bit aunque conserve un hash antiguo. Evidencia local y
+límites en [preparación GX](gx-preparation.md); sin nueva medición de consola.

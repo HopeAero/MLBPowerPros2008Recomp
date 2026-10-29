@@ -1,4 +1,4 @@
-# Traspaso — port de Switch (rama `switch-arm64`), 2026-10-28
+# Traspaso — port de Switch (rama `switch-arm64`), 2026-10-29
 
 Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de trabajo; el historial está en `git log -p docs/traspaso.md`.
 
@@ -338,3 +338,29 @@ símbolos `local/switch/logs/elf-syms-GX-batch2.txt`.
 Pendiente de medición en consola; usar como referencia HLE1-round2 y su log
 `nxlink-HLE1-round2-20261029-182140.log`. No se ha enviado esta candidata a la
 consola. Mantener las sondas cortas y no repetir partidos para avanzar marcador.
+
+## GX batch3: arrays y VAT, fases 77–78
+
+El usuario pidió continuar programando y probar después. **No enviar esta
+candidata por netloader hasta que retome las pruebas.** Se mantiene la condición
+de medir sin overclock cuando corresponda.
+
+Se añadió resolución de arrays de vértices/XF dentro de páginas RAM con bias
+writable válido, evitando Contains más GuestToHostPtr en ese caso. Cruces,
+páginas parciales, bias ausente y spans vacíos o con wrap mantienen la ruta
+anterior. No retiene punteros entre llamadas. VAT aprovecha la igualdad de filas
+ya mantenida por G6/A3, independiente de cambios de generación solo por VCD.
+No cambia las publicaciones que emitía la comparación anterior.
+
+`WIICOMPILED_GX_BATCH_PREP=0` desactiva ambos cambios; los contadores opcionales
+de batch2 ahora incluyen arrays directos/fallback y filas VAT omitidas.
+Pasaron diferenciales activos/apagados, cinco controles negativos, regeneración,
+P11 y build Horizon con cuatro jobs. Los 48.223 archivos traducidos siguen sin
+cambios. Evidencia y límites en [preparación GX](gx-preparation.md).
+
+Candidata privada `local/switch/build/GX-batch3.nro`, SHA-256
+`1a0c2df102e0a3c715623937e997e8153e98234946e52502b5febdcf99433789`;
+símbolos `local/switch/logs/elf-syms-GX-batch3.txt`. Incluye batch2. Ambas tandas
+siguen sin medición de consola; no se les atribuye el resultado de HLE1-round2
+ni 60 fps estables. Para una comparación futura completa, desactivar FIFO, DL
+y PREP en la misma build; cada interruptor controla su parte por separado.
