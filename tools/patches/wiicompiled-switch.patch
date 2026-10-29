@@ -1464,7 +1464,7 @@ index 8b021fe..2e3580f 100644
  
  void GXSetTevColorIn(GXTevStageID stageId, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d) {
 diff --git a/aurora-main/lib/dolphin/gx/GXTexture.cpp b/aurora-main/lib/dolphin/gx/GXTexture.cpp
-index 684ba79..e14b1fa 100644
+index 684ba79..29f7082 100644
 --- a/aurora-main/lib/dolphin/gx/GXTexture.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXTexture.cpp
 @@ -1,5 +1,6 @@
@@ -1490,7 +1490,7 @@ index 684ba79..e14b1fa 100644
  }
  
 -std::pair<u32, u32> resolve_tlut_identity(const void* data, GXTlutFmt format, u16 entries) {
-+std::pair<u32, u32> resolve_tlut_identity_uncached(const void* data, GXTlutFmt format, u16 entries) {
++std::pair<u32, u32> resolve_tlut_identity_uncached(const void* data, GXTlutFmt format, u16 entries, const u64* sampledGeneration = nullptr) {
    if (data == nullptr || entries == 0) {
      return {next_tlut_obj_id(), 1};
    }
@@ -1502,7 +1502,7 @@ index 684ba79..e14b1fa 100644
 +  if (aurora::gx::fifo::a3_enabled()) LIKELY {
 +    const size_t bytes = static_cast<size_t>(entries) * sizeof(u16);
 +    // Sampled before the bytes are read: a racing write costs a digest, never a skipped one.
-+    const u64 generation = aurora::guest_write_generation(data, bytes);
++    const u64 generation = sampledGeneration ? *sampledGeneration : aurora::guest_write_generation(data, bytes);
 +    if (sTlutIdentities.size() >= MaxTlutIdentities) {
 +      sTlutIdentities.clear();
 +    }
@@ -1539,40 +1539,16 @@ index 684ba79..e14b1fa 100644
    const auto digest =
        static_cast<u64>(aurora::xxh3_hash_s(data, static_cast<size_t>(entries) * sizeof(u16)));
    if (sTlutIdentities.size() >= MaxTlutIdentities) {
-@@ -110,6 +156,32 @@ std::pair<u32, u32> resolve_tlut_identity(const void* data, GXTlutFmt format, u1
+@@ -110,6 +156,8 @@ std::pair<u32, u32> resolve_tlut_identity(const void* data, GXTlutFmt format, u1
    return {record.objId, record.dataVersion};
  }
  
-+std::pair<u32, u32> resolve_tlut_identity(const void* data, GXTlutFmt format, u16 entries) {
-+#if defined(__SWITCH__)
-+  struct Memo { bool valid = false; TlutIdentity key{}; u64 generation = 0; std::pair<u32, u32> result{}; };
-+  static Memo memo;
-+  if (gx_model_hle::tlut() && aurora::gx::fifo::a3_enabled() && data && entries) {
-+    const TlutIdentity key{data, static_cast<u32>(format), entries};
-+    const u64 generation = aurora::guest_write_generation(data, static_cast<size_t>(entries) * sizeof(u16));
-+    // At the capacity limit the old path clears the table and mints a new identity, even for a hit.
-+    if (memo.valid && memo.key == key && sTlutIdentities.size() < MaxTlutIdentities &&
-+        aurora::guest_write_generation_matches(memo.generation, generation)) {
-+      ++aurora_gx_a3_counters[aurora::gx::fifo::kA3TlutDigestsSkipped];
-+      gx_model_hle::count(gx_model_hle::TlutHit);
-+      return memo.result;
-+    }
-+    gx_model_hle::count(gx_model_hle::TlutMiss);
-+    memo.valid = false;
-+    const auto result = resolve_tlut_identity_uncached(data, format, entries);
-+    memo = {true, key, generation, result};
-+    return result;
-+  }
-+  // Legacy/untracked calls can update the same record or clear the whole table.
-+  memo.valid = false;
-+#endif
-+  return resolve_tlut_identity_uncached(data, format, entries);
-+}
++#include "gx_model_tlut_cache.inc"
 +
  int __cntlzw(unsigned int val) {
    if (val == 0)
      return 32; // PowerPC returns 32 if the input is 0
-@@ -174,6 +246,34 @@ void emit_loaded_tlut_metadata(const GXTlutObj_& obj, u32 idx) {
+@@ -174,6 +222,34 @@ void emit_loaded_tlut_metadata(const GXTlutObj_& obj, u32 idx) {
    GX_WRITE_U32(obj.tlutObjId);
    GX_WRITE_U32(obj.tlutDataVersion);
  }
@@ -1607,7 +1583,7 @@ index 684ba79..e14b1fa 100644
  } // namespace
  
  extern "C" {
-@@ -211,12 +311,46 @@ void GXInitTexObjLOD(GXTexObj* obj_, GXTexFilter minFilt, GXTexFilter magFilt, f
+@@ -211,12 +287,46 @@ void GXInitTexObjLOD(GXTexObj* obj_, GXTexFilter minFilt, GXTexFilter magFilt, f
    SET_REG_FIELD(0, obj->mode1, 8, 8, static_cast<u8>(16.0f * clampedMax));
  }
  
@@ -1654,7 +1630,7 @@ index 684ba79..e14b1fa 100644
  void GXInitTexObjWrapMode(GXTexObj* obj_, GXTexWrapMode wrapS, GXTexWrapMode wrapT) {
    auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
    SET_REG_FIELD(0, obj->mode0, 2, 0, wrapS);
-@@ -278,18 +412,56 @@ void* GXGetTexObjUserData(const GXTexObj* obj_) {
+@@ -278,18 +388,56 @@ void* GXGetTexObjUserData(const GXTexObj* obj_) {
    return const_cast<void*>(obj->userData);
  }
  
@@ -1713,7 +1689,7 @@ index 684ba79..e14b1fa 100644
    GX_WRITE_RAS_REG(obj->mode0);
    GX_WRITE_RAS_REG(obj->mode1);
    GX_WRITE_RAS_REG(obj->image0);
-@@ -419,6 +591,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
+@@ -419,6 +567,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
  
  void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
    auto* obj = reinterpret_cast<const GXTlutObj_*>(obj_);
@@ -2125,6 +2101,52 @@ index 460791e..aa518c9 100644
  // This shadow register struct contains the GX state Aurora needs on PC.
  struct __GXData_struct {
    u16 vNum;         // vertex count for flush prim
+diff --git a/aurora-main/lib/dolphin/gx/gx_model_tlut_cache.inc b/aurora-main/lib/dolphin/gx/gx_model_tlut_cache.inc
+new file mode 100644
+index 0000000..c0bcf68
+--- /dev/null
++++ b/aurora-main/lib/dolphin/gx/gx_model_tlut_cache.inc
+@@ -0,0 +1,40 @@
++// HLE1.2: palettes alternate between draws. Retain identities across those alternations,
++// by value, and invalidate the whole memo whenever the original identity table can be cleared
++// or a legacy call can mutate a record without a generation notification.
++std::pair<u32, u32> resolve_tlut_identity(const void* data, GXTlutFmt format, u16 entries) {
++#if defined(__SWITCH__)
++  struct Memo { u32 epoch = 0; TlutIdentity key{}; u64 generation = 0; std::pair<u32, u32> result{}; };
++  static Memo memo[128];
++  static u32 epoch = 1;
++  const auto invalidate = [&] {
++    if (++epoch == 0) {
++      for (auto& m : memo) m.epoch = 0;
++      epoch = 1;
++    }
++  };
++  if (gx_model_hle::tlut() && aurora::gx::fifo::a3_enabled() && data && entries) {
++    const TlutIdentity key{data, static_cast<u32>(format), entries};
++    const u64 generation = aurora::guest_write_generation(data, static_cast<size_t>(entries) * sizeof(u16));
++    // A clear invalidates all retained values, even when the next requested key is a hit.
++    if (sTlutIdentities.size() >= MaxTlutIdentities) invalidate();
++    const uintptr_t ptr = reinterpret_cast<uintptr_t>(data);
++    const u32 hash = static_cast<u32>((ptr >> 5) ^ (ptr >> 19)) ^
++        (static_cast<u32>(format) * 0x85EBCA6Bu) ^ (static_cast<u32>(entries) * 0xC2B2AE35u);
++    auto& m = memo[(hash * 0x9E3779B1u) >> 25];
++    if (m.epoch == epoch && m.key == key &&
++        aurora::guest_write_generation_matches(m.generation, generation)) {
++      ++aurora_gx_a3_counters[aurora::gx::fifo::kA3TlutDigestsSkipped];
++      gx_model_hle::count(gx_model_hle::TlutHit);
++      return m.result;
++    }
++    gx_model_hle::count(gx_model_hle::TlutMiss);
++    m.epoch = 0;
++    // Sample the generation once on misses too; the old wrapper sampled it twice.
++    const auto result = resolve_tlut_identity_uncached(data, format, entries, &generation);
++    m = {epoch, key, generation, result};
++    return result;
++  }
++  invalidate();
++#endif
++  return resolve_tlut_identity_uncached(data, format, entries);
++}
 diff --git a/aurora-main/lib/gfx/auto_mips.hpp b/aurora-main/lib/gfx/auto_mips.hpp
 index 58190c7..23620e7 100644
 --- a/aurora-main/lib/gfx/auto_mips.hpp

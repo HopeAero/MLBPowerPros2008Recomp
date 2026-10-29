@@ -291,12 +291,22 @@ build corresponda al parche. La compilación Horizon pasó con cuatro jobs y
 `c4734672f83a54380497b0867d8aadcec61084e8c676566f56f0359c1dac4584`.
 Símbolos: `local/switch/logs/elf-syms-HLE1.txt`.
 
-**Pendiente al redactar esta entrada:** envío por netloader y medición 4–5 min
-de fildeo/toma inicial con profile, spikes=30, spikes_max=256 y profile_dl=1.
-Se pidió al usuario preparar netloader y avisar «listo»; no enviar antes.
-Comparar las mismas cubetas con P22
-`nxlink-MLBPowerPros2008-20261029-142345.log` / `elf-syms-P22.txt` usando
-`local/tmp/cpu/P20-buckets.py`. El análisis baseline quedó en
-`local/tmp/cpu/HLE1-test/P22-buckets.txt`. Aún no hay ahorro de ms/frame ni
-equivalencia visual demostrados en consola. No declarar 60 fps ni tanda medida
-solo por los tests de host.
+Se ejecutaron dos capturas de consola, activa y control TEV/texturas apagados.
+TLUT siguió activo en el control pese al argumento; los contadores lo detectaron.
+La comparación no demuestra mejora global de fildeo. Resultados, límites y
+archivos exactos: [medición HLE1](hle-model-round1.md).
+
+**Revisión posterior, fases 72–73:** se corrigió el hash de descriptores, que
+descartaba los bits de dirección al elegir cubeta; las capturas de sombra en RAM
+plana pasan de cuatro llamadas escalares a un snapshot big-endian equivalente.
+La caché TLUT retiene 128 identidades por valor, conserva invalidación por
+capacidad/legacy y toma la generación una sola vez en los fallos. Folds en
+37/69/71; el resto queda como fases nuevas reproducibles.
+
+Pasaron diferenciales y build Horizon, sin modificar los 48.223 archivos
+traducidos. NRO privada `local/switch/build/HLE1-round2.nro`, SHA-256
+`e81cd3c0622ac1822c1124d6b316bac4163794c6692cf7e14047c210973920fa`;
+símbolos `local/switch/logs/elf-syms-HLE1-round2.txt`. No atribuirle los números
+de consola de la versión inicial: todavía no se midió esta revisión.
+El usuario pidió priorizar más código y evitar seguir repitiendo pruebas
+manuales; se usaron los diferenciales automáticos existentes para esta revisión.

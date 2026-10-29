@@ -1260,12 +1260,20 @@ still govern those operations.
 
 Aurora's TLUT identity depends on data pointer, format and entry count; its
 version changes with the digest. A3 permits skipping the digest under a matching
-tracked generation. HLE1 remembers the last answer by value under that same
+tracked generation. Initial HLE1 remembered the last answer by value; the
+revision retains 128 identities to support alternating palettes under that same
 contract. It keeps no pointers into the relocating Abseil map. At 4096 identities
 the original path clears the map even if the next key already exists; this must
 also defeat the shortcut. Non-A3 calls invalidate the memo because they can
 update versions without a generation notification. `GXInitTlutObj`, replacement
 registration and `GXLoadTlut` still execute.
+
+The revision also captures descriptor shadows directly from fully writable flat
+RAM pages, returning the same four big-endian words from the 32-byte snapshot.
+The decode-cache hash mixes the data address before shifting to select a bucket;
+the first formula discarded its address bits before they could affect bucket
+selection. Evidence: phases 69/72 and host differentials. Initial measurements
+and limitations are recorded in the [Spanish HLE1 report](../hle-model-round1.md).
 
 P21 map corrections confirmed by P23: `80044B7C` increments the texcoord count
 at `gfx+8592`; `80044B54` resets it, and `GXSetNumTexGens` receives its low eight

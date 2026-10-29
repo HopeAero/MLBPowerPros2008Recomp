@@ -1263,13 +1263,22 @@ upload y las invalidaciones por DCFlush/DMA siguen decidiendo esas operaciones.
 
 La identidad TLUT de Aurora depende de puntero de datos, formato y número de
 entradas; su versión cambia con el digest. A3 permite evitar el digest mientras
-coincida una generación rastreable. HLE1 recuerda por valor la última respuesta
-bajo el mismo contrato. No guarda punteros a elementos del mapa Abseil, que
+coincida una generación rastreable. La primera versión de HLE1 recordaba por
+valor la última respuesta; la revisión retiene 128 identidades para soportar
+paletas alternantes bajo el mismo contrato. No guarda punteros a elementos del mapa Abseil, que
 puede moverlos al crecer. Al alcanzar 4096 identidades, la ruta anterior vacía el
 mapa incluso si la siguiente clave ya existía: ese caso debe invalidar también
 el atajo. Las llamadas por la ruta sin A3 invalidan el memo, pues pueden cambiar
 versiones sin notificación de generación. `GXInitTlutObj`, el registro de
 reemplazos y `GXLoadTlut` siguen ejecutándose.
+
+La revisión captura también las sombras de descriptor mediante lectura directa
+de 32 bytes en páginas RAM planas, devolviendo los mismos cuatro words
+big-endian. El hash de la caché de decodificación mezcla la dirección antes del
+desplazamiento que selecciona la cubeta; la primera fórmula descartaba sus bits
+antes de que pudieran influir en esa selección. Evidencia: lectura de las fases
+69/72 y diferenciales host; mediciones iniciales y límites en
+[el informe HLE1](hle-model-round1.md).
 
 Corrección del mapa P21, confirmada por P23: el contador de texcoords que
 incrementa `80044B7C` está en `gfx+8592`; `80044B54` lo reinicia y
