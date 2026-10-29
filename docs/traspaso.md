@@ -231,3 +231,15 @@ pero el perfil consulta reloj por publicación y sesga más el modo off; falta
 medición sin diagnóstico y no es replay bit a bit. Worker/batch siguen default
 off. Siguiente auditoría Luna/max: bloques textura/TLUT con identidad y estado
 propios para eliminar barreras, no más ajustes pequeños de publicación.
+
+### Q77: cargas de textura en la cola y contadores de barreras (2026-10-29, Claude + Sonnet) — veredicto: parar
+
+`WIICOMPILED_GX_HLE_TEXTURES=1` encola `GXLoadTexObj` (snapshot por valor, `TrySubmit` con fallback) y `__GXSetSUTexRegs`; `WIICOMPILED_GX_HLE_FENCE_PROFILE=1` cuenta barreras por función y espera (armGetSystemTick). Tests de host Q66–Q77 pasan; árbol verificado. A/B 90 s stock 1020/307/1331, mismo NRO (`local/switch/build/GX-Q77.nro`):
+
+| Config | fps | p50/p95/p99 ms |
+|---|---|---|
+| worker apagado | 59,35 | 16,67/18,13/22,82 |
+| worker + batch | 46,64 | 21,58/25,52/28,67 |
+| worker + batch + texturas | 46,64 | 21,54/25,78/28,36 |
+
+Texturas: 100% aceptadas (1.310.720), su barrera desapareció, pero quedan 620–800 barreras/frame (`GXInitTlutObj` 240–300, `GXSetProjection` ~50, `GXSetCopyFilter` 40–60, `GXCopyTex` 20–30; `GXGetCPUFifo` 2/frame de 0,3–0,5 ms cada una) y la espera total en barreras es solo **1,9–2,6 ms/frame**, mientras el frame sube ~5 ms. Aun con cero barreras quedaría ~19 ms > 16,7 sin worker: **encolar llamada por llamada cuesta tanto como ejecutar el HLE** (miles de llamadas GX diminutas por frame). Mover el GX con esta granularidad no puede ganar; el worker queda apagado por defecto y no se debe seguir ajustando. Logs `nxlink-GX-Q77-20261029-1301*.log`, `-1304*`, `-1307*`.

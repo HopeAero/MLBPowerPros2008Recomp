@@ -97,7 +97,7 @@ diff --git a/runtime/src/hle/gx/gx_offload.cpp b/runtime/src/hle/gx/gx_offload.c
 new file mode 100644
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload.cpp
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,180 @@
 +#if defined(__SWITCH__) || defined(GX_OFFLOAD_QUEUE_TEST)
 +#include "gx_offload.h"
 +
@@ -125,9 +125,39 @@ new file mode 100644
 +    aurora_gx_offload_vcd_snapshot(&vcd.lo, &vcd.hi, &vcd.flags, &vcd.normalType);
 +}
 +void ServiceWait(void*) {
++    if (fence_profile::Enabled()) {
++        const uint64_t started = fence_profile::Now();
++        VI_HLE_ProcessRetracesDeferred(8);
++        OS_HLE_ProcessAlarmsDeferred(8);
++        Audio_HLE_PollDeferred();
++        fence_profile::NoteService(fence_profile::Now() - started);
++        return;
++    }
 +    VI_HLE_ProcessRetracesDeferred(8);
 +    OS_HLE_ProcessAlarmsDeferred(8);
 +    Audio_HLE_PollDeferred();
++}
++
++// The only place the producer drains the queue for a fence. With the profile off this is one
++// branch plus FlushAll; with it on it also records the entry point, the slots that were still
++// outstanding and the ticks spent waiting.
++void FlushForFence(const char* site) {
++    if (!fence_profile::Enabled()) {
++        queue.FlushAll();
++        return;
++    }
++    const uint64_t started = fence_profile::Now();
++    const uint64_t pending = queue.Watermark() - queue.Completed();
++    queue.FlushAll();
++    const uint64_t finished = fence_profile::Now();
++    const auto wait = queue.TakeWaitStats();
++    fence_profile::AddQueueWait(wait.flush_sleeps, wait.flush_sleep_ns, wait.submit_full_waits,
++                                wait.submit_full_ns);
++    fence_profile::NoteFence(site, pending, finished - started, finished);
++}
++
++void NoteNestedScope(const char* site) noexcept {
++    if (fence_profile::Enabled()) fence_profile::NoteNested(site);
 +}
 +}
 +
@@ -140,17 +170,21 @@ new file mode 100644
 +        std::fprintf(stderr, "[gx-hle] worker=%s core=2 capacity=%zu payload=%zu\n",
 +                     active ? "on" : "off", GxOffloadQueue::kCapacity, GxOffloadQueue::kMaxPayloadBytes);
 +        initialized = true;
++        if (fence_profile::Enabled())
++            std::fprintf(stderr, "[GX-HLE-FENCE-PROFILE] profile=on worker=%s interval_s=5 timer=system_tick\n",
++                         active ? "on" : "off");
 +    }
 +}
 +
 +bool Synchronous() noexcept { return synchronousDepth != 0; }
 +bool Intercept() noexcept { return queue.Active() && ownerTag == &threadTag; }
 +void Fence() {
-+    if (Intercept() && !Synchronous()) queue.FlushAll();
++    if (Intercept() && !Synchronous()) FlushForFence("offload::Fence");
 +}
-+void EnterSynchronous() {
++void EnterSynchronous(const char* site) {
 +    if (queue.Active() && !Intercept()) return;
-+    if (synchronousDepth == 0) queue.FlushAll();
++    if (synchronousDepth == 0) FlushForFence(site);
++    else NoteNestedScope(site);
 +    ++synchronousDepth;
 +}
 +void LeaveSynchronous() noexcept {
@@ -209,9 +243,20 @@ new file mode 100644
 +}
 +}
 +
++extern "C" void GX_HLE_OffloadEnterSite(const char* site) noexcept {
++    try {
++        if (hle::gx::offload::Intercept()) hle::gx::offload::EnterSynchronous(site);
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "[gx-hle] fence failed: %s\n", error.what());
++        std::abort();
++    } catch (...) {
++        std::fprintf(stderr, "[gx-hle] fence failed: worker error\n");
++        std::abort();
++    }
++}
 +extern "C" void GX_HLE_OffloadEnter() noexcept {
 +    try {
-+        if (hle::gx::offload::Intercept()) hle::gx::offload::EnterSynchronous();
++        if (hle::gx::offload::Intercept()) hle::gx::offload::EnterSynchronous("HleProducerScope");
 +    } catch (const std::exception& error) {
 +        std::fprintf(stderr, "[gx-hle] fence failed: %s\n", error.what());
 +        std::abort();
@@ -237,10 +282,11 @@ diff --git a/runtime/src/hle/gx/gx_offload.h b/runtime/src/hle/gx/gx_offload.h
 new file mode 100644
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload.h
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,155 @@
 +#pragma once
 +
 +#include "gx_offload_queue.h"
++#include "gx_offload_fence_profile.h"
 +
 +#include <dolphin/gx/GXStruct.h>
 +#include <dolphin/gx/GXGeometry.h>
@@ -264,7 +310,8 @@ new file mode 100644
 +extern GxOffloadQueue::Queue queue;
 +void Initialize();
 +void Fence();
-+void EnterSynchronous();
++// `site` names the entry point for WIICOMPILED_GX_HLE_FENCE_PROFILE only; it never changes behaviour.
++void EnterSynchronous(const char* site = nullptr);
 +void LeaveSynchronous() noexcept;
 +bool Synchronous() noexcept;
 +bool Intercept() noexcept;
@@ -275,7 +322,7 @@ new file mode 100644
 +void GetVcdState(uint32_t* lo, uint32_t* hi, uint32_t* flags);
 +
 +struct SynchronousScope {
-+    SynchronousScope() { EnterSynchronous(); }
++    explicit SynchronousScope(const char* site = nullptr) { EnterSynchronous(site); }
 +    ~SynchronousScope() { LeaveSynchronous(); }
 +    SynchronousScope(const SynchronousScope&) = delete;
 +    SynchronousScope& operator=(const SynchronousScope&) = delete;
@@ -350,7 +397,7 @@ new file mode 100644
 +            BeforeScalar<Policy>::Apply(args...);
 +        } else {
 +            // Borrowed pointers and result-bearing calls retain their original observation point.
-+            SynchronousScope scope;
++            SynchronousScope scope(__PRETTY_FUNCTION__);
 +            return Function(args...);
 +        }
 +    }
@@ -384,10 +431,493 @@ new file mode 100644
 +
 +} // namespace hle::gx::offload
 +
++#include "gx_offload_texture.h"
++
 +// Paired scopes also fence renderer/VI entry points outside the HLE bridge.
 +extern "C" void GX_HLE_OffloadEnter() noexcept;
++extern "C" void GX_HLE_OffloadEnterSite(const char* site) noexcept;
 +extern "C" void GX_HLE_OffloadLeave() noexcept;
 +extern "C" void GX_HLE_OffloadStop();
+diff --git a/runtime/src/hle/gx/gx_offload_texture.h b/runtime/src/hle/gx/gx_offload_texture.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_texture.h
+@@ -0,0 +1,189 @@
++#pragma once
++
++#include <cstdlib>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <type_traits>
++
++extern "C" void GXPrepareTexObjLoad(GXTexObj* obj, GXTexMapID id);
++extern "C" void __GXSetSUTexRegs(void);
++extern "C" void __real_GXLoadTexObj(GXTexObj* obj, GXTexMapID id);
++#if defined(__SWITCH__)
++extern "C" bool GXCanOffloadTexObjLoad() noexcept;
++extern "C" bool GX_HLE_MidCommand();
++#endif
++
++namespace hle::gx::offload {
++
++namespace texture_detail {
++#if defined(__SWITCH__)
++inline bool TextureLoadStateAllowsOffload() noexcept {
++    // These are producer-only reads: the Aurora check rejects display-list recording;
++    // the HLE check rejects recording, GXBegin, and a partially buffered FIFO command.
++    return GXCanOffloadTexObjLoad() && !GX_HLE_MidCommand();
++}
++#else
++inline bool TextureLoadStateAllowsOffload() noexcept { return true; }
++#endif
++
++inline bool TextureLoadEnabled() noexcept {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("WIICOMPILED_GX_HLE_TEXTURES");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    return enabled;
++}
++
++inline bool TextureLoadProfileEnabled() noexcept {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("WIICOMPILED_GX_HLE_TEXTURE_PROFILE");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    return enabled;
++}
++
++struct TextureLoadProfileCounters {
++    bool configReported = false;
++    uint64_t calls = 0;
++    uint64_t accepted = 0;
++    uint64_t fallbackFull = 0;
++};
++
++inline TextureLoadProfileCounters& TextureLoadProfile() noexcept {
++    // GX offload has one guest-side producer; counters are producer-owned.
++    static TextureLoadProfileCounters counters;
++    return counters;
++}
++
++inline void ReportTextureLoadProfile(bool texturesEnabled,
++                                     const TextureLoadProfileCounters& counters) noexcept {
++    const double ratio = counters.calls == 0
++                             ? 0.0
++                             : static_cast<double>(counters.accepted) * 100.0 /
++                                   static_cast<double>(counters.calls);
++    std::fprintf(stderr,
++                 "[GX-HLE-TEX-PROFILE] textures_enabled=%u calls=%llu accepted=%llu fallback_full=%llu accepted_ratio=%.2f%%\n",
++                 texturesEnabled ? 1u : 0u,
++                 static_cast<unsigned long long>(counters.calls),
++                 static_cast<unsigned long long>(counters.accepted),
++                 static_cast<unsigned long long>(counters.fallbackFull), ratio);
++    std::fflush(stderr);
++}
++
++inline void NoteTextureLoadAttempt(bool profileEnabled, bool texturesEnabled,
++                                   bool eligible) noexcept {
++    if (!profileEnabled) return;
++    TextureLoadProfileCounters& counters = TextureLoadProfile();
++    if (!counters.configReported) {
++        counters.configReported = true;
++        ReportTextureLoadProfile(texturesEnabled, counters);
++    }
++    if (eligible) ++counters.calls;
++}
++
++inline void NoteTextureLoadResult(bool profileEnabled, bool accepted, bool fallbackFull) noexcept {
++    if (!profileEnabled) return;
++    TextureLoadProfileCounters& counters = TextureLoadProfile();
++    if (accepted) ++counters.accepted;
++    if (fallbackFull) ++counters.fallbackFull;
++    if (counters.calls != 0 && (counters.calls & 0xFFFFu) == 0) {
++        ReportTextureLoadProfile(TextureLoadEnabled(), counters);
++    }
++}
++
++template <auto Function>
++struct TexObjLoadCommand {
++    GXTexObj object{};
++    GXTexMapID id{};
++
++    static_assert(std::is_trivially_copyable_v<GXTexObj>);
++    static_assert(std::is_trivially_copyable_v<GXTexMapID>);
++
++    static void Execute(const void* bytes) {
++        TexObjLoadCommand command{};
++        std::memcpy(&command, bytes, sizeof(command));
++        Function(&command.object, command.id);
++    }
++};
++} // namespace texture_detail
++
++template <> struct Dispatch<&::GXLoadTexObj> {
++    template <auto Function = &::GXLoadTexObj>
++    static void Invoke(GXTexObj* object, GXTexMapID id) {
++        if (!Intercept() || Synchronous()) {
++            Function(object, id);
++            return;
++        }
++
++        const bool texturesEnabled = texture_detail::TextureLoadEnabled();
++        const bool profileEnabled = texture_detail::TextureLoadProfileEnabled();
++        const bool eligible = texturesEnabled && object != nullptr && static_cast<u32>(id) < 8u &&
++                              texture_detail::TextureLoadStateAllowsOffload();
++        texture_detail::NoteTextureLoadAttempt(profileEnabled, texturesEnabled, eligible);
++        if (!eligible) {
++            SynchronousScope scope("GXLoadTexObj (sync: ineligible)");
++            Function(object, id);
++            return;
++        }
++
++        using Command = texture_detail::TexObjLoadCommand<Function>;
++        static_assert(sizeof(Command) <= GxOffloadQueue::kMaxPayloadBytes);
++        static_assert(alignof(Command) <= alignof(std::max_align_t));
++
++        Command command{};
++        std::memcpy(&command.object, object, sizeof(command.object));
++        command.id = id;
++        GXPrepareTexObjLoad(&command.object, id);
++
++        // A worker emission failure follows the Q66 queue-failure contract; the caller's
++        // synchronous HLE catch cannot recover a job after it has been published.
++        if (queue.TrySubmit(&Command::Execute, command)) {
++            // The worker owns command.object. Preserve GXLoadTexObj's immediate host-object
++            // mutation immediately after successful publication; this helper cannot call out.
++            GXPrepareTexObjLoad(object, id);
++            texture_detail::NoteTextureLoadResult(profileEnabled, true, false);
++            return;
++        }
++
++        // TrySubmit returned without waiting or invoking WaitService, and the original object
++        // is still untouched. Preserve the established synchronous fallback on a capacity miss.
++        texture_detail::NoteTextureLoadResult(profileEnabled, false, true);
++        SynchronousScope scope("GXLoadTexObj (sync: ring full)");
++        Function(object, id);
++    }
++};
++
++// __GXSetSUTexRegs() takes no arguments and only reads/writes __gx and the FIFO, so with
++// WIICOMPILED_GX_HLE_TEXTURES=1 it is queued behind the GXLoadTexObj jobs whose tImage0/tMode0
++// it consumes instead of draining the queue first. It follows the same eligibility rules as the
++// texture load (no display-list recording, no partially buffered HLE FIFO command) and falls back
++// to the established synchronous path when the ring is full. The HLE wrapper keeps its guest
++// write (__GXData+2) on the producer.
++namespace texture_detail {
++template <auto Function>
++struct SuTexRegsCommand {
++    static void Execute(const void*) { Function(); }
++};
++} // namespace texture_detail
++
++template <> struct Dispatch<&::__GXSetSUTexRegs> {
++    template <auto Function = &::__GXSetSUTexRegs>
++    static void Invoke() {
++        if (!Intercept() || Synchronous()) {
++            Function();
++            return;
++        }
++        if (!texture_detail::TextureLoadEnabled() || !texture_detail::TextureLoadStateAllowsOffload()) {
++            SynchronousScope scope("__GXSetSUTexRegs (sync: ineligible)");
++            Function();
++            return;
++        }
++        if (queue.TrySubmit(&texture_detail::SuTexRegsCommand<Function>::Execute, nullptr, 0)) return;
++        SynchronousScope scope("__GXSetSUTexRegs (sync: ring full)");
++        Function();
++    }
++};
++
++} // namespace hle::gx::offload
+diff --git a/runtime/src/hle/gx/gx_offload_fence_profile.h b/runtime/src/hle/gx/gx_offload_fence_profile.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_fence_profile.h
+@@ -0,0 +1,281 @@
++#pragma once
++
++// Opt-in accounting of producer-side GX offload fences (WIICOMPILED_GX_HLE_FENCE_PROFILE=1).
++//
++// A "fence" is a SynchronousScope entered at depth 0 (or an explicit Fence()): the producer
++// publishes the queue watermark and waits until the worker has completed everything. This file
++// counts them per entry point (the Dispatch policy that forced the scope, or the Aurora
++// HleProducerScope site) and the time the producer spent inside Queue::FlushAll, using the
++// system tick (no clock_gettime). Everything is producer-thread-only, allocation-free and a
++// single predictable branch when the switch is off.
++//
++// Report: one summary line plus one line per entry point, every ~5 s, on stderr:
++//   [GX-HLE-FENCE-PROFILE] window ...
++//   [GX-HLE-FENCE-PROFILE]   site=<name> ...
++
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#if defined(__SWITCH__)
++#include <switch.h>
++#elif defined(GX_OFFLOAD_QUEUE_TEST)
++#include <chrono>
++#endif
++
++namespace hle::gx::offload::fence_profile {
++
++inline uint64_t Now() noexcept {
++#if defined(__SWITCH__)
++    return armGetSystemTick();
++#elif defined(GX_OFFLOAD_QUEUE_TEST)
++    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++#else
++    return 0;
++#endif
++}
++
++inline uint64_t TicksToNs(uint64_t ticks) noexcept {
++#if defined(__SWITCH__)
++    return armTicksToNs(ticks);
++#else
++    return ticks; // test builds count nanoseconds directly
++#endif
++}
++
++inline bool Enabled() noexcept {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("WIICOMPILED_GX_HLE_FENCE_PROFILE");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    return enabled;
++}
++
++struct Site {
++    const char* name = nullptr;
++    bool frame = false;        // Aurora end_frame: one entry per presented frame
++    uint64_t entries = 0;      // every scope entry attributed to this site
++    uint64_t fences = 0;       // entries that really drained (depth 0)
++    uint64_t blocking = 0;    // fences that found work outstanding
++    uint64_t pending = 0;      // sum of outstanding slots at blocking fences
++    uint64_t ticks = 0;        // time in FlushAll
++    uint64_t maxTicks = 0;
++};
++
++constexpr size_t kMaxSites = 192;
++
++struct State {
++    Site sites[kMaxSites];
++    size_t used = 0;
++    uint64_t otherEntries = 0, otherFences = 0, otherBlocking = 0, otherTicks = 0;
++    uint64_t windowStart = 0;
++    uint64_t serviceCalls = 0, serviceTicks = 0;
++    // Queue-side waits (producer thread): Flush left the spin window and slept; Submit found the
++    // ring full and slept. Times in nanoseconds.
++    uint64_t flushSleeps = 0, flushSleepNs = 0, submitFullWaits = 0, submitFullNs = 0;
++};
++
++inline State& GetState() noexcept {
++    static State state;
++    return state;
++}
++
++// Resolve a site by its (static) name pointer; identical pointers share an entry.
++inline Site* Find(State& state, const char* name) noexcept {
++    for (size_t i = 0; i < state.used; ++i)
++        if (state.sites[i].name == name) return &state.sites[i];
++    if (state.used == kMaxSites) return nullptr;
++    Site& site = state.sites[state.used++];
++    site.name = name;
++    site.frame = name != nullptr && std::strcmp(name, "aurora::end_frame") == 0;
++    return &site;
++}
++
++// GCC/Clang __PRETTY_FUNCTION__ of Dispatch<Policy>::Invoke names the GX entry point either as
++// "auto Policy = GXFoo]" (primary template) or "Dispatch<GXFoo>::Invoke" (specializations).
++// Anything else (the Aurora HleProducerScope names) is printed as is.
++inline void DisplayName(const char* raw, char* out, size_t size) noexcept {
++    if (size == 0) return;
++    out[0] = '\0';
++    if (raw == nullptr) {
++        std::snprintf(out, size, "(unnamed)");
++        return;
++    }
++    const char* begin = nullptr;
++    const char* end = nullptr;
++    if (const char* policy = std::strstr(raw, "Policy = ")) {
++        begin = policy + 9;
++        end = begin;
++        while (*end != '\0' && *end != ']' && *end != ';') ++end;
++    } else if (const char* dispatch = std::strstr(raw, "Dispatch<")) {
++        begin = dispatch + 9;
++        end = begin;
++        int depth = 1;
++        while (*end != '\0') {
++            if (*end == '<') ++depth;
++            else if (*end == '>' && --depth == 0) break;
++            ++end;
++        }
++    }
++    if (begin == nullptr) {
++        std::snprintf(out, size, "%s", raw);
++        return;
++    }
++    // Specializations may print "(void (*)(...))GXFoo": keep the trailing identifier chain.
++    const char* last = end;
++    while (last > begin && (last[-1] == '_' || (last[-1] >= '0' && last[-1] <= '9') ||
++                            (last[-1] >= 'A' && last[-1] <= 'Z') || (last[-1] >= 'a' && last[-1] <= 'z') ||
++                            last[-1] == ':'))
++        --last;
++    if (last == end) last = begin; // no identifier at the end: print the whole argument
++    std::snprintf(out, size, "%.*s", static_cast<int>(end - last), last);
++}
++
++inline void Report(State& state, uint64_t now) noexcept {
++    const uint64_t windowNs = TicksToNs(now - state.windowStart);
++    uint64_t frames = 0, entries = state.otherEntries, fences = state.otherFences,
++             blocking = state.otherBlocking, ticks = state.otherTicks;
++    for (size_t i = 0; i < state.used; ++i) {
++        const Site& s = state.sites[i];
++        if (s.frame) frames += s.entries;
++        entries += s.entries;
++        fences += s.fences;
++        blocking += s.blocking;
++        ticks += s.ticks;
++    }
++    const double perFrame = frames != 0 ? 1.0 / static_cast<double>(frames) : 0.0;
++    const double waitMs = static_cast<double>(TicksToNs(ticks)) / 1e6;
++    std::fprintf(stderr,
++                 "[GX-HLE-FENCE-PROFILE] window=%.2fs frames=%llu scopes=%llu fences=%llu blocking=%llu "
++                 "flush_wait_ms=%.2f | per_frame fences=%.2f blocking=%.2f flush_wait_ms=%.3f | "
++                 "service_calls=%llu service_ms=%.2f | flush_sleeps=%llu flush_sleep_ms=%.2f "
++                 "submit_full_waits=%llu submit_full_ms=%.2f\n",
++                 static_cast<double>(windowNs) / 1e9, static_cast<unsigned long long>(frames),
++                 static_cast<unsigned long long>(entries), static_cast<unsigned long long>(fences),
++                 static_cast<unsigned long long>(blocking), waitMs, static_cast<double>(fences) * perFrame,
++                 static_cast<double>(blocking) * perFrame, waitMs * perFrame,
++                 static_cast<unsigned long long>(state.serviceCalls),
++                 static_cast<double>(TicksToNs(state.serviceTicks)) / 1e6,
++                 static_cast<unsigned long long>(state.flushSleeps),
++                 static_cast<double>(state.flushSleepNs) / 1e6,
++                 static_cast<unsigned long long>(state.submitFullWaits),
++                 static_cast<double>(state.submitFullNs) / 1e6);
++
++    // Entry points ordered by time spent waiting, then by fence count; unused ones are skipped.
++    size_t order[kMaxSites];
++    size_t count = 0;
++    for (size_t i = 0; i < state.used; ++i)
++        if (state.sites[i].entries != 0) order[count++] = i;
++    for (size_t i = 1; i < count; ++i) {
++        const size_t key = order[i];
++        size_t j = i;
++        while (j > 0) {
++            const Site& a = state.sites[order[j - 1]];
++            const Site& b = state.sites[key];
++            if (a.ticks > b.ticks || (a.ticks == b.ticks && a.fences >= b.fences)) break;
++            order[j] = order[j - 1];
++            --j;
++        }
++        order[j] = key;
++    }
++    const size_t shown = count < 24 ? count : 24;
++    for (size_t k = 0; k < shown; ++k) {
++        const Site& s = state.sites[order[k]];
++        char name[96];
++        DisplayName(s.name, name, sizeof(name));
++        const double avgPending =
++            s.blocking != 0 ? static_cast<double>(s.pending) / static_cast<double>(s.blocking) : 0.0;
++        const double siteMs = static_cast<double>(TicksToNs(s.ticks)) / 1e6;
++        const double avgUs = s.fences != 0 ? siteMs * 1000.0 / static_cast<double>(s.fences) : 0.0;
++        std::fprintf(stderr,
++                     "[GX-HLE-FENCE-PROFILE]   site=%s scopes=%llu fences=%llu blocking=%llu "
++                     "avg_pending=%.1f wait_ms=%.2f avg_us=%.2f max_us=%.1f | per_frame fences=%.2f wait_ms=%.3f\n",
++                     name, static_cast<unsigned long long>(s.entries),
++                     static_cast<unsigned long long>(s.fences), static_cast<unsigned long long>(s.blocking),
++                     avgPending, siteMs, avgUs, static_cast<double>(TicksToNs(s.maxTicks)) / 1e3,
++                     static_cast<double>(s.fences) * perFrame, siteMs * perFrame);
++    }
++    if (count > shown || state.otherEntries != 0)
++        std::fprintf(stderr, "[GX-HLE-FENCE-PROFILE]   (%zu more sites, %llu overflow scopes)\n",
++                     count - shown, static_cast<unsigned long long>(state.otherEntries));
++    std::fflush(stderr);
++}
++
++// Clears the window counters but keeps the site table (names stay registered).
++inline void ResetWindow(State& state, uint64_t now) noexcept {
++    for (size_t i = 0; i < state.used; ++i) {
++        Site& s = state.sites[i];
++        s.entries = s.fences = s.blocking = s.pending = s.ticks = s.maxTicks = 0;
++    }
++    state.otherEntries = state.otherFences = state.otherBlocking = state.otherTicks = 0;
++    state.serviceCalls = state.serviceTicks = 0;
++    state.flushSleeps = state.flushSleepNs = state.submitFullWaits = state.submitFullNs = 0;
++    state.windowStart = now;
++}
++
++constexpr uint64_t kReportIntervalNs = 5'000'000'000ull;
++
++// Window length; a variable only so the host test can shorten it.
++inline uint64_t& ReportIntervalNs() noexcept {
++    static uint64_t interval = kReportIntervalNs;
++    return interval;
++}
++
++inline void MaybeReport(State& state, uint64_t now) noexcept {
++    if (state.windowStart == 0) {
++        state.windowStart = now;
++        return;
++    }
++    if (TicksToNs(now - state.windowStart) < ReportIntervalNs()) return;
++    Report(state, now);
++    ResetWindow(state, now);
++}
++
++// A scope entered while another one is already open: no drain, counted for context only.
++inline void NoteNested(const char* site) noexcept {
++    State& state = GetState();
++    if (Site* s = Find(state, site)) ++s->entries;
++    else ++state.otherEntries;
++}
++
++// A real drain at depth 0. `pending` is the number of slots staged but not yet completed when the
++// fence started; `ticks` the time spent in Queue::FlushAll.
++inline void NoteFence(const char* site, uint64_t pending, uint64_t ticks, uint64_t now) noexcept {
++    State& state = GetState();
++    if (Site* s = Find(state, site)) {
++        ++s->entries;
++        ++s->fences;
++        s->ticks += ticks;
++        if (ticks > s->maxTicks) s->maxTicks = ticks;
++        if (pending != 0) {
++            ++s->blocking;
++            s->pending += pending;
++        }
++    } else {
++        ++state.otherEntries;
++        ++state.otherFences;
++        state.otherTicks += ticks;
++        if (pending != 0) ++state.otherBlocking;
++    }
++    MaybeReport(state, now);
++}
++
++inline void AddQueueWait(uint64_t flushSleeps, uint64_t flushSleepNs, uint64_t submitFullWaits,
++                         uint64_t submitFullNs) noexcept {
++    State& state = GetState();
++    state.flushSleeps += flushSleeps;
++    state.flushSleepNs += flushSleepNs;
++    state.submitFullWaits += submitFullWaits;
++    state.submitFullNs += submitFullNs;
++}
++
++inline void NoteService(uint64_t ticks) noexcept {
++    State& state = GetState();
++    ++state.serviceCalls;
++    state.serviceTicks += ticks;
++}
++
++} // namespace hle::gx::offload::fence_profile
 diff --git a/runtime/src/hle/gx/gx_offload_array.h b/runtime/src/hle/gx/gx_offload_array.h
 new file mode 100644
 --- /dev/null
@@ -443,7 +973,7 @@ new file mode 100644
 +        if (!Intercept() || Synchronous()) return Function(list, nbytes);
 +        if (list == nullptr || nbytes == 0 ||
 +            nbytes > GxOffloadQueue::kMaxPayloadBytes - sizeof(u32)) {
-+            SynchronousScope scope;
++            SynchronousScope scope(__PRETTY_FUNCTION__);
 +            return Function(list, nbytes);
 +        }
 +        using Command = DisplayListCommand<Function>;
@@ -730,7 +1260,7 @@ diff --git a/runtime/src/hle/gx/gx_offload_queue.cpp b/runtime/src/hle/gx/gx_off
 new file mode 100644
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload_queue.cpp
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,473 @@
 +#include "gx_offload_queue.h"
 +
 +#include <cstdlib>
@@ -807,6 +1337,9 @@ new file mode 100644
 +    batch_publication_enabled_ = false;
 +    const char* profile = std::getenv("WIICOMPILED_GX_HLE_BATCH_PROFILE");
 +    batch_profile_enabled_ = profile != nullptr && profile[0] == '1' && profile[1] == '\0';
++    const char* fence_profile = std::getenv("WIICOMPILED_GX_HLE_FENCE_PROFILE");
++    wait_profile_enabled_ = fence_profile != nullptr && fence_profile[0] == '1' && fence_profile[1] == '\0';
++    wait_stats_ = WaitStats{};
 +    profile_publish_count_ = 0;
 +    profile_slot_count_ = 0;
 +    profile_last_log_ns_ = 0;
@@ -895,7 +1428,14 @@ new file mode 100644
 +        // staged prefix visible before waiting, because WaitService may
 +        // re-enter Submit and the worker must be able to release ring space.
 +        PublishThrough(write);
-+        WaitForProducerProgress(read + 1);
++        if (wait_profile_enabled_) {
++            const uint64_t wait_started = MonotonicNanoseconds();
++            WaitForProducerProgress(read + 1);
++            ++wait_stats_.submit_full_waits;
++            wait_stats_.submit_full_ns += MonotonicNanoseconds() - wait_started;
++        } else {
++            WaitForProducerProgress(read + 1);
++        }
 +        spin_started = MonotonicNanoseconds();
 +    }
 +
@@ -913,6 +1453,40 @@ new file mode 100644
 +        PublishThrough(sequence);
 +    }
 +    return sequence;
++}
++
++bool Queue::TrySubmit(Execute execute, const void* payload, size_t payload_size) {
++    ValidateSubmit(execute, payload, payload_size);
++
++    // Preserve the queue's synchronous fallback when worker creation was disabled or failed.
++    if (!worker_started_) {
++        Submit(execute, payload, payload_size);
++        return true;
++    }
++
++    // Queue is SPSC: this producer is the only writer, and the worker only advances read.
++    // Between this check and Submit, occupancy can only decrease, so Submit cannot reach its
++    // wait/callback path. A full ring is an ordinary fallback signal with no slot mutation.
++    const Sequence write = staged_position_.load(std::memory_order_relaxed);
++    const Sequence read = read_position_.load(std::memory_order_acquire);
++    if (write - read >= kCapacity) {
++        // Observe a concurrent worker error before reporting a capacity miss.
++        if (failed_.load(std::memory_order_acquire)) RethrowFailureIfReached(Watermark() + 1);
++        return false;
++    }
++
++    Submit(execute, payload, payload_size);
++    return true;
++}
++
++void Queue::ValidateSubmit(Execute execute, const void* payload, size_t payload_size) const {
++    if (stopped_) throw std::logic_error("GX offload queue Submit after Stop");
++    if (OnWorkerThread() || g_executing_queue == this)
++        throw std::logic_error("GX offload jobs must not submit recursively");
++    if (execute == nullptr || payload_size > kMaxPayloadBytes ||
++        (payload == nullptr && payload_size != 0))
++        throw std::invalid_argument("invalid GX offload work item");
++    if (failed_.load(std::memory_order_acquire)) RethrowFailureIfReached(Watermark() + 1);
 +}
 +
 +Sequence Queue::Watermark() const noexcept {
@@ -966,7 +1540,14 @@ new file mode 100644
 +        RethrowFailureIfReached(watermark);
 +        if (!worker_started_) throw std::logic_error("inline GX offload work has not completed");
 +        if (MonotonicNanoseconds() - spin_started < kSpinWindowNs) continue;
-+        WaitForProducerProgress(watermark);
++        if (wait_profile_enabled_) {
++            const uint64_t wait_started = MonotonicNanoseconds();
++            WaitForProducerProgress(watermark);
++            ++wait_stats_.flush_sleeps;
++            wait_stats_.flush_sleep_ns += MonotonicNanoseconds() - wait_started;
++        } else {
++            WaitForProducerProgress(watermark);
++        }
 +        spin_started = MonotonicNanoseconds();
 +    }
 +    RethrowFailureIfReached(watermark);
@@ -1157,7 +1738,7 @@ diff --git a/runtime/src/hle/gx/gx_offload_queue.h b/runtime/src/hle/gx/gx_offlo
 new file mode 100644
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload_queue.h
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,189 @@
 +#pragma once
 +
 +#include <array>
@@ -1210,6 +1791,11 @@ new file mode 100644
 +    // Guest callbacks, guest memory and queue re-entry remain producer-only.
 +    Sequence Submit(Execute execute, const void* payload, size_t payload_size);
 +
++    // Attempts to submit without waiting or invoking WaitService. Returns false only when
++    // the worker-backed ring is full; validation and worker failures still throw. With no
++    // worker, the job uses Submit's inline fallback and returns true.
++    bool TrySubmit(Execute execute, const void* payload, size_t payload_size);
++
 +    template <typename Payload>
 +    Sequence Submit(Execute execute, const Payload& payload) {
 +        static_assert(std::is_trivially_copyable<Payload>::value,
@@ -1221,8 +1807,33 @@ new file mode 100644
 +        return Submit(execute, &payload, sizeof(Payload));
 +    }
 +
++    template <typename Payload>
++    bool TrySubmit(Execute execute, const Payload& payload) {
++        static_assert(std::is_trivially_copyable<Payload>::value,
++                      "GX offload payloads must be trivially copyable");
++        static_assert(sizeof(Payload) <= kMaxPayloadBytes,
++                      "GX offload payload exceeds the owned payload storage");
++        static_assert(alignof(Payload) <= alignof(std::max_align_t),
++                      "GX offload payload alignment exceeds the owned payload storage");
++        return TrySubmit(execute, &payload, sizeof(Payload));
++    }
++
 +    // Highest submitted sequence, including slots not yet visible to the worker.
 +    Sequence Watermark() const noexcept;
++    // Highest sequence the worker has completed.
++    Sequence Completed() const noexcept { return completed_sequence_.load(std::memory_order_acquire); }
++
++    // WIICOMPILED_GX_HLE_FENCE_PROFILE=1: producer-side time spent sleeping (past the spin window)
++    // in Flush and in Submit's ring-full wait. Producer-thread only; TakeWaitStats clears them.
++    struct WaitStats {
++        uint64_t flush_sleeps = 0, flush_sleep_ns = 0;
++        uint64_t submit_full_waits = 0, submit_full_ns = 0;
++    };
++    WaitStats TakeWaitStats() noexcept {
++        const WaitStats stats = wait_stats_;
++        wait_stats_ = WaitStats{};
++        return stats;
++    }
 +    void Flush(Sequence watermark);
 +    void FlushAll();
 +    void Stop();
@@ -1246,6 +1857,8 @@ new file mode 100644
 +        test_context_ = context;
 +    }
 +    void WakeWorkerForTest() noexcept;
++    // Makes every staged slot visible to the worker (batch mode otherwise holds up to 15 back).
++    void PublishAllForTest() noexcept { PublishThrough(Watermark()); }
 +#endif
 +
 +private:
@@ -1257,6 +1870,7 @@ new file mode 100644
 +
 +    bool StartImpl(bool enable_worker, bool force_create_failure, bool enable_batch,
 +                   WaitService wait_service, void* wait_context);
++    void ValidateSubmit(Execute execute, const void* payload, size_t payload_size) const;
 +    void PublishThrough(Sequence watermark) noexcept;
 +    void RunWorker() noexcept;
 +    void WaitForProducerProgress(Sequence target);
@@ -1305,6 +1919,8 @@ new file mode 100644
 +    bool worker_started_{};
 +    bool batch_publication_enabled_{};
 +    bool batch_profile_enabled_{};
++    bool wait_profile_enabled_{};
++    WaitStats wait_stats_{};
 +    uint64_t profile_publish_count_{};
 +    uint64_t profile_slot_count_{};
 +    uint64_t profile_last_log_ns_{};
@@ -1343,7 +1959,7 @@ new file mode 100644
 +    static void Invoke(const void* matrix, u32 id, u32 rowStride) {
 +        if (!Intercept() || Synchronous()) return Function(matrix, id, rowStride);
 +        if (!matrix || (rowStride != 3 && rowStride != 4)) {
-+            SynchronousScope scope;
++            SynchronousScope scope(__PRETTY_FUNCTION__);
 +            return Function(matrix, id, rowStride);
 +        }
 +
@@ -1411,7 +2027,7 @@ new file mode 100644
 +            valid = attr >= static_cast<u32>(GX_VA_PNMTXIDX) && attr < static_cast<u32>(GX_VA_MAX_ATTR);
 +        }
 +        if (!valid) {
-+            SynchronousScope scope;
++            SynchronousScope scope(__PRETTY_FUNCTION__);
 +            return Function(list, count);
 +        }
 +
@@ -1436,7 +2052,7 @@ new file mode 100644
 +            valid = attr >= static_cast<u32>(GX_VA_POS) && attr < static_cast<u32>(GX_VA_MAX_ATTR);
 +        }
 +        if (!valid) {
-+            SynchronousScope scope;
++            SynchronousScope scope(__PRETTY_FUNCTION__);
 +            return Function(vtxfmt, list, count);
 +        }
 +
@@ -2299,7 +2915,7 @@ diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
  
  bool begin_frame() noexcept {
  #ifdef AURORA_ENABLE_GX
-+  aurora::gx::HleProducerScope hleScope;
++  aurora::gx::HleProducerScope hleScope("aurora::begin_frame");
    // The asynchronous fast path below can return a logically prepared frame
    // without entering begin_frame_impl(), so loss must be checked before it.
    webgpu::fail_if_device_lost();
@@ -2307,7 +2923,7 @@ diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
  
  void end_frame() {
  #ifdef AURORA_ENABLE_GX
-+  aurora::gx::HleProducerScope hleScope;
++  aurora::gx::HleProducerScope hleScope("aurora::end_frame");
    webgpu::fail_if_device_lost();
  #endif
    if (!frame_worker_requested()) {
@@ -2330,6 +2946,41 @@ diff --git a/aurora-main/lib/dolphin/gx/GXGet.cpp b/aurora-main/lib/dolphin/gx/G
  void GXGetVtxDescv(GXVtxDescList* vcd) {
    CHECK(vcd != nullptr, "null vtx desc list");
  
+diff --git a/aurora-main/lib/dolphin/gx/GXTexture.cpp b/aurora-main/lib/dolphin/gx/GXTexture.cpp
+--- a/aurora-main/lib/dolphin/gx/GXTexture.cpp
++++ b/aurora-main/lib/dolphin/gx/GXTexture.cpp
+@@ -385,17 +385,29 @@
+   return const_cast<void*>(obj->userData);
+ }
+ 
+-void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
++void GXPrepareTexObjLoad(GXTexObj* obj_, GXTexMapID id) {
+   auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
+   SET_REG_FIELD(0, obj->mode0, 8, 24, GXTexMode0Ids[id]);
+   SET_REG_FIELD(0, obj->mode1, 8, 24, GXTexMode1Ids[id]);
+   SET_REG_FIELD(0, obj->image0, 8, 24, GXTexImage0Ids[id]);
++  SET_REG_FIELD(0, obj->image3, 8, 24, GXTexImage3Ids[id]);
++}
++
++#if defined(__SWITCH__)
++extern "C" bool GXCanOffloadTexObjLoad() noexcept {
++  // Recording must keep writes in the caller's display-list buffer before return.
++  return !gx_fifo_packet::direct();
++}
++#endif
++
++void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
++  auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
++  GXPrepareTexObjLoad(obj_, id);
+ 
+   u32 image1 = 0;
+   u32 image2 = 0;
+   SET_REG_FIELD(0, image1, 8, 24, GXTexImage1Ids[id]);
+   SET_REG_FIELD(0, image2, 8, 24, GXTexImage2Ids[id]);
+-  SET_REG_FIELD(0, obj->image3, 8, 24, GXTexImage3Ids[id]);
+ 
+ #if defined(__SWITCH__)
+   // Every byte below in one write (__gx.h, gx_fifo_packet): ~1000 loads a frame in a match.
 diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/command_processor.cpp
 --- a/aurora-main/lib/gx/command_processor.cpp
 +++ b/aurora-main/lib/gx/command_processor.cpp
@@ -2343,7 +2994,7 @@ diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/comma
  
  bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
                       uint32_t vertexBytes) {
-+  aurora::gx::HleProducerScope hleScope;
++  aurora::gx::HleProducerScope hleScope("aurora::submit_raw_draw");
    ZoneScoped;
    if (vertices == nullptr || vtxCount == 0 || vertexBytes == 0) {
      return false;
@@ -2357,22 +3008,46 @@ diff --git a/aurora-main/lib/gx/fifo.cpp b/aurora-main/lib/gx/fifo.cpp
  #include "../gfx/common.hpp"
  #include "../internal.hpp"
  
-@@ -114,6 +115,7 @@
+@@ -113,7 +114,23 @@
+ 
  void drain() { drain(DrainReason::Other); }
  
++namespace {
++// Static labels for WIICOMPILED_GX_HLE_FENCE_PROFILE; indexed by DrainReason.
++const char* drain_site_name(DrainReason reason) noexcept {
++  static const char* const names[] = {"fifo::drain(Other)",        "fifo::drain(Draw)",
++                                      "fifo::drain(DisplayList)",  "fifo::drain(RawDraw)",
++                                      "fifo::drain(DrawDone)",     "fifo::drain(Copy)",
++                                      "fifo::drain(EndFrame)",     "fifo::drain(EfbFlush)",
++                                      "fifo::drain(Offscreen)",    "fifo::drain(RenderArea)",
++                                      "fifo::drain(ViewportPolicy)"};
++  static_assert(sizeof(names) / sizeof(names[0]) == static_cast<size_t>(DrainReason::Count));
++  const auto index = static_cast<size_t>(reason);
++  return index < sizeof(names) / sizeof(names[0]) ? names[index] : "fifo::drain(?)";
++}
++} // namespace
++
  void drain(DrainReason reason) {
-+  aurora::gx::HleProducerScope hleScope;
++  aurora::gx::HleProducerScope hleScope(drain_site_name(reason));
    if (async_mode()) UNLIKELY {
      async_drain(reason);
      return;
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 --- a/aurora-main/lib/gx/fifo_async.inc
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -930,6 +930,7 @@
+@@ -930,6 +930,15 @@
  }
  
  void quiesce(QuiesceReason reason) {
-+  aurora::gx::HleProducerScope hleScope;
++  // Static labels for WIICOMPILED_GX_HLE_FENCE_PROFILE; indexed by QuiesceReason.
++  static const char* const kSiteNames[] = {"fifo::quiesce(DecoderRead)", "fifo::quiesce(CopyFilter)",
++                                           "fifo::quiesce(NativeWrite)", "fifo::quiesce(VIConfigure)",
++                                           "fifo::quiesce(Room)"};
++  static_assert(sizeof(kSiteNames) / sizeof(kSiteNames[0]) == static_cast<size_t>(QuiesceReason::Count));
++  const auto siteIndex = static_cast<size_t>(reason);
++  aurora::gx::HleProducerScope hleScope(siteIndex < sizeof(kSiteNames) / sizeof(kSiteNames[0])
++                                            ? kSiteNames[siteIndex]
++                                            : "fifo::quiesce(?)");
    if (!async_mode()) LIKELY {
      return;
    }
@@ -2380,20 +3055,25 @@ diff --git a/aurora-main/lib/gx/hle_producer_scope.hpp b/aurora-main/lib/gx/hle_
 new file mode 100644
 --- /dev/null
 +++ b/aurora-main/lib/gx/hle_producer_scope.hpp
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,29 @@
 +#pragma once
 +
 +#if defined(__SWITCH__)
 +extern "C" void GX_HLE_OffloadEnter() noexcept __attribute__((weak));
++extern "C" void GX_HLE_OffloadEnterSite(const char* site) noexcept __attribute__((weak));
 +extern "C" void GX_HLE_OffloadLeave() noexcept __attribute__((weak));
 +extern "C" void GX_HLE_OffloadStop() __attribute__((weak));
 +#endif
 +
 +namespace aurora::gx {
 +struct HleProducerScope {
-+  HleProducerScope() {
++  // `site` only labels the fence for WIICOMPILED_GX_HLE_FENCE_PROFILE (a string with static storage).
++  explicit HleProducerScope(const char* site = nullptr) {
 +#if defined(__SWITCH__)
-+    if (GX_HLE_OffloadEnter != nullptr) GX_HLE_OffloadEnter();
++    if (site != nullptr && GX_HLE_OffloadEnterSite != nullptr) GX_HLE_OffloadEnterSite(site);
++    else if (GX_HLE_OffloadEnter != nullptr) GX_HLE_OffloadEnter();
++#else
++    (void)site;
 +#endif
 +  }
 +  ~HleProducerScope() {

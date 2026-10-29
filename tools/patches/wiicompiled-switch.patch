@@ -53,7 +53,7 @@ index a71eb74..c6538d9 100644
  #else
  void GXSetArray(GXAttr attr, const void* data, u8 stride);
 diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
-index bc80c3c..6bd59bf 100644
+index bc80c3c..9c03ef3 100644
 --- a/aurora-main/lib/aurora.cpp
 +++ b/aurora-main/lib/aurora.cpp
 @@ -4,12 +4,17 @@
@@ -326,7 +326,7 @@ index bc80c3c..6bd59bf 100644
  
  bool begin_frame() noexcept {
  #ifdef AURORA_ENABLE_GX
-+  aurora::gx::HleProducerScope hleScope;
++  aurora::gx::HleProducerScope hleScope("aurora::begin_frame");
    // The asynchronous fast path below can return a logically prepared frame
    // without entering begin_frame_impl(), so loss must be checked before it.
    webgpu::fail_if_device_lost();
@@ -343,7 +343,7 @@ index bc80c3c..6bd59bf 100644
  
  void end_frame() {
  #ifdef AURORA_ENABLE_GX
-+  aurora::gx::HleProducerScope hleScope;
++  aurora::gx::HleProducerScope hleScope("aurora::end_frame");
    webgpu::fail_if_device_lost();
  #endif
    if (!frame_worker_requested()) {
@@ -1336,7 +1336,7 @@ index 80b3b92..789dc44 100644
    __gx->dirtyState = 0;
  }
 diff --git a/aurora-main/lib/dolphin/gx/GXTexture.cpp b/aurora-main/lib/dolphin/gx/GXTexture.cpp
-index 684ba79..f45d028 100644
+index 684ba79..be8f5e4 100644
 --- a/aurora-main/lib/dolphin/gx/GXTexture.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXTexture.cpp
 @@ -60,6 +60,10 @@ struct TlutIdentityRecord {
@@ -1480,9 +1480,35 @@ index 684ba79..f45d028 100644
  void GXInitTexObjWrapMode(GXTexObj* obj_, GXTexWrapMode wrapS, GXTexWrapMode wrapT) {
    auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
    SET_REG_FIELD(0, obj->mode0, 2, 0, wrapS);
-@@ -290,6 +397,32 @@ void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
+@@ -278,18 +385,56 @@ void* GXGetTexObjUserData(const GXTexObj* obj_) {
+   return const_cast<void*>(obj->userData);
+ }
+ 
+-void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
++void GXPrepareTexObjLoad(GXTexObj* obj_, GXTexMapID id) {
+   auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
+   SET_REG_FIELD(0, obj->mode0, 8, 24, GXTexMode0Ids[id]);
+   SET_REG_FIELD(0, obj->mode1, 8, 24, GXTexMode1Ids[id]);
+   SET_REG_FIELD(0, obj->image0, 8, 24, GXTexImage0Ids[id]);
++  SET_REG_FIELD(0, obj->image3, 8, 24, GXTexImage3Ids[id]);
++}
++
++#if defined(__SWITCH__)
++extern "C" bool GXCanOffloadTexObjLoad() noexcept {
++  // Recording must keep writes in the caller's display-list buffer before return.
++  return !gx_fifo_packet::direct();
++}
++#endif
++
++void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
++  auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
++  GXPrepareTexObjLoad(obj_, id);
+ 
+   u32 image1 = 0;
+   u32 image2 = 0;
+   SET_REG_FIELD(0, image1, 8, 24, GXTexImage1Ids[id]);
    SET_REG_FIELD(0, image2, 8, 24, GXTexImage2Ids[id]);
-   SET_REG_FIELD(0, obj->image3, 8, 24, GXTexImage3Ids[id]);
+-  SET_REG_FIELD(0, obj->image3, 8, 24, GXTexImage3Ids[id]);
  
 +#if defined(__SWITCH__)
 +  // Every byte below in one write (__gx.h, gx_fifo_packet): ~1000 loads a frame in a match.
@@ -1513,7 +1539,7 @@ index 684ba79..f45d028 100644
    GX_WRITE_RAS_REG(obj->mode0);
    GX_WRITE_RAS_REG(obj->mode1);
    GX_WRITE_RAS_REG(obj->image0);
-@@ -419,6 +552,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
+@@ -419,6 +564,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
  
  void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
    auto* obj = reinterpret_cast<const GXTlutObj_*>(obj_);
@@ -2949,7 +2975,7 @@ index 8b55612..1afac0a 100644
    // Consume the pending registration. The map is keyed by a guest object address that can be freed
    // or reused at any time, and entries used to live until shutdown.
 diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/command_processor.cpp
-index a9443c6..3350924 100644
+index a9443c6..184c4ae 100644
 --- a/aurora-main/lib/gx/command_processor.cpp
 +++ b/aurora-main/lib/gx/command_processor.cpp
 @@ -1,4 +1,5 @@
@@ -3085,7 +3111,7 @@ index a9443c6..3350924 100644
 +
  bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
                       uint32_t vertexBytes) {
-+  aurora::gx::HleProducerScope hleScope;
++  aurora::gx::HleProducerScope hleScope("aurora::submit_raw_draw");
    ZoneScoped;
    if (vertices == nullptr || vtxCount == 0 || vertexBytes == 0) {
      return false;
@@ -3138,7 +3164,7 @@ index a9443c6..3350924 100644
  
    else {
 diff --git a/aurora-main/lib/gx/fifo.cpp b/aurora-main/lib/gx/fifo.cpp
-index 9818084..59d50e7 100644
+index 9818084..ef23e67 100644
 --- a/aurora-main/lib/gx/fifo.cpp
 +++ b/aurora-main/lib/gx/fifo.cpp
 @@ -1,5 +1,6 @@
@@ -3188,7 +3214,7 @@ index 9818084..59d50e7 100644
    uint32_t needed = detail::sBufferSize + length;
    uint32_t newCap = std::max(detail::sBufferCapacity * 2, needed);
    detail::sBufferData = static_cast<uint8_t*>(realloc(detail::sBufferData, newCap));
-@@ -65,15 +88,39 @@ uint32_t end_display_list() {
+@@ -65,15 +88,54 @@ uint32_t end_display_list() {
    return padded;
  }
  
@@ -3221,8 +3247,23 @@ index 9818084..59d50e7 100644
 +
 +void drain() { drain(DrainReason::Other); }
 +
++namespace {
++// Static labels for WIICOMPILED_GX_HLE_FENCE_PROFILE; indexed by DrainReason.
++const char* drain_site_name(DrainReason reason) noexcept {
++  static const char* const names[] = {"fifo::drain(Other)",        "fifo::drain(Draw)",
++                                      "fifo::drain(DisplayList)",  "fifo::drain(RawDraw)",
++                                      "fifo::drain(DrawDone)",     "fifo::drain(Copy)",
++                                      "fifo::drain(EndFrame)",     "fifo::drain(EfbFlush)",
++                                      "fifo::drain(Offscreen)",    "fifo::drain(RenderArea)",
++                                      "fifo::drain(ViewportPolicy)"};
++  static_assert(sizeof(names) / sizeof(names[0]) == static_cast<size_t>(DrainReason::Count));
++  const auto index = static_cast<size_t>(reason);
++  return index < sizeof(names) / sizeof(names[0]) ? names[index] : "fifo::drain(?)";
++}
++} // namespace
++
 +void drain(DrainReason reason) {
-+  aurora::gx::HleProducerScope hleScope;
++  aurora::gx::HleProducerScope hleScope(drain_site_name(reason));
 +  if (async_mode()) UNLIKELY {
 +    async_drain(reason);
 +    return;
@@ -3231,7 +3272,7 @@ index 9818084..59d50e7 100644
    // SEALED, not DONE.
    const auto waited = aurora::wait_for_frame_worker_sealed();
    if (waited.count() > 0) UNLIKELY {
-@@ -82,6 +129,7 @@ void drain() {
+@@ -82,6 +144,7 @@ void drain() {
    if (detail::sBufferSize == 0) {
      return;
    }
@@ -3239,7 +3280,7 @@ index 9818084..59d50e7 100644
    uint32_t consumed = 0;
    bool retried = false;
    while (consumed < detail::sBufferSize) {
-@@ -92,15 +140,19 @@ void drain() {
+@@ -92,15 +155,19 @@ void drain() {
      if (consumed == detail::sBufferSize) break;
      // process returned with its renderer lock released. No recursive drain.
      gfx::split_staging_batch();
@@ -3477,10 +3518,10 @@ index b01ea45..8d7f5fc 100644
 +#endif
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 new file mode 100644
-index 0000000..8db0e1b
+index 0000000..0e20651
 --- /dev/null
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -0,0 +1,1187 @@
+@@ -0,0 +1,1195 @@
 +// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
 +// at the end of fifo.cpp.
 +//
@@ -4413,7 +4454,15 @@ index 0000000..8db0e1b
 +}
 +
 +void quiesce(QuiesceReason reason) {
-+  aurora::gx::HleProducerScope hleScope;
++  // Static labels for WIICOMPILED_GX_HLE_FENCE_PROFILE; indexed by QuiesceReason.
++  static const char* const kSiteNames[] = {"fifo::quiesce(DecoderRead)", "fifo::quiesce(CopyFilter)",
++                                           "fifo::quiesce(NativeWrite)", "fifo::quiesce(VIConfigure)",
++                                           "fifo::quiesce(Room)"};
++  static_assert(sizeof(kSiteNames) / sizeof(kSiteNames[0]) == static_cast<size_t>(QuiesceReason::Count));
++  const auto siteIndex = static_cast<size_t>(reason);
++  aurora::gx::HleProducerScope hleScope(siteIndex < sizeof(kSiteNames) / sizeof(kSiteNames[0])
++                                            ? kSiteNames[siteIndex]
++                                            : "fifo::quiesce(?)");
 +  if (!async_mode()) LIKELY {
 +    return;
 +  }
@@ -5324,23 +5373,28 @@ index 563fd06..0b910c8 100644
    case GX_VA_PNMTXIDX:
 diff --git a/aurora-main/lib/gx/hle_producer_scope.hpp b/aurora-main/lib/gx/hle_producer_scope.hpp
 new file mode 100644
-index 0000000..ccc24e2
+index 0000000..4316bc1
 --- /dev/null
 +++ b/aurora-main/lib/gx/hle_producer_scope.hpp
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,29 @@
 +#pragma once
 +
 +#if defined(__SWITCH__)
 +extern "C" void GX_HLE_OffloadEnter() noexcept __attribute__((weak));
++extern "C" void GX_HLE_OffloadEnterSite(const char* site) noexcept __attribute__((weak));
 +extern "C" void GX_HLE_OffloadLeave() noexcept __attribute__((weak));
 +extern "C" void GX_HLE_OffloadStop() __attribute__((weak));
 +#endif
 +
 +namespace aurora::gx {
 +struct HleProducerScope {
-+  HleProducerScope() {
++  // `site` only labels the fence for WIICOMPILED_GX_HLE_FENCE_PROFILE (a string with static storage).
++  explicit HleProducerScope(const char* site = nullptr) {
 +#if defined(__SWITCH__)
-+    if (GX_HLE_OffloadEnter != nullptr) GX_HLE_OffloadEnter();
++    if (site != nullptr && GX_HLE_OffloadEnterSite != nullptr) GX_HLE_OffloadEnterSite(site);
++    else if (GX_HLE_OffloadEnter != nullptr) GX_HLE_OffloadEnter();
++#else
++    (void)site;
 +#endif
 +  }
 +  ~HleProducerScope() {
