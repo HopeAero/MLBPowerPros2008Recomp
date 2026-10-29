@@ -585,7 +585,7 @@ index ec98605..3350b96 100644
      // nowhere near a palette, so reject them without walking the map.
 diff --git a/runtime/src/hle/gx/gx_offload.cpp b/runtime/src/hle/gx/gx_offload.cpp
 new file mode 100644
-index 0000000..9f278b1
+index 0000000..239aed0
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload.cpp
 @@ -0,0 +1,180 @@
@@ -668,7 +668,7 @@ index 0000000..9f278b1
 +}
 +
 +bool Synchronous() noexcept { return synchronousDepth != 0; }
-+bool Intercept() noexcept { return queue.Active() && ownerTag == &threadTag; }
++bool InterceptOwner() noexcept { return ownerTag == &threadTag; }
 +void Fence() {
 +    if (Intercept() && !Synchronous()) FlushForFence("offload::Fence");
 +}
@@ -771,10 +771,10 @@ index 0000000..9f278b1
 +#endif
 diff --git a/runtime/src/hle/gx/gx_offload.h b/runtime/src/hle/gx/gx_offload.h
 new file mode 100644
-index 0000000..021c0ea
+index 0000000..cddfdec
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_offload.h
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,165 @@
 +#pragma once
 +
 +#include "gx_offload_queue.h"
@@ -806,7 +806,9 @@ index 0000000..021c0ea
 +void EnterSynchronous(const char* site = nullptr);
 +void LeaveSynchronous() noexcept;
 +bool Synchronous() noexcept;
-+bool Intercept() noexcept;
++bool InterceptOwner() noexcept;
++// Inline: with the worker off (the default) a wrapped GX call pays one acquire load (P22).
++inline bool Intercept() noexcept { return queue.Active() && InterceptOwner(); }
 +void SetVtxDescShadow(GXAttr attr, GXAttrType type) noexcept;
 +void ClearVtxDescShadow() noexcept;
 +void GetVtxDesc(GXAttr attr, GXAttrType* type);
@@ -814,10 +816,18 @@ index 0000000..021c0ea
 +void GetVcdState(uint32_t* lo, uint32_t* hi, uint32_t* flags);
 +
 +struct SynchronousScope {
-+    explicit SynchronousScope(const char* site = nullptr) { EnterSynchronous(site); }
-+    ~SynchronousScope() { LeaveSynchronous(); }
++    // An inactive queue has nothing to flush and nobody reads the VCD shadow (P22).
++    explicit SynchronousScope(const char* site = nullptr) : entered_(queue.Active()) {
++        if (entered_) EnterSynchronous(site);
++    }
++    ~SynchronousScope() {
++        if (entered_) LeaveSynchronous();
++    }
 +    SynchronousScope(const SynchronousScope&) = delete;
 +    SynchronousScope& operator=(const SynchronousScope&) = delete;
++
++private:
++    bool entered_;
 +};
 +
 +// These functions operate on producer-owned host objects, never on __gx or FIFO.
