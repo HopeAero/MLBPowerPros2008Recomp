@@ -379,3 +379,12 @@ El usuario recibió indicación de cerrar tras una sonda corta; al tomar la
 instantánea la captura seguía abierta y la confirmación visual estaba pendiente.
 No confundir esta instantánea con el log completo posterior ni afirmar 60 fps
 estables. Archivos de análisis bajo `local/tmp/cpu/GX-prep-test/`.
+
+**Cierre posterior:** conexión terminada normalmente. Doce ventanas DK,
+19.519 presents y cero frames GPU >16 ms en todo el log. El análisis CPU
+conservador usa once de doce inicios de volcado; `cpu-priorities.txt` conserva
+la distribución. Priorizar preparación/envío GX por modelo, despacho indirecto
+y origen de asignaciones/copias; el coste está repartido entre muchas funciones.
+Los contadores activos tienen coste propio y no cuentan como progreso de juego.
+El usuario identificó la CPU como prioridad. Sigue pendiente su confirmación
+visual; no se inició otra prueba de consola.

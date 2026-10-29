@@ -119,3 +119,24 @@ Análisis reproducible privado: `console_report.py console-snapshot.log`,
 `console-report.txt/json`, `last-complete.log` y `hotspots.txt`, bajo
 `local/tmp/cpu/GX-prep-test/`. La captura en vivo puede contener datos
 posteriores que no forman parte de esta instantánea.
+
+### Cierre y prioridades CPU
+
+La conexión cerró normalmente. El log completo contiene doce inicios de
+volcado; para ordenar costes se toman conservadoramente los once anteriores
+al último inicio, sin modificar las cifras de la instantánea anterior.
+`cpu_priorities.py` genera `cpu-priorities.txt` a partir del log y sus símbolos.
+Las doce ventanas DK suman 19.519 presents, con cero frames de GPU >16 ms;
+incluyen arranque, menús y partido. Esto respalda priorizar el lado CPU en
+las escenas medidas, sin generalizar a escenas aún no probadas.
+
+En la cubeta 600–639, con 299 frames, destacan muestras en despacho indirecto
+(0,488 ms/frame), memset/malloc/memmove (0,291/0,227/0,177), entrada de listas
+(0,288), texturas (0,284), kick FIFO (0,244) y escritura FIFO (0,217).
+Son costes propios aproximados por muestras, no tiempos de llamadas completos
+ni una atribución de los frames más lentos. El coste está distribuido: conviene
+reducir trabajo repetido de preparación/envío por modelo y rastrear las
+asignaciones y copias hasta sus llamadores antes de cambiar sus contratos.
+Los contadores opcionales también aparecen (0,375); eso es coste de diagnóstico,
+no progreso de recomp ni un ahorro de juego demostrado al desactivarlos.
+La confirmación visual continúa pendiente.
