@@ -60,7 +60,62 @@ actualizadas y 48.223 sin cambios. Candidata privada:
 `1a0c2df102e0a3c715623937e997e8153e98234946e52502b5febdcf99433789`.
 Símbolos: `local/switch/logs/elf-syms-GX-batch3.txt`.
 
-La candidata incluye batch2 y esta revisión. Ambas siguen pendientes de una
-sonda corta comparable, a los mismos relojes sin overclock. La referencia de
-consola continúa siendo `nxlink-HLE1-round2-20261029-182140.log`; no se atribuyen
-a esta build sus resultados ni se afirma que alcance 60 fps estables en fildeo.
+La candidata incluye batch2 y esta revisión. Se envió a consola posteriormente,
+cuando el usuario confirmó que estaba en netloader. La primera medición se
+describe a continuación; no se afirma que alcance 60 fps estables en fildeo.
+
+## Primera medición en consola
+
+Log privado `nxlink-GX-batch3-20261029-191939.log`, con los símbolos y SHA-256
+de esta candidata. Se habilitaron profile_dl, spikes=30, spikes_max=256 y
+batch_profile; los contadores confirman que se ejecutaron los atajos. Se mantuvo
+la instrucción del usuario de probar sin overclock, sin telemetría de relojes
+en este modo. No se añadió otra partida para aumentar la muestra.
+
+El informe usa una instantánea privada tomada a las 19:24:44, mientras la
+captura seguía abierta: `local/tmp/cpu/GX-prep-test/console-snapshot.log`.
+Contiene ocho inicios de volcado; se usan los siete cuya impresión terminó
+antes del siguiente inicio. Se reparó un anchor dividido por la intercalación
+del reporte DK. En el volcado elegido se reconocen sus 9.697 registros PC;
+la referencia archivada HLE1-round2 tiene seis volcados completos.
+
+Comparación de CPU ocupada estimada por muestras PC, en cubetas compartidas
+240–479 listas/frame con al menos 200 frames por captura. Pesos: mínimo de
+frames por cubeta, 1654/964/808/401/257. Son escenas distintas, sin replay del
+mismo estado; estas cifras no son tiempos completos de frame ni FPS.
+
+| Grupo | HLE1-round2, ms | GX-batch3, ms |
+|---|---:|---:|
+| CPU ocupada muestreada | 8,764 | 8,104 |
+| FIFO y envío de atributos | 0,350 | 0,163 |
+| Preparación/envío de listas | 0,215 | 0,194 |
+| Preparación VCD | 0,176 | 0,140 |
+| Preparación VAT | 0,041 | 0,015 |
+| Preparación de arrays | 0,107 | 0,140 |
+| GuestToHostPtr | 0,076 | 0,069 |
+
+La diferencia global observada es −0,660 ms de CPU ocupada, con resultados
+heterogéneos: 240–279 empeora 0,230 ms, 280–319 mejora 3,494 ms y 360–399
+empeora 2,590 ms. No demuestra un ahorro causal de ese tamaño. Arrays no
+presenta reducción medida en esta comparación, aunque se confirma el uso de
+su resolución directa. No se aíslan por separado las contribuciones batch2/3.
+
+Los contadores opcionales cuestan aproximadamente 0,194 ms en esas cubetas;
+están activos solo en la candidata durante esta comparación. No se deben
+restar para inventar un resultado sin diagnóstico: esa configuración no se
+midió. En la cubeta 600–639 hay 298 frames nuevos frente a solo 49 de la
+referencia, insuficientes para comparar la toma más pesada. Allí siguen
+apareciendo costes en llamadas indirectas, listas, memoria/asignaciones y GX.
+El audio se mantiene fuera del alcance de los cambios.
+
+En las ventanas DK de esta instantánea no hubo frames con GPU mayor que 16 ms.
+Las ventanas con partido muestran p95 de GPU entre 6,50 y 9,25 ms, mientras
+persisten picos de intervalo de unos 30–40 ms o más, atribuidos a CPU por DK.
+No se registran errores GX en la instantánea. La confirmación visual del
+usuario sigue pendiente; esto no es validación pixel a pixel ni evidencia de
+60 fps estables.
+
+Análisis reproducible privado: `console_report.py console-snapshot.log`,
+`console-report.txt/json`, `last-complete.log` y `hotspots.txt`, bajo
+`local/tmp/cpu/GX-prep-test/`. La captura en vivo puede contener datos
+posteriores que no forman parte de esta instantánea.

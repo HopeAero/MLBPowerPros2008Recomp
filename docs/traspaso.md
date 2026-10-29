@@ -341,9 +341,10 @@ consola. Mantener las sondas cortas y no repetir partidos para avanzar marcador.
 
 ## GX batch3: arrays y VAT, fases 77–78
 
-El usuario pidió continuar programando y probar después. **No enviar esta
-candidata por netloader hasta que retome las pruebas.** Se mantiene la condición
-de medir sin overclock cuando corresponda.
+El usuario pidió continuar programando y probar después; posteriormente confirmó
+que estaba en netloader y se envió la candidata. Se mantiene la condición de
+medir sin overclock. Esta captura basta para la primera revisión; evitar
+repetir partidos para ampliar muestras.
 
 Se añadió resolución de arrays de vértices/XF dentro de páginas RAM con bias
 writable válido, evitando Contains más GuestToHostPtr en ese caso. Cruces,
@@ -360,7 +361,21 @@ cambios. Evidencia y límites en [preparación GX](gx-preparation.md).
 
 Candidata privada `local/switch/build/GX-batch3.nro`, SHA-256
 `1a0c2df102e0a3c715623937e997e8153e98234946e52502b5febdcf99433789`;
-símbolos `local/switch/logs/elf-syms-GX-batch3.txt`. Incluye batch2. Ambas tandas
-siguen sin medición de consola; no se les atribuye el resultado de HLE1-round2
-ni 60 fps estables. Para una comparación futura completa, desactivar FIFO, DL
-y PREP en la misma build; cada interruptor controla su parte por separado.
+símbolos `local/switch/logs/elf-syms-GX-batch3.txt`. Incluye batch2. Para una
+comparación futura completa, desactivar FIFO, DL y PREP en la misma build;
+cada interruptor controla su parte por separado.
+
+**Primera captura GX-batch3:** log `nxlink-GX-batch3-20261029-191939.log`.
+El análisis fija una instantánea de las 19:24:44, con siete volcados completos
+y otro iniciado. En las cubetas compartidas 240–479, CPU ocupada muestreada
+HLE1-round2 → batch3: 8,764 → 8,104 ms (−0,660 ms), heterogénea entre escenas,
+sin replay ni ahorro causal probado. FIFO y VAT bajan; arrays no mejora en esa
+comparación. Los contadores opcionales añaden aproximadamente 0,194 ms. DK
+atribuye los picos a CPU; ninguna ventana de la instantánea tiene GPU >16 ms.
+Siguen picos de 30–40 ms o más. Detalles, pesos y limitaciones en
+[la medición GX](gx-preparation.md#primera-medición-en-consola).
+
+El usuario recibió indicación de cerrar tras una sonda corta; al tomar la
+instantánea la captura seguía abierta y la confirmación visual estaba pendiente.
+No confundir esta instantánea con el log completo posterior ni afirmar 60 fps
+estables. Archivos de análisis bajo `local/tmp/cpu/GX-prep-test/`.

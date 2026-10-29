@@ -72,5 +72,5 @@ antes de enviar y mantener los mismos relojes. Usar una lista corta de argumento
 con profile_dl, spikes=30, spikes_max=256 y batch_profile=1.
 
 Actualización posterior: [GX batch3](gx-preparation.md) incluye estos cambios
-y optimiza arrays/VAT. El usuario pidió posponer las pruebas de consola;
-continuar con esa candidata cuando retome las sondas.
+y optimiza arrays/VAT. Tras la confirmación posterior de netloader se obtuvo
+[una primera medición conjunta](gx-preparation.md#primera-medición-en-consola).
