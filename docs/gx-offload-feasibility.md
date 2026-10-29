@@ -253,3 +253,42 @@ cambiar headers incluidos por el código traducido. Integración con `mkswitch.s
 `treecheck.sh` y ambos `diff -rq`; build solo por el líder con cuatro jobs. A/B en
 consola separando diagnóstico de benchmark y sin atribuir causalidad a partidas
 distintas. Un pico limitado por GPU puede persistir aunque baje el coste del principal.
+
+## Fase 66: candidata optativa compilada
+
+La primera implementación está en `tools/patches/wiicompiled-gx-offload-source.patch`
+y en los dos parches Switch generados. `WIICOMPILED_GX_HLE_WORKER=1` crea un worker
+libnx en core 2 con 16.384 registros propios de hasta 128 bytes; sin la variable,
+las llamadas siguen el camino original. El enlace intercepta 143 entradas GX/Aurora.
+En esta fase, 91 emisores escalares y tres cargas de matrices/luz con copia exacta
+pueden ejecutarse en el worker. Las llamadas con resultados, punteros prestados,
+objetos de textura/TLUT, callbacks y control se cercan y ejecutan en el principal.
+La sombra VCD permite las consultas de atributos sin esperar cada setter. Las
+escrituras guest de HLE, el escaneo de listas y la construcción G7 permanecen en el
+principal. **Por tanto, esta fase aún no saca el GX entero del hilo del juego.**
+
+La cola conserva orden FIFO y copia el payload antes de publicar; cada publicación
+sincroniza el aviso con el mutex del worker, lo que cierra las dos carreras de wake
+detectadas durante revisión. Los límites de frame, drain/quiesce, raw draw y locks G7
+ceden la propiedad al productor solo tras vaciarla. Las esperas atienden VI, alarmas
+y la consulta de audio desde el principal; el worker no ejecuta callbacks guest.
+`GXEnd` comparte el orden encolado de `GXBegin` y los vértices. Se hace join antes
+de cerrar Aurora y antes de destruir las fibras guest. Una excepción del worker en
+un hook `noexcept` se registra y termina el proceso, pues la cola y el estado Aurora
+ya no admiten continuación segura.
+
+Verificación local: test de cola con wake forzado y variante negativa de copia;
+diferenciales con cuerpos reales HLE/Aurora para RAM guest, VCD, FIFO, scissor,
+matrices/luz, reentrada y seis wrappers GNU `--wrap`. Los mutantes de fence, sombra,
+orden de callback y payload fueron detectados. La cadena de 74 parches más Linux y
+Switch aplica con rebind; `treecheck` coincide exactamente en runtime y Aurora. La
+traducción dejó 48.223 archivos iguales; el build Switch de cuatro trabajos enlazó
+el NRO Vulkan de 119.314.629 bytes, SHA-256
+`93bda05ab39c64953a09a8858a2a555c8a17c919a3266a50e578efc69f8e6a0a`.
+El NRO previo está en `local/switch/build/GX-Q66-baseline.nro` con SHA-256
+`6d0b1ab24d2082cba079fe13b1577b52fa449a8c03ef9ee1d707f79008e597f2`.
+
+Pendiente: A/B en la Switch con worker=0/1, mismos relojes y secuencias comparables;
+medir coste del principal, esperas, carga de core 2, p95/p99 y GPU. Solo esa prueba
+permite decidir cuánto más GX migrar. Ni el build ni los tests host garantizan 60 fps
+estables o fidelidad visual/audio durante un partido completo.

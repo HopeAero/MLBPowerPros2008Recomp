@@ -583,6 +583,1869 @@ index ec98605..3350b96 100644
      EnsureTlutObjBoundsLocked();
      // Most DCStoreRange calls flush small material/vertex buffers that live
      // nowhere near a palette, so reject them without walking the map.
+diff --git a/runtime/src/hle/gx/gx_offload.cpp b/runtime/src/hle/gx/gx_offload.cpp
+new file mode 100644
+index 0000000..c895f4a
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload.cpp
+@@ -0,0 +1,135 @@
++#if defined(__SWITCH__) || defined(GX_OFFLOAD_QUEUE_TEST)
++#include "gx_offload.h"
++
++#include <stdexcept>
++#include <cstdio>
++#include <cstdlib>
++
++extern "C" void aurora_gx_offload_vcd_snapshot(uint32_t*, uint32_t*, uint32_t*, uint32_t*);
++void VI_HLE_ProcessRetracesDeferred(int);
++extern "C" void OS_HLE_ProcessAlarmsDeferred(int);
++void Audio_HLE_PollDeferred();
++
++namespace hle::gx::offload {
++GxOffloadQueue::Queue queue;
++namespace {
++thread_local unsigned synchronousDepth = 0;
++thread_local char threadTag;
++const void* ownerTag = nullptr;
++bool initialized = false;
++struct VcdShadow {
++    uint32_t lo = 0, hi = 0, flags = 0, normalType = 0;
++} vcd;
++
++void RefreshVcd() noexcept {
++    aurora_gx_offload_vcd_snapshot(&vcd.lo, &vcd.hi, &vcd.flags, &vcd.normalType);
++}
++void ServiceWait(void*) {
++    VI_HLE_ProcessRetracesDeferred(8);
++    OS_HLE_ProcessAlarmsDeferred(8);
++    Audio_HLE_PollDeferred();
++}
++}
++
++void Initialize() {
++    Fence();
++    RefreshVcd();
++    if (!initialized) {
++        ownerTag = &threadTag;
++        const bool active = queue.Start(ServiceWait);
++        std::fprintf(stderr, "[gx-hle] worker=%s core=2 capacity=%zu payload=%zu\n",
++                     active ? "on" : "off", GxOffloadQueue::kCapacity, GxOffloadQueue::kMaxPayloadBytes);
++        initialized = true;
++    }
++}
++
++bool Synchronous() noexcept { return synchronousDepth != 0; }
++bool Intercept() noexcept { return queue.Active() && ownerTag == &threadTag; }
++void Fence() {
++    if (Intercept() && !Synchronous()) queue.FlushAll();
++}
++void EnterSynchronous() {
++    if (queue.Active() && !Intercept()) return;
++    if (synchronousDepth == 0) queue.FlushAll();
++    ++synchronousDepth;
++}
++void LeaveSynchronous() noexcept {
++    if (queue.Active() && !Intercept()) return;
++    if (--synchronousDepth == 0) RefreshVcd();
++}
++
++void SetVtxDescShadow(GXAttr attr, GXAttrType type) noexcept {
++    constexpr uint8_t shifts[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 13, 15, 0, 2, 4, 6, 8, 10, 12, 14};
++    const uint32_t a = static_cast<uint32_t>(attr);
++    if (a <= GX_VA_TEX7 && a != GX_VA_NRM) {
++        const uint32_t shift = shifts[a];
++        const uint32_t mask = (a <= GX_VA_TEX7MTXIDX ? 1u : 3u) << shift;
++        auto& reg = a >= GX_VA_TEX0 ? vcd.hi : vcd.lo;
++        reg = (reg & ~mask) | (static_cast<uint32_t>(type) << shift);
++    } else if (a == GX_VA_NRM || a == GX_VA_NBT) {
++        const uint32_t flag = a == GX_VA_NRM ? 1u : 2u;
++        vcd.flags = (vcd.flags & ~flag) | (type != GX_NONE ? flag : 0u);
++        if (type != GX_NONE) vcd.normalType = static_cast<uint32_t>(type);
++    }
++    vcd.lo = (vcd.lo & ~(3u << 11)) | ((vcd.flags != 0 ? vcd.normalType : 0u) << 11);
++}
++void ClearVtxDescShadow() noexcept {
++    vcd.lo = 1u << 9;
++    vcd.hi = 0;
++    vcd.flags = 0;
++}
++void GetVtxDesc(GXAttr attr, GXAttrType* type) {
++    if (type == nullptr) throw std::invalid_argument("null GX vertex descriptor result");
++    constexpr uint8_t shifts[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 14};
++    const uint32_t a = static_cast<uint32_t>(attr);
++    uint32_t value = 0;
++    if (a <= GX_VA_TEX7) {
++        const uint32_t reg = a >= GX_VA_TEX0 ? vcd.hi : vcd.lo;
++        value = (reg >> shifts[a]) & (a <= GX_VA_TEX7MTXIDX ? 1u : 3u);
++        if (a == GX_VA_NRM && (vcd.flags & 1u) == 0) value = 0;
++    } else if (a == GX_VA_NBT && (vcd.flags & 2u) != 0) {
++        value = (vcd.lo >> 11) & 3u;
++    }
++    *type = static_cast<GXAttrType>(value);
++}
++void GetVtxDescv(GXVtxDescList* list) {
++    if (list == nullptr) throw std::invalid_argument("null GX vertex descriptor list");
++    for (int attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; ++attr, ++list) {
++        list->attr = static_cast<GXAttr>(attr);
++        GetVtxDesc(list->attr, &list->type);
++    }
++    list->attr = GX_VA_NBT;
++    GetVtxDesc(GX_VA_NBT, &list->type);
++    (++list)->attr = GX_VA_NULL;
++}
++void GetVcdState(uint32_t* lo, uint32_t* hi, uint32_t* flags) {
++    *lo = vcd.lo;
++    *hi = vcd.hi;
++    *flags = vcd.flags;
++}
++}
++
++extern "C" void GX_HLE_OffloadEnter() noexcept {
++    try {
++        if (hle::gx::offload::Intercept()) hle::gx::offload::EnterSynchronous();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "[gx-hle] fence failed: %s\n", error.what());
++        std::abort();
++    } catch (...) {
++        std::fprintf(stderr, "[gx-hle] fence failed: worker error\n");
++        std::abort();
++    }
++}
++extern "C" void GX_HLE_OffloadLeave() noexcept {
++    if (hle::gx::offload::Intercept()) hle::gx::offload::LeaveSynchronous();
++}
++extern "C" void GX_HLE_OffloadStop() {
++    try {
++        hle::gx::offload::queue.Stop();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "[gx-hle] shutdown: %s\n", error.what());
++    } catch (...) {
++        std::fprintf(stderr, "[gx-hle] shutdown: worker failure\n");
++    }
++}
++#endif
+diff --git a/runtime/src/hle/gx/gx_offload.h b/runtime/src/hle/gx/gx_offload.h
+new file mode 100644
+index 0000000..1c31080
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload.h
+@@ -0,0 +1,142 @@
++#pragma once
++
++#include "gx_offload_queue.h"
++
++#include <dolphin/gx/GXStruct.h>
++#include <dolphin/gx/GXGeometry.h>
++#include <dolphin/gx/GXGet.h>
++#include <dolphin/gx/GXTexture.h>
++#include <dolphin/gx.h>
++
++#include <cstring>
++#include <type_traits>
++#include <utility>
++
++extern "C" void GXLoadPosMtxImmBE(const void*, u32);
++extern "C" void GXLoadLightObjImmBE(const void*, GXLightID);
++
++namespace hle::gx::offload {
++
++extern GxOffloadQueue::Queue queue;
++void Initialize();
++void Fence();
++void EnterSynchronous();
++void LeaveSynchronous() noexcept;
++bool Synchronous() noexcept;
++bool Intercept() noexcept;
++void SetVtxDescShadow(GXAttr attr, GXAttrType type) noexcept;
++void ClearVtxDescShadow() noexcept;
++void GetVtxDesc(GXAttr attr, GXAttrType* type);
++void GetVtxDescv(GXVtxDescList* list);
++void GetVcdState(uint32_t* lo, uint32_t* hi, uint32_t* flags);
++
++struct SynchronousScope {
++    SynchronousScope() { EnterSynchronous(); }
++    ~SynchronousScope() { LeaveSynchronous(); }
++    SynchronousScope(const SynchronousScope&) = delete;
++    SynchronousScope& operator=(const SynchronousScope&) = delete;
++};
++
++// These functions operate on producer-owned host objects, never on __gx or FIFO.
++template <auto Function> inline constexpr bool LocalObjectOperation = false;
++#define GX_LOCAL_OBJECT_OPERATION(name) \
++    template <> inline constexpr bool LocalObjectOperation<&::name> = true
++GX_LOCAL_OBJECT_OPERATION(GXInitTexObj);
++GX_LOCAL_OBJECT_OPERATION(GXInitTexObjCI);
++GX_LOCAL_OBJECT_OPERATION(GXInitTexObjLOD);
++GX_LOCAL_OBJECT_OPERATION(GXInitTexObjWrapMode);
++GX_LOCAL_OBJECT_OPERATION(GXInitTexObjFilter);
++GX_LOCAL_OBJECT_OPERATION(GXInitTexObjLODBias);
++GX_LOCAL_OBJECT_OPERATION(GXInitTexObjUserData);
++GX_LOCAL_OBJECT_OPERATION(GXInitTexObjTlut);
++GX_LOCAL_OBJECT_OPERATION(GXInitTexObjData);
++GX_LOCAL_OBJECT_OPERATION(GXGetTexBufferSize);
++#undef GX_LOCAL_OBJECT_OPERATION
++
++template <auto Function> inline constexpr bool AsyncOperation = false;
++#include "gx_offload_async.inc"
++
++template <auto Function> struct BeforeScalar {
++    template <typename... Args> static void Apply(Args...) noexcept {}
++};
++template <> struct BeforeScalar<&::GXSetVtxDesc> {
++    static void Apply(GXAttr attr, GXAttrType type) noexcept { SetVtxDescShadow(attr, type); }
++};
++template <> struct BeforeScalar<&::GXClearVtxDesc> {
++    static void Apply() noexcept { ClearVtxDescShadow(); }
++};
++
++template <typename Value> uint64_t PackValue(const Value& value) noexcept {
++    static_assert(std::is_trivially_copyable_v<Value> && sizeof(Value) <= sizeof(uint64_t));
++    uint64_t word = 0;
++    std::memcpy(&word, &value, sizeof(Value));
++    return word;
++}
++template <typename Value> Value UnpackValue(uint64_t word) noexcept {
++    Value value{};
++    std::memcpy(&value, &word, sizeof(Value));
++    return value;
++}
++
++template <auto Function, typename... Args> struct ScalarCommand {
++    uint64_t words[sizeof...(Args) + 1]{};
++    template <size_t... Index> void Run(std::index_sequence<Index...>) const {
++        Function(UnpackValue<Args>(words[Index])...);
++    }
++    static void Execute(const void* bytes) {
++        ScalarCommand command;
++        std::memcpy(&command, bytes, sizeof(command));
++        command.Run(std::index_sequence_for<Args...>{});
++    }
++};
++
++template <auto Policy> struct Dispatch {
++    template <auto Function = Policy, typename... Args> static decltype(auto) Invoke(Args... args) {
++        using Result = std::invoke_result_t<decltype(Function), Args...>;
++        if (!Intercept() || Synchronous()) return Function(args...);
++        if constexpr (LocalObjectOperation<Policy>) {
++            return Function(args...);
++        } else if constexpr (AsyncOperation<Policy> && std::is_void_v<Result> &&
++                             ((!std::is_pointer_v<Args> && std::is_trivially_copyable_v<Args> &&
++                               sizeof(Args) <= sizeof(uint64_t)) && ...)) {
++            using Command = ScalarCommand<Function, Args...>;
++            Command command{{PackValue(args)...}};
++            queue.Submit(&Command::Execute, command);
++            // A full-queue wait may run a nested guest callback before this record is published.
++            BeforeScalar<Policy>::Apply(args...);
++        } else {
++            // Borrowed pointers and result-bearing calls retain their original observation point.
++            SynchronousScope scope;
++            return Function(args...);
++        }
++    }
++};
++
++template <> struct Dispatch<&::GXGetVtxDesc> {
++    template <auto Function = &::GXGetVtxDesc> static void Invoke(GXAttr attr, GXAttrType* type) {
++        if (!Intercept() || Synchronous()) return Function(attr, type);
++        GetVtxDesc(attr, type);
++    }
++};
++template <> struct Dispatch<&::GXGetVtxDescv> {
++    template <auto Function = &::GXGetVtxDescv> static void Invoke(GXVtxDescList* list) {
++        if (!Intercept() || Synchronous()) return Function(list);
++        GetVtxDescv(list);
++    }
++};
++
++template <auto Function, typename... Args> decltype(auto) Call(Args... args) {
++    return Dispatch<Function>::Invoke(args...);
++}
++template <auto Policy, auto Function, typename... Args> decltype(auto) CallReal(Args... args) {
++    return Dispatch<Policy>::template Invoke<Function>(args...);
++}
++
++#include "gx_offload_snapshots.h"
++
++} // namespace hle::gx::offload
++
++// Paired scopes also fence renderer/VI entry points outside the HLE bridge.
++extern "C" void GX_HLE_OffloadEnter() noexcept;
++extern "C" void GX_HLE_OffloadLeave() noexcept;
++extern "C" void GX_HLE_OffloadStop();
+diff --git a/runtime/src/hle/gx/gx_offload_async.inc b/runtime/src/hle/gx/gx_offload_async.inc
+new file mode 100644
+index 0000000..94cd003
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_async.inc
+@@ -0,0 +1,91 @@
++// Audited scalar Aurora entry points; generated by GX-Q66-wrap.py.
++template <> inline constexpr bool AsyncOperation<&::GXBegin> = true;
++template <> inline constexpr bool AsyncOperation<&::GXColor3u8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXColor4u8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXEnd> = true;
++template <> inline constexpr bool AsyncOperation<&::GXFlush> = true;
++template <> inline constexpr bool AsyncOperation<&::GXInvalidateTexAll> = true;
++template <> inline constexpr bool AsyncOperation<&::GXMatrixIndex1u8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXNormal3f32> = true;
++template <> inline constexpr bool AsyncOperation<&::GXNormal3s16> = true;
++template <> inline constexpr bool AsyncOperation<&::GXNormal3s8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXNormal3u16> = true;
++template <> inline constexpr bool AsyncOperation<&::GXNormal3u8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXPosition2f32> = true;
++template <> inline constexpr bool AsyncOperation<&::GXPosition2s16> = true;
++template <> inline constexpr bool AsyncOperation<&::GXPosition2s8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXPosition2u16> = true;
++template <> inline constexpr bool AsyncOperation<&::GXPosition2u8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXPosition3f32> = true;
++template <> inline constexpr bool AsyncOperation<&::GXPosition3s16> = true;
++template <> inline constexpr bool AsyncOperation<&::GXPosition3s8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXPosition3u16> = true;
++template <> inline constexpr bool AsyncOperation<&::GXPosition3u8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetAlphaCompare> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetAlphaUpdate> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetBlendMode> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetChanAmbColor> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetChanCtrl> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetChanMatColor> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetClipMode> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetCoPlanar> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetColorUpdate> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetCopyClamp> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetCullMode> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetCurrentMtx> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetDispCopyDst> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetDispCopyFrame2Field> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetDispCopyGamma> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetDispCopySrc> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetDither> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetDstAlpha> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetFog> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetIndTexCoordScale> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetIndTexOrder> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetLineWidth> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetNumChans> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetNumIndStages> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetNumTevStages> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetNumTexGens> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetPixelFmt> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetPointSize> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetScissor> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetScissorBoxOffset> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetSourceVtxDesc> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevAlphaIn> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevAlphaOp> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevColor> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevColorIn> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevColorOp> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevColorS10> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevDirect> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevKAlphaSel> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevKColor> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevKColorSel> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevOp> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevOrder> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevSwapMode> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTevSwapModeTable> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTexCoordBias> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTexCoordGen2> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTexCoordScaleManually> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTexCopyDst> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetTexCopySrc> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetViewport> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetViewportJitter> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetVtxAttrFmt> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetVtxDesc> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetZCompLoc> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetZMode> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetZScaleOffset> = true;
++template <> inline constexpr bool AsyncOperation<&::GXSetZTexture> = true;
++template <> inline constexpr bool AsyncOperation<&::GXTexCoord1f32> = true;
++template <> inline constexpr bool AsyncOperation<&::GXTexCoord1s16> = true;
++template <> inline constexpr bool AsyncOperation<&::GXTexCoord1s8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXTexCoord1u16> = true;
++template <> inline constexpr bool AsyncOperation<&::GXTexCoord1u8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXTexCoord2f32> = true;
++template <> inline constexpr bool AsyncOperation<&::GXTexCoord2s16> = true;
++template <> inline constexpr bool AsyncOperation<&::GXTexCoord2s8> = true;
++template <> inline constexpr bool AsyncOperation<&::GXTexCoord2u16> = true;
++template <> inline constexpr bool AsyncOperation<&::GXTexCoord2u8> = true;
+diff --git a/runtime/src/hle/gx/gx_offload_link.cmake b/runtime/src/hle/gx/gx_offload_link.cmake
+new file mode 100644
+index 0000000..4790c08
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_link.cmake
+@@ -0,0 +1,151 @@
++# Switch-only GX mailbox interception; no translated-header changes.
++target_link_options(WiiCompiled PRIVATE
++    "LINKER:--wrap=GXApplyBPReg"
++    "LINKER:--wrap=GXBegin"
++    "LINKER:--wrap=GXCallDisplayList"
++    "LINKER:--wrap=GXCallDisplayListRef"
++    "LINKER:--wrap=GXClearBoundingBox"
++    "LINKER:--wrap=GXClearVtxDesc"
++    "LINKER:--wrap=GXColor3u8"
++    "LINKER:--wrap=GXColor4u8"
++    "LINKER:--wrap=GXCopyDisp"
++    "LINKER:--wrap=GXCopyTex"
++    "LINKER:--wrap=GXDestroyCopyTex"
++    "LINKER:--wrap=GXDestroyTexObj"
++    "LINKER:--wrap=GXDestroyTlutObj"
++    "LINKER:--wrap=GXDrawDone"
++    "LINKER:--wrap=GXEnableTexOffsets"
++    "LINKER:--wrap=GXEnd"
++    "LINKER:--wrap=GXFlush"
++    "LINKER:--wrap=GXGetCPUFifo"
++    "LINKER:--wrap=GXGetTexBufferSize"
++    "LINKER:--wrap=GXGetVtxDesc"
++    "LINKER:--wrap=GXGetVtxDescv"
++    "LINKER:--wrap=GXInit"
++    "LINKER:--wrap=GXInitFifoBase"
++    "LINKER:--wrap=GXInitLightAttn"
++    "LINKER:--wrap=GXInitLightColor"
++    "LINKER:--wrap=GXInitLightDir"
++    "LINKER:--wrap=GXInitLightPos"
++    "LINKER:--wrap=GXInitTexObj"
++    "LINKER:--wrap=GXInitTexObjCI"
++    "LINKER:--wrap=GXInitTexObjData"
++    "LINKER:--wrap=GXInitTexObjLOD"
++    "LINKER:--wrap=GXInitTexObjTlut"
++    "LINKER:--wrap=GXInitTexObjUserData"
++    "LINKER:--wrap=GXInitTexObjWrapMode"
++    "LINKER:--wrap=GXInitTlutObj"
++    "LINKER:--wrap=GXInvalidateTexAll"
++    "LINKER:--wrap=GXLoadLightObjImm"
++    "LINKER:--wrap=GXLoadLightObjImmBE"
++    "LINKER:--wrap=GXLoadNrmMtxImm"
++    "LINKER:--wrap=GXLoadNrmMtxImmBE"
++    "LINKER:--wrap=GXLoadPosMtxImm"
++    "LINKER:--wrap=GXLoadPosMtxImmBE"
++    "LINKER:--wrap=GXLoadTexMtxImm"
++    "LINKER:--wrap=GXLoadTexObj"
++    "LINKER:--wrap=GXLoadTlut"
++    "LINKER:--wrap=GXMatrixIndex1u8"
++    "LINKER:--wrap=GXNormal3f32"
++    "LINKER:--wrap=GXNormal3s16"
++    "LINKER:--wrap=GXNormal3s8"
++    "LINKER:--wrap=GXNormal3u16"
++    "LINKER:--wrap=GXNormal3u8"
++    "LINKER:--wrap=GXPixModeSync"
++    "LINKER:--wrap=GXPosition2f32"
++    "LINKER:--wrap=GXPosition2s16"
++    "LINKER:--wrap=GXPosition2s8"
++    "LINKER:--wrap=GXPosition2u16"
++    "LINKER:--wrap=GXPosition2u8"
++    "LINKER:--wrap=GXPosition3f32"
++    "LINKER:--wrap=GXPosition3s16"
++    "LINKER:--wrap=GXPosition3s8"
++    "LINKER:--wrap=GXPosition3u16"
++    "LINKER:--wrap=GXPosition3u8"
++    "LINKER:--wrap=GXSaveCPUFifo"
++    "LINKER:--wrap=GXSetAlphaCompare"
++    "LINKER:--wrap=GXSetAlphaUpdate"
++    "LINKER:--wrap=GXSetArray"
++    "LINKER:--wrap=GXSetBlendMode"
++    "LINKER:--wrap=GXSetCPUFifo"
++    "LINKER:--wrap=GXSetChanAmbColor"
++    "LINKER:--wrap=GXSetChanCtrl"
++    "LINKER:--wrap=GXSetChanMatColor"
++    "LINKER:--wrap=GXSetClipMode"
++    "LINKER:--wrap=GXSetCoPlanar"
++    "LINKER:--wrap=GXSetColorUpdate"
++    "LINKER:--wrap=GXSetCopyClamp"
++    "LINKER:--wrap=GXSetCopyFilter"
++    "LINKER:--wrap=GXSetCullMode"
++    "LINKER:--wrap=GXSetCurrentMtx"
++    "LINKER:--wrap=GXSetDispCopyDst"
++    "LINKER:--wrap=GXSetDispCopyFrame2Field"
++    "LINKER:--wrap=GXSetDispCopyGamma"
++    "LINKER:--wrap=GXSetDispCopySrc"
++    "LINKER:--wrap=GXSetDither"
++    "LINKER:--wrap=GXSetDstAlpha"
++    "LINKER:--wrap=GXSetFog"
++    "LINKER:--wrap=GXSetGPFifo"
++    "LINKER:--wrap=GXSetIndTexCoordScale"
++    "LINKER:--wrap=GXSetIndTexMtx"
++    "LINKER:--wrap=GXSetIndTexOrder"
++    "LINKER:--wrap=GXSetLineWidth"
++    "LINKER:--wrap=GXSetNumChans"
++    "LINKER:--wrap=GXSetNumIndStages"
++    "LINKER:--wrap=GXSetNumTevStages"
++    "LINKER:--wrap=GXSetNumTexGens"
++    "LINKER:--wrap=GXSetPixelFmt"
++    "LINKER:--wrap=GXSetPointSize"
++    "LINKER:--wrap=GXSetProjection"
++    "LINKER:--wrap=GXSetScissor"
++    "LINKER:--wrap=GXSetScissorBoxOffset"
++    "LINKER:--wrap=GXSetSourceVtxDesc"
++    "LINKER:--wrap=GXSetTevAlphaIn"
++    "LINKER:--wrap=GXSetTevAlphaOp"
++    "LINKER:--wrap=GXSetTevColor"
++    "LINKER:--wrap=GXSetTevColorIn"
++    "LINKER:--wrap=GXSetTevColorOp"
++    "LINKER:--wrap=GXSetTevColorS10"
++    "LINKER:--wrap=GXSetTevDirect"
++    "LINKER:--wrap=GXSetTevIndWarp"
++    "LINKER:--wrap=GXSetTevIndirect"
++    "LINKER:--wrap=GXSetTevKAlphaSel"
++    "LINKER:--wrap=GXSetTevKColor"
++    "LINKER:--wrap=GXSetTevKColorSel"
++    "LINKER:--wrap=GXSetTevOp"
++    "LINKER:--wrap=GXSetTevOrder"
++    "LINKER:--wrap=GXSetTevSwapMode"
++    "LINKER:--wrap=GXSetTevSwapModeTable"
++    "LINKER:--wrap=GXSetTexCoordBias"
++    "LINKER:--wrap=GXSetTexCoordGen2"
++    "LINKER:--wrap=GXSetTexCoordScaleManually"
++    "LINKER:--wrap=GXSetTexCopyDst"
++    "LINKER:--wrap=GXSetTexCopySrc"
++    "LINKER:--wrap=GXSetViewport"
++    "LINKER:--wrap=GXSetViewportJitter"
++    "LINKER:--wrap=GXSetVtxAttrFmt"
++    "LINKER:--wrap=GXSetVtxAttrFmtRun"
++    "LINKER:--wrap=GXSetVtxDesc"
++    "LINKER:--wrap=GXSetVtxDescRun"
++    "LINKER:--wrap=GXSetZCompLoc"
++    "LINKER:--wrap=GXSetZMode"
++    "LINKER:--wrap=GXSetZScaleOffset"
++    "LINKER:--wrap=GXSetZTexture"
++    "LINKER:--wrap=GXTexCoord1f32"
++    "LINKER:--wrap=GXTexCoord1s16"
++    "LINKER:--wrap=GXTexCoord1s8"
++    "LINKER:--wrap=GXTexCoord1u16"
++    "LINKER:--wrap=GXTexCoord1u8"
++    "LINKER:--wrap=GXTexCoord2f32"
++    "LINKER:--wrap=GXTexCoord2s16"
++    "LINKER:--wrap=GXTexCoord2s8"
++    "LINKER:--wrap=GXTexCoord2u16"
++    "LINKER:--wrap=GXTexCoord2u8"
++    "LINKER:--wrap=__GXSetSUTexRegs"
++    "LINKER:--wrap=aurora_gx_vcd_state"
++)
++set_source_files_properties(
++    "${MKW_RUNTIME_SOURCE_DIR}/src/hle/gx/gx_offload.cpp"
++    "${MKW_RUNTIME_SOURCE_DIR}/src/hle/gx/gx_offload_queue.cpp"
++    "${MKW_RUNTIME_SOURCE_DIR}/src/hle/gx/gx_offload_wrap.cpp"
++    PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+diff --git a/runtime/src/hle/gx/gx_offload_queue.cpp b/runtime/src/hle/gx/gx_offload_queue.cpp
+new file mode 100644
+index 0000000..2120e46
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_queue.cpp
+@@ -0,0 +1,348 @@
++#include "gx_offload_queue.h"
++
++#include <cstdlib>
++#include <chrono>
++#include <cstring>
++#include <stdexcept>
++
++namespace hle::gx::GxOffloadQueue {
++namespace {
++
++thread_local const Queue* g_worker_queue = nullptr;
++thread_local const Queue* g_executing_queue = nullptr;
++thread_local unsigned g_wait_service_depth = 0;
++
++constexpr Sequence kHalfSequenceRange = Sequence{1} << 63;
++constexpr uint64_t kSpinWindowNs = 30000;
++constexpr uint64_t kWorkerSpinWindowNs = 30000;
++static_assert(kCapacity != 0 && (kCapacity & (kCapacity - 1)) == 0,
++              "GX offload queue capacity must be a power of two");
++static_assert(kCapacity < kHalfSequenceRange, "queue capacity must fit the sequence comparison");
++
++uint64_t MonotonicNanoseconds() noexcept {
++#if defined(__SWITCH__)
++    return armTicksToNs(armGetSystemTick());
++#elif defined(GX_OFFLOAD_QUEUE_TEST)
++    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++#else
++    return 0;
++#endif
++}
++
++void CpuRelax() noexcept {
++#if defined(__aarch64__)
++    __asm__ __volatile__("yield" ::: "memory");
++#elif defined(__x86_64__) || defined(_M_X64)
++    __asm__ __volatile__("pause" ::: "memory");
++#else
++    std::atomic_signal_fence(std::memory_order_seq_cst);
++#endif
++}
++
++} // namespace
++
++Queue::~Queue() noexcept {
++    try {
++        Stop();
++    } catch (...) {
++    }
++}
++
++bool Queue::Start(WaitService wait_service, void* wait_context) {
++    const char* enabled = std::getenv("WIICOMPILED_GX_HLE_WORKER");
++    return StartImpl(enabled != nullptr && enabled[0] == '1' && enabled[1] == '\0', false,
++                     wait_service, wait_context);
++}
++
++#if defined(GX_OFFLOAD_QUEUE_TEST)
++bool Queue::StartForTest(bool enable_worker, bool force_create_failure,
++                         WaitService wait_service, void* wait_context) {
++    return StartImpl(enable_worker, force_create_failure, wait_service, wait_context);
++}
++#endif
++
++bool Queue::StartImpl(bool enable_worker, bool force_create_failure,
++                      WaitService wait_service, void* wait_context) {
++    if (start_called_) throw std::logic_error("GX offload queue Start called more than once");
++    start_called_ = true;
++    wait_service_ = wait_service;
++    wait_context_ = wait_context;
++    RethrowFailureIfReached(Watermark());
++    if (!enable_worker || force_create_failure) return false;
++
++#if defined(__SWITCH__)
++    if (R_FAILED(threadCreate(&worker_thread_, &Queue::SwitchWorkerEntry, this,
++                              nullptr, 0x10000, 0x2C, 2))) {
++        return false;
++    }
++    if (R_FAILED(threadStart(&worker_thread_))) {
++        threadClose(&worker_thread_);
++        return false;
++    }
++    worker_started_ = true;
++    active_.store(true, std::memory_order_release);
++    return true;
++#elif defined(GX_OFFLOAD_QUEUE_TEST)
++    try {
++        worker_thread_ = std::thread(&Queue::HostWorkerEntry, this);
++    } catch (...) {
++        return false;
++    }
++    worker_started_ = true;
++    active_.store(true, std::memory_order_release);
++    return true;
++#else
++    return false;
++#endif
++}
++
++Sequence Queue::Submit(Execute execute, const void* payload, size_t payload_size) {
++    if (stopped_) throw std::logic_error("GX offload queue Submit after Stop");
++    if (OnWorkerThread() || g_executing_queue == this)
++        throw std::logic_error("GX offload jobs must not submit recursively");
++    if (execute == nullptr || payload_size > kMaxPayloadBytes ||
++        (payload == nullptr && payload_size != 0))
++        throw std::invalid_argument("invalid GX offload work item");
++    if (failed_.load(std::memory_order_acquire)) RethrowFailureIfReached(Watermark() + 1);
++
++    if (!worker_started_) {
++        alignas(std::max_align_t) std::array<std::byte, kMaxPayloadBytes> copied_payload{};
++        if (payload_size != 0) std::memcpy(copied_payload.data(), payload, payload_size);
++        const Sequence sequence = write_position_.load(std::memory_order_relaxed) + 1;
++        write_position_.store(sequence, std::memory_order_release);
++        const Queue* previous = g_executing_queue;
++        g_executing_queue = this;
++        try {
++            execute(copied_payload.data());
++        } catch (...) {
++            g_executing_queue = previous;
++            CaptureFailure(std::current_exception(), sequence);
++            throw;
++        }
++        g_executing_queue = previous;
++        completed_sequence_.store(sequence, std::memory_order_release);
++        return sequence;
++    }
++
++    Sequence write = 0;
++    Sequence read = 0;
++    uint64_t spin_started = MonotonicNanoseconds();
++    for (;;) {
++        if (stopped_) throw std::logic_error("GX offload queue stopped during Submit");
++        if (failed_.load(std::memory_order_acquire)) RethrowFailureIfReached(Watermark() + 1);
++        write = write_position_.load(std::memory_order_relaxed);
++        read = read_position_.load(std::memory_order_acquire);
++        if (write - read < kCapacity) break;
++        if (MonotonicNanoseconds() - spin_started < kSpinWindowNs) continue;
++        WaitForProducerProgress(read + 1);
++        spin_started = MonotonicNanoseconds();
++    }
++
++    Slot& slot = slots_[static_cast<size_t>(write & (kCapacity - 1))];
++    slot.execute = execute;
++    slot.payload_size = static_cast<uint8_t>(payload_size);
++    if (payload_size != 0) std::memcpy(slot.payload.data(), payload, payload_size);
++#if defined(GX_OFFLOAD_QUEUE_TEST)
++    if (test_hook_) test_hook_(test_context_, TestPoint::BeforeSubmitPublish);
++#endif
++    const Sequence sequence = write + 1;
++    write_position_.store(sequence, std::memory_order_release);
++    SignalWorker();
++    return sequence;
++}
++
++Sequence Queue::Watermark() const noexcept {
++    return write_position_.load(std::memory_order_acquire);
++}
++
++void Queue::Flush(Sequence watermark) {
++    if (OnWorkerThread() || g_executing_queue == this)
++        throw std::logic_error("GX offload worker cannot flush its own queue");
++    if (Ahead(watermark, Watermark())) throw std::invalid_argument("GX offload watermark was never submitted");
++    uint64_t spin_started = MonotonicNanoseconds();
++    while (!Reached(completed_sequence_.load(std::memory_order_acquire), watermark)) {
++        RethrowFailureIfReached(watermark);
++        if (!worker_started_) throw std::logic_error("inline GX offload work has not completed");
++        if (MonotonicNanoseconds() - spin_started < kSpinWindowNs) continue;
++        WaitForProducerProgress(watermark);
++        spin_started = MonotonicNanoseconds();
++    }
++    RethrowFailureIfReached(watermark);
++}
++
++void Queue::FlushAll() {
++    for (;;) {
++        const Sequence target = Watermark();
++        Flush(target);
++        if (target == Watermark()) return;
++    }
++}
++
++void Queue::Stop() {
++    if (stopped_) return;
++    if (OnWorkerThread()) throw std::logic_error("GX offload worker cannot stop itself");
++
++    std::exception_ptr error;
++    try {
++        FlushAll();
++    } catch (...) {
++        error = std::current_exception();
++    }
++
++    if (worker_started_) {
++        stop_requested_.store(true, std::memory_order_release);
++        SignalWorker();
++#if defined(__SWITCH__)
++        const Result wait_result = threadWaitForExit(&worker_thread_);
++        const Result close_result = threadClose(&worker_thread_);
++        if (!error && R_FAILED(wait_result))
++            error = std::make_exception_ptr(std::runtime_error("libnx failed to join GX offload worker"));
++        if (!error && R_FAILED(close_result))
++            error = std::make_exception_ptr(std::runtime_error("libnx failed to close GX offload worker"));
++#elif defined(GX_OFFLOAD_QUEUE_TEST)
++        if (worker_thread_.joinable()) worker_thread_.join();
++#endif
++        worker_started_ = false;
++    }
++
++    active_.store(false, std::memory_order_release);
++    stopped_ = true;
++    if (error) std::rethrow_exception(error);
++}
++
++bool Queue::OnWorkerThread() const noexcept { return g_worker_queue == this; }
++
++void Queue::WaitForProducerProgress(Sequence target) {
++    for (;;) {
++        if (Reached(completed_sequence_.load(std::memory_order_acquire), target)) break;
++        RethrowFailureIfReached(target);
++
++        bool reached = false;
++        {
++            std::unique_lock<std::mutex> lock(wait_mutex_);
++            producer_wait_target_.store(target, std::memory_order_seq_cst);
++            producer_waiting_.store(true, std::memory_order_seq_cst);
++            reached = producer_cv_.wait_for(lock, std::chrono::milliseconds(1), [this, target] {
++                return Reached(completed_sequence_.load(std::memory_order_seq_cst), target) ||
++                       failed_.load(std::memory_order_acquire);
++            });
++            producer_waiting_.store(false, std::memory_order_relaxed);
++        }
++
++        if (Reached(completed_sequence_.load(std::memory_order_acquire), target)) break;
++        RethrowFailureIfReached(target);
++        if (!reached && wait_service_ != nullptr && g_wait_service_depth == 0) {
++            ++g_wait_service_depth;
++            try {
++                wait_service_(wait_context_);
++            } catch (...) {
++                --g_wait_service_depth;
++                throw;
++            }
++            --g_wait_service_depth;
++        }
++    }
++    RethrowFailureIfReached(target);
++}
++
++void Queue::SignalWorker() noexcept {
++    std::lock_guard<std::mutex> lock(wait_mutex_);
++    if (worker_asleep_.load(std::memory_order_relaxed)) worker_cv_.notify_one();
++}
++
++void Queue::SignalProducer(Sequence completed) noexcept {
++    if (!producer_waiting_.load(std::memory_order_seq_cst) ||
++        (!failed_.load(std::memory_order_acquire) &&
++         !Reached(completed, producer_wait_target_.load(std::memory_order_seq_cst))))
++        return;
++    std::lock_guard<std::mutex> lock(wait_mutex_);
++    producer_cv_.notify_all();
++}
++
++void Queue::WaitForWorker() noexcept {
++    const uint64_t spin_started = MonotonicNanoseconds();
++    while (MonotonicNanoseconds() - spin_started < kWorkerSpinWindowNs) {
++        if (stop_requested_.load(std::memory_order_acquire) ||
++            read_position_.load(std::memory_order_acquire) != write_position_.load(std::memory_order_acquire))
++            return;
++        CpuRelax();
++    }
++    std::unique_lock<std::mutex> lock(wait_mutex_);
++    worker_asleep_.store(true, std::memory_order_seq_cst);
++    worker_cv_.wait(lock, [this] {
++        const bool ready = stop_requested_.load(std::memory_order_acquire) ||
++                           read_position_.load(std::memory_order_seq_cst) !=
++                               write_position_.load(std::memory_order_seq_cst);
++#if defined(GX_OFFLOAD_QUEUE_TEST)
++        if (!ready && test_hook_)
++            test_hook_(test_context_, TestPoint::AfterWorkerPredicateFalse);
++#endif
++        return ready;
++    });
++    worker_asleep_.store(false, std::memory_order_relaxed);
++}
++
++void Queue::CaptureFailure(std::exception_ptr error, Sequence sequence) noexcept {
++    worker_error_ = error;
++    error_sequence_ = sequence;
++    failed_.store(true, std::memory_order_release);
++    completed_sequence_.store(sequence, std::memory_order_seq_cst);
++}
++
++void Queue::RethrowFailureIfReached(Sequence watermark) const {
++    if (failed_.load(std::memory_order_acquire) && Reached(watermark, error_sequence_))
++        std::rethrow_exception(worker_error_);
++}
++
++void Queue::RunWorker() noexcept {
++    const Queue* previous_worker = g_worker_queue;
++    g_worker_queue = this;
++    for (;;) {
++        const Sequence read = read_position_.load(std::memory_order_relaxed);
++        const Sequence write = write_position_.load(std::memory_order_acquire);
++        if (read == write) {
++            if (stop_requested_.load(std::memory_order_acquire)) break;
++            WaitForWorker();
++            continue;
++        }
++
++        Slot& slot = slots_[static_cast<size_t>(read & (kCapacity - 1))];
++        const Queue* previous_execute = g_executing_queue;
++        g_executing_queue = this;
++        try {
++            slot.execute(slot.payload.data());
++        } catch (...) {
++            g_executing_queue = previous_execute;
++            CaptureFailure(std::current_exception(), read + 1);
++            read_position_.store(read + 1, std::memory_order_release);
++            SignalProducer(read + 1);
++            break;
++        }
++        g_executing_queue = previous_execute;
++        read_position_.store(read + 1, std::memory_order_release);
++        completed_sequence_.store(read + 1, std::memory_order_seq_cst);
++        SignalProducer(read + 1);
++    }
++    g_worker_queue = previous_worker;
++}
++
++bool Queue::Reached(Sequence current, Sequence target) noexcept {
++    return static_cast<Sequence>(current - target) < kHalfSequenceRange;
++}
++
++bool Queue::Ahead(Sequence sequence, Sequence watermark) noexcept {
++    return sequence != watermark && !Reached(watermark, sequence);
++}
++
++#if defined(__SWITCH__)
++void Queue::SwitchWorkerEntry(void* argument) {
++    static_cast<Queue*>(argument)->RunWorker();
++}
++#elif defined(GX_OFFLOAD_QUEUE_TEST)
++void Queue::HostWorkerEntry(Queue* queue) { queue->RunWorker(); }
++
++void Queue::WakeWorkerForTest() noexcept { SignalWorker(); }
++#endif
++
++} // namespace hle::gx::GxOffloadQueue
+diff --git a/runtime/src/hle/gx/gx_offload_queue.h b/runtime/src/hle/gx/gx_offload_queue.h
+new file mode 100644
+index 0000000..ed3b99a
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_queue.h
+@@ -0,0 +1,131 @@
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <condition_variable>
++#include <exception>
++#include <mutex>
++#include <type_traits>
++
++#if defined(__SWITCH__)
++#include <switch.h>
++#elif defined(GX_OFFLOAD_QUEUE_TEST)
++#include <thread>
++#endif
++
++namespace hle::gx::GxOffloadQueue {
++
++#if defined(GX_OFFLOAD_QUEUE_TEST)
++constexpr size_t kCapacity = 64;
++#else
++constexpr size_t kCapacity = 16384;
++#endif
++constexpr size_t kMaxPayloadBytes = 128;
++using Sequence = uint64_t;
++using Execute = void (*)(const void*);
++// Called by the producer before a bounded wait to pump timers; it holds no queue lock.
++using WaitService = void (*)(void*);
++
++class Queue {
++public:
++    Queue() noexcept = default;
++    ~Queue() noexcept;
++
++    Queue(const Queue&) = delete;
++    Queue& operator=(const Queue&) = delete;
++    Queue(Queue&&) = delete;
++    Queue& operator=(Queue&&) = delete;
++
++    // The worker is opt-in through WIICOMPILED_GX_HLE_WORKER=1; otherwise jobs run inline.
++    bool Start(WaitService wait_service = nullptr, void* wait_context = nullptr);
++    // Execute runs on the worker; use copied host data only, no guest callbacks/memory or queue re-entry.
++    Sequence Submit(Execute execute, const void* payload, size_t payload_size);
++
++    template <typename Payload>
++    Sequence Submit(Execute execute, const Payload& payload) {
++        static_assert(std::is_trivially_copyable<Payload>::value,
++                      "GX offload payloads must be trivially copyable");
++        static_assert(sizeof(Payload) <= kMaxPayloadBytes,
++                      "GX offload payload exceeds the owned payload storage");
++        static_assert(alignof(Payload) <= alignof(std::max_align_t),
++                      "GX offload payload alignment exceeds the owned payload storage");
++        return Submit(execute, &payload, sizeof(Payload));
++    }
++
++    Sequence Watermark() const noexcept;
++    void Flush(Sequence watermark);
++    void FlushAll();
++    void Stop();
++
++    bool Active() const noexcept { return active_.load(std::memory_order_acquire); }
++    bool OnWorkerThread() const noexcept;
++
++#if defined(GX_OFFLOAD_QUEUE_TEST)
++    enum class TestPoint : uint8_t { BeforeSubmitPublish, AfterWorkerPredicateFalse };
++    using TestHook = void (*)(void*, TestPoint);
++
++    bool StartForTest(bool enable_worker, bool force_create_failure,
++                      WaitService wait_service = nullptr, void* wait_context = nullptr);
++    void SetTestHook(TestHook hook, void* context) noexcept {
++        test_hook_ = hook;
++        test_context_ = context;
++    }
++    void WakeWorkerForTest() noexcept;
++#endif
++
++private:
++    struct Slot {
++        Execute execute{};
++        uint8_t payload_size{};
++        alignas(std::max_align_t) std::array<std::byte, kMaxPayloadBytes> payload{};
++    };
++
++    bool StartImpl(bool enable_worker, bool force_create_failure,
++                   WaitService wait_service, void* wait_context);
++    void RunWorker() noexcept;
++    void WaitForProducerProgress(Sequence target);
++    void SignalWorker() noexcept;
++    void SignalProducer(Sequence completed) noexcept;
++    void WaitForWorker() noexcept;
++    void CaptureFailure(std::exception_ptr error, Sequence sequence) noexcept;
++    void RethrowFailureIfReached(Sequence watermark) const;
++    static bool Reached(Sequence current, Sequence target) noexcept;
++    static bool Ahead(Sequence sequence, Sequence watermark) noexcept;
++
++#if defined(__SWITCH__)
++    static void SwitchWorkerEntry(void* argument);
++    Thread worker_thread_{};
++#elif defined(GX_OFFLOAD_QUEUE_TEST)
++    static void HostWorkerEntry(Queue* queue);
++    std::thread worker_thread_;
++#endif
++
++    std::array<Slot, kCapacity> slots_{};
++    alignas(64) std::mutex wait_mutex_;
++    std::condition_variable worker_cv_;
++    std::condition_variable producer_cv_;
++    alignas(64) std::atomic<Sequence> write_position_{0};
++    alignas(64) std::atomic<Sequence> read_position_{0};
++    alignas(64) std::atomic<Sequence> completed_sequence_{0};
++    std::atomic<bool> stop_requested_{false};
++    std::atomic<bool> failed_{false};
++    std::atomic<bool> active_{false};
++    std::atomic<bool> worker_asleep_{false};
++    std::atomic<bool> producer_waiting_{false};
++    std::atomic<Sequence> producer_wait_target_{0};
++    std::exception_ptr worker_error_{};
++    Sequence error_sequence_{};
++    WaitService wait_service_{};
++    void* wait_context_{};
++#if defined(GX_OFFLOAD_QUEUE_TEST)
++    TestHook test_hook_{};
++    void* test_context_{};
++#endif
++    bool start_called_{};
++    bool worker_started_{};
++    bool stopped_{};
++};
++
++} // namespace hle::gx::GxOffloadQueue
+diff --git a/runtime/src/hle/gx/gx_offload_snapshots.h b/runtime/src/hle/gx/gx_offload_snapshots.h
+new file mode 100644
+index 0000000..d7ffb8e
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_snapshots.h
+@@ -0,0 +1,81 @@
++#pragma once
++
++// Included by gx_offload.h inside hle::gx::offload, after CallReal is declared.
++// Queue only the host-side FIFO emitters below; their guest-visible reads are copied first.
++
++namespace snapshot_detail {
++
++struct PosMtxImmBE {
++    u32 id;
++    unsigned char words[48];
++};
++
++struct LightObjImmBE {
++    GXLightID id;
++    alignas(u32) unsigned char words[52];
++};
++
++struct TexMtxImm {
++    u32 id;
++    GXTexMtxType type;
++    f32 matrix[3][4];
++};
++
++static_assert(sizeof(PosMtxImmBE) <= GxOffloadQueue::kMaxPayloadBytes);
++static_assert(sizeof(LightObjImmBE) <= GxOffloadQueue::kMaxPayloadBytes);
++static_assert(sizeof(TexMtxImm) <= GxOffloadQueue::kMaxPayloadBytes);
++
++template <auto Function> void RunPosMtxImmBE(const void* bytes) {
++    PosMtxImmBE command;
++    std::memcpy(&command, bytes, sizeof(command));
++    Function(command.words, command.id);
++}
++
++template <auto Function> void RunLightObjImmBE(const void* bytes) {
++    LightObjImmBE command;
++    std::memcpy(&command, bytes, sizeof(command));
++    Function(command.words, command.id);
++}
++
++template <auto Function> void RunTexMtxImm(const void* bytes) {
++    TexMtxImm command;
++    std::memcpy(&command, bytes, sizeof(command));
++    Function(command.matrix, command.id, command.type);
++}
++
++} // namespace snapshot_detail
++
++template <> struct Dispatch<&::GXLoadPosMtxImmBE> {
++    template <auto Function = &::GXLoadPosMtxImmBE>
++    static void Invoke(const void* matrix, u32 id) {
++        if (!Intercept() || Synchronous()) return Function(matrix, id);
++        snapshot_detail::PosMtxImmBE command{};
++        command.id = id;
++        std::memcpy(command.words, matrix, sizeof(command.words));
++        queue.Submit(&snapshot_detail::RunPosMtxImmBE<Function>, command);
++    }
++};
++
++template <> struct Dispatch<&::GXLoadLightObjImmBE> {
++    template <auto Function = &::GXLoadLightObjImmBE>
++    static void Invoke(const void* light, GXLightID id) {
++        if (!Intercept() || Synchronous()) return Function(light, id);
++        snapshot_detail::LightObjImmBE command{};
++        command.id = id;
++        std::memcpy(command.words, light, sizeof(command.words));
++        queue.Submit(&snapshot_detail::RunLightObjImmBE<Function>, command);
++    }
++};
++
++template <> struct Dispatch<&::GXLoadTexMtxImm> {
++    template <auto Function = &::GXLoadTexMtxImm, typename Matrix>
++    static void Invoke(Matrix matrix, u32 id, GXTexMtxType type) {
++        if (!Intercept() || Synchronous()) return Function(matrix, id, type);
++        snapshot_detail::TexMtxImm command{};
++        command.id = id;
++        command.type = type;
++        const size_t bytes = (type == GX_MTX2x4 ? 8 : 12) * sizeof(u32);
++        std::memcpy(command.matrix, matrix, bytes);
++        queue.Submit(&snapshot_detail::RunTexMtxImm<Function>, command);
++    }
++};
+diff --git a/runtime/src/hle/gx/gx_offload_wrap.cpp b/runtime/src/hle/gx/gx_offload_wrap.cpp
+new file mode 100644
+index 0000000..cbb27eb
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_offload_wrap.cpp
+@@ -0,0 +1,736 @@
++// Switch-only GNU ld --wrap adapters. Do not call a wrapped public symbol from a job.
++#if defined(__SWITCH__)
++#include "gx_offload.h"
++
++extern "C" {
++void GXApplyBPReg(u8 reg, u32 value);
++void __real_GXApplyBPReg(u8 reg, u32 value);
++void GXBegin(GXPrimitive type, GXVtxFmt vtxfmt, u16 nverts);
++void __real_GXBegin(GXPrimitive type, GXVtxFmt vtxfmt, u16 nverts);
++void GXCallDisplayList(const void* list, u32 nbytes);
++void __real_GXCallDisplayList(const void* list, u32 nbytes);
++void GXCallDisplayListRef(const void* list, u32 bytes);
++void __real_GXCallDisplayListRef(const void* list, u32 bytes);
++void GXClearBoundingBox(void);
++void __real_GXClearBoundingBox(void);
++void GXClearVtxDesc(void);
++void __real_GXClearVtxDesc(void);
++void GXColor3u8(u8 r, u8 g, u8 b);
++void __real_GXColor3u8(u8 r, u8 g, u8 b);
++void GXColor4u8(u8 r, u8 g, u8 b, u8 a);
++void __real_GXColor4u8(u8 r, u8 g, u8 b, u8 a);
++void GXCopyDisp(void* dest, GXBool clear);
++void __real_GXCopyDisp(void* dest, GXBool clear);
++void GXCopyTex(void* dest, GXBool clear);
++void __real_GXCopyTex(void* dest, GXBool clear);
++void GXDestroyCopyTex(void* dest);
++void __real_GXDestroyCopyTex(void* dest);
++void GXDestroyTexObj(GXTexObj* obj);
++void __real_GXDestroyTexObj(GXTexObj* obj);
++void GXDestroyTlutObj(GXTlutObj* obj);
++void __real_GXDestroyTlutObj(GXTlutObj* obj);
++void GXDrawDone(void);
++void __real_GXDrawDone(void);
++void GXEnableTexOffsets(GXTexCoordID coord, GXBool line_enable, GXBool point_enable);
++void __real_GXEnableTexOffsets(GXTexCoordID coord, GXBool line_enable, GXBool point_enable);
++void GXEnd(void);
++void __real_GXEnd(void);
++void GXFlush(void);
++void __real_GXFlush(void);
++GXFifoObj* GXGetCPUFifo(void);
++GXFifoObj* __real_GXGetCPUFifo(void);
++u32 GXGetTexBufferSize(u16 width, u16 height, u32 format, GXBool mipmap, u8 max_lod);
++u32 __real_GXGetTexBufferSize(u16 width, u16 height, u32 format, GXBool mipmap, u8 max_lod);
++void GXGetVtxDesc(GXAttr attr, GXAttrType* type);
++void __real_GXGetVtxDesc(GXAttr attr, GXAttrType* type);
++void GXGetVtxDescv(GXVtxDescList* vcd);
++void __real_GXGetVtxDescv(GXVtxDescList* vcd);
++GXFifoObj* GXInit(void* base, u32 size);
++GXFifoObj* __real_GXInit(void* base, u32 size);
++void GXInitFifoBase(GXFifoObj* fifo, void* base, u32 size);
++void __real_GXInitFifoBase(GXFifoObj* fifo, void* base, u32 size);
++void GXInitLightAttn(GXLightObj* lt_obj, f32 a0, f32 a1, f32 a2, f32 k0, f32 k1, f32 k2);
++void __real_GXInitLightAttn(GXLightObj* lt_obj, f32 a0, f32 a1, f32 a2, f32 k0, f32 k1, f32 k2);
++void GXInitLightColor(GXLightObj* lt_obj, GXColor color);
++void __real_GXInitLightColor(GXLightObj* lt_obj, GXColor color);
++void GXInitLightDir(GXLightObj* lt_obj, f32 nx, f32 ny, f32 nz);
++void __real_GXInitLightDir(GXLightObj* lt_obj, f32 nx, f32 ny, f32 nz);
++void GXInitLightPos(GXLightObj* lt_obj, f32 x, f32 y, f32 z);
++void __real_GXInitLightPos(GXLightObj* lt_obj, f32 x, f32 y, f32 z);
++void GXInitTexObj(GXTexObj* obj, const void* data, u16 width, u16 height, GXTexFmt format, GXTexWrapMode wrapS, GXTexWrapMode wrapT, GXBool mipmap);
++void __real_GXInitTexObj(GXTexObj* obj, const void* data, u16 width, u16 height, GXTexFmt format, GXTexWrapMode wrapS, GXTexWrapMode wrapT, GXBool mipmap);
++void GXInitTexObjCI(GXTexObj* obj, const void* data, u16 width, u16 height, GXCITexFmt format, GXTexWrapMode wrapS, GXTexWrapMode wrapT, GXBool mipmap, u32 tlut);
++void __real_GXInitTexObjCI(GXTexObj* obj, const void* data, u16 width, u16 height, GXCITexFmt format, GXTexWrapMode wrapS, GXTexWrapMode wrapT, GXBool mipmap, u32 tlut);
++void GXInitTexObjData(GXTexObj* obj, const void* data);
++void __real_GXInitTexObjData(GXTexObj* obj, const void* data);
++void GXInitTexObjLOD(GXTexObj* obj, GXTexFilter min_filt, GXTexFilter mag_filt, f32 min_lod, f32 max_lod, f32 lod_bias, GXBool bias_clamp, GXBool do_edge_lod, GXAnisotropy max_aniso);
++void __real_GXInitTexObjLOD(GXTexObj* obj, GXTexFilter min_filt, GXTexFilter mag_filt, f32 min_lod, f32 max_lod, f32 lod_bias, GXBool bias_clamp, GXBool do_edge_lod, GXAnisotropy max_aniso);
++void GXInitTexObjTlut(GXTexObj* obj_, u32 tlut);
++void __real_GXInitTexObjTlut(GXTexObj* obj_, u32 tlut);
++void GXInitTexObjUserData(GXTexObj* obj, void* user_data);
++void __real_GXInitTexObjUserData(GXTexObj* obj, void* user_data);
++void GXInitTexObjWrapMode(GXTexObj* obj, GXTexWrapMode s, GXTexWrapMode t);
++void __real_GXInitTexObjWrapMode(GXTexObj* obj, GXTexWrapMode s, GXTexWrapMode t);
++void GXInitTlutObj(GXTlutObj* obj, const void* data, GXTlutFmt format, u16 entries);
++void __real_GXInitTlutObj(GXTlutObj* obj, const void* data, GXTlutFmt format, u16 entries);
++void GXInvalidateTexAll();
++void __real_GXInvalidateTexAll();
++void GXLoadLightObjImm(GXLightObj* lt_obj, GXLightID light);
++void __real_GXLoadLightObjImm(GXLightObj* lt_obj, GXLightID light);
++void GXLoadLightObjImmBE(const void* light, GXLightID id);
++void __real_GXLoadLightObjImmBE(const void* light, GXLightID id);
++void GXLoadNrmMtxImm(const void* mtx, u32 id);
++void __real_GXLoadNrmMtxImm(const void* mtx, u32 id);
++void GXLoadNrmMtxImmBE(const void* matrix, u32 id, u32 rowStride);
++void __real_GXLoadNrmMtxImmBE(const void* matrix, u32 id, u32 rowStride);
++void GXLoadPosMtxImm(const void* mtx, u32 id);
++void __real_GXLoadPosMtxImm(const void* mtx, u32 id);
++void GXLoadPosMtxImmBE(const void* matrix, u32 id);
++void __real_GXLoadPosMtxImmBE(const void* matrix, u32 id);
++void GXLoadTexMtxImm(const void* mtx, u32 id, GXTexMtxType type);
++void __real_GXLoadTexMtxImm(const void* mtx, u32 id, GXTexMtxType type);
++void GXLoadTexObj(GXTexObj* obj, GXTexMapID id);
++void __real_GXLoadTexObj(GXTexObj* obj, GXTexMapID id);
++void GXLoadTlut(const GXTlutObj* obj, u32 idx);
++void __real_GXLoadTlut(const GXTlutObj* obj, u32 idx);
++void GXMatrixIndex1u8(GXAttr attr, u8 index);
++void __real_GXMatrixIndex1u8(GXAttr attr, u8 index);
++void GXNormal3f32(f32 x, f32 y, f32 z);
++void __real_GXNormal3f32(f32 x, f32 y, f32 z);
++void GXNormal3s16(s16 x, s16 y, s16 z);
++void __real_GXNormal3s16(s16 x, s16 y, s16 z);
++void GXNormal3s8(s8 x, s8 y, s8 z);
++void __real_GXNormal3s8(s8 x, s8 y, s8 z);
++void GXNormal3u16(u16 x, u16 y, u16 z);
++void __real_GXNormal3u16(u16 x, u16 y, u16 z);
++void GXNormal3u8(u8 x, u8 y, u8 z);
++void __real_GXNormal3u8(u8 x, u8 y, u8 z);
++void GXPixModeSync(void);
++void __real_GXPixModeSync(void);
++void GXPosition2f32(f32 x, f32 y);
++void __real_GXPosition2f32(f32 x, f32 y);
++void GXPosition2s16(s16 x, s16 y);
++void __real_GXPosition2s16(s16 x, s16 y);
++void GXPosition2s8(s8 x, s8 y);
++void __real_GXPosition2s8(s8 x, s8 y);
++void GXPosition2u16(u16 x, u16 y);
++void __real_GXPosition2u16(u16 x, u16 y);
++void GXPosition2u8(u8 x, u8 y);
++void __real_GXPosition2u8(u8 x, u8 y);
++void GXPosition3f32(f32 x, f32 y, f32 z);
++void __real_GXPosition3f32(f32 x, f32 y, f32 z);
++void GXPosition3s16(s16 x, s16 y, s16 z);
++void __real_GXPosition3s16(s16 x, s16 y, s16 z);
++void GXPosition3s8(s8 x, s8 y, s8 z);
++void __real_GXPosition3s8(s8 x, s8 y, s8 z);
++void GXPosition3u16(u16 x, u16 y, u16 z);
++void __real_GXPosition3u16(u16 x, u16 y, u16 z);
++void GXPosition3u8(u8 x, u8 y, u8 z);
++void __real_GXPosition3u8(u8 x, u8 y, u8 z);
++void GXSaveCPUFifo(GXFifoObj* fifo);
++void __real_GXSaveCPUFifo(GXFifoObj* fifo);
++void GXSetAlphaCompare(GXCompare comp0, u8 ref0, GXAlphaOp op, GXCompare comp1, u8 ref1);
++void __real_GXSetAlphaCompare(GXCompare comp0, u8 ref0, GXAlphaOp op, GXCompare comp1, u8 ref1);
++void GXSetAlphaUpdate(GXBool update_enable);
++void __real_GXSetAlphaUpdate(GXBool update_enable);
++void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le);
++void __real_GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le);
++void GXSetBlendMode(GXBlendMode type, GXBlendFactor src_factor, GXBlendFactor dst_factor, GXLogicOp op);
++void __real_GXSetBlendMode(GXBlendMode type, GXBlendFactor src_factor, GXBlendFactor dst_factor, GXLogicOp op);
++void GXSetCPUFifo(GXFifoObj* fifo);
++void __real_GXSetCPUFifo(GXFifoObj* fifo);
++void GXSetChanAmbColor(GXChannelID chan, GXColor amb_color);
++void __real_GXSetChanAmbColor(GXChannelID chan, GXColor amb_color);
++void GXSetChanCtrl(GXChannelID chan, GXBool enable, GXColorSrc amb_src, GXColorSrc mat_src, u32 light_mask, GXDiffuseFn diff_fn, GXAttnFn attn_fn);
++void __real_GXSetChanCtrl(GXChannelID chan, GXBool enable, GXColorSrc amb_src, GXColorSrc mat_src, u32 light_mask, GXDiffuseFn diff_fn, GXAttnFn attn_fn);
++void GXSetChanMatColor(GXChannelID chan, GXColor mat_color);
++void __real_GXSetChanMatColor(GXChannelID chan, GXColor mat_color);
++void GXSetClipMode(GXClipMode mode);
++void __real_GXSetClipMode(GXClipMode mode);
++void GXSetCoPlanar(GXBool enable);
++void __real_GXSetCoPlanar(GXBool enable);
++void GXSetColorUpdate(GXBool update_enable);
++void __real_GXSetColorUpdate(GXBool update_enable);
++void GXSetCopyClamp(GXFBClamp clamp);
++void __real_GXSetCopyClamp(GXFBClamp clamp);
++void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]);
++void __real_GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]);
++void GXSetCullMode(GXCullMode mode);
++void __real_GXSetCullMode(GXCullMode mode);
++void GXSetCurrentMtx(u32 id);
++void __real_GXSetCurrentMtx(u32 id);
++void GXSetDispCopyDst(u16 wd, u16 ht);
++void __real_GXSetDispCopyDst(u16 wd, u16 ht);
++void GXSetDispCopyFrame2Field(u32 mode);
++void __real_GXSetDispCopyFrame2Field(u32 mode);
++void GXSetDispCopyGamma(GXGamma gamma);
++void __real_GXSetDispCopyGamma(GXGamma gamma);
++void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht);
++void __real_GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht);
++void GXSetDither(GXBool dither);
++void __real_GXSetDither(GXBool dither);
++void GXSetDstAlpha(GXBool enable, u8 alpha);
++void __real_GXSetDstAlpha(GXBool enable, u8 alpha);
++void GXSetFog(GXFogType type, f32 startz, f32 endz, f32 nearz, f32 farz, GXColor color);
++void __real_GXSetFog(GXFogType type, f32 startz, f32 endz, f32 nearz, f32 farz, GXColor color);
++void GXSetGPFifo(GXFifoObj* fifo);
++void __real_GXSetGPFifo(GXFifoObj* fifo);
++void GXSetIndTexCoordScale(GXIndTexStageID indStage, GXIndTexScale scaleS, GXIndTexScale scaleT);
++void __real_GXSetIndTexCoordScale(GXIndTexStageID indStage, GXIndTexScale scaleS, GXIndTexScale scaleT);
++void GXSetIndTexMtx(GXIndTexMtxID mtx_sel, const void* offset, s8 scale_exp);
++void __real_GXSetIndTexMtx(GXIndTexMtxID mtx_sel, const void* offset, s8 scale_exp);
++void GXSetIndTexOrder(GXIndTexStageID ind_stage, GXTexCoordID tex_coord, GXTexMapID tex_map);
++void __real_GXSetIndTexOrder(GXIndTexStageID ind_stage, GXTexCoordID tex_coord, GXTexMapID tex_map);
++void GXSetLineWidth(u8 width, GXTexOffset texOffsets);
++void __real_GXSetLineWidth(u8 width, GXTexOffset texOffsets);
++void GXSetNumChans(u8 nChans);
++void __real_GXSetNumChans(u8 nChans);
++void GXSetNumIndStages(u8 nIndStages);
++void __real_GXSetNumIndStages(u8 nIndStages);
++void GXSetNumTevStages(u8 nStages);
++void __real_GXSetNumTevStages(u8 nStages);
++void GXSetNumTexGens(u8 nTexGens);
++void __real_GXSetNumTexGens(u8 nTexGens);
++void GXSetPixelFmt(GXPixelFmt pix_fmt, GXZFmt16 z_fmt);
++void __real_GXSetPixelFmt(GXPixelFmt pix_fmt, GXZFmt16 z_fmt);
++void GXSetPointSize(u8 pointSize, GXTexOffset texOffsets);
++void __real_GXSetPointSize(u8 pointSize, GXTexOffset texOffsets);
++void GXSetProjection(const void* mtx, GXProjectionType type);
++void __real_GXSetProjection(const void* mtx, GXProjectionType type);
++void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht);
++void __real_GXSetScissor(u32 left, u32 top, u32 wd, u32 ht);
++void GXSetScissorBoxOffset(s32 x_off, s32 y_off);
++void __real_GXSetScissorBoxOffset(s32 x_off, s32 y_off);
++void GXSetSourceVtxDesc(GXAttr attr, GXAttrType type);
++void __real_GXSetSourceVtxDesc(GXAttr attr, GXAttrType type);
++void GXSetTevAlphaIn(GXTevStageID stage, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d);
++void __real_GXSetTevAlphaIn(GXTevStageID stage, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d);
++void GXSetTevAlphaOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out_reg);
++void __real_GXSetTevAlphaOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out_reg);
++void GXSetTevColor(GXTevRegID id, GXColor color);
++void __real_GXSetTevColor(GXTevRegID id, GXColor color);
++void GXSetTevColorIn(GXTevStageID stage, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d);
++void __real_GXSetTevColorIn(GXTevStageID stage, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d);
++void GXSetTevColorOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out_reg);
++void __real_GXSetTevColorOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out_reg);
++void GXSetTevColorS10(GXTevRegID id, GXColorS10 color);
++void __real_GXSetTevColorS10(GXTevRegID id, GXColorS10 color);
++void GXSetTevDirect(GXTevStageID tev_stage);
++void __real_GXSetTevDirect(GXTevStageID tev_stage);
++void GXSetTevIndWarp(GXTevStageID tev_stage, GXIndTexStageID ind_stage, GXBool signed_offsets, GXBool replace_mode, GXIndTexMtxID matrix_sel);
++void __real_GXSetTevIndWarp(GXTevStageID tev_stage, GXIndTexStageID ind_stage, GXBool signed_offsets, GXBool replace_mode, GXIndTexMtxID matrix_sel);
++void GXSetTevIndirect(GXTevStageID tev_stage, GXIndTexStageID ind_stage, GXIndTexFormat format, GXIndTexBiasSel bias_sel, GXIndTexMtxID matrix_sel, GXIndTexWrap wrap_s, GXIndTexWrap wrap_t, GXBool add_prev, GXBool ind_lod, GXIndTexAlphaSel alpha_sel);
++void __real_GXSetTevIndirect(GXTevStageID tev_stage, GXIndTexStageID ind_stage, GXIndTexFormat format, GXIndTexBiasSel bias_sel, GXIndTexMtxID matrix_sel, GXIndTexWrap wrap_s, GXIndTexWrap wrap_t, GXBool add_prev, GXBool ind_lod, GXIndTexAlphaSel alpha_sel);
++void GXSetTevKAlphaSel(GXTevStageID stage, GXTevKAlphaSel sel);
++void __real_GXSetTevKAlphaSel(GXTevStageID stage, GXTevKAlphaSel sel);
++void GXSetTevKColor(GXTevKColorID id, GXColor color);
++void __real_GXSetTevKColor(GXTevKColorID id, GXColor color);
++void GXSetTevKColorSel(GXTevStageID stage, GXTevKColorSel sel);
++void __real_GXSetTevKColorSel(GXTevStageID stage, GXTevKColorSel sel);
++void GXSetTevOp(GXTevStageID id, GXTevMode mode);
++void __real_GXSetTevOp(GXTevStageID id, GXTevMode mode);
++void GXSetTevOrder(GXTevStageID stage, GXTexCoordID coord, GXTexMapID map, GXChannelID color);
++void __real_GXSetTevOrder(GXTevStageID stage, GXTexCoordID coord, GXTexMapID map, GXChannelID color);
++void GXSetTevSwapMode(GXTevStageID stage, GXTevSwapSel ras_sel, GXTevSwapSel tex_sel);
++void __real_GXSetTevSwapMode(GXTevStageID stage, GXTevSwapSel ras_sel, GXTevSwapSel tex_sel);
++void GXSetTevSwapModeTable(GXTevSwapSel table, GXTevColorChan red, GXTevColorChan green, GXTevColorChan blue, GXTevColorChan alpha);
++void __real_GXSetTevSwapModeTable(GXTevSwapSel table, GXTevColorChan red, GXTevColorChan green, GXTevColorChan blue, GXTevColorChan alpha);
++void GXSetTexCoordBias(GXTexCoordID coord, GXBool s_enable, GXBool t_enable);
++void __real_GXSetTexCoordBias(GXTexCoordID coord, GXBool s_enable, GXBool t_enable);
++void GXSetTexCoordGen2(GXTexCoordID dst_coord, GXTexGenType func, GXTexGenSrc src_param, u32 mtx, GXBool normalize, u32 postmtx);
++void __real_GXSetTexCoordGen2(GXTexCoordID dst_coord, GXTexGenType func, GXTexGenSrc src_param, u32 mtx, GXBool normalize, u32 postmtx);
++void GXSetTexCoordScaleManually(GXTexCoordID coord, GXBool enable, u16 ss, u16 ts);
++void __real_GXSetTexCoordScaleManually(GXTexCoordID coord, GXBool enable, u16 ss, u16 ts);
++void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap);
++void __real_GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap);
++void GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht);
++void __real_GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht);
++void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz);
++void __real_GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz);
++void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field);
++void __real_GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field);
++void GXSetVtxAttrFmt(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac);
++void __real_GXSetVtxAttrFmt(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac);
++void GXSetVtxAttrFmtRun(GXVtxFmt fmt, const GXVtxAttrFmtList* list, u32 count);
++void __real_GXSetVtxAttrFmtRun(GXVtxFmt fmt, const GXVtxAttrFmtList* list, u32 count);
++void GXSetVtxDesc(GXAttr attr, GXAttrType type);
++void __real_GXSetVtxDesc(GXAttr attr, GXAttrType type);
++void GXSetVtxDescRun(const GXVtxDescList* list, u32 count);
++void __real_GXSetVtxDescRun(const GXVtxDescList* list, u32 count);
++void GXSetZCompLoc(GXBool before_tex);
++void __real_GXSetZCompLoc(GXBool before_tex);
++void GXSetZMode(GXBool compare_enable, GXCompare func, GXBool update_enable);
++void __real_GXSetZMode(GXBool compare_enable, GXCompare func, GXBool update_enable);
++void GXSetZScaleOffset(f32 scale, f32 offset);
++void __real_GXSetZScaleOffset(f32 scale, f32 offset);
++void GXSetZTexture(GXZTexOp op, GXTexFmt fmt, u32 bias);
++void __real_GXSetZTexture(GXZTexOp op, GXTexFmt fmt, u32 bias);
++void GXTexCoord1f32(f32 s);
++void __real_GXTexCoord1f32(f32 s);
++void GXTexCoord1s16(s16 s);
++void __real_GXTexCoord1s16(s16 s);
++void GXTexCoord1s8(s8 s);
++void __real_GXTexCoord1s8(s8 s);
++void GXTexCoord1u16(u16 s);
++void __real_GXTexCoord1u16(u16 s);
++void GXTexCoord1u8(u8 s);
++void __real_GXTexCoord1u8(u8 s);
++void GXTexCoord2f32(f32 s, f32 t);
++void __real_GXTexCoord2f32(f32 s, f32 t);
++void GXTexCoord2s16(s16 s, s16 t);
++void __real_GXTexCoord2s16(s16 s, s16 t);
++void GXTexCoord2s8(s8 s, s8 t);
++void __real_GXTexCoord2s8(s8 s, s8 t);
++void GXTexCoord2u16(u16 s, u16 t);
++void __real_GXTexCoord2u16(u16 s, u16 t);
++void GXTexCoord2u8(u8 s, u8 t);
++void __real_GXTexCoord2u8(u8 s, u8 t);
++void __GXSetSUTexRegs(void);
++void __real___GXSetSUTexRegs(void);
++void aurora_gx_vcd_state(u32*, u32*, u32*);
++void __real_aurora_gx_vcd_state(u32*, u32*, u32*);
++}
++
++namespace hle::gx::offload {
++template <> struct Dispatch<&::aurora_gx_vcd_state> {
++  template <auto Function> static void Invoke(u32* lo, u32* hi, u32* flags) {
++    if (!Intercept() || Synchronous()) return Function(lo, hi, flags);
++    GetVcdState(lo, hi, flags);
++  }
++};
++}
++
++extern "C" {
++void __wrap_GXApplyBPReg(u8 reg, u32 value) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXApplyBPReg)>(&::GXApplyBPReg), &::__real_GXApplyBPReg>(reg, value);
++}
++void __wrap_GXBegin(GXPrimitive type, GXVtxFmt vtxfmt, u16 nverts) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXBegin)>(&::GXBegin), &::__real_GXBegin>(type, vtxfmt, nverts);
++}
++void __wrap_GXCallDisplayList(const void* list, u32 nbytes) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXCallDisplayList)>(&::GXCallDisplayList), &::__real_GXCallDisplayList>(list, nbytes);
++}
++void __wrap_GXCallDisplayListRef(const void* list, u32 bytes) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXCallDisplayListRef)>(&::GXCallDisplayListRef), &::__real_GXCallDisplayListRef>(list, bytes);
++}
++void __wrap_GXClearBoundingBox(void) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXClearBoundingBox)>(&::GXClearBoundingBox), &::__real_GXClearBoundingBox>();
++}
++void __wrap_GXClearVtxDesc(void) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXClearVtxDesc)>(&::GXClearVtxDesc), &::__real_GXClearVtxDesc>();
++}
++void __wrap_GXColor3u8(u8 r, u8 g, u8 b) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXColor3u8)>(&::GXColor3u8), &::__real_GXColor3u8>(r, g, b);
++}
++void __wrap_GXColor4u8(u8 r, u8 g, u8 b, u8 a) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXColor4u8)>(&::GXColor4u8), &::__real_GXColor4u8>(r, g, b, a);
++}
++void __wrap_GXCopyDisp(void* dest, GXBool clear) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXCopyDisp)>(&::GXCopyDisp), &::__real_GXCopyDisp>(dest, clear);
++}
++void __wrap_GXCopyTex(void* dest, GXBool clear) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXCopyTex)>(&::GXCopyTex), &::__real_GXCopyTex>(dest, clear);
++}
++void __wrap_GXDestroyCopyTex(void* dest) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXDestroyCopyTex)>(&::GXDestroyCopyTex), &::__real_GXDestroyCopyTex>(dest);
++}
++void __wrap_GXDestroyTexObj(GXTexObj* obj) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXDestroyTexObj)>(&::GXDestroyTexObj), &::__real_GXDestroyTexObj>(obj);
++}
++void __wrap_GXDestroyTlutObj(GXTlutObj* obj) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXDestroyTlutObj)>(&::GXDestroyTlutObj), &::__real_GXDestroyTlutObj>(obj);
++}
++void __wrap_GXDrawDone(void) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXDrawDone)>(&::GXDrawDone), &::__real_GXDrawDone>();
++}
++void __wrap_GXEnableTexOffsets(GXTexCoordID coord, GXBool line_enable, GXBool point_enable) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXEnableTexOffsets)>(&::GXEnableTexOffsets), &::__real_GXEnableTexOffsets>(coord, line_enable, point_enable);
++}
++void __wrap_GXEnd(void) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXEnd)>(&::GXEnd), &::__real_GXEnd>();
++}
++void __wrap_GXFlush(void) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXFlush)>(&::GXFlush), &::__real_GXFlush>();
++}
++GXFifoObj* __wrap_GXGetCPUFifo(void) {
++  return hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXGetCPUFifo)>(&::GXGetCPUFifo), &::__real_GXGetCPUFifo>();
++}
++u32 __wrap_GXGetTexBufferSize(u16 width, u16 height, u32 format, GXBool mipmap, u8 max_lod) {
++  return hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXGetTexBufferSize)>(&::GXGetTexBufferSize), &::__real_GXGetTexBufferSize>(width, height, format, mipmap, max_lod);
++}
++void __wrap_GXGetVtxDesc(GXAttr attr, GXAttrType* type) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXGetVtxDesc)>(&::GXGetVtxDesc), &::__real_GXGetVtxDesc>(attr, type);
++}
++void __wrap_GXGetVtxDescv(GXVtxDescList* vcd) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXGetVtxDescv)>(&::GXGetVtxDescv), &::__real_GXGetVtxDescv>(vcd);
++}
++GXFifoObj* __wrap_GXInit(void* base, u32 size) {
++  auto result = hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInit)>(&::GXInit), &::__real_GXInit>(base, size);
++  hle::gx::offload::Initialize();
++  return result;
++}
++void __wrap_GXInitFifoBase(GXFifoObj* fifo, void* base, u32 size) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitFifoBase)>(&::GXInitFifoBase), &::__real_GXInitFifoBase>(fifo, base, size);
++}
++void __wrap_GXInitLightAttn(GXLightObj* lt_obj, f32 a0, f32 a1, f32 a2, f32 k0, f32 k1, f32 k2) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitLightAttn)>(&::GXInitLightAttn), &::__real_GXInitLightAttn>(lt_obj, a0, a1, a2, k0, k1, k2);
++}
++void __wrap_GXInitLightColor(GXLightObj* lt_obj, GXColor color) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitLightColor)>(&::GXInitLightColor), &::__real_GXInitLightColor>(lt_obj, color);
++}
++void __wrap_GXInitLightDir(GXLightObj* lt_obj, f32 nx, f32 ny, f32 nz) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitLightDir)>(&::GXInitLightDir), &::__real_GXInitLightDir>(lt_obj, nx, ny, nz);
++}
++void __wrap_GXInitLightPos(GXLightObj* lt_obj, f32 x, f32 y, f32 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitLightPos)>(&::GXInitLightPos), &::__real_GXInitLightPos>(lt_obj, x, y, z);
++}
++void __wrap_GXInitTexObj(GXTexObj* obj, const void* data, u16 width, u16 height, GXTexFmt format, GXTexWrapMode wrapS, GXTexWrapMode wrapT, GXBool mipmap) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitTexObj)>(&::GXInitTexObj), &::__real_GXInitTexObj>(obj, data, width, height, format, wrapS, wrapT, mipmap);
++}
++void __wrap_GXInitTexObjCI(GXTexObj* obj, const void* data, u16 width, u16 height, GXCITexFmt format, GXTexWrapMode wrapS, GXTexWrapMode wrapT, GXBool mipmap, u32 tlut) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitTexObjCI)>(&::GXInitTexObjCI), &::__real_GXInitTexObjCI>(obj, data, width, height, format, wrapS, wrapT, mipmap, tlut);
++}
++void __wrap_GXInitTexObjData(GXTexObj* obj, const void* data) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitTexObjData)>(&::GXInitTexObjData), &::__real_GXInitTexObjData>(obj, data);
++}
++void __wrap_GXInitTexObjLOD(GXTexObj* obj, GXTexFilter min_filt, GXTexFilter mag_filt, f32 min_lod, f32 max_lod, f32 lod_bias, GXBool bias_clamp, GXBool do_edge_lod, GXAnisotropy max_aniso) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitTexObjLOD)>(&::GXInitTexObjLOD), &::__real_GXInitTexObjLOD>(obj, min_filt, mag_filt, min_lod, max_lod, lod_bias, bias_clamp, do_edge_lod, max_aniso);
++}
++void __wrap_GXInitTexObjTlut(GXTexObj* obj_, u32 tlut) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitTexObjTlut)>(&::GXInitTexObjTlut), &::__real_GXInitTexObjTlut>(obj_, tlut);
++}
++void __wrap_GXInitTexObjUserData(GXTexObj* obj, void* user_data) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitTexObjUserData)>(&::GXInitTexObjUserData), &::__real_GXInitTexObjUserData>(obj, user_data);
++}
++void __wrap_GXInitTexObjWrapMode(GXTexObj* obj, GXTexWrapMode s, GXTexWrapMode t) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitTexObjWrapMode)>(&::GXInitTexObjWrapMode), &::__real_GXInitTexObjWrapMode>(obj, s, t);
++}
++void __wrap_GXInitTlutObj(GXTlutObj* obj, const void* data, GXTlutFmt format, u16 entries) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInitTlutObj)>(&::GXInitTlutObj), &::__real_GXInitTlutObj>(obj, data, format, entries);
++}
++void __wrap_GXInvalidateTexAll() {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXInvalidateTexAll)>(&::GXInvalidateTexAll), &::__real_GXInvalidateTexAll>();
++}
++void __wrap_GXLoadLightObjImm(GXLightObj* lt_obj, GXLightID light) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXLoadLightObjImm)>(&::GXLoadLightObjImm), &::__real_GXLoadLightObjImm>(lt_obj, light);
++}
++void __wrap_GXLoadLightObjImmBE(const void* light, GXLightID id) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXLoadLightObjImmBE)>(&::GXLoadLightObjImmBE), &::__real_GXLoadLightObjImmBE>(light, id);
++}
++void __wrap_GXLoadNrmMtxImm(const void* mtx, u32 id) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXLoadNrmMtxImm)>(&::GXLoadNrmMtxImm), &::__real_GXLoadNrmMtxImm>(mtx, id);
++}
++void __wrap_GXLoadNrmMtxImmBE(const void* matrix, u32 id, u32 rowStride) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXLoadNrmMtxImmBE)>(&::GXLoadNrmMtxImmBE), &::__real_GXLoadNrmMtxImmBE>(matrix, id, rowStride);
++}
++void __wrap_GXLoadPosMtxImm(const void* mtx, u32 id) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXLoadPosMtxImm)>(&::GXLoadPosMtxImm), &::__real_GXLoadPosMtxImm>(mtx, id);
++}
++void __wrap_GXLoadPosMtxImmBE(const void* matrix, u32 id) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXLoadPosMtxImmBE)>(&::GXLoadPosMtxImmBE), &::__real_GXLoadPosMtxImmBE>(matrix, id);
++}
++void __wrap_GXLoadTexMtxImm(const void* mtx, u32 id, GXTexMtxType type) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXLoadTexMtxImm)>(&::GXLoadTexMtxImm), &::__real_GXLoadTexMtxImm>(mtx, id, type);
++}
++void __wrap_GXLoadTexObj(GXTexObj* obj, GXTexMapID id) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXLoadTexObj)>(&::GXLoadTexObj), &::__real_GXLoadTexObj>(obj, id);
++}
++void __wrap_GXLoadTlut(const GXTlutObj* obj, u32 idx) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXLoadTlut)>(&::GXLoadTlut), &::__real_GXLoadTlut>(obj, idx);
++}
++void __wrap_GXMatrixIndex1u8(GXAttr attr, u8 index) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXMatrixIndex1u8)>(&::GXMatrixIndex1u8), &::__real_GXMatrixIndex1u8>(attr, index);
++}
++void __wrap_GXNormal3f32(f32 x, f32 y, f32 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXNormal3f32)>(&::GXNormal3f32), &::__real_GXNormal3f32>(x, y, z);
++}
++void __wrap_GXNormal3s16(s16 x, s16 y, s16 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXNormal3s16)>(&::GXNormal3s16), &::__real_GXNormal3s16>(x, y, z);
++}
++void __wrap_GXNormal3s8(s8 x, s8 y, s8 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXNormal3s8)>(&::GXNormal3s8), &::__real_GXNormal3s8>(x, y, z);
++}
++void __wrap_GXNormal3u16(u16 x, u16 y, u16 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXNormal3u16)>(&::GXNormal3u16), &::__real_GXNormal3u16>(x, y, z);
++}
++void __wrap_GXNormal3u8(u8 x, u8 y, u8 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXNormal3u8)>(&::GXNormal3u8), &::__real_GXNormal3u8>(x, y, z);
++}
++void __wrap_GXPixModeSync(void) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPixModeSync)>(&::GXPixModeSync), &::__real_GXPixModeSync>();
++}
++void __wrap_GXPosition2f32(f32 x, f32 y) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPosition2f32)>(&::GXPosition2f32), &::__real_GXPosition2f32>(x, y);
++}
++void __wrap_GXPosition2s16(s16 x, s16 y) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPosition2s16)>(&::GXPosition2s16), &::__real_GXPosition2s16>(x, y);
++}
++void __wrap_GXPosition2s8(s8 x, s8 y) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPosition2s8)>(&::GXPosition2s8), &::__real_GXPosition2s8>(x, y);
++}
++void __wrap_GXPosition2u16(u16 x, u16 y) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPosition2u16)>(&::GXPosition2u16), &::__real_GXPosition2u16>(x, y);
++}
++void __wrap_GXPosition2u8(u8 x, u8 y) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPosition2u8)>(&::GXPosition2u8), &::__real_GXPosition2u8>(x, y);
++}
++void __wrap_GXPosition3f32(f32 x, f32 y, f32 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPosition3f32)>(&::GXPosition3f32), &::__real_GXPosition3f32>(x, y, z);
++}
++void __wrap_GXPosition3s16(s16 x, s16 y, s16 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPosition3s16)>(&::GXPosition3s16), &::__real_GXPosition3s16>(x, y, z);
++}
++void __wrap_GXPosition3s8(s8 x, s8 y, s8 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPosition3s8)>(&::GXPosition3s8), &::__real_GXPosition3s8>(x, y, z);
++}
++void __wrap_GXPosition3u16(u16 x, u16 y, u16 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPosition3u16)>(&::GXPosition3u16), &::__real_GXPosition3u16>(x, y, z);
++}
++void __wrap_GXPosition3u8(u8 x, u8 y, u8 z) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXPosition3u8)>(&::GXPosition3u8), &::__real_GXPosition3u8>(x, y, z);
++}
++void __wrap_GXSaveCPUFifo(GXFifoObj* fifo) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSaveCPUFifo)>(&::GXSaveCPUFifo), &::__real_GXSaveCPUFifo>(fifo);
++}
++void __wrap_GXSetAlphaCompare(GXCompare comp0, u8 ref0, GXAlphaOp op, GXCompare comp1, u8 ref1) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetAlphaCompare)>(&::GXSetAlphaCompare), &::__real_GXSetAlphaCompare>(comp0, ref0, op, comp1, ref1);
++}
++void __wrap_GXSetAlphaUpdate(GXBool update_enable) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetAlphaUpdate)>(&::GXSetAlphaUpdate), &::__real_GXSetAlphaUpdate>(update_enable);
++}
++void __wrap_GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetArray)>(&::GXSetArray), &::__real_GXSetArray>(attr, data, size, stride, le);
++}
++void __wrap_GXSetBlendMode(GXBlendMode type, GXBlendFactor src_factor, GXBlendFactor dst_factor, GXLogicOp op) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetBlendMode)>(&::GXSetBlendMode), &::__real_GXSetBlendMode>(type, src_factor, dst_factor, op);
++}
++void __wrap_GXSetCPUFifo(GXFifoObj* fifo) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetCPUFifo)>(&::GXSetCPUFifo), &::__real_GXSetCPUFifo>(fifo);
++}
++void __wrap_GXSetChanAmbColor(GXChannelID chan, GXColor amb_color) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetChanAmbColor)>(&::GXSetChanAmbColor), &::__real_GXSetChanAmbColor>(chan, amb_color);
++}
++void __wrap_GXSetChanCtrl(GXChannelID chan, GXBool enable, GXColorSrc amb_src, GXColorSrc mat_src, u32 light_mask, GXDiffuseFn diff_fn, GXAttnFn attn_fn) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetChanCtrl)>(&::GXSetChanCtrl), &::__real_GXSetChanCtrl>(chan, enable, amb_src, mat_src, light_mask, diff_fn, attn_fn);
++}
++void __wrap_GXSetChanMatColor(GXChannelID chan, GXColor mat_color) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetChanMatColor)>(&::GXSetChanMatColor), &::__real_GXSetChanMatColor>(chan, mat_color);
++}
++void __wrap_GXSetClipMode(GXClipMode mode) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetClipMode)>(&::GXSetClipMode), &::__real_GXSetClipMode>(mode);
++}
++void __wrap_GXSetCoPlanar(GXBool enable) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetCoPlanar)>(&::GXSetCoPlanar), &::__real_GXSetCoPlanar>(enable);
++}
++void __wrap_GXSetColorUpdate(GXBool update_enable) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetColorUpdate)>(&::GXSetColorUpdate), &::__real_GXSetColorUpdate>(update_enable);
++}
++void __wrap_GXSetCopyClamp(GXFBClamp clamp) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetCopyClamp)>(&::GXSetCopyClamp), &::__real_GXSetCopyClamp>(clamp);
++}
++void __wrap_GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetCopyFilter)>(&::GXSetCopyFilter), &::__real_GXSetCopyFilter>(aa, sample_pattern, vf, vfilter);
++}
++void __wrap_GXSetCullMode(GXCullMode mode) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetCullMode)>(&::GXSetCullMode), &::__real_GXSetCullMode>(mode);
++}
++void __wrap_GXSetCurrentMtx(u32 id) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetCurrentMtx)>(&::GXSetCurrentMtx), &::__real_GXSetCurrentMtx>(id);
++}
++void __wrap_GXSetDispCopyDst(u16 wd, u16 ht) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetDispCopyDst)>(&::GXSetDispCopyDst), &::__real_GXSetDispCopyDst>(wd, ht);
++}
++void __wrap_GXSetDispCopyFrame2Field(u32 mode) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetDispCopyFrame2Field)>(&::GXSetDispCopyFrame2Field), &::__real_GXSetDispCopyFrame2Field>(mode);
++}
++void __wrap_GXSetDispCopyGamma(GXGamma gamma) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetDispCopyGamma)>(&::GXSetDispCopyGamma), &::__real_GXSetDispCopyGamma>(gamma);
++}
++void __wrap_GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetDispCopySrc)>(&::GXSetDispCopySrc), &::__real_GXSetDispCopySrc>(left, top, wd, ht);
++}
++void __wrap_GXSetDither(GXBool dither) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetDither)>(&::GXSetDither), &::__real_GXSetDither>(dither);
++}
++void __wrap_GXSetDstAlpha(GXBool enable, u8 alpha) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetDstAlpha)>(&::GXSetDstAlpha), &::__real_GXSetDstAlpha>(enable, alpha);
++}
++void __wrap_GXSetFog(GXFogType type, f32 startz, f32 endz, f32 nearz, f32 farz, GXColor color) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetFog)>(&::GXSetFog), &::__real_GXSetFog>(type, startz, endz, nearz, farz, color);
++}
++void __wrap_GXSetGPFifo(GXFifoObj* fifo) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetGPFifo)>(&::GXSetGPFifo), &::__real_GXSetGPFifo>(fifo);
++}
++void __wrap_GXSetIndTexCoordScale(GXIndTexStageID indStage, GXIndTexScale scaleS, GXIndTexScale scaleT) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetIndTexCoordScale)>(&::GXSetIndTexCoordScale), &::__real_GXSetIndTexCoordScale>(indStage, scaleS, scaleT);
++}
++void __wrap_GXSetIndTexMtx(GXIndTexMtxID mtx_sel, const void* offset, s8 scale_exp) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetIndTexMtx)>(&::GXSetIndTexMtx), &::__real_GXSetIndTexMtx>(mtx_sel, offset, scale_exp);
++}
++void __wrap_GXSetIndTexOrder(GXIndTexStageID ind_stage, GXTexCoordID tex_coord, GXTexMapID tex_map) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetIndTexOrder)>(&::GXSetIndTexOrder), &::__real_GXSetIndTexOrder>(ind_stage, tex_coord, tex_map);
++}
++void __wrap_GXSetLineWidth(u8 width, GXTexOffset texOffsets) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetLineWidth)>(&::GXSetLineWidth), &::__real_GXSetLineWidth>(width, texOffsets);
++}
++void __wrap_GXSetNumChans(u8 nChans) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetNumChans)>(&::GXSetNumChans), &::__real_GXSetNumChans>(nChans);
++}
++void __wrap_GXSetNumIndStages(u8 nIndStages) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetNumIndStages)>(&::GXSetNumIndStages), &::__real_GXSetNumIndStages>(nIndStages);
++}
++void __wrap_GXSetNumTevStages(u8 nStages) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetNumTevStages)>(&::GXSetNumTevStages), &::__real_GXSetNumTevStages>(nStages);
++}
++void __wrap_GXSetNumTexGens(u8 nTexGens) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetNumTexGens)>(&::GXSetNumTexGens), &::__real_GXSetNumTexGens>(nTexGens);
++}
++void __wrap_GXSetPixelFmt(GXPixelFmt pix_fmt, GXZFmt16 z_fmt) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetPixelFmt)>(&::GXSetPixelFmt), &::__real_GXSetPixelFmt>(pix_fmt, z_fmt);
++}
++void __wrap_GXSetPointSize(u8 pointSize, GXTexOffset texOffsets) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetPointSize)>(&::GXSetPointSize), &::__real_GXSetPointSize>(pointSize, texOffsets);
++}
++void __wrap_GXSetProjection(const void* mtx, GXProjectionType type) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetProjection)>(&::GXSetProjection), &::__real_GXSetProjection>(mtx, type);
++}
++void __wrap_GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetScissor)>(&::GXSetScissor), &::__real_GXSetScissor>(left, top, wd, ht);
++}
++void __wrap_GXSetScissorBoxOffset(s32 x_off, s32 y_off) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetScissorBoxOffset)>(&::GXSetScissorBoxOffset), &::__real_GXSetScissorBoxOffset>(x_off, y_off);
++}
++void __wrap_GXSetSourceVtxDesc(GXAttr attr, GXAttrType type) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetSourceVtxDesc)>(&::GXSetSourceVtxDesc), &::__real_GXSetSourceVtxDesc>(attr, type);
++}
++void __wrap_GXSetTevAlphaIn(GXTevStageID stage, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevAlphaIn)>(&::GXSetTevAlphaIn), &::__real_GXSetTevAlphaIn>(stage, a, b, c, d);
++}
++void __wrap_GXSetTevAlphaOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out_reg) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevAlphaOp)>(&::GXSetTevAlphaOp), &::__real_GXSetTevAlphaOp>(stage, op, bias, scale, clamp, out_reg);
++}
++void __wrap_GXSetTevColor(GXTevRegID id, GXColor color) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevColor)>(&::GXSetTevColor), &::__real_GXSetTevColor>(id, color);
++}
++void __wrap_GXSetTevColorIn(GXTevStageID stage, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevColorIn)>(&::GXSetTevColorIn), &::__real_GXSetTevColorIn>(stage, a, b, c, d);
++}
++void __wrap_GXSetTevColorOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out_reg) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevColorOp)>(&::GXSetTevColorOp), &::__real_GXSetTevColorOp>(stage, op, bias, scale, clamp, out_reg);
++}
++void __wrap_GXSetTevColorS10(GXTevRegID id, GXColorS10 color) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevColorS10)>(&::GXSetTevColorS10), &::__real_GXSetTevColorS10>(id, color);
++}
++void __wrap_GXSetTevDirect(GXTevStageID tev_stage) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevDirect)>(&::GXSetTevDirect), &::__real_GXSetTevDirect>(tev_stage);
++}
++void __wrap_GXSetTevIndWarp(GXTevStageID tev_stage, GXIndTexStageID ind_stage, GXBool signed_offsets, GXBool replace_mode, GXIndTexMtxID matrix_sel) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevIndWarp)>(&::GXSetTevIndWarp), &::__real_GXSetTevIndWarp>(tev_stage, ind_stage, signed_offsets, replace_mode, matrix_sel);
++}
++void __wrap_GXSetTevIndirect(GXTevStageID tev_stage, GXIndTexStageID ind_stage, GXIndTexFormat format, GXIndTexBiasSel bias_sel, GXIndTexMtxID matrix_sel, GXIndTexWrap wrap_s, GXIndTexWrap wrap_t, GXBool add_prev, GXBool ind_lod, GXIndTexAlphaSel alpha_sel) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevIndirect)>(&::GXSetTevIndirect), &::__real_GXSetTevIndirect>(tev_stage, ind_stage, format, bias_sel, matrix_sel, wrap_s, wrap_t, add_prev, ind_lod, alpha_sel);
++}
++void __wrap_GXSetTevKAlphaSel(GXTevStageID stage, GXTevKAlphaSel sel) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevKAlphaSel)>(&::GXSetTevKAlphaSel), &::__real_GXSetTevKAlphaSel>(stage, sel);
++}
++void __wrap_GXSetTevKColor(GXTevKColorID id, GXColor color) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevKColor)>(&::GXSetTevKColor), &::__real_GXSetTevKColor>(id, color);
++}
++void __wrap_GXSetTevKColorSel(GXTevStageID stage, GXTevKColorSel sel) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevKColorSel)>(&::GXSetTevKColorSel), &::__real_GXSetTevKColorSel>(stage, sel);
++}
++void __wrap_GXSetTevOp(GXTevStageID id, GXTevMode mode) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevOp)>(&::GXSetTevOp), &::__real_GXSetTevOp>(id, mode);
++}
++void __wrap_GXSetTevOrder(GXTevStageID stage, GXTexCoordID coord, GXTexMapID map, GXChannelID color) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevOrder)>(&::GXSetTevOrder), &::__real_GXSetTevOrder>(stage, coord, map, color);
++}
++void __wrap_GXSetTevSwapMode(GXTevStageID stage, GXTevSwapSel ras_sel, GXTevSwapSel tex_sel) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevSwapMode)>(&::GXSetTevSwapMode), &::__real_GXSetTevSwapMode>(stage, ras_sel, tex_sel);
++}
++void __wrap_GXSetTevSwapModeTable(GXTevSwapSel table, GXTevColorChan red, GXTevColorChan green, GXTevColorChan blue, GXTevColorChan alpha) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTevSwapModeTable)>(&::GXSetTevSwapModeTable), &::__real_GXSetTevSwapModeTable>(table, red, green, blue, alpha);
++}
++void __wrap_GXSetTexCoordBias(GXTexCoordID coord, GXBool s_enable, GXBool t_enable) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTexCoordBias)>(&::GXSetTexCoordBias), &::__real_GXSetTexCoordBias>(coord, s_enable, t_enable);
++}
++void __wrap_GXSetTexCoordGen2(GXTexCoordID dst_coord, GXTexGenType func, GXTexGenSrc src_param, u32 mtx, GXBool normalize, u32 postmtx) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTexCoordGen2)>(&::GXSetTexCoordGen2), &::__real_GXSetTexCoordGen2>(dst_coord, func, src_param, mtx, normalize, postmtx);
++}
++void __wrap_GXSetTexCoordScaleManually(GXTexCoordID coord, GXBool enable, u16 ss, u16 ts) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTexCoordScaleManually)>(&::GXSetTexCoordScaleManually), &::__real_GXSetTexCoordScaleManually>(coord, enable, ss, ts);
++}
++void __wrap_GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTexCopyDst)>(&::GXSetTexCopyDst), &::__real_GXSetTexCopyDst>(wd, ht, fmt, mipmap);
++}
++void __wrap_GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetTexCopySrc)>(&::GXSetTexCopySrc), &::__real_GXSetTexCopySrc>(left, top, wd, ht);
++}
++void __wrap_GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetViewport)>(&::GXSetViewport), &::__real_GXSetViewport>(left, top, wd, ht, nearz, farz);
++}
++void __wrap_GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetViewportJitter)>(&::GXSetViewportJitter), &::__real_GXSetViewportJitter>(left, top, wd, ht, nearz, farz, field);
++}
++void __wrap_GXSetVtxAttrFmt(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetVtxAttrFmt)>(&::GXSetVtxAttrFmt), &::__real_GXSetVtxAttrFmt>(vtxfmt, attr, cnt, type, frac);
++}
++void __wrap_GXSetVtxAttrFmtRun(GXVtxFmt fmt, const GXVtxAttrFmtList* list, u32 count) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetVtxAttrFmtRun)>(&::GXSetVtxAttrFmtRun), &::__real_GXSetVtxAttrFmtRun>(fmt, list, count);
++}
++void __wrap_GXSetVtxDesc(GXAttr attr, GXAttrType type) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetVtxDesc)>(&::GXSetVtxDesc), &::__real_GXSetVtxDesc>(attr, type);
++}
++void __wrap_GXSetVtxDescRun(const GXVtxDescList* list, u32 count) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetVtxDescRun)>(&::GXSetVtxDescRun), &::__real_GXSetVtxDescRun>(list, count);
++}
++void __wrap_GXSetZCompLoc(GXBool before_tex) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetZCompLoc)>(&::GXSetZCompLoc), &::__real_GXSetZCompLoc>(before_tex);
++}
++void __wrap_GXSetZMode(GXBool compare_enable, GXCompare func, GXBool update_enable) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetZMode)>(&::GXSetZMode), &::__real_GXSetZMode>(compare_enable, func, update_enable);
++}
++void __wrap_GXSetZScaleOffset(f32 scale, f32 offset) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetZScaleOffset)>(&::GXSetZScaleOffset), &::__real_GXSetZScaleOffset>(scale, offset);
++}
++void __wrap_GXSetZTexture(GXZTexOp op, GXTexFmt fmt, u32 bias) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXSetZTexture)>(&::GXSetZTexture), &::__real_GXSetZTexture>(op, fmt, bias);
++}
++void __wrap_GXTexCoord1f32(f32 s) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXTexCoord1f32)>(&::GXTexCoord1f32), &::__real_GXTexCoord1f32>(s);
++}
++void __wrap_GXTexCoord1s16(s16 s) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXTexCoord1s16)>(&::GXTexCoord1s16), &::__real_GXTexCoord1s16>(s);
++}
++void __wrap_GXTexCoord1s8(s8 s) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXTexCoord1s8)>(&::GXTexCoord1s8), &::__real_GXTexCoord1s8>(s);
++}
++void __wrap_GXTexCoord1u16(u16 s) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXTexCoord1u16)>(&::GXTexCoord1u16), &::__real_GXTexCoord1u16>(s);
++}
++void __wrap_GXTexCoord1u8(u8 s) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXTexCoord1u8)>(&::GXTexCoord1u8), &::__real_GXTexCoord1u8>(s);
++}
++void __wrap_GXTexCoord2f32(f32 s, f32 t) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXTexCoord2f32)>(&::GXTexCoord2f32), &::__real_GXTexCoord2f32>(s, t);
++}
++void __wrap_GXTexCoord2s16(s16 s, s16 t) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXTexCoord2s16)>(&::GXTexCoord2s16), &::__real_GXTexCoord2s16>(s, t);
++}
++void __wrap_GXTexCoord2s8(s8 s, s8 t) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXTexCoord2s8)>(&::GXTexCoord2s8), &::__real_GXTexCoord2s8>(s, t);
++}
++void __wrap_GXTexCoord2u16(u16 s, u16 t) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXTexCoord2u16)>(&::GXTexCoord2u16), &::__real_GXTexCoord2u16>(s, t);
++}
++void __wrap_GXTexCoord2u8(u8 s, u8 t) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real_GXTexCoord2u8)>(&::GXTexCoord2u8), &::__real_GXTexCoord2u8>(s, t);
++}
++void __wrap___GXSetSUTexRegs(void) {
++  hle::gx::offload::CallReal<static_cast<decltype(&::__real___GXSetSUTexRegs)>(&::__GXSetSUTexRegs), &::__real___GXSetSUTexRegs>();
++}
++void __wrap_aurora_gx_vcd_state(u32* lo, u32* hi, u32* flags) {
++  hle::gx::offload::CallReal<&::aurora_gx_vcd_state, &::__real_aurora_gx_vcd_state>(lo, hi, flags);
++}
++}
++#endif
 diff --git a/runtime/src/hle/gx/gx_stream_common.h b/runtime/src/hle/gx/gx_stream_common.h
 index 006ab47..8ed9d12 100644
 --- a/runtime/src/hle/gx/gx_stream_common.h
@@ -6212,10 +8075,20 @@ index 5f029c0..0b51bbe 100644
  enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
  struct Capture {
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
-index 7269747..49093ee 100644
+index 7269747..796606b 100644
 --- a/runtime/src/main.cpp
 +++ b/runtime/src/main.cpp
-@@ -429,6 +429,9 @@ std::string ReadInstalledSetupVersion() {
+@@ -83,6 +83,9 @@ extern std::atomic_bool g_auroraFrameActive;
+ extern "C" int g_gxFrameCount;
+ extern "C" const char* DVDResolveHostPathForTest(const char* dvdPath);
+ bool OS_HLE_InterruptsEnabled() noexcept;
++#if defined(__SWITCH__)
++extern "C" void GX_HLE_OffloadStop();
++#endif
+ 
+ namespace {
+ 
+@@ -429,6 +432,9 @@ std::string ReadInstalledSetupVersion() {
      return text.substr(open + 1, close - open - 1);
  }
  
@@ -6225,7 +8098,7 @@ index 7269747..49093ee 100644
  void InitializeProcessTranscript(int argc, char** argv) {
      auto& state = GetProcessTranscriptState();
      if (state.initialized.exchange(true, std::memory_order_acq_rel)) {
-@@ -469,6 +472,19 @@ void InitializeProcessTranscript(int argc, char** argv) {
+@@ -469,6 +475,19 @@ void InitializeProcessTranscript(int argc, char** argv) {
          state.file.flush();
      }
  
@@ -6245,7 +8118,7 @@ index 7269747..49093ee 100644
      state.savedStdoutFd = DuplicateFileDescriptor(GetFileDescriptor(stdout));
      state.savedStderrFd = DuplicateFileDescriptor(GetFileDescriptor(stderr));
  
-@@ -1133,6 +1149,9 @@ void InstallSehLogger() {
+@@ -1133,6 +1152,9 @@ void InstallSehLogger() {
          SetUnhandledExceptionFilter(UnhandledSehFilter);
      }
  }
@@ -6255,7 +8128,7 @@ index 7269747..49093ee 100644
  #else
  // POSIX counterpart to SehLogger above. Unlike Windows' AddVectoredExceptionHandler, which lets
  // GuestFlat and this module each install their own handler and defensively re-check each other,
-@@ -1322,6 +1341,11 @@ static void TerminateHandler() {
+@@ -1322,6 +1344,11 @@ static void TerminateHandler() {
      } else {
          terminateDetails = "std::terminate() without current exception.";
      }
@@ -6267,7 +8140,7 @@ index 7269747..49093ee 100644
      ShowRuntimeFatalPopup("an unhandled C++ exception occurred", terminateDetails);
      const std::string hostStackSummary = FormatHostStackTrace(1);
      if (!hostStackSummary.empty()) {
-@@ -1441,6 +1465,10 @@ int RuntimeMain(int argc, char** argv) {
+@@ -1441,6 +1468,10 @@ int RuntimeMain(int argc, char** argv) {
              {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
              {"null", BACKEND_NULL},
          }};
@@ -6278,7 +8151,37 @@ index 7269747..49093ee 100644
  #elif defined(_WIN32)
          static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
              {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN}, {"d3d11", BACKEND_D3D11},
-@@ -1587,6 +1615,15 @@ int RuntimeMain(int argc, char** argv) {
+@@ -1547,6 +1578,9 @@ int RuntimeMain(int argc, char** argv) {
+         RT_LOG(RT_TAG_RUNTIME) << label << " => 0x" << std::hex << result << std::dec << " (" << result << ")" << std::endl;
+         
+         // Shutdown fiber system
++        #if defined(__SWITCH__)
++        GX_HLE_OffloadStop();
++        #endif
+         Fiber::GuestFiberManager::Shutdown();
+         WindowPlacementPersistence::Flush(true);
+         aurora_shutdown();
+@@ -1565,6 +1599,9 @@ int RuntimeMain(int argc, char** argv) {
+         ShowRuntimeFatalPopup("a guest memory access was out of bounds", details.str());
+         WriteFatalLogImpl("access_violation", details.str());
+         SetRuntimeExitCodeImpl(1);
++        #if defined(__SWITCH__)
++        GX_HLE_OffloadStop();
++        #endif
+         Fiber::GuestFiberManager::Shutdown();
+         WindowPlacementPersistence::Flush(true);
+         aurora_shutdown();
+@@ -1577,6 +1614,9 @@ int RuntimeMain(int argc, char** argv) {
+         ShowRuntimeFatalPopup("a runtime exception occurred", ex.what());
+         WriteFatalLogImpl("exception");
+         SetRuntimeExitCodeImpl(1);
++        #if defined(__SWITCH__)
++        GX_HLE_OffloadStop();
++        #endif
+         Fiber::GuestFiberManager::Shutdown();
+         WindowPlacementPersistence::Flush(true);
+         aurora_shutdown();
+@@ -1587,6 +1627,15 @@ int RuntimeMain(int argc, char** argv) {
  }
  
  int main(int argc, char** argv) {

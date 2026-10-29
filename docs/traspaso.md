@@ -91,6 +91,30 @@ Objetivo: el mayor ahorro posible en el hilo principal (core 0) moviendo la capa
 3. Implementar por partes detrás de interruptores, con pruebas diferenciales de host (como `local/tmp/cpu/P17-test/`, `P19-test/`) que comparen los bytes de FIFO/estado aurora generados, y A/B en consola con el perfil por ventanas.
 4. Fidelidad intacta: mismo orden de comandos y mismo resultado en pantalla; audio sin tocar.
 
+## GX fase 66: candidata de worker lista para prueba de consola
+
+- `WIICOMPILED_GX_HLE_WORKER=1` activa la cola libnx en core 2. Sin la variable,
+  conserva el camino anterior. La NRO Vulkan está en
+  `local/switch/build/MLBPowerPros2008.nro` (SHA-256 `93bda05ab39c64953a09a8858a2a555c8a17c919a3266a50e578efc69f8e6a0a`);
+  la anterior, `GX-Q66-baseline.nro` (SHA-256 `6d0b1ab24d2082cba079fe13b1577b52fa449a8c03ef9ee1d707f79008e597f2`).
+- Encola 91 emisores escalares y tres snapshots de matrices/luz con valor propio;
+  mantiene guest stores, parser de listas, objetos G7 y operaciones con punteros o
+  resultados en el principal con fence. Es una fase del traslado, no el GX entero.
+- Tres revisiones Luna/max cubrieron inventario, cola, snapshots y diferencial.
+  El líder corrigió dos wake perdidos y la omisión de `GXEnd`, revisó los resultados
+  y repitió las pruebas. Host: cola, wake determinista, negativos de copia y
+  diferenciales de RAM/VCD/FIFO/`--wrap`; todos pasan. Build y enlace Switch
+  completos con cuatro trabajos, 48.223 archivos traducidos sin cambios.
+- `mkswitch.sh`, rebind, `treecheck.sh` y los dos `diff -rq` pasan. Fuente de fase 66:
+  `tools/patches/wiicompiled-gx-offload-source.patch`; aplicación integrada en los
+  dos parches Switch. El checker de contenido pasa. Los parches generados conservan
+  26 líneas de espacios finales heredadas del árbol previo; `git diff --check`
+  las señala aunque no son cambios de ejecución.
+- Falta ejecutar A/B en hardware con el mismo camino de datos, primero worker=0,
+  luego =1, registrando relojes, frames, p95/p99, esperas y GPU. Requiere que el
+  usuario vuelva a poner netloader y avise «listo». No prometer 60 fps estables;
+  la ventana GPU previa también excedió 16,6 ms en algunas escenas.
+
 ## Cómo se trabaja (flujo probado)
 
 - **Patch de Switch:** se genera desde `local/tmp/switch_edit.py`, con fases 1–65 de `sub()` / `write()` y folds de los cambios al texto de fases anteriores.
