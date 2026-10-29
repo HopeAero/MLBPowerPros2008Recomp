@@ -214,14 +214,20 @@ encontraron un hueco de orden pendiente en esos casos. El build Switch y
 Batch-on en stock dio 45,9614 fps (4.137 frames/90,0103 s), p50/p95/p99
 21,85/26,11/28,43 ms y cero errores GX. Se midieron 12,371 comandos por
 publicación en 17 deltas completos dentro de grabación. `Flush` pasó a 18.792
-muestras, `Submit` 12.566 de 88.483. Falta batch-off con la misma NRO y flags;
-la mejora frente a Q75 es pequeña y no se atribuye causalidad. Log privado
+muestras, `Submit` 12.566 de 88.483. La mejora frente a Q75 es pequeña y no se
+atribuye causalidad. Log privado
 `nxlink-GX-Q76-publish-20261029-113957.log`. Esta agrupación aún deja el scan
 HLE, objetos y RAM guest en el principal. La NRO medida conserva el experimento
 BP inactivo; el código final lo elimina e incluye `Idle()` solo en tests.
 La limpieza recompiló y pasó Q66/Q76 y `P11-verify.sh`. NRO privada
 `local/switch/build/GX-Q76-clean.nro`, SHA-256
 `0493c0e5327528016e89c17fb9fb6f0ea1eb89ab74eb194ed5041f2f0b37ae8e`.
-No se ha lanzado esa limpieza en Switch. Para completar el A/B usar la NRO
-original `GX-Q76-publish.nro` con exactamente los mismos argumentos de la
-captura on, cambiando solo `WIICOMPILED_GX_HLE_BATCH=0`; netloader pendiente.
+No se ha lanzado esa limpieza en Switch. El control batch-off usó la NRO
+original `GX-Q76-publish.nro` y los mismos argumentos, cambiando solo
+`WIICOMPILED_GX_HLE_BATCH=0`: 44,5163 fps, p50/p95/p99 22,55/26,46/29,38 ms,
+cero errores GX, una publicación por slot. Log privado
+`nxlink-GX-Q76-publish-20261029-115235.log`. La diferencia on/off es ~3,25%,
+pero el perfil consulta reloj por publicación y sesga más el modo off; falta
+medición sin diagnóstico y no es replay bit a bit. Worker/batch siguen default
+off. Siguiente auditoría Luna/max: bloques textura/TLUT con identidad y estado
+propios para eliminar barreras, no más ajustes pequeños de publicación.

@@ -428,8 +428,7 @@ se excluyeron startup y el delta que cruzaba el inicio de grabación. No equival
 a un ahorro de CPU o FPS del mismo porcentaje. `Flush` recibió 18.792 de 88.483
 muestras (21,2%), `Submit` 12.566 (14,2%) y `PublishThrough` 469 (0,53%).
 Las muestras de `Flush` aumentaron frente a Q75 aunque bajaron las de mutex.
-La comparación con Q75 es pequeña y mixta; falta el control batch-off con la
-misma NRO y los mismos diagnósticos. Log privado
+La comparación con Q75 es pequeña y mixta. Log privado
 `nxlink-GX-Q76-publish-20261029-113957.log`; análisis `GX-Q76-console-on.md`.
 
 Después se retiró Q75 y `Idle()` quedó bajo `GX_OFFLOAD_QUEUE_TEST`. El diff de
@@ -437,5 +436,30 @@ Después se retiró Q75 y `Idle()` quedó bajo `GX_OFFLOAD_QUEUE_TEST`. El diff 
 configuración batch on/off volvieron a pasar; la reconstrucción del parche y el
 build Switch también. NRO limpia privada `local/switch/build/GX-Q76-clean.nro`,
 SHA-256 `0493c0e5327528016e89c17fb9fb6f0ea1eb89ab74eb194ed5041f2f0b37ae8e`.
-Esta limpieza no se ha ejecutado en consola; el control batch-off pendiente usa
-la NRO original `GX-Q76-publish.nro` para conservar el mismo binario.
+Esta limpieza no se ha ejecutado en consola; el control batch-off usó la NRO
+original `GX-Q76-publish.nro` para conservar el mismo binario.
+
+### Control Q76 con el mismo binario y diagnósticos
+
+Ambas capturas usan `GX-Q76-publish.nro`, worker HLE activo, portátil stock
+1020/307/1331 MHz, deko3d, match de 90 s, perfiles general/GX, picos de 20 ms
+limitados a 40 y los contadores BP/batch. Solo cambió `WIICOMPILED_GX_HLE_BATCH`.
+
+| Batch | Frames | FPS | Host p50 / p95 / p99 ms | Flush / Submit / PublishThrough (muestras) |
+|---|---:|---:|---:|---:|
+| 0 | 4007 | 44,5163 | 22,5546 / 26,4585 / 29,3840 | 13115 / 13259 / 2645 de 88491 |
+| 1 | 4137 | 45,9614 | 21,8487 / 26,1113 / 28,4295 | 18792 / 12566 / 469 de 88483 |
+
+Los dos runs registraron cero errores de decode y cero bloques BP. El control
+batch-off mostró una publicación por slot. La diferencia observada de FPS es
+~3,25%, con arranque sembrado pero sin replay bit a bit. Tampoco se ha medido sin
+diagnósticos: el contador batch consulta el reloj por publicación, por lo que el
+modo off paga ese coste más veces. `PublishThrough` recibió 2,99% de las muestras
+off frente a 0,53% on; no se puede atribuir el 3,25% a rendimiento de producción.
+Los porcentajes son muestras PC, no tiempos exactos de espera.
+
+El control off está en `nxlink-GX-Q76-publish-20261029-115235.log`, con los mismos
+símbolos Q76. La cola sigue siendo experimental y apagada por defecto: ambos
+modos quedan lejos de 60 fps y de la referencia worker-off. El siguiente trabajo
+debe mover bloques HLE con sus objetos y estado, eliminando barreras obligatorias;
+agrupar solo las publicaciones no ha resuelto el coste principal.
