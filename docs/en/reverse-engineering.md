@@ -1312,3 +1312,15 @@ validity. Only a valid row with a clean, matching HLE hash can bypass comparison
 without changing setter calls. Partial publication invalidates the row bit even
 though an older hash remains stored. See the [Spanish preparation report](../gx-preparation.md)
 for local evidence and limitations. No new console measurement has been made.
+
+### Render-target memory compression (P30, 2026-10-29)
+
+`dk_objects.cpp` now allows hardware compression directly for color and depth
+render targets, with no environment switches. Formats, resolution, shaders and
+draw regions remain unchanged. This targets EFB memory traffic across the
+opening shot's roughly 60 passes. In the pinned deko3d source,
+`dkImageLayoutInitialize` selects the memory kind and rounds size/alignment to
+large pages; the existing allocator honors both, and `dkImageInitialize` sets
+the corresponding mapping. This is storage compression with no extra texel
+quantization. Screenshot comparison and console measurement remain pending;
+neither GPU savings nor verified visual equivalence are claimed yet.

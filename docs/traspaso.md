@@ -406,3 +406,25 @@ visual; no se inició otra prueba de consola.
 - **Toma inicial:** en portátil limita el GPU (307 MHz; ~60 pasadas, sombras por jugador, ver P14); en dock limita la CPU. Hacen falta ambos frentes.
 - **Ideas pendientes:** portar a PC/Linux/Deck las optimizaciones HLE no exclusivas de Switch (hoy viven en el parche Switch con guardas `__SWITCH__`); listas de dibujo ya traducidas cacheadas (RAM por CPU); mods de callnames (`sound/voiceN.bin`) y animaciones como proyecto posterior.
 - Disco C: del usuario casi lleno; `docker_data.vhdx` de 40 GB quedó tras desinstalar Docker (puede tener datos de conch: decide el usuario).
+
+## P30: compresión hardware del EFB (2026-10-29)
+
+El usuario pidió implementar primero, sin esperar una prueba y sin interruptor.
+`tools/switch/deko/aurora/dk_objects.cpp` permite compresión hardware en los
+render targets de color y profundidad y elimina los dos interruptores anteriores
+de compresión. No añade instrumentación. Es código deko versionado directamente;
+no cambia runtime/Aurora, fases del parche, audio ni código generado.
+
+Baseline privado conservado en `local/switch/build/P30-before-compression.nro`
+(SHA-256 `0cda74e4db56f16cc8222615a53ff0f35366310738ce7da8441047c73cb0ff3d`).
+Faltan capturas comparables y A/B limpio en portátil a stock; cualquier corrida
+con PASS_TIMES/DRAW_TIMES/DRAW_PIXELS o capturas será solo diagnóstico, separada
+de la medición final con las estadísticas periódicas existentes. No atribuir
+mejora medida ni igualdad de imagen validada antes de esas pruebas.
+
+Build Horizon completado con cuatro jobs: 0 archivos traducidos actualizados,
+48.223 sin cambios. Candidata privada `local/switch/build/P30-compression.nro`,
+SHA-256 `1677bbf4c0db19b1a928f84bec5625cd96f31ef4b8bf56a2076ea29cdedc6c1a`.
+Pasaron `git diff --check` y `tools/check_no_game_data.py --all`. El primer
+build dentro del sandbox falló al preparar .NET; el mismo comando fuera del
+sandbox compiló correctamente. No se ejecutó la candidata en consola.

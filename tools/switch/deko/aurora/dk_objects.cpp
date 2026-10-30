@@ -50,8 +50,6 @@ ObjectStats g_stats;  // under g_mutex
 std::mutex g_slotMutex;
 std::vector<uint32_t> g_freedSlots;
 
-bool g_compression = false;  // WIICOMPILED_DK_COMPRESSION=1: hardware compression on colour render targets
-bool g_depthCompression = false;  // WIICOMPILED_DK_DEPTH_COMPRESSION=1: and on depth render targets
 std::atomic<bool> g_active{false};
 
 // WriteTexture uploads and new textures to clear, for the next batch (g_uploadMutex)
@@ -162,16 +160,6 @@ void release_bind_group(BindGroup* g) {
 
 // ---- creation
 Tex* make_texture(WGPUTexture handle, const WGPUTextureDescriptor& d) {
-    static bool once = [] {
-        g_compression = swdk::env_flag("WIICOMPILED_DK_COMPRESSION", false);
-        g_depthCompression = swdk::env_flag("WIICOMPILED_DK_DEPTH_COMPRESSION", false);
-        dklog("textures: images in the deko3d image heap; colour render targets %s (WIICOMPILED_DK_COMPRESSION=1), "
-              "depth render targets %s (WIICOMPILED_DK_DEPTH_COMPRESSION=1)",
-              g_compression ? "with hardware compression" : "without hardware compression",
-              g_depthCompression ? "with hardware compression" : "without hardware compression");
-        return true;
-    }();
-    (void)once;
     auto* t = new Tex;
     t->handle = handle;
     t->wformat = d.format;
@@ -220,9 +208,8 @@ Tex* make_texture(WGPUTexture handle, const WGPUTextureDescriptor& d) {
     if (render && f.canRender) m.flags |= DkImageFlags_UsageRender;
     t->render = render && f.canRender && d.dimension != WGPUTextureDimension_3D;
     if (f.can2d) m.flags |= DkImageFlags_Usage2DEngine;
-    // (compression lives in the image's memory mapping: the 3D engine, the texture units and the copy
-    // engine all read and write it through L2 as plain data; nothing else touches image memory)
-    if (render && f.canRender && (f.depth ? g_depthCompression : g_compression)) m.flags |= DkImageFlags_HwCompression;
+    // Lossless memory compression reduces render-target traffic; deko3d supplies its page alignment.
+    if (t->render) m.flags |= DkImageFlags_HwCompression;
     swdk::image_tile_size_fix(m, f.compressed ? (t->height + f.blockH - 1) / f.blockH : t->height);
     DkImageLayout layout;
     dkImageLayoutInitialize(&layout, &m);

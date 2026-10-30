@@ -1320,3 +1320,16 @@ validez por fila: solo una fila válida con hash HLE limpio e idéntico permite
 evitar sus comparaciones sin cambiar las publicaciones. Una fila parcialmente
 publicada invalida ese bit aunque conserve un hash antiguo. Evidencia local y
 límites en [preparación GX](gx-preparation.md); sin nueva medición de consola.
+
+### Compresión de memoria de render targets (P30, 2026-10-29)
+
+`dk_objects.cpp` permite compresión hardware directamente en los render targets
+de color y profundidad, sin interruptores de entorno. No cambia sus formatos,
+resolución, shaders ni regiones dibujadas. El objetivo es reducir tráfico de
+memoria del EFB compartido entre las ~60 pasadas de la toma inicial.
+En la dependencia deko3d fijada, `dkImageLayoutInitialize` selecciona el tipo de
+memoria y redondea tamaño/alineación a páginas grandes; el allocator existente
+respeta ambos, y `dkImageInitialize` configura el mapeo correspondiente.
+La compresión es de almacenamiento, sin cuantización adicional de los texels.
+Pendientes la comparación de capturas y la medición en consola: no se atribuye
+todavía ahorro de GPU ni equivalencia visual comprobada a este cambio.
