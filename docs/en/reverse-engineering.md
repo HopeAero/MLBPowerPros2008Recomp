@@ -1377,3 +1377,31 @@ recorded 53.3 fps in the heavy window (GPU p50/p95/p99 13.25/20.75/21.00 ms;
 shaders or deko3d messages. A causal CPU frame-time or fps gain remains
 unproven without a matched control and replay. Capture ended normally and
 P34 remains installed. Full table and limitations are in `docs/traspaso.md`.
+
+### Vertex colors outside the general FIFO parser (P36, 2026-10-30)
+
+Immediate FIFO float attributes already had a fast path, but every color write
+still entered `HleFifoWriteGeneral`. P36 uses the same color decoder and
+attribute completion through a separate router; the previous body becomes
+`HleFifoWriteGeneralSlow`, keeping the float entry's stack small. It handles complete words and
+one/two-byte fragments that do not cross the color boundary, preserving
+scratch bytes, offsets and state observed at each callback. Crossings,
+insufficient room, recording and rejected cases retain the general parser.
+No new state, counters, logs or switches.
+
+Tests passed 4,875,000 differential operations, 3,000 aliases and 168,237
+directed states across three configurations. The regression fails on P34's
+general-parser entry and passes on P36; alpha/completion/recording mutants
+were caught. Host medians with mocked Aurora went from 123.731 to 106.604
+ns/packed color and 135.610 to 115.934 ns/color written byte by byte. These
+are PC routine timings, not Switch frame-time or fps gains.
+P11 and the Horizon build passed; final assembly retains the float entry's
+32-byte stack frame. P36 has not yet been sent to the console.
+
+**Bat contact and the ball:** the play-camera application route was inspected
+(`0x808F1C5C` → `0x80C779D4`, returning at `0x808F1CD8`). This does not identify
+ball physics. Previous late Q samples include model preparation/FIFO work,
+but only sample beyond 17 ms; physics earlier in the same frame cannot be
+excluded. Mixed windows have no contact/flight markers. The ball's
+contribution versus fielding/camera/rendering remains unresolved;
+trajectories, collisions and simulation frequency are unchanged.

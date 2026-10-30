@@ -1088,7 +1088,7 @@ index 818478d..9c71b5d 100644
  
                  SyncAppliedVtxStateFromHleReal();
 diff --git a/runtime/src/hle/gx/gx_fifo.cpp b/runtime/src/hle/gx/gx_fifo.cpp
-index a77e96e..16c6e5c 100644
+index a77e96e..0bd67e7 100644
 --- a/runtime/src/hle/gx/gx_fifo.cpp
 +++ b/runtime/src/hle/gx/gx_fifo.cpp
 @@ -1,7 +1,9 @@
@@ -1131,7 +1131,7 @@ index a77e96e..16c6e5c 100644
      for (int i = startAttr + 1; i < 26; ++i) {
          if (vtxDesc[i] != GX_NONE) {
              return static_cast<GXAttr>(i);
-@@ -343,15 +361,51 @@ void SubmitAttribute(GXAttr attr, float* comps, const VtxAttrFmt& fmt, const u32
+@@ -343,15 +361,62 @@ void SubmitAttribute(GXAttr attr, float* comps, const VtxAttrFmt& fmt, const u32
      }
  }
  
@@ -1152,7 +1152,7 @@ index a77e96e..16c6e5c 100644
 +// that function's whole prologue/epilogue (callee-saved registers, the lambdas' frame) for every
 +// word of every sprite and matrix the game writes by hand. A word it does not take is handled by
 +// HleFifoWriteGeneral exactly as before (the checks here are the ones in front of that case there).
-+void HleFifoWrite(u32 val, uint32_t sizeBytes) {
+ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
 +    if (GxVtxF32::kEnabled && (sizeBytes == 4 || sizeBytes == 0) && g_hleGxState.inBegin && !IsDisplayListActive() &&
 +        GxBatch::FifoEnabled() && TryDirectF32FifoWord(val)) {
 +        return;
@@ -1165,9 +1165,20 @@ index a77e96e..16c6e5c 100644
 +    HleFifoWriteGeneral(val, sizeBytes);
 +}
 +
++static void HleFifoWriteGeneralSlow(u32 val, uint32_t sizeBytes);
++
++// Keep color dispatch out of the entry so float writes retain their small stack frame.
 +__attribute__((noinline)) static void HleFifoWriteGeneral(u32 val, uint32_t sizeBytes) {
++    if (g_hleGxState.inBegin && !IsDisplayListActive() && GxBatch::FifoEnabled() &&
++        TryDirectColorFifoWrite(val, sizeBytes)) {
++        return;
++    }
++    HleFifoWriteGeneralSlow(val, sizeBytes);
++}
++
++__attribute__((noinline)) static void HleFifoWriteGeneralSlow(u32 val, uint32_t sizeBytes) {
 +#else
- void HleFifoWrite(u32 val, uint32_t sizeBytes) {
++void HleFifoWrite(u32 val, uint32_t sizeBytes) {
 +#endif
      const bool recordOnly = IsDisplayListActive();
      if (recordOnly) {
@@ -1183,7 +1194,7 @@ index a77e96e..16c6e5c 100644
      auto resetFifoBuffer = [&]() {
          g_hleGxState.fifoReadOffset = 0;
          g_hleGxState.fifoByteCount = 0;
-@@ -659,8 +713,13 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
+@@ -659,8 +724,13 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
  // lists, XF/draw calls), which would misorder that work relative to the stream.
  static void HleFifoWriteBurstChunked(const uint8_t* data, uint32_t sizeBytes) {
      uint32_t offset = 0;

@@ -1389,3 +1389,32 @@ dio 53,3 fps en la toma pesada (GPU p50/p95/p99 13,25/20,75/21,00 ms;
 fallidos/omitidos ni mensajes deko3d. No demuestra una mejora causal de fps o
 tiempo de CPU: faltan control emparejado y replay. La captura terminó
 normalmente; P34 queda instalada. Tabla y límites en `docs/traspaso.md`.
+
+### Colores de vértice fuera del parser general (P36, 2026-10-30)
+
+El FIFO inmediato ya aceleraba atributos float, pero los colores seguían
+entrando en `HleFifoWriteGeneral` por cada escritura. P36 usa el mismo decoder
+de color y la misma finalización de atributo desde un enrutador separado; el
+cuerpo anterior queda en `HleFifoWriteGeneralSlow`. Así evita aumentar la pila
+de la entrada de floats. Admite
+palabras completas y fragmentos de uno/dos bytes que no cruzan el final del
+color; mantiene scratch, offset y estado observado por cada callback. Cruces,
+falta de espacio, grabación y casos rechazados conservan el parser general.
+No añade estado, contadores, logs ni interruptores.
+
+Pasaron 4.875.000 operaciones diferenciales, 3.000 alias y 168.237 estados
+dirigidos entre tres configuraciones. La regresión detecta el paso por el
+parser grande en P34 y pasa con P36; tres mutantes de alfa, finalización y
+grabación fueron detectados. En host con Aurora simulada, la mediana pasó de
+123,731 a 106,604 ns/color empaquetado y de 135,610 a 115,934 ns/color enviado
+byte a byte. Son tiempos de la rutina en PC, no ms/frame ni fps de Switch.
+P11 y el build Horizon pasaron; el ensamblado final conserva la entrada de
+32 bytes de pila para floats. P36 todavía no se ha enviado a consola.
+
+**Batazo y pelota:** se revisó la aplicación de la cámara de jugada
+(`0x808F1C5C` → `0x80C779D4`, retorno `0x808F1CD8`). Esto no identifica la
+física de la pelota. Los perfiles Q anteriores contienen preparación de
+modelos y FIFO, pero muestrean después de 17 ms: no permiten descartar física
+ejecutada antes en el mismo frame. Las ventanas mixtas no tienen marcas de
+contacto/vuelo. Sigue sin atribuirse cuánto aporta la pelota frente a defensa,
+cámara y dibujo; no se cambian trayectorias, colisiones ni simulación.

@@ -586,3 +586,64 @@ comparación de píxeles y confirmación visual específica de P34. nxlink termi
 normalmente al cerrar la salida; no queda receptor corriendo. P34 queda
 instalada. No se revirtió el ahorro de trabajo probado en las rutinas host,
 pero no se declara aún una ganancia de fps o ms de CPU en Switch.
+
+## P36: CPU, colores inmediatos y revisión del batazo (2026-10-30)
+
+El usuario pidió seguir optimizando CPU y revisar la pelota después del
+batazo, sin más comparaciones manuales por ahora. Pregunta opcional pendiente:
+si el bajón es al contacto o durante vuelo/fildeo. No se inició otra captura.
+
+`gx_batch_fifo.inc` añade `TryDirectColorFifoWrite`, llamado por un enrutador
+`HleFifoWriteGeneral`; el cuerpo anterior es `HleFifoWriteGeneralSlow`.
+La primera versión ponía el color en la entrada y aumentaba su pila AArch64
+de 32 a 64 bytes, con más spills en los floats. Se separó ese enrutador para
+preservar la entrada original. Reutiliza `ColorByteSize`, `DecodeColorBytes` y la
+finalización de atributo existente (renombrada `FinishDirectFifoAttribute`).
+Escrituras 0/4, 1 y 2 bytes copian al mismo scratch. Solo consume el color
+actual: una escritura que cruza al atributo siguiente, grabación, begin no
+iniciado, espacio insuficiente y condiciones rechazadas mantienen el parser.
+Sin contadores, logs, estado nuevo ni interruptor; audio y GPU sin cambios.
+
+Pruebas privadas `local/tmp/cpu/P36-test/`:
+
+- `run.py`: cuerpos reales frente al parser pre-batch2; 1.625.000 operaciones
+  y 1.000 alias por configuración, más 56.079 estados dirigidos. Se ejecutó con
+  FIFO activo, apagado y VTXF32 apagado: 4.875.000 operaciones, 3.000 alias y
+  168.237 estados. Compara estado completo, scratch, bytes y orden de llamadas,
+  incluido el estado observado en los callbacks. Cubre formatos de color,
+  ambos atributos, fragmentos, grabación, colores finales y extremos del ring.
+- `bench.py` reproduce el fallo de la regresión en la fuente P34 (una entrada
+  al parser general para RGBA) y compara P34/P36 sin el contador de entradas
+  del test. Cinco rondas alternadas de 1.000.000 colores, mismo checksum:
+  empaquetado 123,731 → 106,604 ns/color; cuatro bytes separados 135,610 →
+  115,934. Host con Aurora simulada: no extrapolar a ms/frame de Switch.
+- `negative.py`: detecta alfa incorrecto, omitir finalización y aceptar colores
+  durante grabación. Resultados en `results.txt`, `before-results.txt`,
+  `bench-results.txt` y `negative-results.txt`.
+
+Fase 86 plegada en 74/82 mediante `local/tmp/cpu/P36-fold.py` y `compile()`
+validado. `mkswitch.sh` pasó toda la cadena; cambian los parches primero y
+segundo. `P11-verify.sh` confirma árboles runtime/Aurora idénticos. Build
+Horizon con cuatro jobs pasó: 0 archivos traducidos actualizados y 48.223 sin
+cambios. Logs `P36-{mkswitch,verify,build}.txt`. El ensamblado final confirma
+32 bytes de pila en `HleFifoWrite`, como P34, frente a los 64 de la primera
+colocación del atajo. Archivos `before-HleFifoWrite.asm`,
+`after-HleFifoWrite.asm` (intermedio) y `final-HleFifoWrite.asm` en P36-test.
+NRO final privada `local/switch/build/P36-direct-color.nro`, SHA-256
+`ccfabfc98afb1bd865af62b1ae422aa24eb26b48d9d2fb997fb28df0a561dcff`.
+No enviada: P34 sigue instalada. No se atribuye ganancia de fps/CPU por frame
+en Switch; pendientes medida limpia e imagen. No quedan capturas abiertas.
+
+**P35 no integrado:** experimento privado de copia XF por bloque, probado y
+compilado, pero se retiró al revisar que el emisor caliente `0x8004A0B0`
+genera vértices, no matrices. La NRO `P35-matrix-burst.nro` es experimental,
+no se envió y no representa la versión final. No atribuirle ahorro al juego.
+
+**Pelota:** revisada la cámara `0x808F1C5C` → `0x80C779D4` (LR `0x808F1CD8`).
+Esto no identifica el cálculo físico. `local/tmp/cpu/P35-test/review-profile.py`
+reanálisis privado de P29: 3150 muestras Q entre 90–240 s; 77 en parser general,
+27 en entrada de ráfagas y 145 en `0x8001EAE0`/`0x8004A0B0`. Q solo observa
+lo ejecutado después de 17 ms: no descartar física que acabó antes. El
+histograma P de todos los frames sí contiene lógica del partido; las ventanas
+mixtas no identifican los instantes de contacto/vuelo. No hay una atribución
+causal del bajón a la pelota. Física, colisiones y trayectorias intactas.

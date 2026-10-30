@@ -10253,10 +10253,10 @@ index 0000000..01d4e89
 +}
 diff --git a/runtime/src/hle/gx/gx_batch_fifo.inc b/runtime/src/hle/gx/gx_batch_fifo.inc
 new file mode 100644
-index 0000000..42929ba
+index 0000000..047553e
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_batch_fifo.inc
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,112 @@
 +// GX batch2: consume direct F32 attributes without serializing each component through
 +// the command ring. Keep scratch bytes/buffers, call boundaries and vertex completion identical.
 +static inline int DirectF32FifoRemaining() {
@@ -10279,7 +10279,7 @@ index 0000000..42929ba
 +    return expected-g.currentComp;
 +}
 +
-+static inline void FinishDirectF32FifoAttribute(GXAttr attr) {
++static inline void FinishDirectFifoAttribute(GXAttr attr) {
 +    auto& g=g_hleGxState;
 +    g.currentAttr=g.NextEnabledAttr(attr); g.currentComp=0;
 +    if (g.currentAttr==GX_VA_NULL) {
@@ -10288,6 +10288,36 @@ index 0000000..42929ba
 +            g.inBegin=false; g.auroraBeginCalled=false; GXEnd();
 +        }
 +    }
++}
++
++// Color writes have no component conversion; keep the parser's bytes and completion order.
++static inline bool TryDirectColorFifoWrite(u32 value, uint32_t sizeBytes) {
++    auto& g = g_hleGxState;
++    const GXAttr attr = g.currentAttr;
++    if (!g.auroraBeginCalled || g.currentVtxFmt >= GX_MAX_VTXFMT ||
++        (attr != GX_VA_CLR0 && attr != GX_VA_CLR1) || g.vtxDesc[attr] != GX_DIRECT) return false;
++    const auto& fmt = g.vtxAttrFmt[g.currentVtxFmt][attr];
++    const uint32_t colorSize = ColorByteSize(fmt.type, fmt.cnt);
++    const uint32_t count = sizeBytes == 0 ? 4u : sizeBytes;
++    if ((count != 1u && count != 2u && count != 4u) || g.fifoByteCount >= colorSize ||
++        count > colorSize - g.fifoByteCount || g.fifoReadOffset > g.fifoBytes.size() ||
++        g.fifoByteCount + count > g.fifoBytes.size() - g.fifoReadOffset) return false;
++    uint8_t* data = g.fifoBytes.data() + g.fifoReadOffset;
++    uint8_t* out = data + g.fifoByteCount;
++    if (count == 4u) BigEndian::Write32(out, value);
++    else if (count == 2u) BigEndian::Write16(out, static_cast<uint16_t>(value));
++    else *out = static_cast<uint8_t>(value);
++    g.fifoByteCount += count;
++    if (g.fifoByteCount == colorSize) {
++        GXColor color{};
++        DecodeColorBytes(data, fmt.type, fmt.cnt, color);
++        g.fifoReadOffset = 0;
++        g.fifoByteCount = 0;
++        if (fmt.cnt == GX_CLR_RGB) GXColor3u8(color.r, color.g, color.b);
++        else GXColor4u8(color.r, color.g, color.b, color.a);
++        FinishDirectFifoAttribute(attr);
++    }
++    return true;
 +}
 +
 +static inline bool TryDirectF32FifoWord(u32 value) {
@@ -10301,7 +10331,7 @@ index 0000000..42929ba
 +    ++g.currentComp;
 +    if (remaining==1) {
 +        SubmitAttribute(attr,g.compBuffer,f,g.rawCompBuffer);
-+        FinishDirectF32FifoAttribute(attr);
++        FinishDirectFifoAttribute(attr);
 +    }
 +    GxBatch::CountHit(GxBatch::ScalarWords);
 +    return true;
@@ -10333,7 +10363,7 @@ index 0000000..42929ba
 +        BigEndian::Write32(g.fifoBytes.data(),value);
 +        if (take==static_cast<uint32_t>(remaining)) {
 +            SubmitAttribute(attr,g.compBuffer,f,g.rawCompBuffer);
-+            FinishDirectF32FifoAttribute(attr);
++            FinishDirectFifoAttribute(attr);
 +        }
 +    }
 +    if (offset) GxBatch::CountHit(GxBatch::BurstWords,offset/4u);
