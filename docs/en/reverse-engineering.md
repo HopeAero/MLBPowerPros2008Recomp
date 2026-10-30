@@ -1338,8 +1338,11 @@ P31 reuses `tev_byte_f32` for deko3d GX shader alpha comparison, preserving the
 clamp and resulting byte while replacing the separate round/conversion path.
 `kTevFastSeed` changes so cached modules cannot hide the rewrite. The host test
 extracts the real rewrite function and checks all 1,065,353,217 positive floats
-from 0 to 1, clamp edges, fallback and idempotence. Console GPU savings have
-not yet been measured.
+from 0 to 1, clamp edges, fallback and idempotence. The combined P32 console
+probe, without extra diagnostics, does not establish a gain over P30: the heavy
+window recorded 52.9 fps and GPU p95 20.75 ms. Two gameplay windows recorded
+59.7/59.2 fps and GPU p95 14.25/14.50 ms, with no failed or skipped shaders.
+A matched control and image comparison remain outstanding; details in `docs/traspaso.md`.
 
 P32 targets `HleFifoWriteGeneral` (~2–4% of P29 late-frame samples). Its existing
 incomplete-XF word append now runs in the small `HleFifoWrite` entry, avoiding

@@ -1348,8 +1348,11 @@ GX de deko3d, en lugar de otra secuencia `round` + conversión flotante/entero.
 Conserva el clamp y el byte resultante; cambia la semilla `kTevFastSeed` para
 que los módulos antiguos no oculten el cambio. El test host extrae la función
 real de reescritura y comprueba todos los 1.065.353.217 floats positivos entre
-0 y 1, los límites del clamp, el fallback y la idempotencia. No se ha medido
-todavía su efecto GPU en consola.
+0 y 1, los límites del clamp, el fallback y la idempotencia. La sonda combinada
+P32 en consola, sin diagnósticos adicionales, no demuestra mejora frente a P30:
+la ventana pesada dio 52,9 fps y GPU p95 20,75 ms. En dos ventanas de juego dio
+59,7/59,2 fps y GPU p95 14,25/14,50 ms. Sin shaders fallidos ni omitidos; faltan
+control emparejado y comparación de imagen. Log y límites en `docs/traspaso.md`.
 
 P32 responde a `HleFifoWriteGeneral` (~2–4% de muestras tardías en P29): el
 atajo existente que añade una palabra de una matriz XF incompleta estaba

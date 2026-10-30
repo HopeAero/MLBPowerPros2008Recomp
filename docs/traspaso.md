@@ -494,9 +494,21 @@ P11, el test GPU final y el control de contenido pasaron; la cadena de patches
 conserva las 26 líneas de espacios finales heredadas conocidas. No hay cambios
 de espacios finales nuevos en el diff de esta tanda.
 
-Faltan mediciones limpias y comprobación visual de estos dos cambios en consola.
-Se pidió al usuario netloader y se espera su «listo»; aún no se envió P31/P32.
-La primera
-ejecución de P31/P32 recompilará los módulos de shader con clave nueva: medir
-cuando termine el calentamiento y no haya shaders omitidos/fallidos. No usar
-la mejora previa de ~1 ms de P30 como resultado de P31/P32.
+**Sonda de consola terminada (2026-10-30):** P32 enviada tras «listo», log privado
+`nxlink-P32-alpha-xf-20261029-235853.log`. Handheld, diagnósticos adicionales
+apagados; se excluyó el arranque con compilación de caché nueva. Ventanas sin
+compilaciones activas, shaders fallidos/omitidos ni mensajes deko3d:
+
+| Frames | Presents/s | GPU p50/p95/p99 ms | Frames tarde (por GPU) |
+|---|---:|---:|---:|
+| 4962–6548, pesada | 52,9 | 15,75 / 20,75 / 20,75 | 586/1587 (582) |
+| 8286–10078, juego | 59,7 | 14,00 / 14,25 / 14,75 | 42/1793 (1) |
+| 10079–11854, juego | 59,2 | 12,25 / 14,50 / 15,00 | 107/1776 (4) |
+| 11855–13564, juego | 57,0 | 14,75 / 15,50 / 15,50 | 286/1710 (2) |
+
+No hay mejora causal demostrada frente a P30: escenas mezcladas, sin replay ni
+control emparejado, y sin relojes registrados. No usar el ~1 ms previo de P30
+como resultado de P31/P32. El usuario cerró la captura y pidió continuar CPU;
+nxlink terminó normalmente y no queda receptor corriendo. P32 sigue instalada.
+La comprobación visual específica de P32 quedó sin respuesta; no se capturaron
+píxeles en esta corrida. Prioridad siguiente: CPU, sin más sondas GPU por ahora.
