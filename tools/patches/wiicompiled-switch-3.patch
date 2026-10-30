@@ -477,10 +477,10 @@ index 0000000..e01a61b
 +#endif
 diff --git a/runtime/src/platform/switch/switch_profiler.cpp b/runtime/src/platform/switch/switch_profiler.cpp
 new file mode 100644
-index 0000000..9605442
+index 0000000..24119b8
 --- /dev/null
 +++ b/runtime/src/platform/switch/switch_profiler.cpp
-@@ -0,0 +1,548 @@
+@@ -0,0 +1,555 @@
 +// Sampling profiler on Horizon: svcSetThreadActivity pauses the main thread (which runs the guest
 +// fibers), svcGetThreadContext3 reads where it is, and it resumes. Started and dumped by the match
 +// benchmark (match_benchmark_overlay.inc) when WIICOMPILED_SWITCH_PROFILE=1.
@@ -769,7 +769,7 @@ index 0000000..9605442
 +// WIICOMPILED_SWITCH_PROFILE_WINDOW=<s> (with a free-running spike capture): the main thread's PC/LR
 +// histograms of every <s> seconds of a played game, then cleared, so windows (fielding with many
 +// players on screen, pitching) can be compared. Printed and cleared by the sampler thread that fills them.
-+u64 g_winStart = 0, g_winSamples = 0;
++u64 g_winStart = 0, g_winSamples = 0, g_winLate = 0;
 +void WindowMaybeFlush() {
 +    static const u64 windowNs = [] {
 +        const char* v = std::getenv("WIICOMPILED_SWITCH_PROFILE_WINDOW");
@@ -784,10 +784,15 @@ index 0000000..9605442
 +                 g_samples - g_winSamples);
 +    for (const auto& [pc, count] : g_pc) std::fprintf(stderr, "[pwin] P %lx %u\n", pc, count);
 +    for (const auto& [lr, count] : g_lr) std::fprintf(stderr, "[pwin] L %lx %u\n", lr, count);
++    std::fprintf(stderr, "[pwin] late=%lu\n", g_lateSamples - g_winLate);
++    for (const auto& [pc, count] : g_latePc) std::fprintf(stderr, "[pwin] Q %lx %u\n", pc, count);
 +    std::fflush(stderr);
 +    g_pc.clear();
 +    g_lr.clear();
++    g_latePc.clear();
++    g_lateLr.clear();
 +    g_winSamples = g_samples;
++    g_winLate = g_lateSamples;
 +    g_winStart = now;
 +}
 +
@@ -928,7 +933,9 @@ index 0000000..9605442
 +    }();
 +    if (!wanted) return;
 +    if (g_spkFree) {
-+        SpkMark(armGetSystemTick());
++        const u64 hostNow = armGetSystemTick();
++        g_frameStart.store(hostNow, std::memory_order_relaxed);  // P26: late samples of played games
++        SpkMark(hostNow);
 +        if (DlProfileOn()) {
 +            const u32 bucket = std::min(g_dlCalls.exchange(0, std::memory_order_relaxed) / kDlWidth, kDlBuckets - 1);
 +            g_dlBucket.store(bucket, std::memory_order_relaxed);

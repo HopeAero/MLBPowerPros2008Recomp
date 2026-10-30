@@ -9644,7 +9644,7 @@ index 0000000..7657460
 +}
 diff --git a/runtime/src/hle/gx/gx_batch_profile.h b/runtime/src/hle/gx/gx_batch_profile.h
 new file mode 100644
-index 0000000..120399f
+index 0000000..0031d21
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_batch_profile.h
 @@ -0,0 +1,30 @@
@@ -9656,10 +9656,10 @@ index 0000000..120399f
 +#include <cstdlib>
 +namespace GxBatch {
 +inline bool Flag(const char* name, bool fallback = true) { const char* v=std::getenv(name); return v ? v[0]!='0' : fallback; }
-+inline bool FifoEnabled() { static const bool v=Flag("WIICOMPILED_GX_BATCH_FIFO"); return v; }
-+inline bool DlEnabled() { static const bool v=Flag("WIICOMPILED_GX_BATCH_DL"); return v; }
-+inline bool PrepEnabled() { static const bool v=Flag("WIICOMPILED_GX_BATCH_PREP"); return v; }
-+inline bool Profile() { static const bool v=Flag("WIICOMPILED_GX_BATCH_PROFILE",false); return v; }
++inline const bool kFifoEnabled = Flag("WIICOMPILED_GX_BATCH_FIFO"); inline bool FifoEnabled() { return kFifoEnabled; }
++inline const bool kDlEnabled = Flag("WIICOMPILED_GX_BATCH_DL"); inline bool DlEnabled() { return kDlEnabled; }
++inline const bool kPrepEnabled = Flag("WIICOMPILED_GX_BATCH_PREP"); inline bool PrepEnabled() { return kPrepEnabled; }
++inline const bool kProfile = Flag("WIICOMPILED_GX_BATCH_PROFILE",false); inline bool Profile() { return kProfile; }
 +enum Counter { ScalarWords, BurstWords, CachedDl, CacheFallback, XfWords, ArrayDirect, ArrayFallback, VatRow, Count };
 +inline std::atomic<uint64_t> hits[Count]{};
 +inline void CountHit(Counter c,uint64_t n=1) {
