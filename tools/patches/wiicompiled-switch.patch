@@ -2308,10 +2308,10 @@ index 0000000..c0bcf68
 +}
 diff --git a/aurora-main/lib/dolphin/gx/gx_vtx_plan.inc b/aurora-main/lib/dolphin/gx/gx_vtx_plan.inc
 new file mode 100644
-index 0000000..7710422
+index 0000000..0056e50
 --- /dev/null
 +++ b/aurora-main/lib/dolphin/gx/gx_vtx_plan.inc
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,499 @@
 +// P28: vertex-state publish plans (switch phase 82, local/tmp/cpu/P28-vtx.py).
 +//
 +// The runtime republishes its whole vertex layout before every immediate-mode draw, display-list
@@ -2323,12 +2323,15 @@ index 0000000..7710422
 +//     same final registers in one step and count the same elisions;
 +//   - unforced and nothing would change (every entry is a fixed point of the live registers): every
 +//     entry queues its probe; the plan queues the same probes as one record append and sets 0x20;
-+//   - anything else (an entry changes, unsafe values, not the A3 asynchronous mode): the run
++//   - unforced and partially changed: the unchanged prefix queues its probes, then the forced tail
++//     stores the merged result (P33/P34, switch phases 84/85, folded into 82);
++//   - anything else (unsafe values, not the A3 asynchronous mode): the run
 +//     functions above, entry by entry, exactly as before.
 +// WIICOMPILED_GX_VTXPLAN=0 skips this file's paths (the runtime then builds the lists itself).
 +// Included by GXGeometry.cpp at namespace scope after the extern "C" block.
 +#include <cstdlib>
 +#include <cstring>
++#include <algorithm>
 +
 +extern "C" uint64_t aurora_gx_vtxplan_counters[8]; // [0]/[1] desc hit/slow, [2]/[3] fmt hit/slow, [4] plan builds
 +uint64_t aurora_gx_vtxplan_counters[8] = {};
@@ -2365,6 +2368,7 @@ index 0000000..7710422
 +  u32 loMask = 0, loVal = 0, hiMask = 0, hiVal = 0;
 +  bool hasNrm = false, hasNbt = false;
 +  GXAttrType nrmT = GX_NONE, nbtT = GX_NONE;
++  u8 loEntry[32]{}, hiEntry[32]{}, nrmAt = 0, nbtAt = 0;
 +};
 +
 +constexpr u32 kVcdWays = 16;
@@ -2446,9 +2450,11 @@ index 0000000..7710422
 +    const GXAttr attr = p.list[i].attr;
 +    if (attr == GX_VA_NRM) {
 +      p.hasNrm = true;
++      p.nrmAt = static_cast<u8>(i);
 +      p.nrmT = p.list[i].type;
 +    } else if (attr == GX_VA_NBT) {
 +      p.hasNbt = true;
++      p.nbtAt = static_cast<u8>(i);
 +      p.nbtT = p.list[i].type;
 +    } else {
 +      const EntryEffect e = vcd_entry_effect(attr, p.list[i].type);
@@ -2461,6 +2467,8 @@ index 0000000..7710422
 +      p.loVal |= e.loVal;
 +      p.hiMask |= e.hiMask;
 +      p.hiVal |= e.hiVal;
++      for (u32 bits = e.loMask; bits; bits &= bits - 1) p.loEntry[__builtin_ctz(bits)] = static_cast<u8>(i);
++      for (u32 bits = e.hiMask; bits; bits &= bits - 1) p.hiEntry[__builtin_ctz(bits)] = static_cast<u8>(i);
 +    }
 +  }
 +  // The normal-type field (bits 11-12 of vcdLo) is rewritten from hasNrms / nrmType after every entry.
@@ -2488,51 +2496,85 @@ index 0000000..7710422
 +  return gVcd[slot];
 +}
 +
-+// GXSetVtxDescRun's behaviour for this plan, or false (nothing done) when the entry-by-entry run is needed.
++inline void store_vcd_plan(const VcdPlan& p, u32 elided) {
++  auto* const gx = __gx;
++  const u32 lo = gx->vcdLo, hi = gx->vcdHi;
++  u8 hn = gx->hasNrms, hb = gx->hasBiNrms;
++  u32 nt = static_cast<u32>(gx->nrmType);
++  if (p.hasNrm) {
++    hn = p.nrmT != GX_NONE;
++    if (p.nrmT != GX_NONE) nt = static_cast<u32>(p.nrmT);
++  }
++  if (p.hasNbt) {
++    hb = p.nbtT != GX_NONE;
++    if (p.nbtT != GX_NONE) nt = static_cast<u32>(p.nbtT);
++  }
++  gx->vcdLo = (((lo & ~p.loMask) | p.loVal) & ~(3u << 11)) | (((hn || hb) ? nt : 0u) << 11);
++  gx->vcdHi = (hi & ~p.hiMask) | p.hiVal;
++  gx->hasNrms = hn;
++  gx->hasBiNrms = hb;
++  gx->nrmType = static_cast<GXAttrType>(nt);
++  aurora_gx_a3_counters[aurora::gx::fifo::kA3VtxProbesElided] += elided;
++}
++
++bool run_changed_vcd_plan(const VcdPlan& p) {
++  auto* const gx = __gx;
++  u32 prefix = p.count;
++  const u8 hn = gx->hasNrms, hb = gx->hasBiNrms;
++  u32 nt = static_cast<u32>(gx->nrmType);
++  if (((gx->vcdLo >> 11) & 3u) != ((hn || hb) ? nt : 0u)) prefix = 0;
++  for (u32 bits = (gx->vcdLo ^ p.loVal) & p.loMask; bits; bits &= bits - 1)
++    prefix = std::min<u32>(prefix, p.loEntry[__builtin_ctz(bits)]);
++  for (u32 bits = (gx->vcdHi ^ p.hiVal) & p.hiMask; bits; bits &= bits - 1)
++    prefix = std::min<u32>(prefix, p.hiEntry[__builtin_ctz(bits)]);
++  if (p.hasNrm) {
++    const u32 t = p.nrmT != GX_NONE ? static_cast<u32>(p.nrmT) : nt;
++    if ((p.nrmT != GX_NONE) != hn || t != nt) prefix = std::min<u32>(prefix, p.nrmAt);
++    nt = t;
++  }
++  if (p.hasNbt) {
++    const u32 t = p.nbtT != GX_NONE ? static_cast<u32>(p.nbtT) : nt;
++    if ((p.nbtT != GX_NONE) != hb || t != nt) prefix = std::min<u32>(prefix, p.nbtAt);
++  }
++  if (prefix == p.count) return false;
++  // Only entries before the first state change queue probes; the tail is forced.
++  if (prefix != 0) {
++    aurora::gx::fifo::probe_vtx_desc_batch(p.probes, prefix);
++    gx->dirtyState |= 0x20;
++  }
++  gx->dirtyState |= 8;
++  store_vcd_plan(p, p.count - prefix);
++  return true;
++}
++
++// GXSetVtxDescRun's behaviour for this plan, or false when the entry-by-entry run is needed.
 +bool run_vcd_plan(const VcdPlan& p) {
 +  auto* const gx = __gx;
 +  const u32 lo = gx->vcdLo, hi = gx->vcdHi;
 +  const u8 hn = gx->hasNrms, hb = gx->hasBiNrms;
 +  const u32 nt = static_cast<u32>(gx->nrmType);
-+  if (nt > 3u) UNLIKELY {
-+    return false;
-+  }
++  if (nt > 3u) UNLIKELY return false;
 +  if ((gx->dirtyState & 8) != 0) {
 +    // Forced: every entry stores, none queues a probe (P11).
-+    u8 nhn = hn, nhb = hb;
-+    u32 nnt = nt;
-+    if (p.hasNrm) {
-+      nhn = p.nrmT != GX_NONE;
-+      if (p.nrmT != GX_NONE) nnt = static_cast<u32>(p.nrmT);
-+    }
-+    if (p.hasNbt) {
-+      nhb = p.nbtT != GX_NONE;
-+      if (p.nbtT != GX_NONE) nnt = static_cast<u32>(p.nbtT);
-+    }
-+    gx->vcdLo = (((lo & ~p.loMask) | p.loVal) & ~(3u << 11)) | (((nhn || nhb) ? nnt : 0u) << 11);
-+    gx->vcdHi = (hi & ~p.hiMask) | p.hiVal;
-+    gx->hasNrms = nhn;
-+    gx->hasBiNrms = nhb;
-+    gx->nrmType = static_cast<GXAttrType>(nnt);
-+    aurora_gx_a3_counters[aurora::gx::fifo::kA3VtxProbesElided] += p.count;
++    store_vcd_plan(p, p.count);
 +    return true;
 +  }
-+  // Unforced: only when no entry changes anything.
++  // Keep the unchanged case on its short path.
 +  if (((lo >> 11) & 3u) != ((hn || hb) ? nt : 0u) || ((lo ^ p.loVal) & p.loMask) != 0 ||
 +      ((hi ^ p.hiVal) & p.hiMask) != 0) {
-+    return false;
++    return run_changed_vcd_plan(p);
 +  }
 +  u8 sn = hn, sb = hb;
 +  u32 st = nt;
 +  if (p.hasNrm) {
 +    const u8 n2 = p.nrmT != GX_NONE;
 +    const u32 t2 = p.nrmT != GX_NONE ? static_cast<u32>(p.nrmT) : st;
-+    if (n2 != sn || t2 != st) return false;
++    if (n2 != sn || t2 != st) return run_changed_vcd_plan(p);
 +  }
 +  if (p.hasNbt) {
 +    const u8 b2 = p.nbtT != GX_NONE;
 +    const u32 t2 = p.nbtT != GX_NONE ? static_cast<u32>(p.nbtT) : st;
-+    if (b2 != sb || t2 != st) return false;
++    if (b2 != sb || t2 != st) return run_changed_vcd_plan(p);
 +  }
 +  aurora::gx::fifo::probe_vtx_desc_batch(p.probes, p.count);
 +  gx->dirtyState |= 0x20;
@@ -2557,6 +2599,7 @@ index 0000000..7710422
 +  u8 probes[5 * GX_VA_MAX_ATTR]{}; // fmt, attr, cnt, type, frac per entry
 +  u32 restMask[3]{}, restVal[3]{}; // entries other than GX_VA_NRM / GX_VA_NBT
 +  u32 allMask[3]{}, allVal[3]{};   // the whole sequence
++  u32 entryMask[GX_VA_MAX_ATTR][3]{};
 +  u32 nrmCount = 0;
 +  u32 nrmIdx[2]{};
 +};
@@ -2623,6 +2666,7 @@ index 0000000..7710422
 +    vat_apply(o, e.attr, e.cnt, e.type, e.frac);
 +    vat_apply(allZ, e.attr, e.cnt, e.type, e.frac);
 +    vat_apply(allO, e.attr, e.cnt, e.type, e.frac);
++    for (int k = 0; k < 3; ++k) p.entryMask[i][k] = ~(z[k] ^ o[k]);
 +    const bool nrm = e.attr == GX_VA_NRM || e.attr == GX_VA_NBT;
 +    if (nrm) {
 +      for (int k = 0; k < 3; ++k) nrmMask[p.nrmCount][k] = ~(z[k] ^ o[k]);
@@ -2666,6 +2710,36 @@ index 0000000..7710422
 +  return gVat[fmt][slot];
 +}
 +
++bool run_changed_vat_plan(const VatPlan& p, GXVtxFmt vtxfmt, const u32* v) {
++  u32 prefix = 0;
++  for (; prefix < p.count; ++prefix) {
++    const auto& e = p.list[prefix];
++    if (e.attr == GX_VA_NRM || e.attr == GX_VA_NBT) {
++      u32 t[3] = {v[0], v[1], v[2]};
++      vat_apply(t, e.attr, e.cnt, e.type, e.frac);
++      if (t[0] != v[0] || t[1] != v[1] || t[2] != v[2]) break;
++    } else if (((v[0] ^ p.allVal[0]) & p.entryMask[prefix][0]) != 0 ||
++               ((v[1] ^ p.allVal[1]) & p.entryMask[prefix][1]) != 0 ||
++               ((v[2] ^ p.allVal[2]) & p.entryMask[prefix][2]) != 0) {
++      break;
++    }
++  }
++  if (prefix == p.count) return false;
++  auto* const gx = __gx;
++  // The unchanged prefix queues probes; the first change forces every remaining entry.
++  if (prefix != 0) {
++    aurora::gx::fifo::probe_vtx_attr_fmt_batch(static_cast<u32>(vtxfmt), p.probes, prefix);
++    gx->dirtyState |= 0x20;
++  }
++  gx->vatA[vtxfmt] = (v[0] & ~p.allMask[0]) | p.allVal[0];
++  gx->vatB[vtxfmt] = (v[1] & ~p.allMask[1]) | p.allVal[1];
++  gx->vatC[vtxfmt] = (v[2] & ~p.allMask[2]) | p.allVal[2];
++  gx->dirtyState |= 0x10;
++  gx->dirtyVAT |= static_cast<u8>(1u << vtxfmt);
++  aurora_gx_a3_counters[aurora::gx::fifo::kA3VtxProbesElided] += p.count - prefix;
++  return true;
++}
++
 +bool run_vat_plan(const VatPlan& p, GXVtxFmt vtxfmt) {
 +  auto* const gx = __gx;
 +  u32 v[3] = {gx->vatA[vtxfmt], gx->vatB[vtxfmt], gx->vatC[vtxfmt]};
@@ -2679,13 +2753,13 @@ index 0000000..7710422
 +    return true;
 +  }
 +  for (int k = 0; k < 3; ++k) {
-+    if (((v[k] ^ p.restVal[k]) & p.restMask[k]) != 0) return false;
++    if (((v[k] ^ p.restVal[k]) & p.restMask[k]) != 0) return run_changed_vat_plan(p, vtxfmt, v);
 +  }
 +  u32 t[3] = {v[0], v[1], v[2]};
 +  for (u32 n = 0; n < p.nrmCount; ++n) {
 +    const GXVtxAttrFmtList& e = p.list[p.nrmIdx[n]];
 +    vat_apply(t, e.attr, e.cnt, e.type, e.frac);
-+    if (t[0] != v[0] || t[1] != v[1] || t[2] != v[2]) return false;
++    if (t[0] != v[0] || t[1] != v[1] || t[2] != v[2]) return run_changed_vat_plan(p, vtxfmt, v);
 +  }
 +  aurora::gx::fifo::probe_vtx_attr_fmt_batch(static_cast<u32>(vtxfmt), p.probes, p.count);
 +  gx->dirtyState |= 0x20;

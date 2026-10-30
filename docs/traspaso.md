@@ -512,3 +512,51 @@ como resultado de P31/P32. El usuario cerró la captura y pidió continuar CPU;
 nxlink terminó normalmente y no queda receptor corriendo. P32 sigue instalada.
 La comprobación visual específica de P32 quedó sin respuesta; no se capturaron
 píxeles en esta corrida. Prioridad siguiente: CPU, sin más sondas GPU por ahora.
+
+## P33–P34: CPU, publicaciones parciales de vértices (2026-10-30)
+
+El usuario pidió seguir CPU tras cerrar P32. Sin nuevas sondas GPU. Se trabajó
+en `aurora-main/lib/dolphin/gx/gx_vtx_plan.inc`: P28 aún retornaba al bucle
+atributo por atributo cuando cambiaba parcialmente un VAT/VCD. Ahora los planes
+conservan los probes del prefijo sin cambios y agrupan las escrituras de la cola
+forzada. VAT usa máscaras por entrada y trata NRM/NBT en orden; VCD usa la
+propiedad de bits por entrada y detecta la reparación inicial de bits normales.
+Comparten las escrituras finales del VCD forzado. Fallbacks/flags/contadores
+conservados; sin interruptores ni diagnósticos nuevos, audio y GPU sin tocar.
+
+Pruebas privadas reproducibles (cuerpos reales extraídos, datos sintéticos):
+
+- `python local/tmp/cpu/P33-test/run.py after`: 160.121 publicaciones aleatorias
+  de estado/probes/contadores y 6.144 casos VAT dirigidos; baseline falló la
+  regresión de cambios parciales antes de editar.
+- `python local/tmp/cpu/P34-test/run.py after`: misma comparación completa y
+  17.920 casos VCD dirigidos, incluidos flags normales no booleanos y reparación
+  de los bits de normales; baseline también falló antes de editar.
+- `python local/tmp/cpu/P33-test/negative.py`: seis implementaciones rotas
+  detectadas (prefijo VAT/VCD, dirtyVAT, solapamiento normal, dueño de bit y
+  contadores). No se activó instrumentación en consola.
+
+Medianas de cinco tandas de 500.000 llamadas en host, FIFO simulado; las
+ejecuciones before/after conservan las mismas entradas y checksum. No extrapolar
+estos ns a ms/frame de Switch:
+
+| Caso | Antes (ns/llamada) | Después (ns/llamada) |
+|---|---:|---:|
+| VAT sin cambios | 29,41 | 29,48 |
+| VAT cambio en primera entrada | 71,69 | 21,23 |
+| VAT cambio en última entrada | 85,94 | 44,57 |
+| VCD ya forzado | 10,10 | 10,21 |
+| VCD sin cambios | 22,92 | 23,28 |
+| VCD cambio en primera entrada | 37,90 | 15,19 |
+| VCD cambio en TEX0 | 64,23 | 21,96 |
+
+Fuentes baseline, resultados y benchmarks en `local/tmp/cpu/P33-test/` y
+`P34-test/`. Folds de fases 84/85 sobre el archivo completo de fase 82 mediante
+`local/tmp/cpu/P33-P34-fold.py`; `switch_edit.py` validado con `compile()`.
+Regenerados los tres parches (solo `wiicompiled-switch.patch` cambió). P11 pasó:
+runtime y Aurora idénticos al árbol reconstruido. Build combinado con cuatro
+jobs completado: 0 archivos traducidos actualizados, 48.223 intactos. NRO
+privada `local/switch/build/P34-partial-vtx.nro`, SHA-256
+`8675274bace9d00217bd2eb2aa701112fd1706315fcc7e15883c17be5c455c7a`.
+`git diff --check` y el control de contenido pasaron. Se pidió netloader para
+la sonda limpia de esta candidata; aún no se envió ni se atribuye mejora de fps.

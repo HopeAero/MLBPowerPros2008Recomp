@@ -1365,3 +1365,21 @@ alias, con FIFO/VTXF32 activos y apagados, más la regresión que comprueba que
 las palabras intermedias no entran en el parser general. P11 confirmó runtime
 y Aurora idénticos al árbol reproducido. No hay interruptores ni instrumentación
 nuevos; no se atribuye aún una mejora de fps o ms de CPU.
+
+### Cambios parciales de vértices por planes (P33–P34, 2026-10-30)
+
+Los planes de P28 aceleraban publicaciones ya forzadas o sin cambios, pero
+volvían a `GXSetVtxAttrFmtRun`/`GXSetVtxDescRun` cuando cambiaba una sola entrada.
+P33/P34 encuentran la primera entrada que cambia el estado, encolan únicamente
+el prefijo de comprobaciones anterior y aplican la cola forzada con máscaras
+precalculadas. Conservan la secuencia lógica de probes, contadores, dirty bits
+y los efectos intermedios NRM/NBT, incluso cuando el valor final coincide.
+Entradas inseguras y modos ajenos a A3 conservan el fallback. Folds en fase 82,
+registrados como fases 84/85; sin interruptores ni instrumentación nuevos.
+
+En host, con FIFO simulado y llamadas emparejadas, VAT parcial pasó de 72–86 a
+21–45 ns/llamada y VCD parcial de 38–64 a 15–22; los casos sin cambios/forzados
+quedaron casi iguales. No son tiempos de Switch ni ahorro por frame.
+Pasaron 160.121 publicaciones diferenciales, 24.064 casos dirigidos de
+máscaras/normales/flags y seis controles negativos; P11 confirmó los árboles.
+Todavía no hay una mejora de fps o tiempo de CPU demostrada en consola.

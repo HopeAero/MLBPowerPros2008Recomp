@@ -1353,3 +1353,21 @@ passed 4,875,000 differential operations and 3,000 alias cases with FIFO/VTXF32
 enabled/disabled, plus a regression checking that intermediate words bypass
 the general parser. P11 confirmed identical reconstructed runtime/Aurora trees.
 No new switches or instrumentation; no CPU frame-time or fps gain is claimed yet.
+
+### Partial vertex changes through plans (P33–P34, 2026-10-30)
+
+P28 plans accelerated forced or unchanged publications but fell back to
+`GXSetVtxAttrFmtRun`/`GXSetVtxDescRun` when one entry changed. P33/P34 locate the
+first change, queue only the preceding unchanged probe prefix, and apply the
+forced tail through precomputed masks. Logical probe order, counters, dirty
+bits and intermediate NRM/NBT effects remain intact, including intermediate
+changes whose final value matches. Unsafe inputs and non-A3 modes retain the
+fallback. Phase 82 folds are recorded as phases 84/85; no new switches or
+instrumentation.
+
+Paired host routine benchmarks with a mocked FIFO went from 72–86 to 21–45
+ns/call for partial VAT and 38–64 to 15–22 for partial VCD. Unchanged/forced
+cases stayed nearly equal. These are not Switch or per-frame timings.
+Tests passed 160,121 differential publications, 24,064 directed mask/normal/flag
+cases and six negative controls; P11 confirmed identical reconstructed trees.
+A console CPU frame-time or fps gain has not yet been demonstrated.
