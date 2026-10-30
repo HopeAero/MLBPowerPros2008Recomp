@@ -5147,7 +5147,7 @@ index 006ab47..cbf18cc 100644
          if (!options.includeNbt && attr == GX_VA_NBT) {
              continue;
 diff --git a/runtime/src/hle/gx/gx_texture.cpp b/runtime/src/hle/gx/gx_texture.cpp
-index b5ebedd..afcb894 100644
+index b5ebedd..5615bea 100644
 --- a/runtime/src/hle/gx/gx_texture.cpp
 +++ b/runtime/src/hle/gx/gx_texture.cpp
 @@ -11,6 +11,13 @@ static void WriteGuestTexObj(uint32_t addr, uint32_t dataAddr, uint16_t width, u
@@ -5188,8 +5188,29 @@ index b5ebedd..afcb894 100644
      Memory::Write32(addr + 0x00, word0);
      Memory::Write32(addr + 0x04, word1);
      Memory::Write32(addr + 0x08, word2);
-@@ -250,9 +274,17 @@ extern "C" void GX__InitTexObj_801707f8(uint32_t oa, uint32_t da, uint32_t w, ui
-                 oa, da, w, h, f, ws, wt, m, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
+@@ -242,17 +266,36 @@ static uint32_t ComputeMaxMipLevel(uint16_t width, uint16_t height) noexcept {
+     return levels;
+ }
+ 
++// The guest pc/lr of the current context, for diagnostics only. It lives in its own function because the
++// translator's native effect analyzer (RuntimeNativeGuestEffectAnalyzer) reads each native's own body text and
++// gives a body that names TryGetCpuContext a whole-CpuContext contract: a full write-back and reload around every
++// guest call site. The natives below only ever read pc/lr here, to log an error.
++__attribute__((noinline)) static void GxDiagGuestPcLr(uint32_t& pc, uint32_t& lr) {
++    auto* cpu = TryGetCpuContext();
++    pc = cpu ? cpu->pc : 0u;
++    lr = cpu ? cpu->lr : 0u;
++}
++
+ extern "C" void GX__InitTexObj_801707f8(uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m) {
+     if (w == 0 || h == 0) {
+-        auto* cpu = TryGetCpuContext();
++        uint32_t logPc, logLr;
++        GxDiagGuestPcLr(logPc, logLr);
+         RT_LOGF(RT_TAG_GX,
+                 "GXInitTexObj zero size oa=0x%08X da=0x%08X w=%u h=%u f=%u ws=%u wt=%u m=%u pc=0x%08X lr=0x%08X\n",
+-                oa, da, w, h, f, ws, wt, m, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
++                oa, da, w, h, f, ws, wt, m, logPc, logLr);
      }
      const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
 -    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
@@ -5207,8 +5228,17 @@ index b5ebedd..afcb894 100644
      // Also write to guest memory so reads work
      WriteGuestTexObj(oa, canonicalDataAddr, (u16)w, (u16)h, f, ws, wt, m != 0, false, 0);
  }
-@@ -291,9 +323,17 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
-                 oa, da, w, h, f, ws, wt, m, tl, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
+@@ -285,15 +328,24 @@ PPC_NATIVE_OVERRIDE_VOID(801709a0, GX__InitTexObj_caseD_7_801709a0, (uint32_t oa
+ 
+ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m, uint32_t tl) {
+     if (w == 0 || h == 0) {
+-        auto* cpu = TryGetCpuContext();
++        uint32_t logPc, logLr;
++        GxDiagGuestPcLr(logPc, logLr);
+         RT_LOGF(RT_TAG_GX,
+                 "GXInitTexObjCI zero size oa=0x%08X da=0x%08X w=%u h=%u f=%u ws=%u wt=%u m=%u tl=%u pc=0x%08X lr=0x%08X\n",
+-                oa, da, w, h, f, ws, wt, m, tl, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
++                oa, da, w, h, f, ws, wt, m, tl, logPc, logLr);
      }
      const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
 -    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
@@ -5226,7 +5256,7 @@ index b5ebedd..afcb894 100644
      // Also write to guest memory so reads work
      WriteGuestTexObj(oa, canonicalDataAddr, (u16)w, (u16)h, f, ws, wt, m != 0, true, tl);
      // GXInitTexObjCI clears bit1 in the flags byte; keep guest memory consistent.
-@@ -306,9 +346,22 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
+@@ -306,9 +358,22 @@ extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w,
  PPC_NATIVE_OVERRIDE_VOID(80170a04, GX__InitTexObjCI_80170a04, (uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m, uint32_t tl), (oa, da, w, h, f, ws, wt, m, tl));
  
  extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma) {
@@ -5250,7 +5280,7 @@ index b5ebedd..afcb894 100644
      GXInitTexObjLOD(obj, (GXTexFilter)mif, (GXTexFilter)maf, fmil, fmal, lb, (GXBool)bc, (GXBool)el, (GXAnisotropy)ma);
      // Also write LOD info to guest memory
      WriteGuestTexObjLOD(oa, mif, maf, fmil, fmal, lb, bc != 0, el != 0, ma);
-@@ -316,7 +369,7 @@ extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t m
+@@ -316,7 +381,7 @@ extern "C" void GX__InitTexObjLOD_80170a4c(uint32_t oa, uint32_t mif, uint32_t m
  PPC_NATIVE_OVERRIDE_VOID(80170a4c, GX__InitTexObjLOD_80170a4c, (uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma), (oa, mif, maf, mil, mal, lb, bc, el, ma));
  
  extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32_t wt) {
@@ -5259,7 +5289,7 @@ index b5ebedd..afcb894 100644
      GXTexObj* obj = GetHostTexObj(oa);
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.wrapS = ws;
-@@ -332,7 +385,7 @@ extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32
+@@ -332,7 +397,7 @@ extern "C" void GX__InitTexObjWrapMode_80170b50(uint32_t oa, uint32_t ws, uint32
  PPC_NATIVE_OVERRIDE_VOID(80170b50, GX__InitTexObjWrapMode_80170b50, (uint32_t oa, uint32_t ws, uint32_t wt), (oa, ws, wt));
  
  extern "C" void GX__InitTexObjTlut_80170b64(uint32_t oa, uint32_t tl) {
@@ -5268,7 +5298,7 @@ index b5ebedd..afcb894 100644
      GXTexObj* obj = GetHostTexObj(oa);
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.tlut = tl;
-@@ -347,7 +400,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b64, GX__InitTexObjTlut_80170b64, (uint32_t oa, ui
+@@ -347,7 +412,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b64, GX__InitTexObjTlut_80170b64, (uint32_t oa, ui
  
  // GXInitTexObjFilter - sets mag/min filter modes
  extern "C" void GX__InitTexObjFilter_80170b6c(uint32_t oa, uint32_t minFilter, uint32_t magFilter) {
@@ -5277,7 +5307,7 @@ index b5ebedd..afcb894 100644
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.minFilter = minFilter;
      meta.magFilter = magFilter;
-@@ -375,7 +428,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b6c, GX__InitTexObjFilter_80170b6c, (uint32_t oa,
+@@ -375,7 +440,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170b6c, GX__InitTexObjFilter_80170b6c, (uint32_t oa,
  
  // GXInitTexObjLODBias - sets LOD bias value
  extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
@@ -5286,7 +5316,7 @@ index b5ebedd..afcb894 100644
      TexObjMeta& meta = GetTexObjMeta(oa);
      
      // Clamp bias to [-4.0, 3.99...] range as per SDK
-@@ -404,7 +457,7 @@ extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
+@@ -404,7 +469,7 @@ extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
  PPC_NATIVE_OVERRIDE_VOID(80170b94, GX__InitTexObjLODBias_80170b94, (uint32_t oa, float bias), (oa, bias));
  
  extern "C" void GX__InitTexObjUserData_80170be8(uint32_t oa, uint32_t userData) {
@@ -5295,7 +5325,7 @@ index b5ebedd..afcb894 100644
      TexObjMeta& meta = GetTexObjMeta(oa);
      meta.userData = userData;
  
-@@ -454,7 +507,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -454,7 +519,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
      static uint32_t s_metaLookupLogCount = 0;
      static uint32_t s_unknownFormatLogCount = 0;
      static uint32_t s_invalidDataLogCount = 0;
@@ -5304,7 +5334,7 @@ index b5ebedd..afcb894 100644
  
      if (tid >= g_boundTexMaps.size()) {
          if (s_invalidTidLogCount < 128) {
-@@ -464,6 +517,57 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -464,6 +529,57 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
          return;
      }
      
@@ -5362,7 +5392,24 @@ index b5ebedd..afcb894 100644
      // Check if we have metadata for this texture, or try to extract it from guest memory
      TexObjMeta meta;
      if (!TryGetOrExtractTexObjMeta(oa, meta)) {
-@@ -545,12 +649,23 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -519,13 +635,14 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+     const uint32_t size = GXGetTexBufferSize(meta.width, meta.height, meta.format, (GXBool)meta.mipmap, maxLod);
+     if (size == 0 || !Memory::Contains(meta.dataAddr, size)) {
+         if (s_invalidDataLogCount++ < 64) {
+-            auto* cpu = TryGetCpuContext();
++            uint32_t logPc, logLr;
++            GxDiagGuestPcLr(logPc, logLr);
+             RT_LOGF(RT_TAG_GX,
+                     "GXLoadTexObj rejected reason=data-out-of-range "
+                     "oa=0x%08X tid=%u data=0x%08X size=0x%X %ux%u fmt=0x%X mip=%u maxLod=%u pc=0x%08X lr=0x%08X\n",
+                     oa, tid, meta.dataAddr, size, meta.width, meta.height, meta.format,
+                     meta.mipmap ? 1u : 0u, static_cast<uint32_t>(maxLod),
+-                    cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
++                    logPc, logLr);
+         }
+         BindUnloadableTexturePlaceholder(tid);
+         return;
+@@ -545,12 +662,23 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
      meta.lodBias = lodBiasSafe;
      
      // Check if host texture object exists, create if needed
@@ -5388,7 +5435,7 @@ index b5ebedd..afcb894 100644
          if (cached.width != meta.width || cached.height != meta.height || cached.format != meta.format ||
              cached.wrapS != meta.wrapS || cached.wrapT != meta.wrapT || cached.mipmap != meta.mipmap ||
              cached.minFilter != meta.minFilter || cached.magFilter != meta.magFilter ||
-@@ -563,12 +678,29 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -563,12 +691,29 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
      }
      bool tlutChanged = false;
      bool textureDataUploaded = false;
@@ -5418,7 +5465,7 @@ index b5ebedd..afcb894 100644
              if (dp) {
                  if (isPalette) {
                      GXInitTexObjCI(obj, dp, meta.width, meta.height, (GXCITexFmt)meta.format,
-@@ -586,7 +718,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -586,7 +731,7 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
              // Write through GetTexObjMeta so the DCStoreRange interval index is
              // told this entry's backing may have moved.
              GetTexObjMeta(oa) = meta;
@@ -5427,7 +5474,7 @@ index b5ebedd..afcb894 100644
              GXInitTexObjTlut(obj, meta.tlut);
              GetTexObjMeta(oa).tlut = meta.tlut;
              tlutChanged = true;
-@@ -614,6 +746,20 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
+@@ -614,6 +759,20 @@ extern "C" void GX__LoadTexObj_80170f2c(uint32_t oa, uint32_t tid) {
          if (!canSkipHostLoad) {
              GXLoadTexObj(obj, (GXTexMapID)tid);
          }
@@ -5448,7 +5495,7 @@ index b5ebedd..afcb894 100644
      } catch (const std::exception& ex) {
          if (s_hostExceptionLogCount++ < 64) {
              RT_LOGF(RT_TAG_GX,
-@@ -643,7 +789,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170dc8, GX__LoadTexObjPreLoaded_80170dc8, (uint32_t o
+@@ -643,7 +802,7 @@ PPC_NATIVE_OVERRIDE_VOID(80170dc8, GX__LoadTexObjPreLoaded_80170dc8, (uint32_t o
  // ============================================================================
  
  extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp) {
@@ -5457,7 +5504,7 @@ index b5ebedd..afcb894 100644
      TexObjMeta meta;
      if (!TryGetOrExtractTexObjMeta(oa, meta)) {
          RT_LOGF(RT_TAG_GX, "GXGetTexObjAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
-@@ -657,7 +803,7 @@ extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp,
+@@ -657,7 +816,7 @@ extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp,
  PPC_NATIVE_OVERRIDE_VOID(80170bf8, GX__GetTexObjAll_80170bf8, (uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp), (oa, dp, wp, hp, fp, wsp, wtp, mp));
  
  extern "C" void GX__GetTexObjLODAll_80170cbc(uint32_t oa, uint32_t mifp, uint32_t mafp, uint32_t milp, uint32_t malp, uint32_t lbp, uint32_t bcp, uint32_t elp, uint32_t map) {
@@ -5466,7 +5513,7 @@ index b5ebedd..afcb894 100644
      TexObjMeta meta;
      if (!TryGetOrExtractTexObjMeta(oa, meta)) {
          RT_LOGF(RT_TAG_GX, "GXGetTexObjLODAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
-@@ -676,8 +822,13 @@ PPC_NATIVE_OVERRIDE_VOID(80170cbc, GX__GetTexObjLODAll_80170cbc, (uint32_t oa, u
+@@ -676,8 +835,13 @@ PPC_NATIVE_OVERRIDE_VOID(80170cbc, GX__GetTexObjLODAll_80170cbc, (uint32_t oa, u
  // ============================================================================
  
  extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, uint32_t e) {
@@ -5480,7 +5527,7 @@ index b5ebedd..afcb894 100644
      // Leave the object unconstructed on a bad descriptor. A later GXLoadTlut
      // then takes GetHostTlutObj's soft-fail path and gets a fresh empty object
      // instead of aurora reading entries*2 bytes off an unvalidated pointer.
-@@ -686,7 +837,26 @@ extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, u
+@@ -686,7 +850,26 @@ extern "C" void GX__InitTlutObj_80170f80(uint32_t oa, uint32_t da, uint32_t f, u
  }
  PPC_NATIVE_OVERRIDE_VOID(80170f80, GX__InitTlutObj_80170f80, (uint32_t oa, uint32_t da, uint32_t f, uint32_t e), (oa, da, f, e));
  
@@ -5564,7 +5611,7 @@ index f2a82a5..22a237d 100644
          float src[9]{};
          float m[12]{};
 diff --git a/runtime/src/hle/gx/gx_vertex.cpp b/runtime/src/hle/gx/gx_vertex.cpp
-index 80c9be0..fe9fba3 100644
+index 80c9be0..a6fdf0f 100644
 --- a/runtime/src/hle/gx/gx_vertex.cpp
 +++ b/runtime/src/hle/gx/gx_vertex.cpp
 @@ -4,6 +4,9 @@
@@ -5604,7 +5651,33 @@ index 80c9be0..fe9fba3 100644
          }
      }
      if (vf >= GX_MAX_VTXFMT || a < GX_VA_POS || a >= GX_VA_MAX_ATTR) {
-@@ -244,11 +247,24 @@ void ServiceDeferredTimingDuringGxWork() {
+@@ -198,14 +201,21 @@ extern "C" void GX__SetNumTexGens_8016e5a4(uint32_t n) {
+ }
+ PPC_NATIVE_OVERRIDE_VOID(8016e5a4, GX__SetNumTexGens_8016e5a4, (uint32_t n), (n));
+ 
++// The guest pc/lr of the current context, for diagnostics only. It lives in its own function because the
++// translator's native effect analyzer (RuntimeNativeGuestEffectAnalyzer) reads each native's own body text and
++// gives a body that names TryGetCpuContext a whole-CpuContext contract: a full write-back and reload around every
++// guest call site. The natives below only ever read pc/lr here, to log an error.
++__attribute__((noinline)) static void GxDiagGuestPcLrVertex(uint32_t& pc, uint32_t& lr) {
++    auto* cpu = TryGetCpuContext();
++    pc = cpu ? cpu->pc : 0u;
++    lr = cpu ? cpu->lr : 0u;
++}
++
+ extern "C" void GX__SetTexCoordGen2_8016e37c(uint32_t dc, uint32_t f, uint32_t sp, uint32_t m, uint32_t n, uint32_t pm) {
+     if (sp >= static_cast<uint32_t>(GX_MAX_TEXGENSRC)) {
+         uint32_t pc = 0;
+         uint32_t lr = 0;
+-        if (auto* cpu = TryGetCpuContext()) {
+-            pc = cpu->pc;
+-            lr = cpu->lr;
+-        }
++        GxDiagGuestPcLrVertex(pc, lr);
+         RT_LOGF(RT_TAG_GX,
+                 "GXSetTexCoordGen2 invalid src=%u dst=%u type=%u mtx=%u norm=%u post=%u PC=0x%08X LR=0x%08X\n",
+                 sp, dc, f, m, n, pm, pc, lr);
+@@ -244,11 +254,24 @@ void ServiceDeferredTimingDuringGxWork() {
          return;
      }
  
@@ -11170,62 +11243,3 @@ index 502f72c..885f8bb 100644
  
  namespace {
  struct Context {
-diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index 4eef06f..6e0b7f9 100644
---- a/runtime/src/launcher.cpp
-+++ b/runtime/src/launcher.cpp
-@@ -47,6 +47,8 @@
- #if defined(_WIN32)
- #include <windows.h>
- #include <shellapi.h>
-+#elif defined(__SWITCH__)
-+#include <unistd.h>
- #else
- #include <signal.h>
- #include <spawn.h>
-@@ -429,6 +431,12 @@ constexpr const char* kRosterEditorPage =
- 
- #if defined(_WIN32)
- std::wstring Quoted(const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; }
-+#elif defined(__SWITCH__)
-+// A homebrew title cannot start other programs: desktop tools stay on the PC.
-+bool SpawnDetached(const std::vector<std::string>& command) {
-+    RT_LOG(RT_TAG_RUNTIME) << "launcher: " << command[0] << " is not available on the Switch" << std::endl;
-+    return false;
-+}
- #else
- // Starts a program without waiting for it; the game keeps running. Steam's overlay preload is
- // dropped so desktop tools (xdg-open, the file manager) do not inherit it.
-@@ -507,6 +515,8 @@ void OpenRosterEditor() {
-     const fs::path page = data / "abrir.html";
-     std::ofstream(page, std::ios::binary | std::ios::trunc) << kRosterEditorPage;
-     ShellExecuteW(nullptr, L"open", page.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-+#elif defined(__SWITCH__)
-+    RT_LOG(RT_TAG_RUNTIME) << "launcher: PowerUp+ is not available on the Switch" << std::endl;
- #else
-     namespace fs = std::filesystem;
-     const auto exeDir = RuntimeConfigFile::ExecutableDirectory();
-@@ -692,6 +702,9 @@ bool Relaunch() {
-     CloseHandle(process.hThread);
-     CloseHandle(process.hProcess);
-     return true;
-+#elif defined(__SWITCH__)
-+    RT_LOG(RT_TAG_RUNTIME) << "launcher: restarting is not available on the Switch" << std::endl;
-+    return false;
- #else
-     setenv("WIICOMPILED_SKIP_LAUNCHER", "1", 1);
-     std::vector<char*> args(g_argv, g_argv + g_argc);
-diff --git a/runtime/src/launcher_controls.cpp b/runtime/src/launcher_controls.cpp
-index 5f029c0..0b51bbe 100644
---- a/runtime/src/launcher_controls.cpp
-+++ b/runtime/src/launcher_controls.cpp
-@@ -51,7 +51,8 @@ void LoadPromptStyle() {
-     if (loaded) return;
-     loaded = true;
-     int value = 1;
--    if (std::ifstream(PromptPath()) >> value; value >= 0 && value <= 2) promptStyle = value;
-+    std::ifstream prompts(PromptPath());
-+    if (prompts >> value && value >= 0 && value <= 2) promptStyle = value;
- }
- enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
- struct Capture {

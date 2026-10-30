@@ -7860,7 +7860,7 @@ index 7ac535d..2062fdf 100644
  inline void Memory::Write64(uint32_t addr, uint64_t val) {
      if (!MemoryInline::TryWriteGuestScalar(addr, val)) [[unlikely]]
 diff --git a/runtime/include/native_cpu_calls.inc b/runtime/include/native_cpu_calls.inc
-index 0856e7b..7986015 100644
+index 0856e7b..154e652 100644
 --- a/runtime/include/native_cpu_calls.inc
 +++ b/runtime/include/native_cpu_calls.inc
 @@ -43,7 +43,15 @@ extern "C" void GX__SetBlendMode_8017277c(uint32_t t, uint32_t s, uint32_t d, ui
@@ -7879,8 +7879,18 @@ index 0856e7b..7986015 100644
  #define MKW_KNOWN_TYPED_UNBOUND(addr, fn, ...) static_assert(true)
  #define MKW_KNOWN_NATIVE_CPU_UNBOUND(addr, fn) static_assert(true)
  #ifdef WIICOMPILED_NO_MKW_NATIVES
-@@ -93,6 +101,17 @@ MKW_KNOWN_TYPED_NATIVE(0x80173214u, GX__SetCurrentMtx_80173214, cpu->gpr[3]);
+@@ -91,8 +99,27 @@ MKW_KNOWN_TYPED_NATIVE(0x8017277Cu, GX__SetBlendMode_8017277c, cpu->gpr[3], cpu-
+ MKW_KNOWN_TYPED_NATIVE(0x8017310Cu, GX__LoadPosMtxImm_8017310c, cpu->gpr[3], cpu->gpr[4]);
+ MKW_KNOWN_TYPED_NATIVE(0x80173214u, GX__SetCurrentMtx_80173214, cpu->gpr[3]);
  
++// Display-list call and indexed-colour texture object init: no leaf binding (they leave the nonvolatile-GPR guard and
++// the current-context check in place, like every typed binding here), but no registry lookup and no raw-invoker
++// thunk either.
++extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes);
++extern "C" void GX__InitTexObjCI_80170a04(uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m, uint32_t tl);
++MKW_KNOWN_TYPED_NATIVE(0x80172F64u, GX__CallDisplayList_80172f64, cpu->gpr[3], cpu->gpr[4]);
++MKW_KNOWN_TYPED_NATIVE(0x80170A04u, GX__InitTexObjCI_80170a04, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6], cpu->gpr[7], cpu->gpr[8], cpu->gpr[9], cpu->gpr[10], Memory::Read32(cpu->gpr[1] + 8u));
++
  #undef MKW_KNOWN_TYPED_NATIVE
  
 +#if defined(__SWITCH__) && defined(WIICOMPILED_GAME_RL8E54) && !defined(WIICOMPILED_NO_MKW_NATIVES)
@@ -7897,7 +7907,7 @@ index 0856e7b..7986015 100644
  #ifdef WIICOMPILED_NO_MKW_NATIVES
  #define MKW_KNOWN_NATIVE_CPU_CALL(addr, fn) static_assert(true)
  #else
-@@ -108,3 +127,215 @@ MKW_KNOWN_NATIVE_CPU_CALL(0x800847C0u, nw4r__lyt__detail__DrawQuad_800847c0);
+@@ -108,3 +135,215 @@ MKW_KNOWN_NATIVE_CPU_CALL(0x800847C0u, nw4r__lyt__detail__DrawQuad_800847c0);
  MKW_KNOWN_NATIVE_CPU_CALL(0x80084D20u, nw4r__lyt__detail__DrawQuad_80084d20);
  
  #undef MKW_KNOWN_NATIVE_CPU_CALL

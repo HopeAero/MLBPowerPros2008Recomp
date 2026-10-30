@@ -1,3 +1,62 @@
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 4eef06f..6e0b7f9 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -47,6 +47,8 @@
+ #if defined(_WIN32)
+ #include <windows.h>
+ #include <shellapi.h>
++#elif defined(__SWITCH__)
++#include <unistd.h>
+ #else
+ #include <signal.h>
+ #include <spawn.h>
+@@ -429,6 +431,12 @@ constexpr const char* kRosterEditorPage =
+ 
+ #if defined(_WIN32)
+ std::wstring Quoted(const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; }
++#elif defined(__SWITCH__)
++// A homebrew title cannot start other programs: desktop tools stay on the PC.
++bool SpawnDetached(const std::vector<std::string>& command) {
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: " << command[0] << " is not available on the Switch" << std::endl;
++    return false;
++}
+ #else
+ // Starts a program without waiting for it; the game keeps running. Steam's overlay preload is
+ // dropped so desktop tools (xdg-open, the file manager) do not inherit it.
+@@ -507,6 +515,8 @@ void OpenRosterEditor() {
+     const fs::path page = data / "abrir.html";
+     std::ofstream(page, std::ios::binary | std::ios::trunc) << kRosterEditorPage;
+     ShellExecuteW(nullptr, L"open", page.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++#elif defined(__SWITCH__)
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: PowerUp+ is not available on the Switch" << std::endl;
+ #else
+     namespace fs = std::filesystem;
+     const auto exeDir = RuntimeConfigFile::ExecutableDirectory();
+@@ -692,6 +702,9 @@ bool Relaunch() {
+     CloseHandle(process.hThread);
+     CloseHandle(process.hProcess);
+     return true;
++#elif defined(__SWITCH__)
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: restarting is not available on the Switch" << std::endl;
++    return false;
+ #else
+     setenv("WIICOMPILED_SKIP_LAUNCHER", "1", 1);
+     std::vector<char*> args(g_argv, g_argv + g_argc);
+diff --git a/runtime/src/launcher_controls.cpp b/runtime/src/launcher_controls.cpp
+index 5f029c0..0b51bbe 100644
+--- a/runtime/src/launcher_controls.cpp
++++ b/runtime/src/launcher_controls.cpp
+@@ -51,7 +51,8 @@ void LoadPromptStyle() {
+     if (loaded) return;
+     loaded = true;
+     int value = 1;
+-    if (std::ifstream(PromptPath()) >> value; value >= 0 && value <= 2) promptStyle = value;
++    std::ifstream prompts(PromptPath());
++    if (prompts >> value && value >= 0 && value <= 2) promptStyle = value;
+ }
+ enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
+ struct Capture {
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
 index 7269747..796606b 100644
 --- a/runtime/src/main.cpp
@@ -1675,6 +1734,476 @@ index 418c00a..d61eb79 100644
  #elif defined(__APPLE__)
    #define section(name) __attribute__((section("__TEXT,__" #name)))
  #else
+diff --git a/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.EmitInstruction.cs b/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.EmitInstruction.cs
+index b4874b1..bead74b 100644
+--- a/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.EmitInstruction.cs
++++ b/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.EmitInstruction.cs
+@@ -522,7 +522,7 @@ public sealed partial class CxxLinearCodeGenerator
+                     // Tail dispatch: the callee inherits authoritative context
+                     // and this frame never observes registers again, so the
+                     // locals must not be written back afterwards.
+-                    AppendFlush(sb, pad);
++                    AppendExitFlush(sb, pad);
+                     sb.AppendLine($"{pad}InvokeIndirectJump({jumpTarget}, ctx);");
+                     sb.AppendLine($"{pad}return;");
+                 }
+diff --git a/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.RegisterResidency.cs b/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.RegisterResidency.cs
+index 9c03dba..4ecec87 100644
+--- a/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.RegisterResidency.cs
++++ b/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.RegisterResidency.cs
+@@ -26,13 +26,93 @@ public sealed partial class CxxLinearCodeGenerator
+         private bool _writesCtr;
+         private bool _writesXer;
+ 
+-        private RegisterResidency(bool recording) => _recording = recording;
++        // Dirty-register tracking (CpuContext write-back only for registers whose local changed since the last sync).
++        // A register is dirty while its local may differ from CpuContext: set by a write, cleared by an entry load,
++        // a reload after a boundary, or a write-back. The recording pass summarizes every block as a gen/kill
++        // transfer plus its outgoing edge writes; Snapshot() solves the forward union dataflow over them; the
++        // real pass replays the same transfer from the solved block-entry state at every flush point.
++        // A function that can resume through a local LR-continuation label has edges this analysis does not
++        // see, so it keeps the old write-back-everything-written behaviour.
++        private readonly string? _entryLabel;
++        private readonly bool _conservative;
++        private Dictionary<string, BlockSummary>? _blocks;
++        private Dictionary<string, DirtySet>? _blockIn;
++        private BlockSummary? _activeBlock;
++        private DirtySet _activeIn;
++        private string? _edgeTarget;
++        private DirtySet _edgeGen;
++        private readonly Stack<(Transfer Base, List<Transfer> Done)> _alternatives = new();
++
++        private const byte CrBit = 1;
++        private const byte CtrBit = 2;
++        private const byte XerBit = 4;
++
++        internal struct DirtySet : IEquatable<DirtySet>
++        {
++            public uint Gpr;
++            public uint Fpr;
++            public byte Flags;
++
++            public static DirtySet Or(DirtySet a, DirtySet b) =>
++                new() { Gpr = a.Gpr | b.Gpr, Fpr = a.Fpr | b.Fpr, Flags = (byte)(a.Flags | b.Flags) };
++
++            public static DirtySet And(DirtySet a, DirtySet b) =>
++                new() { Gpr = a.Gpr & b.Gpr, Fpr = a.Fpr & b.Fpr, Flags = (byte)(a.Flags & b.Flags) };
++
++            public static DirtySet AndNot(DirtySet a, DirtySet b) =>
++                new() { Gpr = a.Gpr & ~b.Gpr, Fpr = a.Fpr & ~b.Fpr, Flags = (byte)(a.Flags & ~b.Flags) };
++
++            public bool Equals(DirtySet other) => Gpr == other.Gpr && Fpr == other.Fpr && Flags == other.Flags;
++            public override bool Equals(object? obj) => obj is DirtySet other && Equals(other);
++            public override int GetHashCode() => HashCode.Combine(Gpr, Fpr, Flags);
++        }
+ 
+-        public static RegisterResidency CreateRecorder() => new(true);
++        /// <summary>out = (in minus Kill) plus Gen. Closed under sequencing and under join of alternatives.</summary>
++        internal struct Transfer
++        {
++            public DirtySet Gen;
++            public DirtySet Kill;
++
++            public readonly DirtySet Apply(DirtySet input) => DirtySet.Or(DirtySet.AndNot(input, Kill), Gen);
++
++            public void Write(DirtySet written)
++            {
++                Gen = DirtySet.Or(Gen, written);
++                Kill = DirtySet.AndNot(Kill, written);
++            }
++
++            public void Clean(DirtySet cleaned)
++            {
++                Gen = DirtySet.AndNot(Gen, cleaned);
++                Kill = DirtySet.Or(Kill, cleaned);
++            }
++
++            public static Transfer Join(Transfer a, Transfer b) => new()
++            {
++                Gen = DirtySet.Or(a.Gen, b.Gen),
++                Kill = DirtySet.And(a.Kill, b.Kill)
++            };
++        }
++
++        private sealed class BlockSummary
++        {
++            public Transfer Transfer;
++            public readonly List<(string Target, DirtySet Gen)> Edges = new();
++        }
++
++        private RegisterResidency(bool recording, string? entryLabel = null, bool conservative = false)
++        {
++            _recording = recording;
++            _entryLabel = entryLabel;
++            _conservative = conservative;
++        }
++
++        public static RegisterResidency CreateRecorder(string? entryLabel = null, bool conservative = false) =>
++            new(true, entryLabel, conservative) { _blocks = new Dictionary<string, BlockSummary>(StringComparer.OrdinalIgnoreCase) };
+ 
+         public RegisterResidency Snapshot()
+         {
+-            var snapshot = new RegisterResidency(false);
++            var snapshot = new RegisterResidency(false, _entryLabel, _conservative);
+             snapshot._gprs.UnionWith(_gprs);
+             snapshot._fprs.UnionWith(_fprs);
+             snapshot._writtenGprs.UnionWith(_writtenGprs);
+@@ -43,9 +123,143 @@ public sealed partial class CxxLinearCodeGenerator
+             snapshot._writesCr = _writesCr;
+             snapshot._writesCtr = _writesCtr;
+             snapshot._writesXer = _writesXer;
++            snapshot._blocks = _blocks;
++            snapshot._blockIn = SolveDirtyEntryStates(snapshot.WrittenSet());
+             return snapshot;
+         }
+ 
++        private DirtySet WrittenSet()
++        {
++            var set = new DirtySet();
++            foreach (var gpr in _writtenGprs) set.Gpr |= 1u << gpr;
++            foreach (var fpr in _writtenFprs) set.Fpr |= 1u << fpr;
++            if (_writesCr) set.Flags |= CrBit;
++            if (_writesCtr) set.Flags |= CtrBit;
++            if (_writesXer) set.Flags |= XerBit;
++            return set;
++        }
++
++        /// <summary>
++        /// Forward union dataflow over the recorded blocks. The entry block starts clean (entry loads); a block no
++        /// recorded edge reaches (and that is not the entry) starts with everything dirty, the old behaviour.
++        /// </summary>
++        private Dictionary<string, DirtySet>? SolveDirtyEntryStates(DirtySet all)
++        {
++            if (_blocks is null || _conservative || _entryLabel is null || !_blocks.ContainsKey(_entryLabel))
++                return null;
++
++            var ins = new Dictionary<string, DirtySet>(StringComparer.OrdinalIgnoreCase);
++            var reached = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++            foreach (var block in _blocks.Values)
++                foreach (var edge in block.Edges)
++                    reached.Add(edge.Target);
++            foreach (var label in _blocks.Keys)
++                ins[label] = !string.Equals(label, _entryLabel, StringComparison.OrdinalIgnoreCase) && !reached.Contains(label)
++                    ? all
++                    : default;
++
++            bool changed;
++            do
++            {
++                changed = false;
++                foreach (var (label, block) in _blocks)
++                {
++                    var output = block.Transfer.Apply(ins[label]);
++                    foreach (var (target, edgeGen) in block.Edges)
++                    {
++                        if (!ins.TryGetValue(target, out var current)) continue;
++                        var merged = DirtySet.Or(current, DirtySet.Or(output, edgeGen));
++                        if (!merged.Equals(current))
++                        {
++                            ins[target] = merged;
++                            changed = true;
++                        }
++                    }
++                }
++            }
++            while (changed);
++
++            return ins;
++        }
++
++        /// <summary>Starts a block: the running transfer is empty and, in the real pass, its entry state is the solved one.</summary>
++        public void BeginBlock(string label)
++        {
++            _activeBlock = new BlockSummary();
++            _edgeTarget = null;
++            _alternatives.Clear();
++            if (_recording)
++            {
++                _blocks![label] = _activeBlock;
++                _activeIn = default;
++            }
++            else
++            {
++                _activeIn = _blockIn is not null && _blockIn.TryGetValue(label, out var known) ? known : WrittenSet();
++            }
++        }
++
++        /// <summary>Writes made while a CFG edge's normalization is emitted belong to that edge only.</summary>
++        public void BeginEdge(string target)
++        {
++            if (_activeBlock is null) return;
++            _edgeTarget = target;
++            _edgeGen = default;
++        }
++
++        public void EndEdge()
++        {
++            if (_activeBlock is null || _edgeTarget is null) return;
++            if (_recording) _activeBlock.Edges.Add((_edgeTarget, _edgeGen));
++            _edgeTarget = null;
++        }
++
++        /// <summary>
++        /// Brackets code whose arms are alternatives within one block (a state-free call's fast and slow arm):
++        /// each arm starts from the state at <see cref="BeginAlternatives"/>; afterwards the state is their join.
++        /// </summary>
++        public void BeginAlternatives()
++        {
++            if (_activeBlock is null) return;
++            _alternatives.Push((_activeBlock.Transfer, new List<Transfer>()));
++        }
++
++        public void NextAlternative()
++        {
++            if (_activeBlock is null) return;
++            var (baseTransfer, done) = _alternatives.Peek();
++            done.Add(_activeBlock.Transfer);
++            _activeBlock.Transfer = baseTransfer;
++        }
++
++        public void EndAlternatives()
++        {
++            if (_activeBlock is null) return;
++            var (_, done) = _alternatives.Pop();
++            var joined = _activeBlock.Transfer;
++            foreach (var arm in done) joined = Transfer.Join(joined, arm);
++            _activeBlock.Transfer = joined;
++        }
++
++        private DirtySet CurrentDirty()
++        {
++            if (_activeBlock is null || _conservative) return WrittenSet();
++            return _activeBlock.Transfer.Apply(_activeIn);
++        }
++
++        private void NoteWrite(DirtySet written)
++        {
++            if (_activeBlock is null) return;
++            if (_edgeTarget is not null) _edgeGen = DirtySet.Or(_edgeGen, written);
++            else _activeBlock.Transfer.Write(written);
++        }
++
++        private void NoteClean(DirtySet cleaned)
++        {
++            if (_activeBlock is null || _edgeTarget is not null) return;
++            _activeBlock.Transfer.Clean(cleaned);
++        }
++
+         public bool IsEmpty => _gprs.Count == 0 && _fprs.Count == 0 && !_cr && !_ctr && !_xer;
+ 
+         public static string GprLocal(int index) => GprRegisterName(index);
+@@ -88,6 +302,7 @@ public sealed partial class CxxLinearCodeGenerator
+ 
+         public string Cr(bool written)
+         {
++            if (written) NoteWrite(new DirtySet { Flags = CrBit });
+             if (_recording)
+             {
+                 _cr = true;
+@@ -104,6 +319,7 @@ public sealed partial class CxxLinearCodeGenerator
+ 
+         public string Ctr(bool written)
+         {
++            if (written) NoteWrite(new DirtySet { Flags = CtrBit });
+             if (_recording)
+             {
+                 _ctr = true;
+@@ -124,6 +340,7 @@ public sealed partial class CxxLinearCodeGenerator
+         /// </summary>
+         public string Xer(bool written)
+         {
++            if (written) NoteWrite(new DirtySet { Flags = XerBit });
+             if (_recording)
+             {
+                 _xer = true;
+@@ -140,6 +357,12 @@ public sealed partial class CxxLinearCodeGenerator
+ 
+         private void Track(SortedSet<int> referenced, SortedSet<int> written, int index, bool isWrite, string prefix)
+         {
++            if (isWrite)
++            {
++                var bit = 1u << index;
++                NoteWrite(ReferenceEquals(referenced, _gprs) ? new DirtySet { Gpr = bit } : new DirtySet { Fpr = bit });
++            }
++
+             if (_recording)
+             {
+                 referenced.Add(index);
+@@ -183,18 +406,36 @@ public sealed partial class CxxLinearCodeGenerator
+         /// or overwrite are published; see <see cref="ResidencyBoundarySync"/>
+         /// for why the write set has to participate in the flush mask.
+         /// </summary>
+-        public void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync)
++        public void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync) =>
++            AppendFlush(sb, pad, sync, leavesFrame: false);
++
++        /// <summary>
++        /// Writes back the registers that are both dirty and in the boundary's flush set. A flush that stays in
++        /// this frame (<paramref name="leavesFrame"/> false) leaves them clean afterwards; one that returns or
++        /// tail-dispatches must not change the state the sibling paths of the block see.
++        /// </summary>
++        public void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync, bool leavesFrame)
+         {
+-            if (_recording) return;
+-            foreach (var gpr in _writtenGprs)
+-                if (sync.FlushesGpr(gpr))
+-                    sb.Append(pad).Append("ctx->gpr[").Append(gpr).Append("] = ").Append(GprLocal(gpr)).AppendLine(";");
+-            foreach (var fpr in _writtenFprs)
+-                if (sync.FlushesFpr(fpr))
+-                    sb.Append(pad).Append("ctx->fpr[").Append(fpr).Append("] = ").Append(FprLocal(fpr)).AppendLine(";");
+-            if (_writesCr && sync.FlushesCr) sb.Append(pad).AppendLine($"ctx->cr = {CrLocal};");
+-            if (_writesCtr && sync.FlushesCtr) sb.Append(pad).AppendLine($"ctx->ctr = {CtrLocal};");
+-            if (_writesXer && sync.FlushesXer) sb.Append(pad).AppendLine($"ctx->xer = {XerLocal};");
++            var dirty = CurrentDirty();
++            if (!_recording)
++            {
++                foreach (var gpr in _writtenGprs)
++                    if (sync.FlushesGpr(gpr) && (dirty.Gpr & (1u << gpr)) != 0)
++                        sb.Append(pad).Append("ctx->gpr[").Append(gpr).Append("] = ").Append(GprLocal(gpr)).AppendLine(";");
++                foreach (var fpr in _writtenFprs)
++                    if (sync.FlushesFpr(fpr) && (dirty.Fpr & (1u << fpr)) != 0)
++                        sb.Append(pad).Append("ctx->fpr[").Append(fpr).Append("] = ").Append(FprLocal(fpr)).AppendLine(";");
++                if (_writesCr && sync.FlushesCr && (dirty.Flags & CrBit) != 0) sb.Append(pad).AppendLine($"ctx->cr = {CrLocal};");
++                if (_writesCtr && sync.FlushesCtr && (dirty.Flags & CtrBit) != 0) sb.Append(pad).AppendLine($"ctx->ctr = {CtrLocal};");
++                if (_writesXer && sync.FlushesXer && (dirty.Flags & XerBit) != 0) sb.Append(pad).AppendLine($"ctx->xer = {XerLocal};");
++            }
++
++            if (leavesFrame) return;
++            var flushed = new DirtySet { Gpr = sync.FlushGprMask, Fpr = sync.FlushFprMask };
++            if (sync.FlushesCr) flushed.Flags |= CrBit;
++            if (sync.FlushesCtr) flushed.Flags |= CtrBit;
++            if (sync.FlushesXer) flushed.Flags |= XerBit;
++            NoteClean(flushed);
+         }
+ 
+         /// <summary>
+@@ -206,6 +447,11 @@ public sealed partial class CxxLinearCodeGenerator
+         /// <summary>Contract-narrowed reload.</summary>
+         public void AppendReload(StringBuilder sb, string pad, ResidencyBoundarySync sync)
+         {
++            var reloaded = new DirtySet { Gpr = sync.ReloadGprMask, Fpr = sync.ReloadFprMask };
++            if (sync.ReloadsCr) reloaded.Flags |= CrBit;
++            if (sync.ReloadsCtr) reloaded.Flags |= CtrBit;
++            if (sync.ReloadsXer) reloaded.Flags |= XerBit;
++            NoteClean(reloaded);
+             if (_recording) return;
+             foreach (var gpr in _gprs)
+                 if (sync.ReloadsGpr(gpr))
+@@ -348,6 +594,12 @@ public sealed partial class CxxLinearCodeGenerator
+         if (_activeResidency is { } residency) residency.AppendFlush(sb, pad, sync);
+     }
+ 
++    /// <summary>Write-back on a path that leaves the frame (return, tail dispatch): publishes the dirty registers, tracks nothing.</summary>
++    private static void AppendExitFlush(StringBuilder sb, string pad)
++    {
++        if (_activeResidency is { } residency) residency.AppendFlush(sb, pad, ResidencyBoundarySync.Full, leavesFrame: true);
++    }
++
+     private static void AppendReload(StringBuilder sb, string pad, ResidencyBoundarySync sync)
+     {
+         if (_activeResidency is { } residency) residency.AppendReload(sb, pad, sync);
+diff --git a/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.StateFreeAbi.cs b/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.StateFreeAbi.cs
+index 224b303..f8adb30 100644
+--- a/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.StateFreeAbi.cs
++++ b/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.StateFreeAbi.cs
+@@ -375,6 +375,9 @@ public sealed partial class CxxLinearCodeGenerator
+             $"Resident state-free marshalling requested for 0x{address:X8} without an active residency.");
+ 
+         AppendFlush(sb, pad, ResidencyBoundarySync.StateFreeResidentOuter);
++        // The fast arm's result stores and the slow arm's flush/reload are alternatives: each starts from
++        // the state here and the dirty set afterwards is their join.
++        residency.BeginAlternatives();
+         var inner = pad + "    ";
+         sb.AppendLine($"{pad}if ({StateFreeAvailabilityCondition(address, stateFreeAbiContracts, stateFreeCallSymbols)}) {{");
+         var arguments = StateFreeResidentCallArguments(residency, contract, callSiteLr);
+@@ -391,10 +394,12 @@ public sealed partial class CxxLinearCodeGenerator
+             sb.AppendLine($"{inner}{symbol}({arguments});");
+         }
+         sb.AppendLine($"{pad}}} else {{");
++        residency.NextAlternative();
+         AppendFlush(sb, inner, ResidencyBoundarySync.Full);
+         RecordEmittedDirectCallTarget(address);
+         sb.AppendLine($"{inner}InvokeDirectCpu<0x{address:X8}u>(ctx);");
+         AppendReload(sb, inner, ResidencyBoundarySync.Full);
++        residency.EndAlternatives();
+         sb.AppendLine($"{pad}}}");
+     }
+ 
+diff --git a/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.cs b/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.cs
+index 1af76dd..6be42c7 100644
+--- a/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.cs
++++ b/translator/src/Translator.Core/CodeGen/CxxLinearCodeGenerator.cs
+@@ -333,6 +333,7 @@ public sealed partial class CxxLinearCodeGenerator
+                     var localConstants = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+                     var label = labelNames[block.Label];
+                     RecordEmittedLocalLabel(label);
++                    _activeResidency?.BeginBlock(block.Label);
+                     body.AppendLine($"{label}:");
+                     body.AppendLine("{");
+                     var localPaired = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+@@ -410,12 +411,12 @@ public sealed partial class CxxLinearCodeGenerator
+                     {
+                         case IrUndefined undef:
+                             EmitInstruction(block.Label, -1, undef, body, bufferBaseLength, 1, cfg, labelNames, types, signature, localPaired, _guestAbiProvider, knownConstants, localConstants, linkedAddressRemap, nonReturningCallTargets, lrContinuationCallTargets, stackFacts, inlineGuestThunkStackBase: false, localFallthroughLr: null, guestAbiContracts, stateFreeAbiContracts, stateFreeCallSymbols, stateFreeCallSiteVariants, modOverridableCallTargets, shareLrContinuationDispatch);
+-                            AppendFlush(body, "    ");
++                            AppendExitFlush(body, "    ");
+                             body.AppendLine("    return;");
+                             break;
+ 
+                         case IrReturn ret:
+-                            AppendFlush(body, "    ");
++                            AppendExitFlush(body, "    ");
+                             body.AppendLine("    return;");
+                             break;
+ 
+@@ -463,7 +464,7 @@ public sealed partial class CxxLinearCodeGenerator
+                             // Unlisted selectors leave this frame through the
+                             // dispatcher: publish the locals and never write
+                             // them back afterwards.
+-                            AppendFlush(body, "        ");
++                            AppendExitFlush(body, "        ");
+                             body.AppendLine($"        InvokeIndirectJump({selectorExpr}, ctx);");
+                             body.AppendLine("        return;");
+                             body.AppendLine("    }");
+@@ -484,7 +485,7 @@ public sealed partial class CxxLinearCodeGenerator
+                                 // unreachable and must not write them back.
+                                 if (term is not IrIndirectJump)
+                                 {
+-                                    AppendFlush(body, "    ");
++                                    AppendExitFlush(body, "    ");
+                                 }
+                                 body.AppendLine("    return;");
+                             }
+@@ -534,7 +535,9 @@ public sealed partial class CxxLinearCodeGenerator
+             Environment.NewLine.Length;
+         RegisterResidency? residency = null;
+         {
+-            var recorder = RegisterResidency.CreateRecorder();
++            // A body that can resume through a local LR-continuation label has CFG edges the dirty-register
++            // analysis does not model, so it keeps the write-back-everything-written behaviour.
++            var recorder = RegisterResidency.CreateRecorder(func.EntryLabel, conservative: continuationCallCount > 0);
+             EmitFunctionBody(recorder, bodyBufferBaseLength, discardResult: true);
+             var discovered = recorder.Snapshot();
+             if (!discovered.IsEmpty)
+@@ -988,6 +991,9 @@ public sealed partial class CxxLinearCodeGenerator
+         IReadOnlyDictionary<string, HashSet<string>> pairedIn,
+         IReadOnlyDictionary<string, HashSet<string>> liveIn)
+     {
++        // The edge's own register writes (normalization) and its target are what the dirty-register
++        // dataflow needs; every emitted CFG edge goes through here.
++        _activeResidency?.BeginEdge(toLabel);
+         pairedOut.TryGetValue(fromLabel, out var fromSet);
+         pairedIn.TryGetValue(toLabel, out var toSet);
+ 
+@@ -1021,6 +1027,8 @@ public sealed partial class CxxLinearCodeGenerator
+                 ? $"{pad}{regExpr} = PPC_PsFromScalarInline({regExpr});"
+                 : $"{pad}{regExpr} = PPC_PsToScalarInline({regExpr});");
+         }
++
++        _activeResidency?.EndEdge();
+     }
+ 
+     private static int ParseFloatRegisterIndex(string name)
 diff --git a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
 index 2201e54..42a7f98 100644
 --- a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
@@ -1706,3 +2235,581 @@ index 2201e54..42a7f98 100644
          assembly.AppendLine();
  
          foreach (var blob in blobs)
+diff --git a/translator/tests/Translator.Tests/DirtyRegisterWritebackCodeGenTests.cs b/translator/tests/Translator.Tests/DirtyRegisterWritebackCodeGenTests.cs
+new file mode 100644
+index 0000000..4e27a80
+--- /dev/null
++++ b/translator/tests/Translator.Tests/DirtyRegisterWritebackCodeGenTests.cs
+@@ -0,0 +1,491 @@
++using Translator.Core.Analysis;
++using Translator.Core.Analysis.Representation;
++using Translator.Core.Analysis.Ssa;
++using Translator.Core.CodeGen;
++using Translator.Core.Ir;
++using Translator.Core.Representation;
++
++namespace Translator.Tests;
++
++/// <summary>
++/// Register residency writes a resident register back to CpuContext only while its local may differ from the
++/// context (written since the entry load, the last reload or the last write-back).
++/// </summary>
++public sealed class DirtyRegisterWritebackCodeGenTests
++{
++    private const string Lf = "\n";
++
++    private static string Emit(IrFunction function, RepresentationEnvironment? types = null)
++    {
++        return new CxxLinearCodeGenerator().Emit(
++            0x80001000u,
++            new SsaTransformer().Convert(function),
++            new FunctionAbiClassification(function.Name, ValueRepresentation.Void),
++            types ?? new RepresentationEnvironment(new Dictionary<string, ValueRepresentation>()))
++            .ReplaceLineEndings(Lf);
++    }
++
++    private static int Count(string text, string needle) =>
++        text.Split(needle, StringSplitOptions.None).Length - 1;
++
++    private static string BlockText(string code, string label)
++    {
++        var start = code.IndexOf($"\n{label}:\n", StringComparison.Ordinal);
++        Assert.True(start >= 0, $"missing block {label}");
++        var end = code.IndexOf("\n}\n", start, StringComparison.Ordinal);
++        Assert.True(end > start, $"unterminated block {label}");
++        return code[start..end];
++    }
++
++    private static IrInstruction Inc(string reg) =>
++        new IrBinary(reg, IrValue.Register(reg), IrValue.Imm(1), "add");
++
++    [Fact]
++    public void StraightLineWritesBackOnlyRegistersChangedSinceTheLastSync()
++    {
++        // r3 and r4 are modified before the call, so the call flushes both. Afterwards only r3 changes, so the
++        // return must publish r3 and nothing else: r4 was reloaded by the call and is equal to CpuContext.
++        var function = new IrFunction("dirty_straight", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                Inc("r3"),
++                Inc("r4"),
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                Inc("r3"),
++                new IrReturn(null)
++            })
++        });
++
++        var code = Emit(function);
++
++        Assert.Equal(2, Count(code, "ctx->gpr[3] = r3;"));
++        Assert.Equal(1, Count(code, "ctx->gpr[4] = r4;"));
++        var call = code.IndexOf("InvokeDirectCpu<0x80002000u>(ctx);", StringComparison.Ordinal);
++        Assert.True(call > 0);
++        Assert.DoesNotContain("ctx->gpr[4] = r4;", code[call..], StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void CleanRegisterIsNotPublishedAgainAfterABoundaryReloadedIt()
++    {
++        var function = new IrFunction("dirty_clean_after_call", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                Inc("r3"),
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                new IrReturn(null)
++            })
++        });
++
++        var code = Emit(function);
++
++        Assert.Equal(1, Count(code, "ctx->gpr[3] = r3;"));
++        Assert.Contains("r3 = ctx->gpr[3];", code, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void RegisterWrittenOnlyAfterTheLastBoundaryIsNotFlushedAtThatBoundary()
++    {
++        var function = new IrFunction("dirty_late_write", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                Inc("r3"),
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                Inc("r5"),
++                new IrReturn(null)
++            })
++        });
++
++        var code = Emit(function);
++        var call = code.IndexOf("InvokeDirectCpu<0x80002000u>(ctx);", StringComparison.Ordinal);
++
++        var beforeCall = code[..call];
++        Assert.Contains("ctx->gpr[3] = r3;", beforeCall, StringComparison.Ordinal);
++        Assert.DoesNotContain("ctx->gpr[5] = r5;", beforeCall, StringComparison.Ordinal);
++        var afterCall = code[call..];
++        Assert.Contains("ctx->gpr[5] = r5;", afterCall, StringComparison.Ordinal);
++        Assert.DoesNotContain("ctx->gpr[3] = r3;", afterCall, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void JoinOfDirtyAndCleanPathsKeepsTheRegisterDirty()
++    {
++        // entry: r3 modified.  a: r5 modified, then a call (flushes + reloads everything).  b: r6 modified.
++        // At merge: r3 and r6 are dirty on the path through b, r5 is clean on both paths. The return publishes r3
++        // and r6 (not r5); the call in a publishes r3 and r5 (not r6, not yet modified there).
++        var function = new IrFunction("dirty_join", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                Inc("r3"),
++                new IrBranch("beq", "a", "b")
++            }),
++            new IrBasicBlock("a", new IrInstruction[]
++            {
++                Inc("r5"),
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                new IrJump("merge")
++            }),
++            new IrBasicBlock("b", new IrInstruction[]
++            {
++                Inc("r6"),
++                new IrJump("merge")
++            }),
++            new IrBasicBlock("merge", new IrInstruction[]
++            {
++                new IrReturn(null)
++            })
++        });
++
++        var code = Emit(function);
++
++        var blockA = BlockText(code, "loc_a");
++        Assert.Contains("ctx->gpr[3] = r3;", blockA, StringComparison.Ordinal);
++        Assert.Contains("ctx->gpr[5] = r5;", blockA, StringComparison.Ordinal);
++        Assert.DoesNotContain("ctx->gpr[6] = r6;", blockA, StringComparison.Ordinal);
++
++        var merge = BlockText(code, "loc_merge");
++        Assert.Contains("ctx->gpr[3] = r3;", merge, StringComparison.Ordinal);
++        Assert.Contains("ctx->gpr[6] = r6;", merge, StringComparison.Ordinal);
++        Assert.DoesNotContain("ctx->gpr[5] = r5;", merge, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void LoopBackEdgeCarriesDirtyStateIntoTheLoopHeader()
++    {
++        // r3 is modified inside the loop body, and the call in the header runs on every iteration: on the second
++        // iteration r3 is dirty at the header's call, so that call must publish it even though it is clean on
++        // the first entry.
++        var function = new IrFunction("dirty_loop", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                new IrJump("head")
++            }),
++            new IrBasicBlock("head", new IrInstruction[]
++            {
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                Inc("r3"),
++                new IrBranch("bne", "head", "exit")
++            }),
++            new IrBasicBlock("exit", new IrInstruction[]
++            {
++                new IrReturn(null)
++            })
++        });
++
++        var code = Emit(function);
++
++        var head = BlockText(code, "loc_head");
++        var call = head.IndexOf("InvokeDirectCpu<0x80002000u>(ctx);", StringComparison.Ordinal);
++        Assert.True(call > 0);
++        Assert.Contains("ctx->gpr[3] = r3;", head[..call], StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void CleanFunctionEntryPublishesNothingAtAnExitThatFollowsNoWrite()
++    {
++        // r3 is written only on the "set" path; the "skip" path returns at once, publishing nothing.
++        var function = new IrFunction("dirty_skip", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                new IrBranch("beq", "set", "skip")
++            }),
++            new IrBasicBlock("set", new IrInstruction[]
++            {
++                Inc("r3"),
++                new IrReturn(null)
++            }),
++            new IrBasicBlock("skip", new IrInstruction[]
++            {
++                new IrReturn(null)
++            })
++        });
++
++        var code = Emit(function);
++
++        Assert.Equal(1, Count(code, "ctx->gpr[3] = r3;"));
++        Assert.DoesNotContain("ctx->gpr[3] = r3;", BlockText(code, "loc_skip"), StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void ConditionRegisterAndCountRegisterAreTrackedLikeGprs()
++    {
++        var function = new IrFunction("dirty_cr_ctr", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                new IrAssign("ctr", IrValue.Register("r3")),
++                new IrSetCrField(0, IrValue.Register("r3"), IrValue.Imm(0), false),
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                new IrReturn(null)
++            })
++        });
++
++        var code = Emit(function);
++
++        // cr and ctr are published once (at the call) and reloaded; the return has nothing left to publish.
++        Assert.Equal(1, Count(code, "ctx->cr = cr;"));
++        Assert.Equal(1, Count(code, "ctx->ctr = ctr;"));
++    }
++
++    [Fact]
++    public void IndirectJumpPublishesDirtyRegistersAndTrackingContinuesPastTheExit()
++    {
++        // The default arm of a jump table leaves the frame; its write-back must not make the register look clean
++        // on the case edges.
++        var function = new IrFunction("dirty_jump_table", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                Inc("r3"),
++                new IrJumpTable("r4", new[]
++                {
++                    new IrJumpTableCase(0x80001010u, "t0"),
++                    new IrJumpTableCase(0x80001020u, "t1")
++                })
++            }),
++            new IrBasicBlock("t0", new IrInstruction[]
++            {
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                new IrReturn(null)
++            }),
++            new IrBasicBlock("t1", new IrInstruction[]
++            {
++                new IrReturn(null)
++            })
++        });
++
++        var code = Emit(function);
++
++        // default arm, t0's call and t1's return each publish r3 (dirty from entry on every path).
++        Assert.Equal(3, Count(code, "ctx->gpr[3] = r3;"));
++        Assert.Contains("ctx->gpr[3] = r3;", BlockText(code, "loc_t1"), StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void EdgeNormalizationWriteMakesTheRegisterDirtyOnThatEdgeOnly()
++    {
++        // f5 is produced as a paired value, flushed and reloaded by a call (clean), then normalized to scalar on the
++        // edge into "merge". The edge write makes f5 dirty at merge's return; the other predecessor leaves it clean.
++        var function = new IrFunction("dirty_edge", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                new IrBranch("beq", "paired", "scalar")
++            }),
++            new IrBasicBlock("paired", new IrInstruction[]
++            {
++                new IrCall("f5", "PPC_PsMul", new[] { IrValue.Register("f1"), IrValue.Register("f2") }),
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                new IrJump("merge")
++            }),
++            new IrBasicBlock("scalar", new IrInstruction[]
++            {
++                new IrAssign("f5", IrValue.Register("f3")),
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                new IrJump("merge")
++            }),
++            new IrBasicBlock("merge", new IrInstruction[]
++            {
++                new IrCall("f6", "PPC_PsNeg", new[] { IrValue.Register("f5") }),
++                new IrReturn(null)
++            })
++        });
++        var types = new RepresentationEnvironment(new Dictionary<string, ValueRepresentation>
++        {
++            ["f1"] = ValueRepresentation.Float64,
++            ["f2"] = ValueRepresentation.Float64,
++            ["f3"] = ValueRepresentation.Float64,
++            ["f5"] = ValueRepresentation.Float64,
++            ["f6"] = ValueRepresentation.Float64,
++            ["cr0"] = ValueRepresentation.UInt32
++        });
++
++        var code = Emit(function, types);
++
++        Assert.Contains("f5.d = PPC_PsToScalarInline(f5.d);", code, StringComparison.Ordinal);
++        var merge = BlockText(code, "loc_merge");
++        // f5 reached merge clean on both paths, and normalization wrote it on one edge: dirty, so published.
++        Assert.Contains("ctx->fpr[5] = f5;", merge, StringComparison.Ordinal);
++        // f6 is produced in merge itself.
++        Assert.Contains("ctx->fpr[6] = f6;", merge, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void IndirectCallIsAFullBoundaryAndLeavesEveryRegisterClean()
++    {
++        var function = new IrFunction("dirty_indirect_call", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                Inc("r3"),
++                Inc("r4"),
++                new IrIndirectCall(string.Empty, IrValue.Register("r5"), Array.Empty<IrValue>()),
++                new IrReturn(null)
++            })
++        });
++
++        var code = Emit(function);
++
++        Assert.Equal(1, Count(code, "ctx->gpr[3] = r3;"));
++        Assert.Equal(1, Count(code, "ctx->gpr[4] = r4;"));
++    }
++
++    [Fact]
++    public void FunctionWithLrContinuationLabelsKeepsPublishingEveryWrittenRegister()
++    {
++        // The callee may resume this body at the continuation label with state the dataflow does not model, so a
++        // function that has one stays on the old write-back-everything-written behaviour.
++        var function = new IrFunction("dirty_lr_continuation", "0x800E591C", new[]
++        {
++            new IrBasicBlock("0x800E591C", new IrInstruction[]
++            {
++                new IrAssign("r4", IrValue.Imm(5)),
++                new IrAssign("lr", IrValue.Imm(unchecked((int)0x800E5920u))),
++                new IrCall(string.Empty, "0x8179AC3C", Array.Empty<IrValue>()),
++                new IrAssign("r3", IrValue.Imm(8)),
++                new IrReturn(null)
++            }),
++            new IrBasicBlock("0x800E5934", new IrInstruction[]
++            {
++                new IrAssign("r3", IrValue.Imm(1)),
++                new IrReturn(null)
++            })
++        });
++        var types = new RepresentationEnvironment(new Dictionary<string, ValueRepresentation>
++        {
++            ["lr"] = ValueRepresentation.UInt32,
++            ["r3"] = ValueRepresentation.UInt32,
++            ["r4"] = ValueRepresentation.UInt32
++        });
++
++        var code = new CxxLinearCodeGenerator().Emit(
++            0x800E591C,
++            new SsaTransformer().Convert(function),
++            new FunctionAbiClassification(function.Name, ValueRepresentation.Void),
++            types,
++            lrContinuationCallTargets: new HashSet<uint> { 0x8179AC3Cu }).ReplaceLineEndings(Lf);
++
++        var continuation = BlockText(code, "loc_800E5934");
++        Assert.Contains("ctx->gpr[3] = r3;", continuation, StringComparison.Ordinal);
++        Assert.Contains("ctx->gpr[4] = r4;", continuation, StringComparison.Ordinal);
++    }
++
++    private static GuestAbiContract Contract(uint gprRead = 0, uint gprWrite = 0) =>
++        new(
++            GprReadBeforeWriteMask: gprRead,
++            GprPossibleWriteMask: gprWrite,
++            GprReturnMask: 0,
++            FprReadBeforeWriteMask: 0,
++            FprPossibleWriteMask: 0,
++            FprReturnMask: 0,
++            CrReadBeforeWriteMask: 0,
++            CrPossibleWriteMask: 0,
++            ReadsXerBeforeWrite: false,
++            MayWriteXer: false,
++            ReadsCtrBeforeWrite: false,
++            MayWriteCtr: false,
++            ReadsLrBeforeWrite: false,
++            MayWriteLr: false,
++            BoundaryFlags: GuestCallBoundaryFlags.None,
++            DirectCallTargets: Array.Empty<uint>());
++
++    [Fact]
++    public void NarrowContractFlushLeavesTheFlushedRegisterCleanWithoutAReload()
++    {
++        // The callee only reads r3: the call publishes r3 and does not reload it, so the return must not publish
++        // it a second time. r4 (written, outside the contract) stays dirty across the call.
++        var function = new IrFunction("dirty_narrow", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                Inc("r3"),
++                Inc("r4"),
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                new IrReturn(null)
++            })
++        });
++
++        var code = new CxxLinearCodeGenerator().Emit(
++            0x80001000u,
++            new SsaTransformer().Convert(function),
++            new FunctionAbiClassification(function.Name, ValueRepresentation.Void),
++            new RepresentationEnvironment(new Dictionary<string, ValueRepresentation>()),
++            guestAbiContracts: new Dictionary<uint, GuestAbiContract>
++            {
++                [0x80002000u] = Contract(gprRead: 1u << 3)
++            }).ReplaceLineEndings(Lf);
++
++        Assert.Equal(1, Count(code, "ctx->gpr[3] = r3;"));
++        Assert.Equal(1, Count(code, "ctx->gpr[4] = r4;"));
++        var call = code.IndexOf("InvokeDirectCpu<0x80002000u>(ctx);", StringComparison.Ordinal);
++        Assert.True(call > 0);
++        Assert.DoesNotContain("ctx->gpr[3] = r3;", code[call..], StringComparison.Ordinal);
++        Assert.Contains("ctx->gpr[4] = r4;", code[call..], StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void StateFreeFastArmResultStaysDirtyAfterTheSlowArmCleanedIt()
++    {
++        // Fast arm: the result lands in the r3 local only (dirty). Slow arm: flush + call + reload (clean). After
++        // the join r3 is dirty, so the return publishes it; r4 was dirty before the call and is not touched by
++        // the fast arm, so it is dirty too.
++        var function = new IrFunction("dirty_state_free", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                Inc("r4"),
++                new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
++                new IrReturn(null)
++            })
++        });
++
++        var code = new CxxLinearCodeGenerator().Emit(
++            0x80001000u,
++            new SsaTransformer().Convert(function),
++            new FunctionAbiClassification(function.Name, ValueRepresentation.Void),
++            new RepresentationEnvironment(new Dictionary<string, ValueRepresentation>()),
++            stateFreeAbiContracts: new Dictionary<uint, GuestAbiContract>
++            {
++                [0x80002000u] = Contract(gprRead: 1u << 3, gprWrite: 1u << 3)
++            },
++            stateFreeCallSymbols: new Dictionary<uint, string> { [0x80002000u] = "callee_native" })
++            .ReplaceLineEndings(Lf);
++
++        var elseArm = code.IndexOf("} else {", StringComparison.Ordinal);
++        var slowEnd = code.IndexOf("\n    }\n", elseArm, StringComparison.Ordinal);
++        Assert.True(elseArm > 0 && slowEnd > elseArm, code);
++        var afterCall = code[slowEnd..];
++        Assert.Contains("ctx->gpr[3] = r3;", afterCall, StringComparison.Ordinal);
++        Assert.Contains("ctx->gpr[4] = r4;", afterCall, StringComparison.Ordinal);
++        // The slow arm itself publishes what is dirty at that point (r4 only: r3 is not yet written there).
++        var slowArm = code[elseArm..slowEnd];
++        Assert.Contains("ctx->gpr[4] = r4;", slowArm, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void BlockNoRecordedEdgeReachesStartsWithEverythingDirty()
++    {
++        var function = new IrFunction("dirty_unreached", "entry", new[]
++        {
++            new IrBasicBlock("entry", new IrInstruction[]
++            {
++                Inc("r3"),
++                new IrReturn(null)
++            }),
++            new IrBasicBlock("orphan", new IrInstruction[]
++            {
++                new IrReturn(null)
++            })
++        });
++
++        var code = Emit(function);
++
++        Assert.Contains("ctx->gpr[3] = r3;", BlockText(code, "loc_orphan"), StringComparison.Ordinal);
++    }
++}
+diff --git a/translator/tests/Translator.Tests/RuntimeNativeLogOnlyContextTests.cs b/translator/tests/Translator.Tests/RuntimeNativeLogOnlyContextTests.cs
+new file mode 100644
+index 0000000..a896947
+--- /dev/null
++++ b/translator/tests/Translator.Tests/RuntimeNativeLogOnlyContextTests.cs
+@@ -0,0 +1,75 @@
++using System;
++using System.IO;
++using Translator.Core.Analysis;
++using Xunit;
++
++namespace Translator.Tests;
++
++/// <summary>
++/// The native effect analyzer reads each native's own body text. A native that reads pc/lr of the current context
++/// only to log an error keeps a narrow, signature-derived contract when that read lives in a helper function, and
++/// gets the whole-context contract when it is spelled in the body (the situation this split removes).
++/// </summary>
++public sealed class RuntimeNativeLogOnlyContextTests
++{
++    private static RuntimeNativeGuestEffectSet Analyze(string source)
++    {
++        var directory = Path.Combine(Path.GetTempPath(), $"mkw-native-logonly-{Guid.NewGuid():N}");
++        Directory.CreateDirectory(directory);
++        try
++        {
++            File.WriteAllText(Path.Combine(directory, "fixture.cpp"), source);
++            return RuntimeNativeGuestEffectAnalyzer.AnalyzeDirectory(directory);
++        }
++        finally
++        {
++            Directory.Delete(directory, recursive: true);
++        }
++    }
++
++    [Fact]
++    public void ContextReadInsideTheBodyGivesTheWholeContextContract()
++    {
++        var effects = Analyze("""
++            extern "C" void LogsInBody(uint32_t first, uint32_t second) {
++                if (first == 0) {
++                    auto* cpu = TryGetCpuContext();
++                    Log(cpu ? cpu->pc : 0u);
++                }
++                Work(first, second);
++            }
++            PPC_NATIVE_OVERRIDE_VOID(80001234, LogsInBody, (uint32_t first, uint32_t second), (first, second));
++            """);
++
++        var contract = effects.Contracts[0x80001234u];
++        Assert.True((contract.BoundaryFlags & GuestCallBoundaryFlags.RequiresCompleteContext) != 0);
++        Assert.NotEqual((1u << 3) | (1u << 4), contract.GprReadBeforeWriteMask);
++    }
++
++    [Fact]
++    public void ContextReadMovedToAHelperKeepsTheSignatureContract()
++    {
++        var effects = Analyze("""
++            __attribute__((noinline)) static void DiagPcLr(uint32_t& pc, uint32_t& lr) {
++                auto* cpu = TryGetCpuContext();
++                pc = cpu ? cpu->pc : 0u;
++                lr = cpu ? cpu->lr : 0u;
++            }
++            extern "C" void LogsInHelper(uint32_t first, uint32_t second) {
++                if (first == 0) {
++                    uint32_t pc, lr;
++                    DiagPcLr(pc, lr);
++                    Log(pc, lr);
++                }
++                Work(first, second);
++            }
++            PPC_NATIVE_OVERRIDE_VOID(80001234, LogsInHelper, (uint32_t first, uint32_t second), (first, second));
++            """);
++
++        var contract = effects.Contracts[0x80001234u];
++        Assert.False(contract.HasFullSynchronizationFence);
++        Assert.Equal((1u << 3) | (1u << 4), contract.GprReadBeforeWriteMask);
++        Assert.Equal(0u, contract.GprPossibleWriteMask);
++        Assert.Contains(0x80001234u, effects.PreciseContracts);
++    }
++}
