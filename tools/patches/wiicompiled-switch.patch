@@ -1474,7 +1474,7 @@ index 8b021fe..2e3580f 100644
  
  void GXSetTevColorIn(GXTevStageID stageId, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d) {
 diff --git a/aurora-main/lib/dolphin/gx/GXTexture.cpp b/aurora-main/lib/dolphin/gx/GXTexture.cpp
-index 684ba79..29f7082 100644
+index 684ba79..929dbb6 100644
 --- a/aurora-main/lib/dolphin/gx/GXTexture.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXTexture.cpp
 @@ -1,5 +1,6 @@
@@ -1593,7 +1593,7 @@ index 684ba79..29f7082 100644
  } // namespace
  
  extern "C" {
-@@ -211,12 +287,46 @@ void GXInitTexObjLOD(GXTexObj* obj_, GXTexFilter minFilt, GXTexFilter magFilt, f
+@@ -211,12 +287,52 @@ void GXInitTexObjLOD(GXTexObj* obj_, GXTexFilter minFilt, GXTexFilter magFilt, f
    SET_REG_FIELD(0, obj->mode1, 8, 8, static_cast<u8>(16.0f * clampedMax));
  }
  
@@ -1619,6 +1619,12 @@ index 684ba79..29f7082 100644
 +  static const int lock = aurora_gx_g7_enabled() != 0 ? g7_env("WIICOMPILED_GX_G7_LOCK", 1) : 0;
 +  return lock;
 +}
++// P38 (local/tmp/cpu/P38-tex.py): the texture/TLUT shortcuts of the runtime's texture-object path
++// (gx_objects.cpp, gx_texture.cpp). WIICOMPILED_GX_TEXFAST=0 turns them off.
++int aurora_gx_texfast_enabled(void) {
++  static const int enabled = g7_env("WIICOMPILED_GX_TEXFAST", 1);
++  return enabled;
++}
 +#endif
 +
  void GXInitTexObjData(GXTexObj* obj_, const void* data) {
@@ -1640,7 +1646,7 @@ index 684ba79..29f7082 100644
  void GXInitTexObjWrapMode(GXTexObj* obj_, GXTexWrapMode wrapS, GXTexWrapMode wrapT) {
    auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
    SET_REG_FIELD(0, obj->mode0, 2, 0, wrapS);
-@@ -278,18 +388,56 @@ void* GXGetTexObjUserData(const GXTexObj* obj_) {
+@@ -278,18 +394,56 @@ void* GXGetTexObjUserData(const GXTexObj* obj_) {
    return const_cast<void*>(obj->userData);
  }
  
@@ -1699,7 +1705,7 @@ index 684ba79..29f7082 100644
    GX_WRITE_RAS_REG(obj->mode0);
    GX_WRITE_RAS_REG(obj->mode1);
    GX_WRITE_RAS_REG(obj->image0);
-@@ -419,6 +567,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
+@@ -419,6 +573,29 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
  
  void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
    auto* obj = reinterpret_cast<const GXTlutObj_*>(obj_);
@@ -10371,10 +10377,10 @@ index 0000000..047553e
 +}
 diff --git a/runtime/src/hle/gx/gx_batch_profile.h b/runtime/src/hle/gx/gx_batch_profile.h
 new file mode 100644
-index 0000000..0031d21
+index 0000000..56ac238
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_batch_profile.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,31 @@
 +#pragma once
 +#if defined(__SWITCH__)
 +#include <atomic>
@@ -10386,6 +10392,7 @@ index 0000000..0031d21
 +inline const bool kFifoEnabled = Flag("WIICOMPILED_GX_BATCH_FIFO"); inline bool FifoEnabled() { return kFifoEnabled; }
 +inline const bool kDlEnabled = Flag("WIICOMPILED_GX_BATCH_DL"); inline bool DlEnabled() { return kDlEnabled; }
 +inline const bool kPrepEnabled = Flag("WIICOMPILED_GX_BATCH_PREP"); inline bool PrepEnabled() { return kPrepEnabled; }
++inline const bool kReplay = Flag("WIICOMPILED_GX_REPLAY"); inline bool ReplayEnabled() { return kReplay; }
 +inline const bool kProfile = Flag("WIICOMPILED_GX_BATCH_PROFILE",false); inline bool Profile() { return kProfile; }
 +enum Counter { ScalarWords, BurstWords, CachedDl, CacheFallback, XfWords, ArrayDirect, ArrayFallback, VatRow, Count };
 +inline std::atomic<uint64_t> hits[Count]{};
@@ -10407,10 +10414,10 @@ index 0000000..0031d21
 +#endif
 diff --git a/runtime/src/hle/gx/gx_batch_xf.inc b/runtime/src/hle/gx/gx_batch_xf.inc
 new file mode 100644
-index 0000000..f53b15f
+index 0000000..eddce74
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_batch_xf.inc
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,71 @@
 +// Matrix XF payloads arrive as scalar FIFO floats. While the packet is incomplete,
 +// the old parser only appended four bytes and reread the same header before returning.
 +// Leave the final word to that parser so dispatch, callbacks and consumption stay identical.
@@ -10425,6 +10432,60 @@ index 0000000..f53b15f
 +    if (g.fifoByteCount+4u>=packetBytes) return false;
 +    BigEndian::Write32(data+g.fifoByteCount,value);
 +    g.fifoByteCount+=4u;
++    GxBatch::CountHit(GxBatch::XfWords);
++    return true;
++}
++// Matrix XF payloads arrive as scalar FIFO writes: Write8(0x10), Write32(header), N floats (the
++// game's hand-written matrix loads, ~220 a frame, 41 bytes each). While the packet is incomplete the
++// old parser only appended the bytes and, finding the packet short, left the ring untouched; the final
++// word completed it (GXCallDisplayList + GXMarkFrameWork + consume).
++// P37: all three kinds of word are handled here, in the same order with the same ring stores.
++//   * command byte (ring empty, XF opcode): the general parser stores it and stops at "fewer than 5 bytes".
++//   * the header word and every payload word that leaves the packet short: store the bytes, stop (the
++//     packet is at least 9 bytes, so 5..8 buffered bytes are still short).
++//   * the word that completes the packet exactly: store it, then what the parser does on a full packet
++//     (the aurora list call, the frame-work mark, the consume), which empties the ring.
++// Anything else (no room for the bytes, a ring the parser would compact, another opcode, a packet the
++// word would overshoot, GxBatch::ReplayEnabled() off) goes to the general parser unchanged.
++static inline bool TryXfFifoWord(u32 value, uint32_t sizeBytes) {
++    auto& g=g_hleGxState;
++    const size_t cap=g.fifoBytes.size();
++    if (g.fifoReadOffset>cap || g.fifoByteCount>cap-g.fifoReadOffset) return false;
++    const size_t room=cap-g.fifoReadOffset-g.fifoByteCount;
++    uint8_t* data=g.fifoBytes.data()+g.fifoReadOffset;
++    if (sizeBytes==1u) {
++        if (g.fifoByteCount!=0 || room<1u ||
++            (static_cast<uint8_t>(value)&GX_OPCODE_MASK_CMD)!=GX_LOAD_XF_REG_CMD) return false;
++        data[0]=static_cast<uint8_t>(value);
++        g.fifoByteCount=1u;
++        GxBatch::CountHit(GxBatch::XfWords);
++        return true;
++    }
++    const size_t n=g.fifoByteCount;
++    if (n==0 || room<4u || (data[0]&GX_OPCODE_MASK_CMD)!=GX_LOAD_XF_REG_CMD) return false;
++    if (n<5u) {
++        // Header not complete yet: the packet is at least 9 bytes, the result at most 8.
++        BigEndian::Write32(data+n,value);
++        g.fifoByteCount=n+4u;
++        GxBatch::CountHit(GxBatch::XfWords);
++        return true;
++    }
++    const uint32_t packetBytes=5u+(static_cast<uint32_t>(ReadBE16(data+1))+1u)*4u;
++    if (n+4u<packetBytes) {
++        BigEndian::Write32(data+n,value);
++        g.fifoByteCount=n+4u;
++        GxBatch::CountHit(GxBatch::XfWords);
++        return true;
++    }
++    if (n+4u!=packetBytes) return false;
++    BigEndian::Write32(data+n,value);
++    g.fifoByteCount=packetBytes;
++    GXCallDisplayList(data,packetBytes);
++    GXMarkFrameWork();
++    // consumeBytes(packetBytes): the ring is empty again, so its offset resets.
++    g.fifoReadOffset+=packetBytes;
++    g.fifoByteCount-=packetBytes;
++    if (g.fifoByteCount==0) g.fifoReadOffset=0;
 +    GxBatch::CountHit(GxBatch::XfWords);
 +    return true;
 +}

@@ -1,3 +1,282 @@
+diff --git a/runtime/src/hle/storage/nand_async.cpp b/runtime/src/hle/storage/nand_async.cpp
+index aeb1962..a9fce54 100644
+--- a/runtime/src/hle/storage/nand_async.cpp
++++ b/runtime/src/hle/storage/nand_async.cpp
+@@ -4,6 +4,9 @@
+ // Shared state and helpers live in nand_internal.h.
+ 
+ #include "nand_internal.h"
++#if defined(__SWITCH__)
++#include <atomic>
++#endif
+ 
+ // Guest callback dispatch: host NAND work completes synchronously, so an "async" call just
+ // queues its guest completion callback here and an HLE pump dispatches it later.
+@@ -16,6 +19,19 @@ struct PendingNandCallback {
+ 
+ static std::mutex g_pendingNandCallbackMutex;
+ static std::deque<PendingNandCallback> g_pendingNandCallbacks;
++#if defined(__SWITCH__)
++// P24: g_pendingNandCallbacks.size(), kept under the mutex. The alarm pass that pumps the queue runs
++// thousands of times a second with the queue empty; it no longer takes the lock to find that out.
++// WIICOMPILED_ALLOC_FAST=0 restores the locked check.
++static std::atomic<uint32_t> g_pendingNandCallbackCount{0};
++static bool NandAllocFastEnabled() {
++    static const bool enabled = [] {
++        const char* v = std::getenv("WIICOMPILED_ALLOC_FAST");
++        return !(v != nullptr && v[0] == '0');
++    }();
++    return enabled;
++}
++#endif
+ 
+ static void DispatchNandCallback(CpuContext* cpu, uint32_t callbackPtr, int32_t result, uint32_t commandBlock) {
+     if (callbackPtr == 0) {
+@@ -54,6 +70,9 @@ static void InvokeNandCallback(uint32_t callbackPtr, int32_t result, uint32_t co
+ 
+     std::lock_guard<std::mutex> lock(g_pendingNandCallbackMutex);
+     g_pendingNandCallbacks.push_back({callbackPtr, result, commandBlock});
++#if defined(__SWITCH__)
++    g_pendingNandCallbackCount.store(static_cast<uint32_t>(g_pendingNandCallbacks.size()), std::memory_order_release);
++#endif
+ }
+ 
+ void NandQueueIosCallback(uint32_t callbackPtr, int32_t result, uint32_t callbackArg) {
+@@ -73,6 +92,12 @@ bool NandProcessPendingCallbacks(CpuContext* cpu, int maxToProcess) {
+     if (g_nandCallbackDrainDepth != 0) {
+         return false;
+     }
++#if defined(__SWITCH__)
++    // P24: with nothing queued the loop below would lock, see an empty deque and return false.
++    if (NandAllocFastEnabled() && g_pendingNandCallbackCount.load(std::memory_order_acquire) == 0) {
++        return false;
++    }
++#endif
+     struct DrainScope {
+         DrainScope() { ++g_nandCallbackDrainDepth; }
+         ~DrainScope() { --g_nandCallbackDrainDepth; }
+@@ -92,6 +117,10 @@ bool NandProcessPendingCallbacks(CpuContext* cpu, int maxToProcess) {
+             }
+             cb = g_pendingNandCallbacks.front();
+             g_pendingNandCallbacks.pop_front();
++#if defined(__SWITCH__)
++            g_pendingNandCallbackCount.store(static_cast<uint32_t>(g_pendingNandCallbacks.size()),
++                                             std::memory_order_release);
++#endif
+         }
+         DispatchNandCallback(cpu, cb.callbackPtr, cb.result, cb.commandBlock);
+         ++processed;
+diff --git a/runtime/src/hle/vi.cpp b/runtime/src/hle/vi.cpp
+index b1feb54..3eeccb8 100644
+--- a/runtime/src/hle/vi.cpp
++++ b/runtime/src/hle/vi.cpp
+@@ -18,6 +18,7 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <iostream>
+ #include <mutex>
+ #include <thread>
+@@ -31,6 +32,10 @@
+ 
+ #include <aurora/aurora.h>
+ 
++// aurora gx/fifo_async.inc: the GX decoder maps viewports with the configured size, so queued GX
++// work (WIICOMPILED_GX_FIFO=deferred|thread) is decoded before VIConfigure changes it.
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason);
++
+ // Forward declaration for OSWakeupThread - used to wake threads on VI retrace queue
+ extern "C" void OSWakeupThread_HLE_801aaaa4(CpuContext* ctx);
+ 
+@@ -454,6 +459,28 @@ void VI_HLE_ProcessRetracesDeferred(int maxToProcess) {
+     OS_HLE_EndDeferredGuestCallbacks();
+ }
+ 
++#if defined(__SWITCH__)
++// hle/os: guest sleep timers during host waits (os_scheduler.cpp OS_HLE_PaceRunDueSleepers explains).
++extern "C" bool OS_HLE_PaceRunDueSleepers();
++extern "C" int64_t OS_HLE_EarliestSleepDeadline();
++extern "C" void OS_HLE_NoteHostPace(bool begin);
++
++namespace {
++// WIICOMPILED_PACE_GUEST_TIMERS=0 restores the waits below that ignore guest OSSleepTicks deadlines.
++bool PaceGuestTimersEnabled() {
++    static const bool enabled = [] {
++        const char* v = std::getenv("WIICOMPILED_PACE_GUEST_TIMERS");
++        return !(v != nullptr && *v == '0');
++    }();
++    return enabled;
++}
++
++Clock::time_point EarliestGuestSleepDeadline() {
++    return Clock::time_point{Clock::duration{OS_HLE_EarliestSleepDeadline()}};
++}
++} // namespace
++#endif
++
+ void VI_HLE_WaitForNextRetracePoll() {
+     Clock::time_point retraceDeadline;
+     {
+@@ -466,6 +493,19 @@ void VI_HLE_WaitForNextRetracePoll() {
+     if (now >= retraceDeadline) {
+         return;
+     }
++#if defined(__SWITCH__)
++    // The idle loop fires sleep timers on every pass: end this wait at the next OSSleepTicks
++    // deadline instead of up to 1 ms past it (the 5 ms sound ticker's wakes).
++    if (PaceGuestTimersEnabled()) {
++        const auto guestDue = EarliestGuestSleepDeadline();
++        if (guestDue < retraceDeadline && guestDue < now + 1ms) {
++            if (guestDue > now) {
++                SleepPreciselyUntil(guestDue);
++            }
++            return;
++        }
++    }
++#endif
+     // Audio DMA and alarm queues still need regular service even when the VI
+     // deadline is farther away. The high-resolution wait removes the 1 ms
+     // scheduler overshoot when retrace is the next event.
+@@ -490,11 +530,39 @@ uint64_t s_lastPresentAnchorNanos = 0;
+ // DMA and timers keep running, then delivers that retrace so guest logic starts exactly on the grid.
+ void PaceToRetraceBoundary(Clock::time_point deadline) {
+     constexpr auto kServiceSlice = 1ms;
++#if defined(__SWITCH__)
++    OS_HLE_NoteHostPace(true);
++    // This wait is the main thread's VIWaitForRetrace (os_scheduler.cpp OS_HLE_PaceRunDueSleepers):
++    // a guest OSSleepTicks deadline that falls in it (the 5 ms sound ticker, 3-4 per frame) is woken
++    // at that deadline, as the alarm interrupt does on hardware, instead of after the wait. Deadlines
++    // in the final spin window are left to the preemption point after the present. Bounded: at most
++    // 64 services per wait, and none after the preemption point refuses.
++    int guestTimerServices = PaceGuestTimersEnabled() ? 64 : 0;
++#endif
+     for (;;) {
+         const auto now = Clock::now();
+         if (now >= deadline) {
+             break;
+         }
++#if defined(__SWITCH__)
++        if (guestTimerServices > 0) {
++            const auto guestDue = EarliestGuestSleepDeadline();
++            if (guestDue < deadline - kFinalSpinWindow) {
++                if (guestDue > now) {
++                    SleepPreciselyUntil(std::min(guestDue, now + kServiceSlice));
++                }
++                OS_HLE_ProcessAlarmsDeferred(8);
++                Audio_HLE_PollDeferred();
++                if (Clock::now() >= guestDue) {
++                    --guestTimerServices;
++                    if (!OS_HLE_PaceRunDueSleepers()) {
++                        guestTimerServices = 0;
++                    }
++                }
++                continue;
++            }
++        }
++#endif
+         if (deadline - now > kServiceSlice + kFinalSpinWindow) {
+             SleepPreciselyUntil(now + kServiceSlice);
+             OS_HLE_ProcessAlarmsDeferred(8);
+@@ -508,6 +576,9 @@ void PaceToRetraceBoundary(Clock::time_point deadline) {
+         SleepPreciselyUntil(deadline, true, kFinalSpinWindow);
+         break;
+     }
++#if defined(__SWITCH__)
++    OS_HLE_NoteHostPace(false);
++#endif
+     VI_HLE_ProcessRetracesDeferred(1);
+ }
+ 
+@@ -752,6 +823,7 @@ extern "C" void VIConfigure_HLE_801b9f6c(CpuContext* ctx)
+             renderMode.xfbHeight != 0 ? renderMode.xfbHeight : renderMode.efbHeight;
+     }
+ 
++    aurora_gx_fifo_quiesce(1);
+     ::VIConfigure(&renderMode);
+ 
+     ViSetR3(ctx, 0);
+diff --git a/runtime/src/host_context.cpp b/runtime/src/host_context.cpp
+index 502f72c..885f8bb 100644
+--- a/runtime/src/host_context.cpp
++++ b/runtime/src/host_context.cpp
+@@ -14,7 +14,7 @@
+ 
+ extern "C" void mkw_co_switch(void** targetSp, void** sourceSp);
+ extern "C" void* mkw_co_init(void* stackTop, void (*entry)(void*), void* argument);
+-#elif defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
++#elif defined(__linux__) || defined(__SWITCH__) || (defined(__APPLE__) && defined(__x86_64__))
+ #include <libco.h>
+ 
+ #include <cstdlib>
+@@ -158,7 +158,7 @@ void Switch(Handle target)
+     g_current = source;
+ }
+ 
+-#elif defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
++#elif defined(__linux__) || defined(__SWITCH__) || (defined(__APPLE__) && defined(__x86_64__))
+ 
+ namespace {
+ struct Context {
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 4eef06f..6e0b7f9 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -47,6 +47,8 @@
+ #if defined(_WIN32)
+ #include <windows.h>
+ #include <shellapi.h>
++#elif defined(__SWITCH__)
++#include <unistd.h>
+ #else
+ #include <signal.h>
+ #include <spawn.h>
+@@ -429,6 +431,12 @@ constexpr const char* kRosterEditorPage =
+ 
+ #if defined(_WIN32)
+ std::wstring Quoted(const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; }
++#elif defined(__SWITCH__)
++// A homebrew title cannot start other programs: desktop tools stay on the PC.
++bool SpawnDetached(const std::vector<std::string>& command) {
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: " << command[0] << " is not available on the Switch" << std::endl;
++    return false;
++}
+ #else
+ // Starts a program without waiting for it; the game keeps running. Steam's overlay preload is
+ // dropped so desktop tools (xdg-open, the file manager) do not inherit it.
+@@ -507,6 +515,8 @@ void OpenRosterEditor() {
+     const fs::path page = data / "abrir.html";
+     std::ofstream(page, std::ios::binary | std::ios::trunc) << kRosterEditorPage;
+     ShellExecuteW(nullptr, L"open", page.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++#elif defined(__SWITCH__)
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: PowerUp+ is not available on the Switch" << std::endl;
+ #else
+     namespace fs = std::filesystem;
+     const auto exeDir = RuntimeConfigFile::ExecutableDirectory();
+@@ -692,6 +702,9 @@ bool Relaunch() {
+     CloseHandle(process.hThread);
+     CloseHandle(process.hProcess);
+     return true;
++#elif defined(__SWITCH__)
++    RT_LOG(RT_TAG_RUNTIME) << "launcher: restarting is not available on the Switch" << std::endl;
++    return false;
+ #else
+     setenv("WIICOMPILED_SKIP_LAUNCHER", "1", 1);
+     std::vector<char*> args(g_argv, g_argv + g_argc);
+diff --git a/runtime/src/launcher_controls.cpp b/runtime/src/launcher_controls.cpp
+index 5f029c0..0b51bbe 100644
+--- a/runtime/src/launcher_controls.cpp
++++ b/runtime/src/launcher_controls.cpp
+@@ -51,7 +51,8 @@ void LoadPromptStyle() {
+     if (loaded) return;
+     loaded = true;
+     int value = 1;
+-    if (std::ifstream(PromptPath()) >> value; value >= 0 && value <= 2) promptStyle = value;
++    std::ifstream prompts(PromptPath());
++    if (prompts >> value && value >= 0 && value <= 2) promptStyle = value;
+ }
+ enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
+ struct Capture {
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
 index 7269747..796606b 100644
 --- a/runtime/src/main.cpp
