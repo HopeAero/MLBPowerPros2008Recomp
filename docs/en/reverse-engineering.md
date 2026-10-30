@@ -1331,3 +1331,22 @@ have different pass counts; clocks were not logged. The user saw no graphical
 differences. Pixel equality and sustained 60 fps have not been demonstrated.
 Private logs: `nxlink-P30-before-compression-20261029-230826.log` and
 `nxlink-P30-compression-20261029-225915.log`; details in `docs/traspaso.md`.
+
+### Alpha conversion and XF FIFO entry (P31–P32, 2026-10-29)
+
+P31 reuses `tev_byte_f32` for deko3d GX shader alpha comparison, preserving the
+clamp and resulting byte while replacing the separate round/conversion path.
+`kTevFastSeed` changes so cached modules cannot hide the rewrite. The host test
+extracts the real rewrite function and checks all 1,065,353,217 positive floats
+from 0 to 1, clamp edges, fallback and idempotence. Console GPU savings have
+not yet been measured.
+
+P32 targets `HleFifoWriteGeneral` (~2–4% of P29 late-frame samples). Its existing
+incomplete-XF word append now runs in the small `HleFifoWrite` entry, avoiding
+the large parser's entry/exit for intermediate matrix words. The last word,
+display-list recording, short writes and rejected cases retain the previous
+parser. Phase 83 records folds into phases 75/82 of the Switch patch. Tests
+passed 4,875,000 differential operations and 3,000 alias cases with FIFO/VTXF32
+enabled/disabled, plus a regression checking that intermediate words bypass
+the general parser. P11 confirmed identical reconstructed runtime/Aurora trees.
+No new switches or instrumentation; no CPU frame-time or fps gain is claimed yet.

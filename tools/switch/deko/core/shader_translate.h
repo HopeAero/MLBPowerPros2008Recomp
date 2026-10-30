@@ -63,7 +63,7 @@ constexpr uint32_t kImmediatesUboSlot = 15;
 // of their own, kTevFastSeed, so both variants share one cache file.)
 constexpr uint32_t kTranslateRevision = 2;  // 2: std140 scalar arrays (array_start)
 // The XXH3 seed of a GX module's key when tev_fast_rewrite applies (0: the plain XXH3 of the WGSL)
-constexpr uint64_t kTevFastSeed = 0x7465765f66617374ull;  // "tev_fast"
+constexpr uint64_t kTevFastSeed = 0x7465765f66617332ull;  // "tev_fas2": alpha compare uses tev_byte_f32 too
 
 struct SlotBinding {
     enum class Kind : uint8_t { Uniform, Storage, Sampler, Immediates };
@@ -109,6 +109,7 @@ bool post_pass(std::string* glsl, const std::vector<SamplerSlot>& samplerSlots, 
 //                        (one FMNMX, one FADD, one IADD: full rate)
 //   f32(tev_regular_i32(...)) / 255.0   (I2F, quarter rate)
 //                     -> tev_i2f(...) / 255.0, tev_i2f(n) = bitcast<f32>(n + 0x4B400000) - 1.5 * 2^23
+// Alpha compare's u32(round(clamp(prev.a, 0, 1) * 255)) also reuses tev_byte_f32 (seed revision 2).
 // Exact: adding 1.5 * 2^23 to a float y with |y| < 2^22 rounds it to the nearest integer, ties to
 // even (the FADD's rounding, as round()), and leaves that integer in the low mantissa bits; the
 // reverse holds for any integer |n| < 2^22. y = x * 255.0 is rounded first exactly as before: the

@@ -460,3 +460,43 @@ netloader, se reenvió `P30-compression.nro` a
 `mlbpowerpros2008/MLBPowerPros2008.nro` con los diagnósticos apagados y
 `--no-server`; transferencia completada (exit 0). La SD queda con la versión
 modificada, sin iniciar otra captura de rendimiento.
+
+## P31–P32: GPU alfa y CPU FIFO XF (2026-10-29)
+
+El usuario pidió continuar con GPU y luego CPU, manteniendo cambios directos
+sin interruptores nuevos y sin diagnósticos adicionales en las mediciones.
+
+- **P31, GPU:** `tev_fast_rewrite` reutiliza `tev_byte_f32` para el byte de la
+  comparación alfa. Conserva clamp y redondeo. Semilla de módulos revisada para
+  invalidar la variante anterior de caché. Test reproducible sin datos del juego:
+  `python tools/switch/deko/test_tev_alpha.py local/tools/llvm-mingw-20260616-ucrt-x86_64/bin/clang++.exe`.
+  Pasó para los 1.065.353.217 floats entre 0 y 1, límites del clamp,
+  fallback/idempotencia y cambio de clave. El test de reescritura falló antes
+  del cambio y pasó después. NRO GPU sola: `local/switch/build/P31-alpha.nro`,
+  SHA-256 `77dc8f1a5f683b092e8679666908358e1a50bd69cedcc3ec618e16e4c9d125aa`.
+- **P32, CPU:** a partir del perfil P29 existente, se trasladó
+  `TryIncompleteXfFifoWord` del parser grande a la entrada pequeña. No cambia
+  los bytes, el despacho final ni los callbacks. Prueba local:
+  `python local/tmp/cpu/P32-test/run.py`; 4.875.000 operaciones diferenciales,
+  3.000 alias y regresión de entradas al parser. Esta regresión falló antes y
+  pasó después. Conserva el camino de grabación y los fallbacks existentes.
+  Fase 83 registrada con folds en 75/82 por `local/tmp/cpu/P32-fold.py`.
+  Regenerados los tres parches (solo `-2.patch` cambió); P11 pasó y confirmó
+  runtime/Aurora idénticos al árbol reconstruido.
+
+No se tocaron audio ni código generado (48.223 archivos sin cambios en ambos
+builds). P31 y P32 compilaron con cuatro jobs. NRO combinada privada:
+`local/switch/build/P32-alpha-xf.nro`, SHA-256
+`7688d51094f81a073467e16ab3cb962abeb156cc64636d6c12d4740036aa87e1`.
+El ELF AArch64 confirma una entrada de 160 bytes de pila en el parser general,
+que ya no se recorre para las palabras XF intermedias (el front usa 32 bytes).
+P11, el test GPU final y el control de contenido pasaron; la cadena de patches
+conserva las 26 líneas de espacios finales heredadas conocidas. No hay cambios
+de espacios finales nuevos en el diff de esta tanda.
+
+Faltan mediciones limpias y comprobación visual de estos dos cambios en consola.
+Se pidió al usuario netloader y se espera su «listo»; aún no se envió P31/P32.
+La primera
+ejecución de P31/P32 recompilará los módulos de shader con clave nueva: medir
+cuando termine el calentamiento y no haya shaders omitidos/fallidos. No usar
+la mejora previa de ~1 ms de P30 como resultado de P31/P32.

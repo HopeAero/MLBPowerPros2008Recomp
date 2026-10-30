@@ -469,6 +469,12 @@ uint32_t tev_fast_rewrite(std::string* wgsl) {
     }
     std::sort(sites.begin(), sites.end(), [](const Site& a, const Site& b) { return a.at > b.at; });
     for (const Site& s : sites) wgsl->replace(s.at, strlen(s.from), s.to);
+    // Alpha compare needs the same rounded byte; reuse the full-rate conversion already in this module.
+    static const char kAlpha[] = "u32(round(clamp(prev.a, 0.0, 1.0) * 255.0))";
+    if (const size_t at = wgsl->find(kAlpha); at != std::string::npos) {
+        wgsl->replace(at, strlen(kAlpha), "u32(tev_byte_f32(clamp(prev.a, 0.0, 1.0)))");
+        return uint32_t(sites.size()) + 1;
+    }
     return uint32_t(sites.size());
 }
 

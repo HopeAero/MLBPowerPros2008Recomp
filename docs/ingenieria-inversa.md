@@ -1340,3 +1340,25 @@ distinta cantidad de pasadas; los relojes no quedaron registrados. El usuario
 no vio diferencias gráficas. No se hizo comparación píxel a píxel ni se
 demostraron 60 fps sostenidos. Logs privados: `nxlink-P30-before-compression-20261029-230826.log`
 y `nxlink-P30-compression-20261029-225915.log`; detalle en `docs/traspaso.md`.
+
+### Conversión alfa y entrada FIFO XF (P31–P32, 2026-10-29)
+
+P31 reutiliza `tev_byte_f32` para cuantizar la comparación alfa de los shaders
+GX de deko3d, en lugar de otra secuencia `round` + conversión flotante/entero.
+Conserva el clamp y el byte resultante; cambia la semilla `kTevFastSeed` para
+que los módulos antiguos no oculten el cambio. El test host extrae la función
+real de reescritura y comprueba todos los 1.065.353.217 floats positivos entre
+0 y 1, los límites del clamp, el fallback y la idempotencia. No se ha medido
+todavía su efecto GPU en consola.
+
+P32 responde a `HleFifoWriteGeneral` (~2–4% de muestras tardías en P29): el
+atajo existente que añade una palabra de una matriz XF incompleta estaba
+dentro del parser grande y pagaba su entrada/salida por cada palabra. Ahora
+se ejecuta en `HleFifoWrite`, antes de entrar en ese parser. La última palabra,
+las listas en grabación, escrituras cortas y casos rechazados conservan el
+parser anterior. Folds en fases 75/82 y registro de fase 83; solo cambia el
+parche Switch. Pasaron 4.875.000 operaciones diferenciales y 3.000 casos de
+alias, con FIFO/VTXF32 activos y apagados, más la regresión que comprueba que
+las palabras intermedias no entran en el parser general. P11 confirmó runtime
+y Aurora idénticos al árbol reproducido. No hay interruptores ni instrumentación
+nuevos; no se atribuye aún una mejora de fps o ms de CPU.
