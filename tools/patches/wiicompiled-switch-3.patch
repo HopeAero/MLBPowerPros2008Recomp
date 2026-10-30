@@ -1,0 +1,1363 @@
+diff --git a/runtime/src/platform/switch/switch_io.cpp b/runtime/src/platform/switch/switch_io.cpp
+new file mode 100644
+index 0000000..f9801bc
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_io.cpp
+@@ -0,0 +1,389 @@
++// Two main-thread costs on Horizon, linked in with -Wl,--wrap (PublicProducts.cmake):
++//
++// 1. WIICOMPILED_SWITCH_IO_LOG=1: every SD card operation goes through libnx's fs calls (fsdev's
++//    open/read/write/stat/close, romfs, SQLite, the shader caches). Each is an IPC to the fs
++//    service, a millisecond or more on the SD card. The wrappers count them per thread, time the
++//    main thread's (core 0, the game's fibers) and name their files; every 30 s a thread of its
++//    own prints the totals and the costliest paths to stderr. Off: one load and a getenv a second.
++// 2. SDL's Switch keyboard poll (SDL_switchkeyboard.c) calls SDL_SendKeyboardKey for each of the
++//    231 scancodes on every SDL_PumpEvents, with or without a keyboard. With no key down on the
++//    keyboard and none down in SDL's state, every one of those calls returns without doing anything
++//    (a key-up for a key that is up), so the poll is skipped then. A key down, or one SDL still
++//    holds down, runs it as before: the same events (repeats included) in the same order.
++#if defined(__SWITCH__)
++#include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++#include <SDL3/SDL_keyboard.h>
++#include <switch.h>
++
++namespace {
++enum Op { kOpen, kRead, kWrite, kFlush, kClose, kSize, kStat, kCreate, kDelete, kRename, kDir, kCommit, kOps };
++const char* const kOpNames[kOps] = {"open",   "read",   "write",  "flush", "close", "size",
++                                    "stat",   "create", "delete", "rename", "dir",  "commit"};
++
++struct Totals {
++    u64 count[kOps] = {};
++    u64 ns[kOps] = {};
++    u64 bytes = 0;
++    u64 Count() const { u64 n = 0; for (u64 c : count) n += c; return n; }
++    u64 Ns() const { u64 n = 0; for (u64 t : ns) n += t; return n; }
++};
++struct PathStats {
++    Totals totals;
++    u64 maxNs = 0;
++};
++
++// Never destroyed: threads may still reach the fs calls while the process exits.
++struct Log {
++    std::mutex mutex;
++    std::unordered_map<u64, std::string> names;  // open FsFile / FsDir (session, object id) -> path
++    std::unordered_map<std::string, PathStats> mainPaths;
++    Totals main, other;
++    u64 mainMaxNs = 0;
++    std::string mainMaxWhat;
++    u64 windowStart = 0;
++};
++Log& L() {
++    static Log* log = new Log;
++    return *log;
++}
++
++// 0: before this file's static initialisation (libnx mounts the SD card and romfs earlier), 1: off
++// so far (the variable comes from nxlink's arguments, which main() turns into the environment), 2: on.
++std::atomic<int> g_state{0};
++struct MarkInitialized {
++    MarkInitialized() { g_state.store(1, std::memory_order_release); }
++} g_markInitialized;
++
++// S8 (switch phase 54): file reads and opens counted and timed, main thread and other threads, while
++// WIICOMPILED_SWITCH_SPIKES is set (the profiler's start); the spike dumps take each frame's share.
++std::atomic<bool> g_spikeIo{false};
++std::atomic<u64> g_spikeIoTotals[4];  // main count, main ticks, others count, others ticks
++void SpikeIoNote(u64 ticks) {
++    const int i = threadGetCurHandle() == envGetMainThreadHandle() ? 0 : 2;
++    g_spikeIoTotals[i].fetch_add(1, std::memory_order_relaxed);
++    g_spikeIoTotals[i + 1].fetch_add(ticks, std::memory_order_relaxed);
++}
++
++void Report() {
++    Totals main, other;
++    std::vector<std::pair<std::string, PathStats>> paths;
++    u64 maxNs = 0;
++    std::string maxWhat;
++    u64 start = 0;
++    const u64 now = armGetSystemTick();
++    {
++        const std::lock_guard<std::mutex> lock(L().mutex);
++        main = std::exchange(L().main, {});
++        other = std::exchange(L().other, {});
++        paths.assign(L().mainPaths.begin(), L().mainPaths.end());
++        L().mainPaths.clear();
++        maxNs = std::exchange(L().mainMaxNs, 0);
++        maxWhat = std::move(L().mainMaxWhat);
++        L().mainMaxWhat.clear();
++        start = std::exchange(L().windowStart, now);
++    }
++    char ops[512];
++    int o = 0;
++    for (int i = 0; i < kOps; ++i) {
++        if (main.count[i] && o < int(sizeof ops)) {
++            o += std::snprintf(ops + o, sizeof ops - size_t(o), "%s%s %llu %.1f ms", o ? ", " : "", kOpNames[i],
++                               (unsigned long long)main.count[i], double(main.ns[i]) / 1e6);
++        }
++    }
++    std::fprintf(stderr,
++                 "[io] %.1f s: main thread %llu file ops, %.1f ms (%s), %.1f KiB; longest %.2f ms%s%s; other "
++                 "threads %llu ops, %.1f ms\n",
++                 double(armTicksToNs(now - start)) / 1e9, (unsigned long long)main.Count(), double(main.Ns()) / 1e6,
++                 o ? ops : "none", double(main.bytes) / 1024.0, double(maxNs) / 1e6, maxWhat.empty() ? "" : " ",
++                 maxWhat.c_str(), (unsigned long long)other.Count(), double(other.Ns()) / 1e6);
++    std::sort(paths.begin(), paths.end(),
++              [](const auto& a, const auto& b) { return a.second.totals.Ns() > b.second.totals.Ns(); });
++    for (size_t p = 0; p < paths.size() && p < 8; ++p) {
++        const Totals& t = paths[p].second.totals;
++        o = 0;
++        for (int i = 0; i < kOps; ++i) {
++            if (t.count[i] && o < int(sizeof ops)) {
++                o += std::snprintf(ops + o, sizeof ops - size_t(o), "%s%s %llu", o ? ", " : "", kOpNames[i],
++                                   (unsigned long long)t.count[i]);
++            }
++        }
++        std::fprintf(stderr, "[io]   main %8.2f ms (max %.2f) %5llu ops (%s) %8.1f KiB  %s\n", double(t.Ns()) / 1e6,
++                     double(paths[p].second.maxNs) / 1e6, (unsigned long long)t.Count(), ops, double(t.bytes) / 1024.0,
++                     paths[p].first.c_str());
++    }
++}
++
++void StartReporter() {
++    {
++        const std::lock_guard<std::mutex> lock(L().mutex);
++        L().windowStart = armGetSystemTick();
++    }
++    std::fprintf(stderr, "[io] WIICOMPILED_SWITCH_IO_LOG=1: SD card operations every 30 s (main thread by file)\n");
++    // a libnx thread: std::thread::detach throws on Horizon (pthread_detach is unsupported) and,
++    // without exceptions, terminated the NRO at the benchmark's start
++    static Thread reporter;
++    const auto loop = [](void*) {
++        for (;;) {
++            svcSleepThread(30'000'000'000LL);
++            Report();  // prints without the lock: its own writes (stderr on the SD card) come back here
++        }
++    };
++    if (R_FAILED(threadCreate(&reporter, loop, nullptr, nullptr, 0x10000, 0x3B, 2)) ||
++        R_FAILED(threadStart(&reporter))) {
++        std::fprintf(stderr, "[io] could not start the reporter thread\n");
++    }
++}
++
++// Turned on by SwitchIoLogStart (the match benchmark's start), never from inside an fs call: starting
++// the reporter (getenv, a thread, stderr) there crashed the NRO at boot.
++bool Enabled() { return g_state.load(std::memory_order_acquire) == 2; }
++} // namespace
++
++extern "C" void SwitchIoLogStart() {
++    const char* value = std::getenv("WIICOMPILED_SWITCH_IO_LOG");
++    if (value == nullptr || std::strcmp(value, "1") != 0) return;
++    int expected = 1;
++    if (g_state.compare_exchange_strong(expected, 2)) StartReporter();
++}
++
++extern "C" void SwitchSpikeIoEnable() { g_spikeIo.store(true, std::memory_order_relaxed); }
++extern "C" void SwitchSpikeIoTotals(u64 out[4]) {
++    for (int i = 0; i < 4; ++i) out[i] = g_spikeIoTotals[i].load(std::memory_order_relaxed);
++}
++
++namespace {
++
++u64 Key(const Service& s) { return (u64(s.session) << 32) | s.object_id; }
++
++void Record(Op op, const char* path, u64 key, u64 ticks, u64 bytes) {
++    const u64 ns = armTicksToNs(ticks);
++    const bool main = threadGetCurHandle() == envGetMainThreadHandle();
++    const std::lock_guard<std::mutex> lock(L().mutex);
++    Totals& totals = main ? L().main : L().other;
++    ++totals.count[op];
++    totals.ns[op] += ns;
++    totals.bytes += bytes;
++    if (!main) return;
++    std::string name;
++    if (path != nullptr) {
++        name = path;
++    } else if (const auto it = L().names.find(key); it != L().names.end()) {
++        name = it->second;
++    } else {
++        name = "(opened before the log started)";
++    }
++    PathStats& stats = L().mainPaths[name];
++    ++stats.totals.count[op];
++    stats.totals.ns[op] += ns;
++    stats.totals.bytes += bytes;
++    stats.maxNs = std::max(stats.maxNs, ns);
++    if (ns > L().mainMaxNs) {
++        L().mainMaxNs = ns;
++        L().mainMaxWhat = std::string(kOpNames[op]) + " " + name;
++    }
++}
++
++void Name(u64 key, const char* path) {
++    const std::lock_guard<std::mutex> lock(L().mutex);
++    L().names[key] = path;
++}
++
++void Forget(u64 key) {
++    const std::lock_guard<std::mutex> lock(L().mutex);
++    L().names.erase(key);
++}
++} // namespace
++
++extern "C" {
++Result __real_fsFsOpenFile(FsFileSystem* fs, const char* path, u32 mode, FsFile* out);
++Result __real_fsFileRead(FsFile* f, s64 off, void* buf, u64 read_size, u32 option, u64* bytes_read);
++Result __real_fsFileWrite(FsFile* f, s64 off, const void* buf, u64 write_size, u32 option);
++Result __real_fsFileFlush(FsFile* f);
++void __real_fsFileClose(FsFile* f);
++Result __real_fsFileGetSize(FsFile* f, s64* out);
++Result __real_fsFileSetSize(FsFile* f, s64 sz);
++Result __real_fsFsGetEntryType(FsFileSystem* fs, const char* path, FsDirEntryType* out);
++Result __real_fsFsGetFileTimeStampRaw(FsFileSystem* fs, const char* path, FsTimeStampRaw* out);
++Result __real_fsFsCreateFile(FsFileSystem* fs, const char* path, s64 size, u32 option);
++Result __real_fsFsDeleteFile(FsFileSystem* fs, const char* path);
++Result __real_fsFsRenameFile(FsFileSystem* fs, const char* cur_path, const char* new_path);
++Result __real_fsFsOpenDirectory(FsFileSystem* fs, const char* path, u32 mode, FsDir* out);
++Result __real_fsDirRead(FsDir* d, s64* total_entries, size_t max_entries, FsDirectoryEntry* buf);
++void __real_fsDirClose(FsDir* d);
++Result __real_fsFsCreateDirectory(FsFileSystem* fs, const char* path);
++Result __real_fsFsCommit(FsFileSystem* fs);
++void __real_SWITCH_PollKeyboard(Uint64 timestamp);
++
++Result __wrap_fsFsOpenFile(FsFileSystem* fs, const char* path, u32 mode, FsFile* out) {
++    if (!Enabled() && !g_spikeIo.load(std::memory_order_relaxed)) return __real_fsFsOpenFile(fs, path, mode, out);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsOpenFile(fs, path, mode, out);
++    const u64 ticks = armGetSystemTick() - t0;
++    if (g_spikeIo.load(std::memory_order_relaxed)) SpikeIoNote(ticks);
++    if (!Enabled()) return rc;
++    if (R_SUCCEEDED(rc)) Name(Key(out->s), path);
++    Record(kOpen, path, 0, ticks, 0);
++    return rc;
++}
++
++Result __wrap_fsFileRead(FsFile* f, s64 off, void* buf, u64 read_size, u32 option, u64* bytes_read) {
++    if (!Enabled() && !g_spikeIo.load(std::memory_order_relaxed))
++        return __real_fsFileRead(f, off, buf, read_size, option, bytes_read);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFileRead(f, off, buf, read_size, option, bytes_read);
++    const u64 ticks = armGetSystemTick() - t0;
++    if (g_spikeIo.load(std::memory_order_relaxed)) SpikeIoNote(ticks);
++    if (!Enabled()) return rc;
++    Record(kRead, nullptr, Key(f->s), ticks, R_SUCCEEDED(rc) && bytes_read ? *bytes_read : 0);
++    return rc;
++}
++
++Result __wrap_fsFileWrite(FsFile* f, s64 off, const void* buf, u64 write_size, u32 option) {
++    if (!Enabled()) return __real_fsFileWrite(f, off, buf, write_size, option);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFileWrite(f, off, buf, write_size, option);
++    Record(kWrite, nullptr, Key(f->s), armGetSystemTick() - t0, write_size);
++    return rc;
++}
++
++Result __wrap_fsFileFlush(FsFile* f) {
++    if (!Enabled()) return __real_fsFileFlush(f);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFileFlush(f);
++    Record(kFlush, nullptr, Key(f->s), armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++void __wrap_fsFileClose(FsFile* f) {
++    if (!Enabled()) return __real_fsFileClose(f);
++    const u64 key = Key(f->s);
++    const u64 t0 = armGetSystemTick();
++    __real_fsFileClose(f);
++    Record(kClose, nullptr, key, armGetSystemTick() - t0, 0);
++    Forget(key);
++}
++
++Result __wrap_fsFileGetSize(FsFile* f, s64* out) {
++    if (!Enabled()) return __real_fsFileGetSize(f, out);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFileGetSize(f, out);
++    Record(kSize, nullptr, Key(f->s), armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFileSetSize(FsFile* f, s64 sz) {
++    if (!Enabled()) return __real_fsFileSetSize(f, sz);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFileSetSize(f, sz);
++    Record(kSize, nullptr, Key(f->s), armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsGetEntryType(FsFileSystem* fs, const char* path, FsDirEntryType* out) {
++    if (!Enabled()) return __real_fsFsGetEntryType(fs, path, out);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsGetEntryType(fs, path, out);
++    Record(kStat, path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsGetFileTimeStampRaw(FsFileSystem* fs, const char* path, FsTimeStampRaw* out) {
++    if (!Enabled()) return __real_fsFsGetFileTimeStampRaw(fs, path, out);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsGetFileTimeStampRaw(fs, path, out);
++    Record(kStat, path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsCreateFile(FsFileSystem* fs, const char* path, s64 size, u32 option) {
++    if (!Enabled()) return __real_fsFsCreateFile(fs, path, size, option);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsCreateFile(fs, path, size, option);
++    Record(kCreate, path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsDeleteFile(FsFileSystem* fs, const char* path) {
++    if (!Enabled()) return __real_fsFsDeleteFile(fs, path);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsDeleteFile(fs, path);
++    Record(kDelete, path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsRenameFile(FsFileSystem* fs, const char* cur_path, const char* new_path) {
++    if (!Enabled()) return __real_fsFsRenameFile(fs, cur_path, new_path);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsRenameFile(fs, cur_path, new_path);
++    Record(kRename, new_path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsOpenDirectory(FsFileSystem* fs, const char* path, u32 mode, FsDir* out) {
++    if (!Enabled()) return __real_fsFsOpenDirectory(fs, path, mode, out);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsOpenDirectory(fs, path, mode, out);
++    const u64 ticks = armGetSystemTick() - t0;
++    if (R_SUCCEEDED(rc)) Name(Key(out->s), path);
++    Record(kDir, path, 0, ticks, 0);
++    return rc;
++}
++
++Result __wrap_fsDirRead(FsDir* d, s64* total_entries, size_t max_entries, FsDirectoryEntry* buf) {
++    if (!Enabled()) return __real_fsDirRead(d, total_entries, max_entries, buf);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsDirRead(d, total_entries, max_entries, buf);
++    Record(kDir, nullptr, Key(d->s), armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++void __wrap_fsDirClose(FsDir* d) {
++    if (!Enabled()) return __real_fsDirClose(d);
++    const u64 key = Key(d->s);
++    const u64 t0 = armGetSystemTick();
++    __real_fsDirClose(d);
++    Record(kDir, nullptr, key, armGetSystemTick() - t0, 0);
++    Forget(key);
++}
++
++Result __wrap_fsFsCreateDirectory(FsFileSystem* fs, const char* path) {
++    if (!Enabled()) return __real_fsFsCreateDirectory(fs, path);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsCreateDirectory(fs, path);
++    Record(kCreate, path, 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++Result __wrap_fsFsCommit(FsFileSystem* fs) {
++    if (!Enabled()) return __real_fsFsCommit(fs);
++    const u64 t0 = armGetSystemTick();
++    const Result rc = __real_fsFsCommit(fs);
++    Record(kCommit, "(commit)", 0, armGetSystemTick() - t0, 0);
++    return rc;
++}
++
++void __wrap_SWITCH_PollKeyboard(Uint64 timestamp) {
++    // The real poll: if hidGetKeyboardStates gives a state, SDL_SendKeyboardKey(pressed) for every
++    // scancode below HidKeyboardKey_RightGui. A failed read does nothing there either.
++    HidKeyboardState state;
++    if (hidGetKeyboardStates(&state, 1) == 0) return;
++    if ((state.keys[0] | state.keys[1] | state.keys[2] | state.keys[3]) == 0) {
++        int count = 0;
++        const bool* down = SDL_GetKeyboardState(&count);
++        if (down == nullptr || count <= 0 || std::memchr(down, 1, size_t(count)) == nullptr) return;
++    }
++    __real_SWITCH_PollKeyboard(timestamp);
++}
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_mbedtls.cpp b/runtime/src/platform/switch/switch_mbedtls.cpp
+new file mode 100644
+index 0000000..d37b613
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_mbedtls.cpp
+@@ -0,0 +1,21 @@
++// mbed TLS's platform hooks on Horizon (include/mbedtls_switch_config.h): entropy from libnx's CSRNG,
++// milliseconds from the monotonic clock.
++#if defined(__SWITCH__)
++#include <cstddef>
++#include <cstdint>
++#include <ctime>
++
++extern "C" void randomGet(void* buf, size_t len);  // libnx
++
++extern "C" int mbedtls_hardware_poll(void*, unsigned char* output, size_t length, size_t* written) {
++    randomGet(output, length);
++    *written = length;
++    return 0;
++}
++
++extern "C" int64_t mbedtls_ms_time(void) {  // mbedtls_ms_time_t
++    timespec now{};
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return int64_t{now.tv_sec} * 1000 + now.tv_nsec / 1000000;
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_posix.cpp b/runtime/src/platform/switch/switch_posix.cpp
+new file mode 100644
+index 0000000..e01a61b
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_posix.cpp
+@@ -0,0 +1,49 @@
++// POSIX calls Horizon's SD card cannot honour, linked in with -Wl,--wrap (PublicProducts.cmake).
++// FAT32/exFAT keep no Unix permissions, so changing them succeeds with nothing to do; libnx's fsdev
++// answers ENOSYS instead, which made every std::filesystem::copy_file fail.
++//
++// FAT has no hard links either. The runtime links a finished temporary file to its final name to
++// publish it without replacing one already there; Horizon's rename refuses an existing destination,
++// so it gives the same result. POSIX rename does replace (atomic saves rely on it): when Horizon
++// refuses, the old file goes first. ponytail: not atomic, which FAT cannot be anyway.
++#if defined(__SWITCH__)
++#include <cerrno>
++#include <pthread.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++extern "C" {
++int __real_rename(const char* from, const char* to);
++
++int __wrap_chmod(const char*, mode_t) { return 0; }
++int __wrap_fchmod(int, mode_t) { return 0; }
++int __wrap_link(const char* from, const char* to) { return __real_rename(from, to); }
++
++int __wrap_rename(const char* from, const char* to) {
++    if (__real_rename(from, to) == 0) return 0;
++    if (errno != EEXIST || ::unlink(to) != 0) return -1;
++    return __real_rename(from, to);
++}
++
++// A thread that asks for no particular stack (std::thread never does) gets 128 KiB from libnx;
++// Dawn's shader compiler alone needs more (GCC gives tint's AnalyzeUniformity a ~110 KB frame).
++// Desktop systems give 1 MiB (Windows) to 8 MiB (Linux). ponytail: one size for every such thread.
++constexpr size_t kDefaultThreadStack = 2 * 1024 * 1024;
++
++int __real_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg);
++
++int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
++    size_t size = 0;
++    if (attr != nullptr) pthread_attr_getstacksize(attr, &size);
++    if (size != 0) return __real_pthread_create(thread, attr, start, arg);
++    pthread_attr_t sized;
++    if (attr != nullptr) {
++        sized = *attr;
++    } else {
++        pthread_attr_init(&sized);
++    }
++    pthread_attr_setstacksize(&sized, kDefaultThreadStack);
++    return __real_pthread_create(thread, &sized, start, arg);
++}
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_profiler.cpp b/runtime/src/platform/switch/switch_profiler.cpp
+new file mode 100644
+index 0000000..9605442
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_profiler.cpp
+@@ -0,0 +1,548 @@
++// Sampling profiler on Horizon: svcSetThreadActivity pauses the main thread (which runs the guest
++// fibers), svcGetThreadContext3 reads where it is, and it resumes. Started and dumped by the match
++// benchmark (match_benchmark_overlay.inc) when WIICOMPILED_SWITCH_PROFILE=1.
++//
++// S8 (switch phase 54): WIICOMPILED_SWITCH_SPIKES=<ms> (also starts the sampler) keeps the last ~4 s
++// of samples with their host frame (SwitchProfilerFrame) and, for every host frame longer than <ms>,
++// keeps that frame's samples: PC, LR and up to 6 return addresses found on the stack above SP (words
++// in the code segment right after a BL/BLR; the translated code is built -fomit-frame-pointer, so a
++// frame-pointer walk would skip every guest frame), plus the frame's file reads/opens, new aurora
++// pipelines, deko3d shader code growth and the longest time without an Audio_HLE_Tick. Printed with
++// the profile as "[spike] ..." lines (local/tmp/cpu/S8-test/prof_spikes.py names them). Without the
++// timed benchmark (WIICOMPILED_MATCH_SECONDS unset) the capture starts at the first host frame
++// (settings_overlay::Draw), marks every host frame and prints what it has every 30 s, so a normal game
++// played over nxlink shows its spikes; WIICOMPILED_SWITCH_SPIKES_MAX caps the spikes (default 40).
++#if defined(__SWITCH__)
++#include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <unordered_map>
++#include <utility>
++#include <switch.h>
++
++#include <aurora/gfx.h>  // aurora_get_stats: createdPipelines
++
++extern "C" void SwitchProfilerStart();                // below: the anchor the dumps give
++extern "C" bool SwitchUsesDeko3d();                   // tools/switch/deko/aurora/dk_present.cpp
++extern "C" void SwitchSpikeIoEnable();                // switch_io.cpp
++extern "C" void SwitchSpikeIoTotals(u64 out[4]);      // switch_io.cpp: main count/ticks, others count/ticks
++namespace swdk {
++uint64_t frames_completed();  // tools/switch/deko/core/memory.cpp (takes the fence lock)
++uint32_t code_used();         // shader code memory in use (takes the code lock)
++} // namespace swdk
++
++namespace {
++std::atomic<bool> g_running{false};
++Thread g_thread;
++std::unordered_map<u64, u32> g_pc, g_lr;
++u64 g_samples = 0, g_failed = 0;
++// P12: optional paired core-1 PC/LR samples; the worker publishes its real handle once.
++std::atomic<Handle> g_gxThread{0};
++bool g_gxEnabled = false;
++u64 g_gxSamples = 0, g_gxPauseFailed = 0, g_gxReadFailed = 0, g_gxResumeFailed = 0;
++u64 g_gxUnregistered = 0, g_gxMainResumeFailed = 0, g_gxFrameChanged = 0;
++// samples taken while the host frame in progress is already past 17 ms (SwitchProfilerFrame marks each
++// frame's start): what the main thread does in the frames that miss a vblank
++std::atomic<u64> g_frameStart{0};
++std::unordered_map<u64, u32> g_latePc, g_lateLr;
++u64 g_lateSamples = 0;
++
++// ---- S8 spikes. Main thread: g_spkFrame, the request queue's tail. Sampler thread: everything else.
++constexpr u32 kSpkRa = 6;              // return addresses kept per sample
++constexpr u32 kSpkRing = 4096;         // the last ~4 s of samples
++constexpr u32 kSpkStore = 12288;       // samples kept over all the spikes
++constexpr u32 kSpkPerSpike = 256;      // samples kept per spike (a load frame: its last 256)
++constexpr u32 kSpkMax = 256;           // spikes kept
++constexpr u32 kSpkQueue = 32;          // spike requests the sampler has not taken yet
++constexpr u64 kSpkScanBytes = 16384;   // stack bytes scanned above SP
++constexpr u32 kSpkFrames = 64;         // per-frame context ring
++
++struct SpkSample {
++    u64 tick, pc, lr;
++    u64 gxTick, gxPc, gxLr;  // zero tick: no paired worker context
++    u64 ra[kSpkRa];
++    u32 frame, raCount;
++};
++// What the sampler saw when a frame began (first sample of it), and the frame's longest audio gap.
++struct SpkContext {
++    u32 frame = ~0u;
++    u64 io[4] = {};   // SwitchSpikeIoTotals
++    u32 pipelines = 0, codeBytes = 0;
++    u64 dkFrame = 0;
++    u64 audioGapTicks = 0;
++};
++struct SpkRequest {
++    u32 frame;
++    u64 start, end;
++};
++struct Spike {
++    SpkRequest request;
++    u32 first, count;
++    SpkContext begin, finish;  // finish: the next frame's begin
++};
++
++u64 g_spkThresholdNs = 0;  // 0: off
++u64 g_spkBenchStart = 0;
++std::atomic<u32> g_spkFrame{0};  // host frames ended since the start = the frame in progress
++u64 g_spkLastEnd = 0;
++SpkRequest g_spkQueue[kSpkQueue];
++std::atomic<u32> g_spkHead{0}, g_spkTail{0};
++u32 g_spkQueueFull = 0;
++std::atomic<u64> g_spkAudioTickAt{0};  // SwitchSpikeAudioTick
++SpkSample* g_spkRing = nullptr;
++u64 g_spkRingNext = 0;
++SpkSample* g_spkStore = nullptr;
++u32 g_spkStoreUsed = 0;
++Spike* g_spikes = nullptr;
++u32 g_spikeCount = 0, g_spikesDropped = 0;
++SpkContext g_spkFrames[kSpkFrames];
++u32 g_spkSeen = ~0u;
++u64 g_spkTextLo = 0, g_spkTextHi = 0;
++bool g_spkDeko = false;
++bool g_spkFree = false;     // started by the first host frame (no match benchmark): flushed every 30 s
++u32 g_spkLimit = 40;        // spikes per session (WIICOMPILED_SWITCH_SPIKES_MAX, at most kSpkMax)
++u32 g_spkTotal = 0;         // spikes recorded this session
++u64 g_spkLastFlush = 0;
++u64 g_spkUpperNs = 0;       // longer frames are loads, not spikes (WIICOMPILED_SWITCH_SPIKES_UPTO; free-running: 150)
++u32 g_spkLong = 0;          // frames skipped for that
++char* g_spkText = nullptr;  // one spike's lines, written with one fwrite
++constexpr size_t kSpkTextSize = 64 * 1024;  // P12: room for P + optional W at all 256 samples
++
++// A word on the stack that is a return address: in the code segment, right after a BL or BLR.
++bool SpkIsReturn(u64 a) {
++    if (a < g_spkTextLo + 4 || a >= g_spkTextHi || (a & 3) != 0) return false;
++    const u32 insn = *reinterpret_cast<const u32*>(a - 4);
++    return (insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u;
++}
++
++// While the main thread is paused: its stack from SP up, within the readable block SP is in (queried
++// every time: transfer memory taken from the heap changes the permissions of heap pages).
++u32 SpkScanStack(u64 sp, u64* out) {
++    MemoryInfo info{};
++    u32 page = 0;
++    if (R_FAILED(svcQueryMemory(&info, &page, sp)) || (info.perm & Perm_R) == 0 || info.type == MemType_Unmapped)
++        return 0;
++    const u64 end = std::min(info.addr + info.size, (sp & ~u64(7)) + kSpkScanBytes);
++    u32 n = 0;
++    for (u64 p = sp & ~u64(7); p < end && n < kSpkRa; p += 8) {
++        const u64 v = *reinterpret_cast<const volatile u64*>(p);
++        if (SpkIsReturn(v)) out[n++] = v;
++    }
++    return n;
++}
++
++void SpkSnapshot(SpkContext& c, u32 frame) {
++    c = {};
++    c.frame = frame;
++    SwitchSpikeIoTotals(c.io);
++    if (const AuroraStats* stats = aurora_get_stats()) {
++        c.pipelines = *reinterpret_cast<const volatile u32*>(&stats->createdPipelines);
++    }
++    if (g_spkDeko) {
++        c.codeBytes = swdk::code_used();
++        c.dkFrame = swdk::frames_completed();
++    }
++}
++
++// Sampler thread, after each sample: the frame's context, then the spikes whose next frame has begun.
++void SpkAfterSample(u32 frame, u64 tick) {
++    if (frame != g_spkSeen) {
++        SpkSnapshot(g_spkFrames[frame % kSpkFrames], frame);
++        g_spkSeen = frame;
++    }
++    SpkContext& now = g_spkFrames[frame % kSpkFrames];
++    const u64 audio = g_spkAudioTickAt.load(std::memory_order_relaxed);
++    if (audio && tick > audio) now.audioGapTicks = std::max(now.audioGapTicks, tick - audio);
++    for (u32 head = g_spkHead.load(std::memory_order_relaxed); head != g_spkTail.load(std::memory_order_acquire);
++         g_spkHead.store(++head, std::memory_order_release)) {
++        const SpkRequest r = g_spkQueue[head % kSpkQueue];
++        if (r.frame >= frame) return;  // the next frame's context comes with its first sample
++        if (g_spikeCount == kSpkMax || g_spkTotal >= g_spkLimit) { ++g_spikesDropped; continue; }
++        ++g_spkTotal;
++        Spike& s = g_spikes[g_spikeCount++];
++        s.request = r;
++        s.first = g_spkStoreUsed;
++        s.count = 0;
++        const u64 held = std::min<u64>(g_spkRingNext, kSpkRing);
++        u64 from = g_spkRingNext - held, matching = 0;
++        for (u64 i = from; i < g_spkRingNext; ++i) matching += g_spkRing[i % kSpkRing].frame == r.frame;
++        u64 skip = matching > kSpkPerSpike ? matching - kSpkPerSpike : 0;
++        for (u64 i = from; i < g_spkRingNext && g_spkStoreUsed < kSpkStore; ++i) {
++            const SpkSample& x = g_spkRing[i % kSpkRing];
++            if (x.frame != r.frame) continue;
++            if (skip) { --skip; continue; }
++            g_spkStore[g_spkStoreUsed++] = x;
++            ++s.count;
++        }
++        const SpkContext& b = g_spkFrames[r.frame % kSpkFrames];
++        const SpkContext& f = g_spkFrames[(r.frame + 1) % kSpkFrames];
++        s.begin = b.frame == r.frame ? b : SpkContext{};
++        s.finish = f.frame == r.frame + 1 ? f : SpkContext{};
++    }
++}
++
++// Main has already resumed. Never scan the worker stack or hold it while collecting other stats.
++void SampleGx(SpkSample& spike, bool mainResumed) {
++    spike.gxTick = 0;
++    if (!mainResumed) { ++g_gxMainResumeFailed; return; }
++    const Handle worker = g_gxThread.load(std::memory_order_acquire);
++    if (!worker) { ++g_gxUnregistered; return; }
++    if (R_FAILED(svcSetThreadActivity(worker, ThreadActivity_Paused))) { ++g_gxPauseFailed; return; }
++    const u32 frame = g_spkFrame.load(std::memory_order_relaxed);
++    const u64 tick = armGetSystemTick();
++    ThreadContext context{};
++    const bool read = frame == spike.frame && R_SUCCEEDED(svcGetThreadContext3(&context, worker));
++    const bool sameFrame = frame == spike.frame && g_spkFrame.load(std::memory_order_relaxed) == frame;
++    // Resume on every successful pause, including a failed read or a frame that advanced.
++    if (R_FAILED(svcSetThreadActivity(worker, ThreadActivity_Runnable))) ++g_gxResumeFailed;
++    if (!sameFrame) { ++g_gxFrameChanged; return; }
++    if (!read) { ++g_gxReadFailed; return; }
++    spike.gxTick = tick;
++    spike.gxPc = context.pc.x;
++    spike.gxLr = context.lr;
++    ++g_gxSamples;
++}
++
++// WIICOMPILED_SWITCH_PROFILE_DL=1 (with a free-running spike capture): main-thread PC histograms
++// bucketed by the previous host frame's GX__CallDisplayList calls (a proxy for the models on camera:
++// players, bats, the ball), cumulative, printed every 30 s ([pdl] lines), to find the code whose
++// per-frame cost grows with the players on screen. Buckets of kDlWidth calls; the sampler fills and
++// prints the histograms, the main thread only counts and picks the bucket once per host frame.
++constexpr u32 kDlBuckets = 16, kDlWidth = 40;
++std::atomic<u32> g_dlCalls{0}, g_dlBucket{0};
++std::atomic<u32> g_dlFrames[kDlBuckets];
++std::unordered_map<u64, u32> g_dlPc[kDlBuckets];
++u64 g_dlLastPrint = 0;
++bool DlProfileOn() {
++    static const bool on = [] {
++        const char* v = std::getenv("WIICOMPILED_SWITCH_PROFILE_DL");
++        return v != nullptr && v[0] == '1';
++    }();
++    return on;
++}
++void DlMaybePrint() {
++    if (!DlProfileOn() || !g_spkFree) return;
++    const u64 now = armGetSystemTick();
++    if (!g_dlLastPrint) g_dlLastPrint = now;
++    if (armTicksToNs(now - g_dlLastPrint) < 30'000'000'000ull) return;
++    g_dlLastPrint = now;
++    std::fprintf(stderr, "[pdl] anchor=0x%lx width=%u\n", reinterpret_cast<u64>(&SwitchProfilerStart), kDlWidth);
++    for (u32 b = 0; b < kDlBuckets; ++b) {
++        const u32 frames = g_dlFrames[b].load(std::memory_order_relaxed);
++        if (!frames) continue;
++        std::fprintf(stderr, "[pdl] bucket=%u frames=%u\n", b, frames);
++        for (const auto& [pc, count] : g_dlPc[b]) {
++            if (count >= 3) std::fprintf(stderr, "[pdl] P %u %lx %u\n", b, pc, count);
++        }
++    }
++    std::fflush(stderr);
++}
++
++void SampleOnce(Handle main) {
++    if (R_FAILED(svcSetThreadActivity(main, ThreadActivity_Paused))) { ++g_failed; return; }
++    ThreadContext context{};
++    const bool read = R_SUCCEEDED(svcGetThreadContext3(&context, main));
++    SpkSample* spike = nullptr;
++    if (read && g_spkThresholdNs) {  // the stack only while the main thread is paused
++        spike = &g_spkRing[g_spkRingNext % kSpkRing];
++        spike->frame = g_spkFrame.load(std::memory_order_relaxed);
++        spike->tick = armGetSystemTick();
++        spike->raCount = SpkScanStack(context.sp, spike->ra);
++    }
++    const bool resumed = R_SUCCEEDED(svcSetThreadActivity(main, ThreadActivity_Runnable));
++    if (!read) { ++g_failed; return; }
++    if (spike) {
++        spike->pc = context.pc.x;
++        spike->lr = context.lr;
++        if (g_gxEnabled) SampleGx(*spike, resumed);
++        ++g_spkRingNext;
++        SpkAfterSample(spike->frame, spike->tick);
++    }
++    ++g_pc[context.pc.x];
++    ++g_lr[context.lr];
++    ++g_samples;
++    if (DlProfileOn()) ++g_dlPc[g_dlBucket.load(std::memory_order_relaxed)][context.pc.x];
++    const u64 start = g_frameStart.load(std::memory_order_relaxed);
++    if (start && armTicksToNs(armGetSystemTick() - start) > 17'000'000) {
++        ++g_latePc[context.pc.x];
++        ++g_lateLr[context.lr];
++        ++g_lateSamples;
++    }
++}
++
++void SpkPrint();
++
++// Free-running (no benchmark dump at the end): the spikes so far every 30 s, or when the store could
++// not take another full spike. Printed from the sampler thread, one fwrite per spike.
++void SpkMaybeFlush() {
++    if (g_spkFree && g_spikeCount &&
++        (armTicksToNs(armGetSystemTick() - g_spkLastFlush) >= 30'000'000'000ull ||
++         g_spkStoreUsed + kSpkPerSpike > kSpkStore || g_spikeCount == kSpkMax)) {
++        SpkPrint();
++    }
++}
++
++// WIICOMPILED_SWITCH_PROFILE_WINDOW=<s> (with a free-running spike capture): the main thread's PC/LR
++// histograms of every <s> seconds of a played game, then cleared, so windows (fielding with many
++// players on screen, pitching) can be compared. Printed and cleared by the sampler thread that fills them.
++u64 g_winStart = 0, g_winSamples = 0;
++void WindowMaybeFlush() {
++    static const u64 windowNs = [] {
++        const char* v = std::getenv("WIICOMPILED_SWITCH_PROFILE_WINDOW");
++        return v ? u64(std::strtod(v, nullptr) * 1e9) : u64(0);
++    }();
++    if (!windowNs || !g_spkFree) return;
++    const u64 now = armGetSystemTick();
++    if (!g_winStart) g_winStart = now;
++    if (armTicksToNs(now - g_winStart) < windowNs) return;
++    std::fprintf(stderr, "[pwin] anchor=0x%lx t=%.1f frame=%u samples=%lu\n", reinterpret_cast<u64>(&SwitchProfilerStart),
++                 double(armTicksToNs(now - g_spkBenchStart)) / 1e9, g_spkFrame.load(std::memory_order_relaxed),
++                 g_samples - g_winSamples);
++    for (const auto& [pc, count] : g_pc) std::fprintf(stderr, "[pwin] P %lx %u\n", pc, count);
++    for (const auto& [lr, count] : g_lr) std::fprintf(stderr, "[pwin] L %lx %u\n", lr, count);
++    std::fflush(stderr);
++    g_pc.clear();
++    g_lr.clear();
++    g_winSamples = g_samples;
++    g_winStart = now;
++}
++
++void Sample(void*) {
++    const Handle main = envGetMainThreadHandle();
++    while (g_running.load(std::memory_order_relaxed)) {
++        svcSleepThread(1'000'000);
++        SampleOnce(main);
++        SpkMaybeFlush();
++        WindowMaybeFlush();
++        DlMaybePrint();
++    }
++}
++} // namespace
++
++// Called by the GX FIFO worker after pinning itself; no extra thread or scheduling changes.
++extern "C" void SwitchProfilerRegisterGxThread() {
++    g_gxThread.store(threadGetCurHandle(), std::memory_order_release);
++}
++
++// Mode, renderer and clocks right now, so a report says whether it ran docked, handheld or
++// overclocked (sys-clk changes them under the game). Phase 25 puts it in the benchmark summary.
++extern "C" const char* SwitchClocks() {
++    static char text[160];
++    u32 hz[3] = {};
++    const PcvModuleId ids[3] = {PcvModuleId_CpuBus, PcvModuleId_GPU, PcvModuleId_EMC};
++    const bool clkrst = R_SUCCEEDED(clkrstInitialize());
++    for (int i = 0; clkrst && i < 3; ++i) {
++        ClkrstSession session;
++        if (R_SUCCEEDED(clkrstOpenSession(&session, ids[i], 3))) {
++            clkrstGetClockRate(&session, &hz[i]);
++            clkrstCloseSession(&session);
++        }
++    }
++    if (clkrst) clkrstExit();
++    const char* renderer = std::getenv("WIICOMPILED_SWITCH_RENDERER");
++    std::snprintf(text, sizeof text, "switch_mode=%s renderer=%s cpu_mhz=%u gpu_mhz=%u emc_mhz=%u",
++                  appletGetOperationMode() == AppletOperationMode_Console ? "docked" : "handheld",
++                  renderer ? renderer : "deko3d", hz[0] / 1000000, hz[1] / 1000000, hz[2] / 1000000);
++    return text;
++}
++
++extern "C" void SwitchIoLogStart();  // switch_io.cpp: WIICOMPILED_SWITCH_IO_LOG=1
++
++namespace {
++double SpikeMs() {
++    static const double ms = [] {
++        const char* v = std::getenv("WIICOMPILED_SWITCH_SPIKES");
++        return v ? std::strtod(v, nullptr) : 0.0;
++    }();
++    return ms;
++}
++
++// Before the sampler starts: the buffers, the code segment, the counters' sources.
++void SpkSetup(bool freeRunning) {
++    const double ms = SpikeMs();
++    if (!(ms > 0.0)) return;
++    MemoryInfo info{};
++    u32 page = 0;
++    g_spkRing = static_cast<SpkSample*>(std::calloc(kSpkRing, sizeof(SpkSample)));
++    g_spkStore = static_cast<SpkSample*>(std::calloc(kSpkStore, sizeof(SpkSample)));
++    g_spikes = static_cast<Spike*>(std::calloc(kSpkMax, sizeof(Spike)));
++    g_spkText = static_cast<char*>(std::malloc(kSpkTextSize));
++    if (!g_spkRing || !g_spkStore || !g_spikes || !g_spkText ||
++        R_FAILED(svcQueryMemory(&info, &page, reinterpret_cast<u64>(&SwitchProfilerStart)))) {
++        std::fprintf(stderr, "[spike] could not set up the spike capture\n");
++        return;
++    }
++    if (const char* v = std::getenv("WIICOMPILED_SWITCH_SPIKES_MAX")) {
++        g_spkLimit = std::min<u32>(u32(std::strtoul(v, nullptr, 10)), kSpkMax);
++    }
++    const char* upto = std::getenv("WIICOMPILED_SWITCH_SPIKES_UPTO");
++    g_spkUpperNs = u64((upto ? std::strtod(upto, nullptr) : freeRunning ? 150.0 : 0.0) * 1e6);
++    g_spkTextLo = info.addr;
++    g_spkTextHi = info.addr + info.size;
++    g_spkDeko = SwitchUsesDeko3d();
++    g_spkFree = freeRunning;
++    g_spkBenchStart = g_spkLastFlush = armGetSystemTick();
++    SwitchSpikeIoEnable();
++    g_spkThresholdNs = u64(ms * 1e6);
++    std::fprintf(stderr, "[spike] capture on: host frames over %.1f ms (up to %.0f ms; 0 = any), at most %u spikes, %s\n",
++                 ms, double(g_spkUpperNs) / 1e6, g_spkLimit, freeRunning ? "free-running (printed every 30 s)" : "printed with the benchmark's profile");
++}
++
++bool StartSampler() {
++    const char* gx = std::getenv("WIICOMPILED_SWITCH_PROFILE_GX");
++    g_gxEnabled = gx && gx[0] == '1' && gx[1] == '\0';
++    // Core 2, above the game's priority and the AX mix worker's (0x2B there: equal priority never
++    // preempts, so samples waited for the mix and landed after the game thread's join).
++    if (R_FAILED(threadCreate(&g_thread, Sample, nullptr, nullptr, 0x10000, 0x2A, 2)) ||
++        R_FAILED(threadStart(&g_thread))) {
++        g_running = false;
++        g_spkThresholdNs = 0;
++        std::fprintf(stderr, "[profile] could not start the sampler\n");
++        return false;
++    }
++    return true;
++}
++
++// Main thread, once per host frame: a frame over the threshold is queued for the sampler.
++void SpkMark(u64 now) {
++    if (g_spkThresholdNs == 0) return;
++    const u32 frame = g_spkFrame.fetch_add(1, std::memory_order_relaxed);  // the frame that just ended
++    const u64 start = std::exchange(g_spkLastEnd, now);
++    if (start == 0 || armTicksToNs(now - start) <= g_spkThresholdNs) return;
++    if (g_spkUpperNs && armTicksToNs(now - start) > g_spkUpperNs) { ++g_spkLong; return; }
++    const u32 tail = g_spkTail.load(std::memory_order_relaxed);
++    if (tail - g_spkHead.load(std::memory_order_acquire) >= kSpkQueue) { ++g_spkQueueFull; return; }
++    g_spkQueue[tail % kSpkQueue] = {frame, start, now};
++    g_spkTail.store(tail + 1, std::memory_order_release);
++}
++} // namespace
++
++extern "C" void SwitchProfilerStart() {
++    std::fprintf(stderr, "[match-bench] at start: %s\n", SwitchClocks());
++    SwitchIoLogStart();
++    const char* enabled = std::getenv("WIICOMPILED_SWITCH_PROFILE");
++    if ((enabled == nullptr || *enabled != '1') && !(SpikeMs() > 0.0)) return;
++    if (g_running.exchange(true)) return;  // already sampling (a free-running spike capture)
++    SpkSetup(false);
++    StartSampler();
++}
++
++// The match benchmark's recorded frames (phase 40).
++extern "C" void SwitchProfilerFrame() {
++    const u64 now = armGetSystemTick();
++    g_frameStart.store(now, std::memory_order_relaxed);
++    if (!g_spkFree) SpkMark(now);
++}
++
++// settings_overlay::Draw, every host frame (S8). WIICOMPILED_SWITCH_SPIKES=<ms> without the timed match
++// benchmark (WIICOMPILED_MATCH_SECONDS): the sampler starts at the first host frame and every host
++// frame is marked, so a normal game played over nxlink prints its spikes.
++extern "C" void SwitchProfilerHostFrame() {
++    static const bool wanted = [] {
++        const char* bench = std::getenv("WIICOMPILED_MATCH_SECONDS");
++        return SpikeMs() > 0.0 && (bench == nullptr || std::strtoul(bench, nullptr, 10) == 0);
++    }();
++    if (!wanted) return;
++    if (g_spkFree) {
++        SpkMark(armGetSystemTick());
++        if (DlProfileOn()) {
++            const u32 bucket = std::min(g_dlCalls.exchange(0, std::memory_order_relaxed) / kDlWidth, kDlBuckets - 1);
++            g_dlBucket.store(bucket, std::memory_order_relaxed);
++            g_dlFrames[bucket].fetch_add(1, std::memory_order_relaxed);
++        }
++        return;
++    }
++    static bool tried = false;
++    if (tried) return;
++    tried = true;
++    if (g_running.exchange(true)) return;
++    SpkSetup(true);
++    if (!g_spkFree) {  // the setup failed
++        g_running = false;
++        return;
++    }
++    StartSampler();
++}
++
++// audio.cpp Audio_HLE_Tick (S8): when the game thread last ticked audio, for the spikes' audio gap.
++void SwitchSpikeAudioTick() { g_spkAudioTickAt.store(armGetSystemTick(), std::memory_order_relaxed); }
++
++namespace {
++// The spikes recorded since the last print (sampler thread while it runs, else the dump), then empty.
++void SpkPrint() {
++    const auto ms = [](u64 ticks) { return double(armTicksToNs(ticks)) / 1e6; };
++    std::fprintf(stderr,
++                 "[spike] anchor=0x%lx text=0x%lx-0x%lx threshold=%.1f ms spikes=%u session=%u/%u dropped=%u "
++                 "queue_full=%u longer_skipped=%u frames=%u\n",
++                 reinterpret_cast<u64>(&SwitchProfilerStart), g_spkTextLo, g_spkTextHi, double(g_spkThresholdNs) / 1e6,
++                 g_spikeCount, g_spkTotal, g_spkLimit, g_spikesDropped, g_spkQueueFull, g_spkLong,
++                 g_spkFrame.load(std::memory_order_relaxed));
++    if (g_gxEnabled) {
++        std::fprintf(stderr, "[spike] worker samples=%lu pause_failed=%lu read_failed=%lu resume_failed=%lu "
++                     "unregistered=%lu main_resume_failed=%lu frame_changed=%lu\n",
++                     g_gxSamples, g_gxPauseFailed, g_gxReadFailed, g_gxResumeFailed,
++                     g_gxUnregistered, g_gxMainResumeFailed, g_gxFrameChanged);
++    }
++    for (u32 i = 0; i < g_spikeCount; ++i) {
++        const Spike& s = g_spikes[i];
++        const SpkContext& b = s.begin;
++        const SpkContext& f = s.finish;
++        const bool both = b.frame != ~0u && f.frame != ~0u;
++        size_t o = 0;
++        const auto put = [&](const char* format, auto... values) {
++            if (o + 160 >= kSpkTextSize) return;
++            o += size_t(std::snprintf(g_spkText + o, kSpkTextSize - o, format, values...));
++        };
++        put("[spike] frame=%u ms=%.1f t=%.3f samples=%u dk=%lu..%lu audio_gap=%.1f io_main=%lu/%.2f "
++            "io_other=%lu/%.2f pipelines=+%u shader_code=+%u%s\n",
++            s.request.frame, ms(s.request.end - s.request.start),
++            double(armTicksToNs(s.request.start - g_spkBenchStart)) / 1e9, s.count, b.dkFrame, f.dkFrame,
++            ms(b.audioGapTicks), both ? f.io[0] - b.io[0] : u64(0), both ? ms(f.io[1] - b.io[1]) : 0.0,
++            both ? f.io[2] - b.io[2] : u64(0), both ? ms(f.io[3] - b.io[3]) : 0.0,
++            both ? f.pipelines - b.pipelines : 0u, both ? f.codeBytes - b.codeBytes : 0u, both ? "" : " (no context)");
++        for (u32 k = 0; k < s.count; ++k) {
++            const SpkSample& x = g_spkStore[s.first + k];
++            put("[spike] P %.2f %lx %lx", x.tick > s.request.start ? ms(x.tick - s.request.start) : 0.0, x.pc, x.lr);
++            for (u32 r = 0; r < x.raCount; ++r) put(" %lx", x.ra[r]);
++            put("\n");
++            if (x.gxTick) {
++                put("[spike] W %.2f %lx %lx\n",
++                    x.gxTick > s.request.start ? ms(x.gxTick - s.request.start) : 0.0, x.gxPc, x.gxLr);
++            }
++        }
++        std::fwrite(g_spkText, 1, o, stderr);
++    }
++    std::fprintf(stderr, "[spike] end\n");
++    std::fflush(stderr);
++    g_spikeCount = 0;
++    g_spkStoreUsed = 0;
++    g_spkLastFlush = armGetSystemTick();
++}
++
++void SpkDump() {
++    if (g_spkThresholdNs == 0) return;
++    SpkPrint();
++    g_spkThresholdNs = 0;
++}
++} // namespace
++
++// GX__CallDisplayList_80172f64 (runtime/src/hle/gx/gx_dl.cpp): one per display-list call (P20).
++extern "C" void SwitchProfilerCountDl() { g_dlCalls.fetch_add(1, std::memory_order_relaxed); }
++
++extern "C" void SwitchProfilerDump() {
++    if (!g_running.exchange(false)) return;
++    threadWaitForExit(&g_thread);
++    threadClose(&g_thread);
++    std::fprintf(stderr, "[profile] anchor=0x%lx samples=%lu failed=%lu\n",
++                 reinterpret_cast<u64>(&SwitchProfilerStart), g_samples, g_failed);
++    for (const auto& [pc, count] : g_pc) std::fprintf(stderr, "[profile] P %lx %u\n", pc, count);
++    for (const auto& [lr, count] : g_lr) std::fprintf(stderr, "[profile] L %lx %u\n", lr, count);
++    std::fprintf(stderr, "[profile] late samples=%lu (host frame past 17 ms)\n", g_lateSamples);
++    for (const auto& [pc, count] : g_latePc) std::fprintf(stderr, "[profile] Q %lx %u\n", pc, count);
++    for (const auto& [lr, count] : g_lateLr) std::fprintf(stderr, "[profile] R %lx %u\n", lr, count);
++    SpkDump();
++    std::fprintf(stderr, "[profile] end\n");
++    std::fflush(stderr);
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_stdio.cpp b/runtime/src/platform/switch/switch_stdio.cpp
+new file mode 100644
+index 0000000..4eab794
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_stdio.cpp
+@@ -0,0 +1,11 @@
++// Standard output on Horizon (main.cpp's process transcript): over the network to nxlink's console on
++// the PC when nxlink started the game (nxlink -s), else nowhere but the log file.
++#if defined(__SWITCH__)
++#include <arpa/inet.h>  // nxlink.h uses struct in_addr without it
++#include <switch.h>
++
++extern "C" bool SwitchStdioToNxlink() {
++    if (__nxlink_host.s_addr == 0 || R_FAILED(socketInitializeDefault())) return false;
++    return nxlinkStdio() >= 0;
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_thread_placement.cpp b/runtime/src/platform/switch/switch_thread_placement.cpp
+new file mode 100644
+index 0000000..624bd23
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_thread_placement.cpp
+@@ -0,0 +1,173 @@
++// Core 0 belongs to the game's main thread (the guest fibers, priority 0x2C).
++//
++// libnx starts every pthread (std::thread, SDL_CreateThread, Mesa's thrd_create, Dawn's workers)
++// through __syscall_thread_create: threadCreate(prio 0x3B, core -2) and then
++// svcSetThreadCoreMask(handle, -1, <process core mask>), i.e. allowed on cores 0, 1 and 2. Horizon
++// then runs those threads on core 0 whenever the main thread blocks for a moment (a fiber switch
++// wait, a FIFO handoff), and the main thread pays the switch back and the cache they evicted.
++// SwitchWakerHD (Wind Waker HD on Switch) measured 20 -> 28 fps in a CPU-bound scene by giving its
++// main thread a core of its own.
++//
++// Here that one libnx call is rewritten while the new thread is still suspended: its affinity
++// becomes WIICOMPILED_SWITCH_THREAD_MASK (default 0x6: cores 1 and 2; 0 keeps libnx's mask), ideal
++// core the highest core in it. Threads that pin themselves later (SwitchPinCurrentThread: the GX
++// FIFO worker, the frame worker, the presenter, the AX mixer, deko3d's shader worker) still do.
++// Linked with -Wl,--wrap=__syscall_thread_create -Wl,--wrap=svcSetThreadCoreMask
++// (PublicProducts.cmake); only the call made inside __syscall_thread_create is changed.
++//
++// WIICOMPILED_SWITCH_THREADS=1 (nxlink argument; N > 1: every N seconds, else every 60 s) prints
++// every thread created that way plus the main thread: ideal core, affinity mask, priority and CPU
++// time per interval ("[threads] ..." on stderr). entry/run are link-time addresses (nm -n of
++// WiiCompiled.elf): entry is the pthread start routine; for a std::thread, run is its _M_run.
++#if defined(__SWITCH__)
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <switch.h>
++
++extern "C" {
++int __real___syscall_thread_create(void* thread, void* (*func)(void*), void* arg, void* stack_addr,
++                                   size_t stack_size);
++Result __real_svcSetThreadCoreMask(Handle handle, s32 preferred_core, u32 affinity_mask);
++extern char __start__[];      // switch.ld: image start (code)
++extern char __rodata_start[]; // end of code
++extern char __relro_start[];  // .data.rel.ro (vtables) ...
++extern char __data_start[];   // ... ends here
++extern char* fake_heap_start; // libsysbase's heap bounds, set by libnx
++extern char* fake_heap_end;
++}
++
++namespace mlb_switch_threads {
++
++struct Created {
++    Handle handle;
++    u64 tid;
++    u64 entry, arg, run; // link-time addresses (run: std::thread _State's _M_run, else 0)
++    u64 lastTicks;
++    std::atomic<bool> ready;
++};
++
++constexpr int kMaxCreated = 96;
++Created g_created[kMaxCreated];
++std::atomic<int> g_count{0};  // slots handed out (a slot is valid once .ready)
++std::atomic<bool> g_dumperStarted{false};
++Thread g_dumper;
++
++// The pthread being created on this thread, between __syscall_thread_create and its core-mask call.
++thread_local void* (*t_start)(void*) = nullptr;
++thread_local void* t_arg = nullptr;
++
++u32 PlacementMask() {
++    const char* text = std::getenv("WIICOMPILED_SWITCH_THREAD_MASK");
++    return text ? u32(std::strtoul(text, nullptr, 0)) & 0x7u : 0x6u;
++}
++
++u64 LinkAddress(const void* p) {
++    return p ? u64(reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(__start__)) : 0;
++}
++
++// std::thread hands pthread a heap _State* whose vtable (in .data.rel.ro) has _M_run at slot 2.
++u64 StdThreadRun(void* arg) {
++    const auto a = reinterpret_cast<uintptr_t>(arg);
++    if (a % 8 || a < uintptr_t(fake_heap_start) || a + 8 > uintptr_t(fake_heap_end)) return 0;
++    const auto vtable = *reinterpret_cast<const uintptr_t*>(a);
++    if (vtable % 8 || vtable < uintptr_t(__relro_start) || vtable + 24 > uintptr_t(__data_start)) return 0;
++    const auto run = reinterpret_cast<const uintptr_t*>(vtable)[2];
++    if (run < uintptr_t(__start__) || run >= uintptr_t(__rodata_start)) return 0;
++    return u64(run - uintptr_t(__start__));
++}
++
++u64 ThreadTicks(Handle handle) {
++    u64 ticks = 0;
++    if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, handle, u64(-1)))) return u64(-1);
++    return ticks;
++}
++
++void DumpOne(const char* label, Handle handle, u64& lastTicks) {
++    s32 ideal = -9, prio = -1;
++    u64 mask = 0, tid = 0;
++    const Result rm = svcGetThreadCoreMask(&ideal, &mask, handle);
++    svcGetThreadPriority(&prio, handle);
++    svcGetThreadId(&tid, handle);
++    const u64 ticks = ThreadTicks(handle);
++    const u64 delta = (ticks != u64(-1) && lastTicks != 0 && ticks >= lastTicks) ? ticks - lastTicks : 0;
++    if (ticks != u64(-1)) lastTicks = ticks;
++    std::fprintf(stderr, "[threads] %s tid=%lu ideal=%d mask=0x%lx prio=0x%x cpu_ms=%lu interval_ms=%lu%s\n",
++                 label, tid, ideal, mask, unsigned(prio), ticks == u64(-1) ? 0 : armTicksToNs(ticks) / 1000000,
++                 armTicksToNs(delta) / 1000000, R_FAILED(rm) ? " (handle gone)" : "");
++}
++
++void Dump() {
++    static u64 mainLast = 0;
++    const int count = g_count.load(std::memory_order_acquire);
++    std::fprintf(stderr, "[threads] dump: %d pthreads created, placement mask 0x%x, sampled on core %u\n",
++                 count, PlacementMask(), svcGetCurrentProcessorNumber());
++    DumpOne("main", envGetMainThreadHandle(), mainLast);
++    for (int i = 0; i < count && i < kMaxCreated; ++i) {
++        Created& c = g_created[i];
++        if (!c.ready.load(std::memory_order_acquire)) continue;
++        char label[96];
++        std::snprintf(label, sizeof label, "#%d created_tid=%lu entry=0x%lx run=0x%lx", i, c.tid, c.entry, c.run);
++        DumpOne(label, c.handle, c.lastTicks);
++    }
++    std::fflush(stderr);
++}
++
++void DumperMain(void*) {
++    const char* text = std::getenv("WIICOMPILED_SWITCH_THREADS");
++    const long every = text ? std::atol(text) : 0;
++    const u64 period = u64(every > 1 ? every : 60) * 1000000000ull;
++    for (;;) {
++        svcSleepThread(s64(period));
++        Dump();
++    }
++}
++
++void MaybeStartDumper() {
++    if (g_dumperStarted.load(std::memory_order_relaxed)) return;
++    const char* text = std::getenv("WIICOMPILED_SWITCH_THREADS");
++    if (text == nullptr || std::atol(text) <= 0 || g_dumperStarted.exchange(true)) return;
++    // Core 2, libnx's preemptive priority: it sleeps all the time and must stay off core 0.
++    if (R_SUCCEEDED(threadCreate(&g_dumper, DumperMain, nullptr, nullptr, 0x8000, 0x3B, 2)))
++        threadStart(&g_dumper);
++}
++
++} // namespace mlb_switch_threads
++
++extern "C" int __wrap___syscall_thread_create(void* thread, void* (*func)(void*), void* arg,
++                                              void* stack_addr, size_t stack_size) {
++    using namespace mlb_switch_threads;
++    MaybeStartDumper();
++    t_start = func;
++    t_arg = arg;
++    const int rc = __real___syscall_thread_create(thread, func, arg, stack_addr, stack_size);
++    t_start = nullptr;
++    t_arg = nullptr;
++    return rc;
++}
++
++extern "C" Result __wrap_svcSetThreadCoreMask(Handle handle, s32 preferred_core, u32 affinity_mask) {
++    using namespace mlb_switch_threads;
++    if (t_start == nullptr || preferred_core != -1) {
++        return __real_svcSetThreadCoreMask(handle, preferred_core, affinity_mask);
++    }
++    // libnx's own call for the thread __syscall_thread_create just made (not started yet).
++    const int slot = g_count.fetch_add(1, std::memory_order_relaxed);
++    if (slot < kMaxCreated) {
++        Created& c = g_created[slot];
++        c.handle = handle;
++        c.tid = 0;
++        svcGetThreadId(&c.tid, handle);
++        c.entry = LinkAddress(reinterpret_cast<void*>(t_start));
++        c.arg = reinterpret_cast<uintptr_t>(t_arg);
++        c.run = StdThreadRun(t_arg);
++        c.lastTicks = 0;
++        c.ready.store(true, std::memory_order_release);
++    }
++    t_start = nullptr;  // one call per creation
++    const u32 mask = PlacementMask() & affinity_mask;
++    if (mask == 0) return __real_svcSetThreadCoreMask(handle, preferred_core, affinity_mask);
++    const s32 ideal = 31 - __builtin_clz(mask);
++    return __real_svcSetThreadCoreMask(handle, ideal, mask);
++}
++#endif
+diff --git a/runtime/src/platform/switch/switch_threads.cpp b/runtime/src/platform/switch/switch_threads.cpp
+new file mode 100644
+index 0000000..e8aa273
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_threads.cpp
+@@ -0,0 +1,11 @@
++// Core and priority for threads that libnx would start at 0x3B on the default core
++// (aurora.cpp's frame worker and presenter, the AX mixer). Lower number = higher priority;
++// the game's main thread runs at 0x2C on core 0.
++#if defined(__SWITCH__)
++#include <switch.h>
++
++extern "C" void SwitchPinCurrentThread(int core, int priority) {
++    svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
++    svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
++}
++#endif
+diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
+index 7a2f7dd..074d20c 100644
+--- a/runtime/src/settings_overlay.cpp
++++ b/runtime/src/settings_overlay.cpp
+@@ -65,6 +65,9 @@ extern "C" void PAD_HLE_SetRumbleEnabled(bool enabled);
+ #include <aurora/gfx.h>
+ 
+ extern "C" int g_gxFrameCount;
++#if defined(__SWITCH__)
++extern "C" void SwitchProfilerHostFrame();  // platform/switch/switch_profiler.cpp (S8 spike capture)
++#endif
+ 
+ // Defined in runtime/src/hle/audio/ax_mix.cpp. That header is private to the HLE
+ // directory and is not on this target's include path.
+@@ -76,10 +79,19 @@ namespace two_way {
+ void OnHostFrame();  // two_way.cpp: the MLB Life drill list's "X Change"
+ }
+ 
++extern "C" void aurora_gx_fifo_stats_mark(void); // aurora gx/fifo_async.inc (match benchmark)
++extern "C" int aurora_gx_fifo_stats_report(char* out, int size);
++#if defined(__SWITCH__)
++extern "C" bool SwitchUsesDeko3d();  // tools/switch/deko/aurora/dk_present.cpp
++#endif
++
+ namespace settings_overlay {
+ namespace {
+ 
+ const char* GraphicsApiDisplayName() {
++#if defined(__SWITCH__)
++    if (SwitchUsesDeko3d()) return "deko3d";
++#endif
+     switch (aurora_get_backend()) {
+     case BACKEND_D3D11: return "Direct3D 11";
+     case BACKEND_D3D12: return "Direct3D 12";
+@@ -1220,6 +1232,11 @@ void DrawGraphicsSettings() {
+ }
+ 
+ // WIICOMPILED_BENCH=<minDraws>,<seconds>[,<maxWaitSeconds>]: event-driven benchmark. Waits until a
++#if defined(__SWITCH__)
++extern "C" void SwitchProfilerStart();  // platform/switch/switch_profiler.cpp
++extern "C" void SwitchProfilerDump();
++extern "C" void SwitchProfilerFrame();
++#endif
+ #include "match_benchmark_overlay.inc"
+ // frame issues at least minDraws draw calls (the scene under test), then records frame-to-frame
+ // times for the given seconds, prints a summary to stderr and exits. Exits with code 3 if the
+@@ -1308,11 +1325,18 @@ void RunBenchmarkFrame() {
+ void DrawFpsOverlay() {
+     DrawMatchBenchmark();
+     RunBenchmarkFrame();
++#if !defined(__SWITCH__)
+     AuroraPresentTiming presentTiming{};
+     aurora_get_present_timing(&presentTiming);
++#endif
+     if (!g_showFps || stadium_viewer::Enabled()) {
+         return;
+     }
++#if defined(__SWITCH__)
++    // Only for the counter it shows: the snapshot locks the presenter's timing ring and walks it.
++    AuroraPresentTiming presentTiming{};
++    aurora_get_present_timing(&presentTiming);
++#endif
+ 
+     const ImGuiIO& io = ImGui::GetIO();
+     constexpr float kMargin = 10.0f;
+@@ -1708,6 +1732,9 @@ void ReleaseControllers() noexcept {
+ }
+ 
+ void Draw() noexcept {
++#if defined(__SWITCH__)
++    SwitchProfilerHostFrame();  // WIICOMPILED_SWITCH_SPIKES without the timed benchmark: marks host frames
++#endif
+     // Wait for the frame worker's DONE phase: it has replayed the previous frame's ImGui draw lists
+     // and started the next ImGui frame, so all overlay callers can now safely issue ImGui commands.
+     aurora_wait_for_frame_worker();
+diff --git a/runtime/third_party/libco/settings.h b/runtime/third_party/libco/settings.h
+index 418c00a..d61eb79 100644
+--- a/runtime/third_party/libco/settings.h
++++ b/runtime/third_party/libco/settings.h
+@@ -120,6 +120,8 @@
+   #define LIBCO_STRINGIFY(x) #x
+   #define LIBCO_TOSTRING(x) LIBCO_STRINGIFY(x)
+   #define section(name) __pragma(code_seg(LIBCO_TOSTRING("." #name))) __declspec(allocate(LIBCO_TOSTRING("." #name)))
++#elif defined(__SWITCH__)
++  #define section(name) __attribute__((section("." #name ".libco")))
+ #elif defined(__APPLE__)
+   #define section(name) __attribute__((section("__TEXT,__" #name)))
+ #else
+diff --git a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
+index 2201e54..42a7f98 100644
+--- a/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
++++ b/translator/src/Translator.Core/IO/AssemblyBlobWriter.cs
+@@ -22,15 +22,17 @@ internal static class AssemblyBlobWriter
+         var expectedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+         var assembly = new StringBuilder();
+         foreach (var header in headerLines) assembly.AppendLine(header);
+-        // PE/COFF (Windows), Mach-O (macOS), and ELF (Linux) spell a read-only data section
+-        // differently in GNU-as syntax. The build always targets
+-        // whichever platform the translator itself runs on (there is no cross-compilation
+-        // support), so that's what this picks the section syntax from.
+-        assembly.AppendLine(OperatingSystem.IsWindows()
+-            ? ".section .rdata,\"dr\""
+-            : OperatingSystem.IsMacOS()
+-                ? ".section __TEXT,__const"
+-                : ".section .rodata,\"a\",@progbits");
++        // PE/COFF (Windows), Mach-O (macOS), and ELF (Linux, Horizon) spell a read-only data
++        // section differently in GNU-as syntax. The target can differ from the platform the
++        // translator runs on (the Switch build translates on Windows), so the preprocessor that
++        // .S files go through picks it.
++        assembly.AppendLine("#if defined(_WIN32)");
++        assembly.AppendLine(".section .rdata,\"dr\"");
++        assembly.AppendLine("#elif defined(__APPLE__)");
++        assembly.AppendLine(".section __TEXT,__const");
++        assembly.AppendLine("#else");
++        assembly.AppendLine(".section .rodata,\"a\",@progbits");
++        assembly.AppendLine("#endif");
+         assembly.AppendLine();
+ 
+         foreach (var blob in blobs)

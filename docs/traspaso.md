@@ -388,3 +388,10 @@ y origen de asignaciones/copias; el coste está repartido entre muchas funciones
 Los contadores activos tienen coste propio y no cuentan como progreso de juego.
 El usuario identificó la CPU como prioridad. Sigue pendiente su confirmación
 visual; no se inició otra prueba de consola.
+
+## Fases 79–80 (2026-10-29, Claude + Sonnet) y parche en tres archivos
+
+- **Fase 79 (P25):** `InvokeIndirectCpu` rápido (`runtime/src/abi_dispatch_fast.cpp`, definición fuerte que gana a las copias weak del header; tabla global 2-vías de 2048 entradas): ~33 instrucciones por acierto frente a ~62, fallos de memo 21% → ~1,4%. Solo destinos traducidos sin guardas; nativas/guardas/otros contextos van por el cuerpo original. `WIICOMPILED_DISPATCH_FAST=0` lo apaga. Tras compilar, `nm -C WiiCompiled.elf | grep ' InvokeIndirectCpu('` debe mostrar `T`. 45,7 M llamadas en host sin diferencias.
+- **Fase 80 (P24):** asignaciones, locks y copias del hilo principal: bombeo de red/NAND sin deque ni locks cuando no hay nada, lecturas diferidas sin mutex fuera de páginas cubiertas, casco de destinos de copia EFB, índice de texobj por desplazamiento, copia DVD por páginas con `memcpy`, `cpWrites` reutilizado, poll de `GX__Begin` con tick del sistema; fold en la fase 33 (`kDlScanFrontSlots` 1024 → 4096). `WIICOMPILED_ALLOC_FAST=0`, `WIICOMPILED_GX_TEXINDEX_ROTATE=0`, `WIICOMPILED_DVD_FAST_COPY=0`.
+- **Tres parches Switch:** ya no caben en dos de 512 KiB; `mkswitch.sh`, `treecheck.sh` y `tools/switch/build-nro.sh` aplican `wiicompiled-switch`, `-2` y `-3`.
+- **Medición limpia en consola** (sin contadores que impriman; la captura GX-batch3 de Codex estaba contaminada por ~5.600 líneas `[gx-batch]` desde el hilo principal, que causan picos): log `nxlink-MLBPowerPros2008-20261029-202219.log`, símbolos `elf-syms-P24.txt`. Picos >30 ms ya jugando (frames >7000): 4 en ~9.800 frames (~0,4/1000) frente a ~1,5/1000 en la fase 68; intro + toma inicial (frames 1,8k–7k): 31 frente a 65. Los 50 picos tempranos (<1.737) son cargas con E/S en menús. Nota: **no activar `WIICOMPILED_GX_BATCH_PROFILE`/`WIICOMPILED_GX_MODEL_PROFILE` para medir tiempos.**
