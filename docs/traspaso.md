@@ -427,4 +427,16 @@ Build Horizon completado con cuatro jobs: 0 archivos traducidos actualizados,
 SHA-256 `1677bbf4c0db19b1a928f84bec5625cd96f31ef4b8bf56a2076ea29cdedc6c1a`.
 Pasaron `git diff --check` y `tools/check_no_game_data.py --all`. El primer
 build dentro del sandbox falló al preparar .NET; el mismo comando fuera del
-sandbox compiló correctamente. No se ejecutó la candidata en consola.
+sandbox compiló correctamente.
+
+Primera corrida limpia enviada tras el «netloader listo» del usuario:
+`nxlink-P30-compression-20261029-225915.log`. Arrancó en handheld con
+PASS_TIMES/DRAW_TIMES/DRAW_PIXELS/SHOT y perfil CPU/picos apagados. Frames
+5119–6709: 53,0 presents/s, GPU p50/p95/p99 16,0/20,0/20,0 ms,
+541/1591 frames tarde, los 541 con GPU >16 ms. Ventana siguiente 6710–8501:
+59,7 presents/s, GPU 15,75/16,25/16,25 ms y 23/1791 tarde, ninguno por GPU.
+No había shaders omitidos/fallidos ni mensajes deko3d. Son ventanas de escenas
+mezcladas: no se ha identificado aún una ventana homogénea de la toma objetivo,
+ni se verificaron los relojes en el log. No comparar causalmente con P29 ni
+atribuir el p95 de 20 ms a una mejora: falta control limpio de la NRO anterior
+y comparación de capturas. La imagen no se capturó en esta corrida de tiempos.
