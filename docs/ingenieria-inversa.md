@@ -1331,5 +1331,12 @@ En la dependencia deko3d fijada, `dkImageLayoutInitialize` selecciona el tipo de
 memoria y redondea tamaño/alineación a páginas grandes; el allocator existente
 respeta ambos, y `dkImageInitialize` configura el mapeo correspondiente.
 La compresión es de almacenamiento, sin cuantización adicional de los texels.
-Pendientes la comparación de capturas y la medición en consola: no se atribuye
-todavía ahorro de GPU ni equivalencia visual comprobada a este cambio.
+Dos corridas limpias en portátil, con igual configuración y equipos/estadio
+confirmados por el usuario: en las ventanas pesadas, GPU p50/p95/p99 pasó de
+17,0/21,0/21,25 ms (control) a 16,0/20,0/20,0 ms (compresión). Presents/s:
+52,6 → 53,0; tarde: 592/1579 → 541/1591. Es un indicio de ~1 ms menos GPU,
+no una comparación de frames idénticos: las ventanas mezclan escenas y tienen
+distinta cantidad de pasadas; los relojes no quedaron registrados. El usuario
+no vio diferencias gráficas. No se hizo comparación píxel a píxel ni se
+demostraron 60 fps sostenidos. Logs privados: `nxlink-P30-before-compression-20261029-230826.log`
+y `nxlink-P30-compression-20261029-225915.log`; detalle en `docs/traspaso.md`.

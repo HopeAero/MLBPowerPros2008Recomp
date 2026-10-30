@@ -417,10 +417,9 @@ no cambia runtime/Aurora, fases del parche, audio ni código generado.
 
 Baseline privado conservado en `local/switch/build/P30-before-compression.nro`
 (SHA-256 `0cda74e4db56f16cc8222615a53ff0f35366310738ce7da8441047c73cb0ff3d`).
-Faltan capturas comparables y A/B limpio en portátil a stock; cualquier corrida
-con PASS_TIMES/DRAW_TIMES/DRAW_PIXELS o capturas será solo diagnóstico, separada
-de la medición final con las estadísticas periódicas existentes. No atribuir
-mejora medida ni igualdad de imagen validada antes de esas pruebas.
+Las dos corridas de rendimiento usaron solo las estadísticas periódicas
+existentes. PASS_TIMES/DRAW_TIMES/DRAW_PIXELS/SHOT y perfil CPU/picos apagados;
+no se mezclaron capturas o instrumentación por dibujo con esos tiempos.
 
 Build Horizon completado con cuatro jobs: 0 archivos traducidos actualizados,
 48.223 sin cambios. Candidata privada `local/switch/build/P30-compression.nro`,
@@ -435,8 +434,27 @@ PASS_TIMES/DRAW_TIMES/DRAW_PIXELS/SHOT y perfil CPU/picos apagados. Frames
 5119–6709: 53,0 presents/s, GPU p50/p95/p99 16,0/20,0/20,0 ms,
 541/1591 frames tarde, los 541 con GPU >16 ms. Ventana siguiente 6710–8501:
 59,7 presents/s, GPU 15,75/16,25/16,25 ms y 23/1791 tarde, ninguno por GPU.
-No había shaders omitidos/fallidos ni mensajes deko3d. Son ventanas de escenas
-mezcladas: no se ha identificado aún una ventana homogénea de la toma objetivo,
-ni se verificaron los relojes en el log. No comparar causalmente con P29 ni
-atribuir el p95 de 20 ms a una mejora: falta control limpio de la NRO anterior
-y comparación de capturas. La imagen no se capturó en esta corrida de tiempos.
+No había shaders omitidos/fallidos ni mensajes deko3d.
+
+Control limpio posterior, cerrado normalmente:
+`nxlink-P30-before-compression-20261029-230826.log`, handheld y compresión
+apagada. Comparación de las ventanas pesadas de 30 s:
+
+| Medida | Control (6654–8232) | Compresión (5119–6709) |
+|---|---:|---:|
+| Presents/s | 52,6 | 53,0 |
+| GPU p50/p95/p99 (ms) | 17,0 / 21,0 / 21,25 | 16,0 / 20,0 / 20,0 |
+| Frames tarde (>18 ms entre presents) | 592/1579 (37,5%) | 541/1591 (34,0%) |
+| Tarde con GPU >16 ms | 591 | 541 |
+| Dibujos por frame | 560,0 | 560,4 |
+| Pasadas por frame | 38,2 | 33,9 |
+
+El usuario confirmó la misma configuración, equipos y estadio y no vio ninguna
+diferencia gráfica. El indicio es ~1 ms menos GPU en los percentiles pesados;
+no es un replay del mismo estado ni una prueba causal aislada: las ventanas
+mezclan escenas y el número de pasadas difiere. No quedaron relojes registrados
+y no se compararon capturas píxel a píxel. No atribuir estos números a 60 fps
+sostenidos, mayor cobertura recomp ni progreso de partido. Ambas conexiones
+nxlink terminaron; no queda un monitor corriendo. La última NRO enviada a la
+SD es el control: para dejar la modificada, reenviar `P30-compression.nro`
+cuando el usuario confirme netloader listo.

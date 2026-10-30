@@ -1322,5 +1322,12 @@ opening shot's roughly 60 passes. In the pinned deko3d source,
 `dkImageLayoutInitialize` selects the memory kind and rounds size/alignment to
 large pages; the existing allocator honors both, and `dkImageInitialize` sets
 the corresponding mapping. This is storage compression with no extra texel
-quantization. Screenshot comparison and console measurement remain pending;
-neither GPU savings nor verified visual equivalence are claimed yet.
+quantization. Two clean handheld runs, with matching configuration and teams/stadium
+confirmed by the user, recorded GPU p50/p95/p99 of 17.0/21.0/21.25 ms (control)
+versus 16.0/20.0/20.0 ms (compression) in the heavy windows. Presents/s:
+52.6 → 53.0; late: 592/1579 → 541/1591. This suggests roughly 1 ms less GPU
+time, but is not an identical-frame comparison: the windows mix scenes and
+have different pass counts; clocks were not logged. The user saw no graphical
+differences. Pixel equality and sustained 60 fps have not been demonstrated.
+Private logs: `nxlink-P30-before-compression-20261029-230826.log` and
+`nxlink-P30-compression-20261029-225915.log`; details in `docs/traspaso.md`.
