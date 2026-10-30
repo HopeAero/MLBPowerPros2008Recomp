@@ -1370,4 +1370,10 @@ ns/call for partial VAT and 38–64 to 15–22 for partial VCD. Unchanged/forced
 cases stayed nearly equal. These are not Switch or per-frame timings.
 Tests passed 160,121 differential publications, 24,064 directed mask/normal/flag
 cases and six negative controls; P11 confirmed identical reconstructed trees.
-A console CPU frame-time or fps gain has not yet been demonstrated.
+The P34 console probe, without extra diagnostics and with a warm cache,
+recorded 53.3 fps in the heavy window (GPU p50/p95/p99 13.25/20.75/21.00 ms;
+584/1600 late frames, 581 with GPU >16 ms). Five gameplay windows recorded
+58.8–59.6 fps and 457/8896 late frames, 25 with GPU >16 ms. No failed/skipped
+shaders or deko3d messages. A causal CPU frame-time or fps gain remains
+unproven without a matched control and replay. Capture ended normally and
+P34 remains installed. Full table and limitations are in `docs/traspaso.md`.

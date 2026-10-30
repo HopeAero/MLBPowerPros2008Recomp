@@ -1382,4 +1382,10 @@ En host, con FIFO simulado y llamadas emparejadas, VAT parcial pasó de 72–86 
 quedaron casi iguales. No son tiempos de Switch ni ahorro por frame.
 Pasaron 160.121 publicaciones diferenciales, 24.064 casos dirigidos de
 máscaras/normales/flags y seis controles negativos; P11 confirmó los árboles.
-Todavía no hay una mejora de fps o tiempo de CPU demostrada en consola.
+La sonda P34 en consola, sin diagnósticos adicionales y con caché caliente,
+dio 53,3 fps en la toma pesada (GPU p50/p95/p99 13,25/20,75/21,00 ms;
+584/1600 frames tarde, 581 con GPU >16 ms). Cinco ventanas de juego dieron
+58,8–59,6 fps y 457/8896 frames tarde, 25 con GPU >16 ms. Sin shaders
+fallidos/omitidos ni mensajes deko3d. No demuestra una mejora causal de fps o
+tiempo de CPU: faltan control emparejado y replay. La captura terminó
+normalmente; P34 queda instalada. Tabla y límites en `docs/traspaso.md`.

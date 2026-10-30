@@ -558,5 +558,31 @@ runtime y Aurora idénticos al árbol reconstruido. Build combinado con cuatro
 jobs completado: 0 archivos traducidos actualizados, 48.223 intactos. NRO
 privada `local/switch/build/P34-partial-vtx.nro`, SHA-256
 `8675274bace9d00217bd2eb2aa701112fd1706315fcc7e15883c17be5c455c7a`.
-`git diff --check` y el control de contenido pasaron. Se pidió netloader para
-la sonda limpia de esta candidata; aún no se envió ni se atribuye mejora de fps.
+`git diff --check` y el control de contenido pasaron.
+
+**Sonda de consola terminada:** enviada P34 tras «listo ya puedes medir again».
+Log privado `nxlink-P34-partial-vtx-20261030-004451.log`; handheld, sin
+diagnósticos adicionales, tiempos por pasada/dibujo y contadores de píxeles
+apagados. Caché caliente: 151 módulos, cero compilaciones durante las ventanas,
+shaders fallidos/omitidos y mensajes deko3d. Se excluyen menús/carga y la
+transición de presentación a juego; se saltó el vídeo antes que en P32.
+
+| Frames | Presents/s | GPU p50/p95/p99 ms | Frames tarde (por GPU) |
+|---|---:|---:|---:|
+| 5364–6963, pesada | 53,3 | 13,25 / 20,75 / 21,00 | 584/1600 (581) |
+| 8689–10477, juego | 59,6 | 13,50 / 14,50 / 17,25 | 67/1789 (15) |
+| 10478–12258, juego | 59,3 | 14,25 / 14,50 / 14,75 | 75/1781 (2) |
+| 12259–14023, juego | 58,8 | 14,00 / 15,00 / 15,00 | 178/1765 (3) |
+| 14024–15810, juego | 59,6 | 14,00 / 14,50 / 15,00 | 57/1787 (3) |
+| 15811–17584, juego | 59,1 | 14,25 / 15,00 / 15,00 | 80/1774 (2) |
+
+En las cinco ventanas de juego hubo 457/8896 frames tarde, 25 con GPU >16 ms
+y 432 clasificados por el runtime del lado CPU. Esto no mide percentiles del
+hilo principal ni identifica por sí solo la función causante. La toma pesada
+sigue limitada por GPU: p95 20,75 ms, como P32; 53,3 frente a 52,9 fps no
+demuestra mejora causal. Sin replay/control emparejado ni relojes registrados,
+tampoco se atribuye al cambio la variación de las ventanas de juego. Pendiente
+comparación de píxeles y confirmación visual específica de P34. nxlink terminó
+normalmente al cerrar la salida; no queda receptor corriendo. P34 queda
+instalada. No se revirtió el ahorro de trabajo probado en las rutinas host,
+pero no se declara aún una ganancia de fps o ms de CPU en Switch.
