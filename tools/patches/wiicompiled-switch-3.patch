@@ -1,3 +1,341 @@
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 7269747..796606b 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -83,6 +83,9 @@ extern std::atomic_bool g_auroraFrameActive;
+ extern "C" int g_gxFrameCount;
+ extern "C" const char* DVDResolveHostPathForTest(const char* dvdPath);
+ bool OS_HLE_InterruptsEnabled() noexcept;
++#if defined(__SWITCH__)
++extern "C" void GX_HLE_OffloadStop();
++#endif
+ 
+ namespace {
+ 
+@@ -429,6 +432,9 @@ std::string ReadInstalledSetupVersion() {
+     return text.substr(open + 1, close - open - 1);
+ }
+ 
++#if defined(__SWITCH__)
++extern "C" bool SwitchStdioToNxlink();  // platform/switch/switch_stdio.cpp
++#endif
+ void InitializeProcessTranscript(int argc, char** argv) {
+     auto& state = GetProcessTranscriptState();
+     if (state.initialized.exchange(true, std::memory_order_acq_rel)) {
+@@ -469,6 +475,19 @@ void InitializeProcessTranscript(int argc, char** argv) {
+         state.file.flush();
+     }
+ 
++#if defined(__SWITCH__)
++    // Horizon has no pipes to tee the standard streams through: they go to nxlink's console on the
++    // PC when it started the game, else straight into this file.
++    state.file.close();
++    state.enabled = false;
++    if (!SwitchStdioToNxlink()) {
++        (void)std::freopen(path.string().c_str(), "a", stdout);
++        (void)std::freopen(path.string().c_str(), "a", stderr);
++    }
++    std::setvbuf(stdout, nullptr, _IONBF, 0);
++    std::setvbuf(stderr, nullptr, _IONBF, 0);
++    return;
++#endif
+     state.savedStdoutFd = DuplicateFileDescriptor(GetFileDescriptor(stdout));
+     state.savedStderrFd = DuplicateFileDescriptor(GetFileDescriptor(stderr));
+ 
+@@ -1133,6 +1152,9 @@ void InstallSehLogger() {
+         SetUnhandledExceptionFilter(UnhandledSehFilter);
+     }
+ }
++#elif defined(__SWITCH__)
++// Horizon delivers no signals: a crash ends in Atmosphère's crash report instead.
++void InstallPosixMemoryFaultHandler() {}
+ #else
+ // POSIX counterpart to SehLogger above. Unlike Windows' AddVectoredExceptionHandler, which lets
+ // GuestFlat and this module each install their own handler and defensively re-check each other,
+@@ -1322,6 +1344,11 @@ static void TerminateHandler() {
+     } else {
+         terminateDetails = "std::terminate() without current exception.";
+     }
++#if defined(__SWITCH__)
++    std::fprintf(stderr, "[terminate] %s\n", terminateDetails.c_str());
++    std::fflush(stderr);
++    __builtin_trap();
++#endif
+     ShowRuntimeFatalPopup("an unhandled C++ exception occurred", terminateDetails);
+     const std::string hostStackSummary = FormatHostStackTrace(1);
+     if (!hostStackSummary.empty()) {
+@@ -1441,6 +1468,10 @@ int RuntimeMain(int argc, char** argv) {
+             {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
+             {"null", BACKEND_NULL},
+         }};
++#elif defined(__SWITCH__)
++        static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
++            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"null", BACKEND_NULL},
++        }};
+ #elif defined(_WIN32)
+         static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
+             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN}, {"d3d11", BACKEND_D3D11},
+@@ -1547,6 +1578,9 @@ int RuntimeMain(int argc, char** argv) {
+         RT_LOG(RT_TAG_RUNTIME) << label << " => 0x" << std::hex << result << std::dec << " (" << result << ")" << std::endl;
+         
+         // Shutdown fiber system
++        #if defined(__SWITCH__)
++        GX_HLE_OffloadStop();
++        #endif
+         Fiber::GuestFiberManager::Shutdown();
+         WindowPlacementPersistence::Flush(true);
+         aurora_shutdown();
+@@ -1565,6 +1599,9 @@ int RuntimeMain(int argc, char** argv) {
+         ShowRuntimeFatalPopup("a guest memory access was out of bounds", details.str());
+         WriteFatalLogImpl("access_violation", details.str());
+         SetRuntimeExitCodeImpl(1);
++        #if defined(__SWITCH__)
++        GX_HLE_OffloadStop();
++        #endif
+         Fiber::GuestFiberManager::Shutdown();
+         WindowPlacementPersistence::Flush(true);
+         aurora_shutdown();
+@@ -1577,6 +1614,9 @@ int RuntimeMain(int argc, char** argv) {
+         ShowRuntimeFatalPopup("a runtime exception occurred", ex.what());
+         WriteFatalLogImpl("exception");
+         SetRuntimeExitCodeImpl(1);
++        #if defined(__SWITCH__)
++        GX_HLE_OffloadStop();
++        #endif
+         Fiber::GuestFiberManager::Shutdown();
+         WindowPlacementPersistence::Flush(true);
+         aurora_shutdown();
+@@ -1587,6 +1627,15 @@ int RuntimeMain(int argc, char** argv) {
+ }
+ 
+ int main(int argc, char** argv) {
++#if defined(__SWITCH__)
++    for (int i = 1; i < argc; ++i) {
++        const char* equals = std::strchr(argv[i], '=');
++        if (std::strncmp(argv[i], "WIICOMPILED_", 12) == 0 && equals != nullptr) {
++            setenv(std::string(argv[i], equals - argv[i]).c_str(), equals + 1, 1);
++        }
++    }
++    argc = 1;
++#endif
+     return RuntimeMain(argc, argv);
+ }
+ extern "C" bool g_dynamicAspectRatioEnabled = false;
+diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
+index 280cfd6..6a4e529 100644
+--- a/runtime/src/match_benchmark_overlay.inc
++++ b/runtime/src/match_benchmark_overlay.inc
+@@ -1,4 +1,7 @@
+ // Included inside settings_overlay's private namespace: reuse its live graphics setters.
++#if defined(__SWITCH__)
++extern "C" const char* SwitchClocks();  // platform/switch/switch_profiler.cpp
++#endif
+ // CPU, threads, RAM, GPU and OS, one per line, for the panel and the saved report.
+ std::string BenchmarkDeviceInfo() {
+     char cpu[49] = {};
+@@ -14,7 +17,11 @@ std::string BenchmarkDeviceInfo() {
+     std::string name = cpu;
+     name.erase(name.find_last_not_of(' ') + 1);
+     name.erase(0, name.find_first_not_of(' '));
++#if defined(__SWITCH__)
++    const std::string gpu = SwitchUsesDeko3d() ? std::string("Tegra X1 (deko3d)") : std::string(aurora_get_adapter_name());
++#else
+     const std::string gpu = aurora_get_adapter_name();
++#endif
+     char ram[32];
+     std::snprintf(ram, sizeof(ram), "%.1f GB", SDL_GetSystemRAM() / 1024.0);
+     return "CPU: " + (name.empty() ? std::string("desconocida") : name) + " (" + std::to_string(SDL_GetNumLogicalCPUCores()) +
+@@ -156,6 +163,10 @@ void DrawMatchBenchmark() {
+         std::error_code ec;
+         std::filesystem::create_directories(folder, ec);
+         report = folder / ("match-" + std::to_string(id));
++#if defined(__SWITCH__)
++        static char csvBuffer[4 << 20];  // flush to the SD card at the end, not every few frames (90 s ~ 1 MB)
++        csv.rdbuf()->pubsetbuf(csvBuffer, sizeof csvBuffer);
++#endif
+         csv.open(report.string() + ".csv");
+         if (!csv) { message = "No se pudo crear el informe"; return; }
+         csv << "utc_unix_ms,elapsed_s,frame_ms,draws,scale,force_16_9,backend,shader_queue,gpu_render_ms,gpu_samples,cpu_encode_ms,efb_copies,efb_source_pixels,efb_snapshots,efb_readbacks,efb_readback_wait_ms,presents,process_cpu_pct,gpu_3d_pct,process_ram_mb,vram_mb,system_ram_used_gb\n";
+@@ -163,6 +174,7 @@ void DrawMatchBenchmark() {
+         start = last = now;
+         base = previous = waits;
+         gpuBase = gpuPrevious = gpu;
++        aurora_gx_fifo_stats_mark();
+         intervals.clear();
+         valid = true;
+         recordedScale = g_resolutionScale;
+@@ -172,10 +184,18 @@ void DrawMatchBenchmark() {
+         recording = true;
+         message = "Midiendo";
+         std::fprintf(stderr, "[match-bench] recording %s scale=%.0f force169=%d\n", report.string().c_str(), g_resolutionScale, g_forceAspect169);
++#if defined(__SWITCH__)
++        SwitchProfilerStart();
++#endif
+     };
+     const auto finish = [&] {
+         recording = false;
+         completed = true;
++#if defined(__SWITCH__)
++        // The profile ends with the last recorded frame: the report's files below (the CSV's one
++        // write of ~0.5 MB, the summary) are no frame of the match. The later call does nothing.
++        SwitchProfilerDump();
++#endif
+         csv.close();
+         auto sorted = intervals;
+         std::sort(sorted.begin(), sorted.end());
+@@ -185,6 +205,9 @@ void DrawMatchBenchmark() {
+         std::ofstream summary(report.string() + ".txt");
+         summary << "Yankees vs Colorado; CPU vs CPU; Coors Field; seeded start\n"
+                 << device << '\n'
++#if defined(__SWITCH__)
++                << SwitchClocks() << '\n'
++#endif
+                 << "valid=" << valid << " start_unix_ms=" << report.filename().string().substr(6) << '\n'
+                 << "scale=" << g_resolutionScale << " force_16_9=" << g_forceAspect169 << " backend=" << GraphicsApiDisplayName() << '\n'
+                 << "seconds=" << elapsed << " presented_frames=" << frames << " fps=" << (elapsed > 0 ? frames/elapsed : 0) << '\n'
+@@ -201,9 +224,17 @@ void DrawMatchBenchmark() {
+             if (loadCount[i]) summary << loadNames[i] << "_mean=" << loadSum[i] / loadCount[i] << ' ' << loadNames[i] << "_peak=" << loadPeak[i] << '\n';
+             else summary << loadNames[i] << "=unavailable\n";
+         }
++        {
++            char fifo[2048];
++            if (aurora_gx_fifo_stats_report(fifo, sizeof fifo) > 0) summary << fifo;
++        }
+         summary << "process_cpu_pct is over all logical cores, like Task Manager. GPU/VRAM from Windows GPU counters.\n"
+                 << "GPU markers exclude presenter work and demanded EFB prefixes. CPU autoplay is not a bit-exact replay.\n";
+         summary.close();
++#if defined(__SWITCH__)
++        if (std::ifstream echo(report.string() + ".txt"); echo) std::cerr << echo.rdbuf() << std::flush;
++        SwitchProfilerDump();  // platform/switch/switch_profiler.cpp (step 17)
++#endif
+         message = "Informe guardado en UserData/Benchmarks";
+         std::fprintf(stderr, "[match-bench] saved %s.txt\n", report.string().c_str());
+     };
+@@ -219,6 +250,9 @@ void DrawMatchBenchmark() {
+     if (recording) {
+         const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+         intervals.push_back(ms);
++#if defined(__SWITCH__)
++        SwitchProfilerFrame();
++#endif
+         const uint64_t samples = gpu.samples - gpuPrevious.samples;
+         csv << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ','
+             << std::chrono::duration<double>(now - start).count() << ',' << ms << ',' << stats->drawCallCount << ','
+diff --git a/runtime/src/memory.cpp b/runtime/src/memory.cpp
+index 88a484e..ba4576b 100644
+--- a/runtime/src/memory.cpp
++++ b/runtime/src/memory.cpp
+@@ -188,6 +188,34 @@ void Memory::ClearDeferredReads() {
+ }
+ 
+ bool MemoryInline::ResolveDeferredReads(uint32_t addr, size_t length) {
++#if defined(__SWITCH__)
++    // P24: every slow-path guest read (the top megabyte of MEM1 with the OS threads and stacks, the
++    // locked cache, ...) took DeferredReadMutex only to find the list had nothing over its pages.
++    // g_deferredReadCoveredPages has a byte set for every page any registered range touches (set and
++    // cleared under the mutex, RefreshDeferredReadPage), so with none set over [addr, addr + length)
++    // no range can overlap and the walk below would match nothing. WIICOMPILED_ALLOC_FAST=0 restores
++    // the unconditional walk.
++    static const bool fastEnabled = [] {
++        const char* v = std::getenv("WIICOMPILED_ALLOC_FAST");
++        return !(v != nullptr && v[0] == '0');
++    }();
++    if (fastEnabled && length != 0) {
++        const uint64_t last = static_cast<uint64_t>(addr) + (length - 1);
++        const uint32_t firstPage = addr >> kPageShift;
++        const uint32_t lastPage = static_cast<uint32_t>(
++            std::min<uint64_t>(last >> kPageShift, kPageCount - 1));
++        bool covered = false;
++        for (uint32_t page = firstPage; page <= lastPage; ++page) {
++            if (__atomic_load_n(&g_deferredReadCoveredPages[page], __ATOMIC_ACQUIRE) != 0) {
++                covered = true;
++                break;
++            }
++        }
++        if (!covered) {
++            return true;
++        }
++    }
++#endif
+     std::vector<DeferredRead> matches;
+     std::vector<uint32_t> affectedPages;
+     {
+@@ -765,7 +793,11 @@ uint8_t* Memory::GetPointer(uint32_t addr) {
+     return GetPointer(addr, 1);
+ }
+ 
++#if defined(__SWITCH__)
++uint8_t* Memory::GetPointerSlow(uint32_t addr, size_t length) {
++#else
+ uint8_t* Memory::GetPointer(uint32_t addr, size_t length) {
++#endif
+     if (auto* ptr = MemoryInline::GetPointerFast(addr, length)) {
+         return ptr;
+     }
+@@ -774,7 +806,11 @@ uint8_t* Memory::GetPointer(uint32_t addr, size_t length) {
+     return region.storagePtr + offset;
+ }
+ 
++#if defined(__SWITCH__)
++bool Memory::ContainsSlow(uint32_t addr, size_t length) {
++#else
+ bool Memory::Contains(uint32_t addr, size_t length) {
++#endif
+     if (MemoryInline::GetPointerFast(addr, length)) {
+         return true;
+     }
+diff --git a/runtime/src/platform/switch/switch_crash.cpp b/runtime/src/platform/switch/switch_crash.cpp
+new file mode 100644
+index 0000000..a133027
+--- /dev/null
++++ b/runtime/src/platform/switch/switch_crash.cpp
+@@ -0,0 +1,46 @@
++// A CPU exception on Horizon (data abort, undefined instruction...): libnx calls this handler instead
++// of letting the system close the program with a bare "an error has occurred". It prints the fault
++// to stdout (nxlink's console on the PC, else the log file) and exits. PC and LR are printed against
++// the address of this function, so `nm WiiCompiled.elf` turns them into names.
++#if defined(__SWITCH__)
++#include <cstdio>
++#include <switch.h>
++
++#include "guest_flat_memory.h"
++
++extern "C" {
++alignas(16) u8 __nx_exception_stack[0x4000];
++u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
++u32 __nx_exception_ignoredebug = 1;
++
++void __libnx_exception_handler(ThreadExceptionDump* ctx) {
++    const auto anchor = reinterpret_cast<u64>(&__libnx_exception_handler);
++    std::printf("\n[crash] CPU exception 0x%x esr=0x%x far=0x%lx\n", ctx->error_desc, ctx->esr, ctx->far.x);
++    // In the flat view, far - base is the guest address the translated code touched.
++    if (const auto flat = reinterpret_cast<u64>(GuestFlat::g_flatBase); flat != 0) {
++        std::printf("[crash] far - flat base = 0x%lx%s (flat base 0x%lx)\n", ctx->far.x - flat,
++                    ctx->far.x - flat < GuestFlat::kGuestSpaceSize ? " (guest address)" : "", flat);
++    }
++    std::printf("[crash] pc=0x%lx lr=0x%lx sp=0x%lx fp=0x%lx (__libnx_exception_handler at 0x%lx)\n",
++                ctx->pc.x, ctx->lr.x, ctx->sp.x, ctx->fp.x, anchor);
++    for (int i = 0; i < 29; ++i) {
++        std::printf("[crash] x%-2d=0x%016lx%s", i, ctx->cpu_gprs[i].x, i % 4 == 3 ? "\n" : "  ");
++    }
++    // Return addresses on the stack: words that point into the program's code (within 256 MB of here).
++    // ponytail: a scan, not an unwinder; enough to name the callers.
++    std::printf("\n[crash] stack:");
++    const auto* stack = reinterpret_cast<const u64*>(ctx->sp.x);
++    for (int i = 0, shown = 0; i < 256 && shown < 24; ++i) {
++        const u64 word = stack[i];
++        if (word + 0x10000000 > anchor && word < anchor + 0x10000000) {
++            std::printf(" 0x%lx", word);
++            ++shown;
++        }
++    }
++    std::printf("\n");
++    std::fflush(stdout);
++    svcSleepThread(500'000'000);  // let nxlink's socket send it
++    svcExitProcess();
++}
++}
++#endif
 diff --git a/runtime/src/platform/switch/switch_io.cpp b/runtime/src/platform/switch/switch_io.cpp
 new file mode 100644
 index 0000000..f9801bc

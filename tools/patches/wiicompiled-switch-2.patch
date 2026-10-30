@@ -1,5 +1,5 @@
 diff --git a/runtime/src/hle/gx/gx_dl.cpp b/runtime/src/hle/gx/gx_dl.cpp
-index 818478d..e78580d 100644
+index 818478d..9c71b5d 100644
 --- a/runtime/src/hle/gx/gx_dl.cpp
 +++ b/runtime/src/hle/gx/gx_dl.cpp
 @@ -2,6 +2,10 @@
@@ -13,10 +13,12 @@ index 818478d..e78580d 100644
  
  #include <cstdlib>
  #include <unordered_map>
-@@ -10,14 +14,49 @@
+@@ -9,15 +13,51 @@
+ // The display-list scan cache validates a cached scan against the live guest
  // bytes with a 64-bit XXH3 digest (see GxDisplayListScanCache::CanReuse).
  #include <xxhash.h>
- 
++#include "gx_vtx_f32.h"
++
 +#include <memory>
 +
 +extern "C" int aurora_gx_fifo_async(void);            // aurora gx/fifo_async.inc
@@ -33,7 +35,7 @@ index 818478d..e78580d 100644
 +    return enabled;
 +}
 +#endif
-+
+ 
  namespace aurora::gx::fifo {
 -bool in_display_list();
  bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
@@ -64,7 +66,7 @@ index 818478d..e78580d 100644
  // Opcode constants and the stream helpers this file shares with gx_fifo.cpp /
  // gx_vertex.cpp; see gx_stream_common.h.
  using namespace GxCmd;
-@@ -37,6 +76,150 @@ constexpr size_t kDlScanCacheMaxStoredBytes = 8u * 1024u * 1024u;
+@@ -37,6 +77,150 @@ constexpr size_t kDlScanCacheMaxStoredBytes = 8u * 1024u * 1024u;
  // once at load and never touched again.
  constexpr uint64_t kDlWriteGenerationUntracked = GxGuestWrite::kUntracked;
  
@@ -215,7 +217,7 @@ index 818478d..e78580d 100644
  // Byte footprint of one vertex of the currently configured layout. Indexed attributes are
  // sized before the matrix-attribute check here (unlike BuildScanVertexLayout), but a
  // GX_INDEX16 matrix attribute is impossible on real hardware so both are unreachable.
-@@ -330,10 +513,13 @@ static void ApplyAuroraVtxStateForDlBegin(GXVtxFmt fmt) {
+@@ -330,10 +514,13 @@ static void ApplyAuroraVtxStateForDlBegin(GXVtxFmt fmt) {
  }
  
  
@@ -231,7 +233,7 @@ index 818478d..e78580d 100644
      GXVtxFmt currentVtxFmt;
      uint64_t vtxLayoutHash;
      bool vtxLayoutHashDirty;
-@@ -345,6 +531,10 @@ struct HleGxVertexStateSnapshot {
+@@ -345,6 +532,10 @@ struct HleGxVertexStateSnapshot {
  };
  
  constexpr uint32_t kAllVtxAttrFmtRows = 0xFFu;
@@ -242,7 +244,7 @@ index 818478d..e78580d 100644
  
  static HleGxVertexStateSnapshot CaptureGxVertexState() {
      HleGxVertexStateSnapshot snapshot;
-@@ -384,6 +574,11 @@ static void RestoreGxVertexState(const HleGxVertexStateSnapshot& snapshot) {
+@@ -384,6 +575,11 @@ static void RestoreGxVertexState(const HleGxVertexStateSnapshot& snapshot) {
      }
      g_hleGxState.vtxLayoutHash = snapshot.vtxLayoutHash;
      g_hleGxState.vtxLayoutHashDirty = snapshot.vtxLayoutHashDirty;
@@ -254,7 +256,7 @@ index 818478d..e78580d 100644
      // The wholesale desc/attr-fmt overwrite above bypasses the per-field change
      // checks that normally bump this, so mirrors must be told to resync.
      ++g_hleGxState.vtxStateGeneration;
-@@ -462,6 +657,8 @@ struct DlScanCacheEntry {
+@@ -462,6 +658,8 @@ struct DlScanCacheEntry {
      std::array<uint32_t, GX_VA_MAX_ATTR> maxXfIdx{};
      std::array<uint32_t, GX_VA_MAX_ATTR> maxXfBytes{};
      std::array<bool, GX_VA_MAX_ATTR> sawXfIdx{};
@@ -263,7 +265,7 @@ index 818478d..e78580d 100644
      GXVtxFmt dlVtxFmt = GX_MAX_VTXFMT;
      bool dlVtxFmtMixed = false;
      bool dlHasNestedDl = false;
-@@ -484,33 +681,94 @@ struct DlScanCacheRecord {
+@@ -484,33 +682,94 @@ struct DlScanCacheRecord {
      uint64_t writeGeneration = kDlWriteGenerationUntracked;
      std::vector<DlCpWrite> cpWrites{};
      std::vector<uint8_t> flattened{};
@@ -273,8 +275,8 @@ index 818478d..e78580d 100644
 +    DlHostStream hostStream{};
 +    uint32_t hostStreamBytes = 0;
 +#endif
-+};
-+
+ };
+ 
 +#if defined(__SWITCH__)
 +// A3: a direct-mapped table in front of `entries`. A hit in the unordered_map costs three
 +// dependent cache misses (bucket, previous node, node key: ~0.7% of the main thread in
@@ -284,7 +286,7 @@ index 818478d..e78580d 100644
 +struct DlScanFrontSlot {
 +    uint64_t key = 0;
 +    DlScanCacheRecord* record = nullptr;
- };
++};
 +// P24: 4096 (was 1024): a match binds 400-600 distinct lists a frame, so a quarter of them shared a
 +// slot with another one and fell through to the unordered_map (std::_Hashtable::find, 0.04 ms/frame).
 +constexpr uint32_t kDlScanFrontSlots = 4096;
@@ -292,7 +294,7 @@ index 818478d..e78580d 100644
 +    return static_cast<uint32_t>((key ^ (key >> 29) ^ (key >> 47)) & (kDlScanFrontSlots - 1u));
 +}
 +#endif
- 
++
  struct DlScanCacheState {
      std::unordered_map<uint64_t, DlScanCacheRecord> entries{};
      size_t storedCommandBytes = 0;
@@ -368,7 +370,7 @@ index 818478d..e78580d 100644
      g_hleGxState.vtxLayoutHash = hash;
      g_hleGxState.vtxLayoutHashDirty = false;
      return g_hleGxState.vtxLayoutHash;
-@@ -544,10 +802,43 @@ static DlScanCacheProbe ProbeDlScanCache(const uint8_t* list, uint32_t listAddr,
+@@ -544,10 +803,43 @@ static DlScanCacheProbe ProbeDlScanCache(const uint8_t* list, uint32_t listAddr,
  
      auto& s_cache = DlScanCache();
      const uint64_t key = DlScanCacheKey(listAddr, nbytes, layoutHash);
@@ -415,7 +417,7 @@ index 818478d..e78580d 100644
          const bool identityMatches = entry.listAddr == CanonicalizeGxMainRamAddress(listAddr) &&
                                       entry.nbytes == nbytes && entry.layoutHash == layoutHash;
          if (identityMatches && probe.writeGeneration != kDlWriteGenerationUntracked &&
-@@ -574,27 +865,61 @@ static DlScanCacheProbe ProbeDlScanCache(const uint8_t* list, uint32_t listAddr,
+@@ -574,27 +866,61 @@ static DlScanCacheProbe ProbeDlScanCache(const uint8_t* list, uint32_t listAddr,
  }
  
  static size_t DlScanCacheRecordBytes(const DlScanCacheRecord& record) {
@@ -480,7 +482,7 @@ index 818478d..e78580d 100644
      }
      DlScanCacheRecord record{};
      record.result = entry;
-@@ -610,12 +935,19 @@ static void StoreDlScanCache(uint32_t listAddr, uint32_t nbytes, uint64_t layout
+@@ -610,12 +936,19 @@ static void StoreDlScanCache(uint32_t listAddr, uint32_t nbytes, uint64_t layout
      if (flattened != nullptr && flattenedBytes != 0) {
          record.flattened.assign(flattened, flattened + flattenedBytes);
      }
@@ -500,7 +502,7 @@ index 818478d..e78580d 100644
  }
  
  static void BuildScanVertexLayout(GXVtxFmt vtxfmt, std::array<ScanAttrStep, 26>& indexedSteps,
-@@ -813,6 +1145,25 @@ static bool DisplayListMayContainDraw(const uint8_t* data, uint32_t nbytes) {
+@@ -813,6 +1146,25 @@ static bool DisplayListMayContainDraw(const uint8_t* data, uint32_t nbytes) {
      return !WalkDisplayList(data, nbytes, visitor, 0);
  }
  
@@ -526,7 +528,7 @@ index 818478d..e78580d 100644
  // Interpreter fallback
  struct DlInterpretVisitor {
      static constexpr int kMaxDepth = 8;
-@@ -1059,7 +1410,21 @@ static std::array<AppliedArrayState, GX_VA_MAX_ATTR> s_appliedArrays{};
+@@ -1059,7 +1411,21 @@ static std::array<AppliedArrayState, GX_VA_MAX_ATTR> s_appliedArrays{};
  static bool s_appliedVtxStateMatchesHle = false;
  static uint32_t s_appliedVtxStateGeneration = 0;
  
@@ -548,7 +550,7 @@ index 818478d..e78580d 100644
      s_appliedVtxDescValid = false;
      s_appliedVtxAttrFmtValid = false;
      s_appliedVtxStateMatchesHle = false;
-@@ -1085,6 +1450,43 @@ static void SyncAppliedVtxStateFromHleReal() {
+@@ -1085,6 +1451,43 @@ static void SyncAppliedVtxStateFromHleReal() {
      std::memcpy(s_appliedSourceVtxDesc.data(), g_hleGxState.vtxDesc, sizeof(g_hleGxState.vtxDesc));
      s_appliedVtxDescValid = true;
  
@@ -592,7 +594,7 @@ index 818478d..e78580d 100644
      std::memcpy(s_appliedVtxAttrFmt, g_hleGxState.vtxAttrFmt, sizeof(g_hleGxState.vtxAttrFmt));
      s_appliedVtxAttrFmtValid = true;
  
-@@ -1116,11 +1518,44 @@ static bool AuroraVtxDescMatchesLive(GXAttr attr, GXAttrType expected) {
+@@ -1116,11 +1519,56 @@ static bool AuroraVtxDescMatchesLive(GXAttr attr, GXAttrType expected) {
  }
  
  
@@ -600,6 +602,7 @@ index 818478d..e78580d 100644
 +// P17: the inputs of the last ApplyAuroraVtxDesc call that published nothing (see local/tmp/cpu/P17-gx.py).
 +static bool s_vcdNoopValid = false;
 +static uint32_t s_vcdNoopGeneration = 0;
++static GXAttrType s_vcdNoopDesc[26]; // P28: the HLE descriptor types that call compared
 +static uint32_t s_vcdNoopLo = 0;
 +static uint32_t s_vcdNoopHi = 0;
 +static uint32_t s_vcdNoopFlags = 0;
@@ -613,10 +616,21 @@ index 818478d..e78580d 100644
 +    bool published = false;
 +    if (p17) {
 +        aurora_gx_vcd_state(&vcdLo, &vcdHi, &vcdFlags);
-+        if (hadValidState && s_vcdNoopValid && s_vcdNoopGeneration == g_hleGxState.vtxStateGeneration &&
-+            s_vcdNoopLo == vcdLo && s_vcdNoopHi == vcdHi && s_vcdNoopFlags == vcdFlags) {
++        if (hadValidState && s_vcdNoopValid && s_vcdNoopLo == vcdLo && s_vcdNoopHi == vcdHi &&
++            s_vcdNoopFlags == vcdFlags &&
++            (s_vcdNoopGeneration == g_hleGxState.vtxStateGeneration ||
++             // P28: the loop below reads nothing of the HLE state but the descriptor types, so a
++             // generation moved by changes that left them as they were (GXClearVtxDesc and the
++             // GXSetVtxDesc calls before every mesh) does not matter; their content does. The live
++             // registers equal the ones that call saw, hence the descriptors it saw, and the mirror
++             // is compared again since the generation no longer vouches for it.
++             (GxVtxF32::kVcdNoopByContent &&
++              std::memcmp(s_vcdNoopDesc, g_hleGxState.vtxDesc, sizeof(s_vcdNoopDesc)) == 0 &&
++              std::memcmp(s_appliedVtxDesc.data(), g_hleGxState.vtxDesc, sizeof(s_vcdNoopDesc)) == 0 &&
++              std::memcmp(s_appliedSourceVtxDesc.data(), g_hleGxState.vtxDesc, sizeof(s_vcdNoopDesc)) == 0))) {
 +            // The previous call compared this very HLE descriptor, mirror and live descriptor and published
 +            // nothing; every input is the same, so this one would publish nothing either.
++            s_vcdNoopGeneration = g_hleGxState.vtxStateGeneration;
 +            return;
 +        }
 +    }
@@ -637,7 +651,7 @@ index 818478d..e78580d 100644
      for (int attr = 0; attr < 26; ++attr) {
          if (attr == GX_VA_NBT) continue;
          const GXAttr gxAttr = static_cast<GXAttr>(attr);
-@@ -1134,18 +1569,34 @@ static void ApplyAuroraVtxDesc() {
+@@ -1134,18 +1582,37 @@ static void ApplyAuroraVtxDesc() {
          // (MLB skinned models) makes aurora mis-size each vertex and decode the rest of
          // the list as XF loads.
          if (!needsPublish && gxAttr <= GX_VA_TEX7) {
@@ -666,6 +680,9 @@ index 818478d..e78580d 100644
 +    // Nothing published: aurora's state is what it was at entry (vcdLo/Hi/flags read there).
 +    s_vcdNoopValid = p17 && hadValidState && !published;
 +    s_vcdNoopGeneration = g_hleGxState.vtxStateGeneration;
++    if (s_vcdNoopValid) {
++        std::memcpy(s_vcdNoopDesc, g_hleGxState.vtxDesc, sizeof(s_vcdNoopDesc));
++    }
 +    s_vcdNoopLo = vcdLo;
 +    s_vcdNoopHi = vcdHi;
 +    s_vcdNoopFlags = vcdFlags;
@@ -673,7 +690,7 @@ index 818478d..e78580d 100644
  }
  
  // Size of one element of the guest array an indexed attribute reads from. An
-@@ -1159,6 +1610,17 @@ static uint32_t GetIndexedAttrElementSizeBytes(GXAttr attr, const VtxAttrFmt& fm
+@@ -1159,6 +1626,17 @@ static uint32_t GetIndexedAttrElementSizeBytes(GXAttr attr, const VtxAttrFmt& fm
  
  static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
      const bool hadValidState = s_appliedVtxAttrFmtValid;
@@ -691,7 +708,7 @@ index 818478d..e78580d 100644
      // Rows other than `fmt` keep their contents and every write below copies
      // g_hleGxState, so an already-matching mirror still matches. Only the rebuild
      // from an invalidated mirror leaves the untouched rows divergent.
-@@ -1174,6 +1636,9 @@ static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
+@@ -1174,6 +1652,9 @@ static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
          }
          GXSetVtxAttrFmt(fmt, static_cast<GXAttr>(attr), f.cnt, f.type, f.frac);
          s_appliedVtxAttrFmt[fmt][attr] = f;
@@ -701,7 +718,7 @@ index 818478d..e78580d 100644
      }
      s_appliedVtxAttrFmtValid = true;
  }
-@@ -1185,6 +1650,12 @@ static void ApplyAuroraVtxAttrFmtAll() {
+@@ -1185,6 +1666,12 @@ static void ApplyAuroraVtxAttrFmtAll() {
  }
  
  static void ApplyAuroraVtxAttrFmtForDisplayList(GXVtxFmt fmt, bool mixed) {
@@ -714,7 +731,7 @@ index 818478d..e78580d 100644
      if (!mixed && fmt < GX_MAX_VTXFMT) {
          ApplyAuroraVtxAttrFmt(fmt);
          return;
-@@ -1206,17 +1677,66 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
+@@ -1206,17 +1693,66 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
      SyncAppliedVtxStateFromHleReal();
  }
  
@@ -782,7 +799,7 @@ index 818478d..e78580d 100644
          const GXAttrType type = g_hleGxState.vtxDesc[attr]; if (type != GX_INDEX8 && type != GX_INDEX16) continue;
          if (!sawIdx[attr]) continue;
          const auto& arr = g_hleGxState.vtxArray[attr];
-@@ -1231,11 +1751,7 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
+@@ -1231,11 +1767,7 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
          }
          const uint32_t span = (count > 0) ? (static_cast<uint32_t>((count - 1u) * arr.stride) + elemSize) : 0u;
          const bool needsPack = arr.stride > 0xffu;
@@ -795,7 +812,7 @@ index 818478d..e78580d 100644
          if (!hostPtr) {
              ok = false;
              continue;
-@@ -1252,7 +1768,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
+@@ -1252,7 +1784,11 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
              ok = false;
              continue;
          }
@@ -808,7 +825,7 @@ index 818478d..e78580d 100644
      }
      return ok;
  }
-@@ -1272,11 +1792,7 @@ static bool ApplyAuroraIndexedXFArraysForDisplayList(const std::array<uint32_t,
+@@ -1272,11 +1808,7 @@ static bool ApplyAuroraIndexedXFArraysForDisplayList(const std::array<uint32_t,
              continue;
          }
          const uint32_t span = maxXfIdx[attr] * arr.stride + bytes;
@@ -821,7 +838,7 @@ index 818478d..e78580d 100644
          if (!hostPtr) {
              ok = false;
              continue;
-@@ -1292,12 +1808,37 @@ extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
+@@ -1292,12 +1824,37 @@ extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
      GxGuestWrite::NotifyWrite(addr, size);
  }
  
@@ -859,7 +876,7 @@ index 818478d..e78580d 100644
          const bool allowScanCache = nbytes <= kDlScanCacheMaxEntryBytes;
          const uint64_t scanLayoutHash = allowScanCache ? HashScanLayoutState() : 0;
          // The digest is computed lazily inside the probe: an entry whose covering
-@@ -1310,11 +1851,30 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1310,11 +1867,30 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
  
          // The scan a cached record came from already walked the list for this,
          // so only a miss pays for DisplayListMayContainDraw.
@@ -890,7 +907,7 @@ index 818478d..e78580d 100644
              GXCallDisplayList(list, nbytes);
              // The republish is required even for register-only lists (verified by
              // experiment: dropping it corrupts in-race geometry decode). It is
-@@ -1323,6 +1883,12 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1323,6 +1899,12 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              SyncAppliedVtxStateFromHleReal();
              return;
          }
@@ -903,7 +920,7 @@ index 818478d..e78580d 100644
          std::array<uint32_t, GX_VA_MAX_ATTR> maxIdx{}; std::array<bool, GX_VA_MAX_ATTR> sawIdx{};
          std::array<uint32_t, GX_VA_MAX_ATTR> maxXfIdx{}; std::array<uint32_t, GX_VA_MAX_ATTR> maxXfBytes{};
          std::array<bool, GX_VA_MAX_ATTR> sawXfIdx{};
-@@ -1330,6 +1896,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1330,6 +1912,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
          bool dlHasNestedDl = false;
          bool dlHasArrayStateWrites = false;
          bool dlHasCpWrites = false;
@@ -911,7 +928,7 @@ index 818478d..e78580d 100644
  
          HleGxVertexStateSnapshot stateBeforeScan;
          bool haveStateBeforeScan = false;
-@@ -1339,11 +1906,34 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1339,11 +1922,34 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
          bool flattenOk = false;
          const uint8_t* auroraStream = nullptr;
          uint32_t auroraStreamBytes = 0;
@@ -946,7 +963,7 @@ index 818478d..e78580d 100644
              maxXfIdx = entry.maxXfIdx;
              maxXfBytes = entry.maxXfBytes;
              sawXfIdx = entry.sawXfIdx;
-@@ -1369,12 +1959,32 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1369,12 +1975,32 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                      auroraStream = list;
                      auroraStreamBytes = nbytes;
                  } else {
@@ -981,7 +998,7 @@ index 818478d..e78580d 100644
              // The scan discovers the list's CP writes as it walks, so this path
              // cannot narrow the snapshot the way the cached one does.
              stateBeforeScan = CaptureGxVertexState();
-@@ -1382,6 +1992,15 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1382,6 +2008,15 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              scanOk = ScanDisplayListMaxIndices(list, nbytes, maxIdx, sawIdx, maxXfIdx, maxXfBytes, sawXfIdx,
                                                 &dlVtxFmt, &dlVtxFmtMixed, &dlHasNestedDl,
                                                 &dlHasArrayStateWrites, &dlHasCpWrites, &cpWrites);
@@ -997,7 +1014,7 @@ index 818478d..e78580d 100644
              needsFlatten = dlHasNestedDl || dlHasArrayStateWrites || dlHasCpWrites;
              bool flattenVerbatim = true;
              auto& flattened = FlattenDisplayListScratch();
-@@ -1410,6 +2029,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1410,6 +2045,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                  entry.layoutHash = scanLayoutHash;
                  entry.maxIdx = maxIdx;
                  entry.sawIdx = sawIdx;
@@ -1005,7 +1022,7 @@ index 818478d..e78580d 100644
                  entry.maxXfIdx = maxXfIdx;
                  entry.maxXfBytes = maxXfBytes;
                  entry.sawXfIdx = sawXfIdx;
-@@ -1426,10 +2046,22 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1426,10 +2062,22 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
  
                  const uint64_t contentDigest =
                      probe.digestValid ? probe.contentDigest : DlContentDigest(list, nbytes);
@@ -1029,7 +1046,7 @@ index 818478d..e78580d 100644
              }
          }
  
-@@ -1439,7 +2071,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1439,7 +2087,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                  ApplyAuroraVtxDesc();
                  ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);
                  const bool flattenArraysOk =
@@ -1038,7 +1055,7 @@ index 818478d..e78580d 100644
                  const bool flattenXfOk =
                      ApplyAuroraIndexedXFArraysForDisplayList(maxXfIdx, maxXfBytes, sawXfIdx);
                  flattenApplyOk = flattenArraysOk && flattenXfOk;
-@@ -1447,6 +2079,11 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1447,6 +2095,11 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              if (flattenApplyOk) {
                  EnsureAuroraFrameActive();
                  GXMarkFrameWork();
@@ -1050,7 +1067,7 @@ index 818478d..e78580d 100644
                  GXCallDisplayList(auroraStream, auroraStreamBytes);
                  // No flip back to GX_DIRECT here
                  SyncAppliedVtxStateFromHleReal();
-@@ -1460,13 +2097,18 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
+@@ -1460,13 +2113,18 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
              if (scanOk) {
                  ApplyAuroraVtxDesc();
                  ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);
@@ -1071,18 +1088,20 @@ index 818478d..e78580d 100644
  
                  SyncAppliedVtxStateFromHleReal();
 diff --git a/runtime/src/hle/gx/gx_fifo.cpp b/runtime/src/hle/gx/gx_fifo.cpp
-index a77e96e..ed5f07b 100644
+index a77e96e..5da955c 100644
 --- a/runtime/src/hle/gx/gx_fifo.cpp
 +++ b/runtime/src/hle/gx/gx_fifo.cpp
-@@ -2,6 +2,7 @@
+@@ -1,7 +1,9 @@
+ #include "gx_internal.h"
  #include "gx_stream_common.h"
  #include "gx_cp_decode.h"
++#include "gx_vtx_f32.h"
  #include "isa/big_endian.h"
 +#include "gx_batch_profile.h"
  
  // Opcode constants and the stream helpers this file shares with gx_dl.cpp /
  // gx_vertex.cpp; see gx_stream_common.h.
-@@ -10,6 +11,16 @@ using namespace GxStream;
+@@ -10,6 +12,16 @@ using namespace GxStream;
  
  HleGxState g_hleGxState;
  
@@ -1099,7 +1118,20 @@ index a77e96e..ed5f07b 100644
  namespace aurora::gx::fifo {
  bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
                       uint32_t vertexBytes);
-@@ -343,8 +354,16 @@ void SubmitAttribute(GXAttr attr, float* comps, const VtxAttrFmt& fmt, const u32
+@@ -21,6 +33,12 @@ void HleGxState::ResetVertex() {
+ }
+ 
+ GXAttr HleGxState::NextEnabledAttr(int startAttr) {
++#if defined(__SWITCH__)
++    // P28: the scan below from the per-generation mask of enabled descriptors.
++    if (GxVtxF32::kEnabled) {
++        return GxVtxF32::NextEnabled(*this, startAttr);
++    }
++#endif
+     for (int i = startAttr + 1; i < 26; ++i) {
+         if (vtxDesc[i] != GX_NONE) {
+             return static_cast<GXAttr>(i);
+@@ -343,15 +361,46 @@ void SubmitAttribute(GXAttr attr, float* comps, const VtxAttrFmt& fmt, const u32
      }
  }
  
@@ -1113,22 +1145,40 @@ index a77e96e..ed5f07b 100644
 +#include "gx_batch_xf.inc"
 +#endif
 +
++#if defined(__SWITCH__)
++static void HleFifoWriteGeneral(u32 val, uint32_t sizeBytes);
++
++// P28: the one-word direct-float case in a function of its own. Inside the big parser below it paid
++// that function's whole prologue/epilogue (callee-saved registers, the lambdas' frame) for every
++// word of every sprite and matrix the game writes by hand. A word it does not take is handled by
++// HleFifoWriteGeneral exactly as before (the checks here are the ones in front of that case there).
  void HleFifoWrite(u32 val, uint32_t sizeBytes) {
++    if (GxVtxF32::kEnabled && (sizeBytes == 4 || sizeBytes == 0) && g_hleGxState.inBegin && !IsDisplayListActive() &&
++        GxBatch::FifoEnabled() && TryDirectF32FifoWord(val)) {
++        return;
++    }
++    HleFifoWriteGeneral(val, sizeBytes);
++}
++
++__attribute__((noinline)) static void HleFifoWriteGeneral(u32 val, uint32_t sizeBytes) {
++#else
++void HleFifoWrite(u32 val, uint32_t sizeBytes) {
++#endif
      const bool recordOnly = IsDisplayListActive();
      if (recordOnly) {
-@@ -352,6 +371,11 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
+         WriteDisplayListData(val, sizeBytes);
          return;
      }
  
 +#if defined(__SWITCH__)
-+    if ((sizeBytes==4 || sizeBytes==0) && g_hleGxState.inBegin &&
++    if (!GxVtxF32::kEnabled && (sizeBytes==4 || sizeBytes==0) && g_hleGxState.inBegin &&
 +        GxBatch::FifoEnabled() && TryDirectF32FifoWord(val)) return;
 +#endif
 +
      auto resetFifoBuffer = [&]() {
          g_hleGxState.fifoReadOffset = 0;
          g_hleGxState.fifoByteCount = 0;
-@@ -417,6 +441,9 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
+@@ -417,6 +466,9 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
          return true;
      };
  
@@ -1138,7 +1188,7 @@ index a77e96e..ed5f07b 100644
      pushBytes(val, sizeBytes == 0 ? 4 : sizeBytes);
  
      // Parse raw FIFO command packets written directly to the gather pipe
-@@ -659,8 +686,13 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
+@@ -659,8 +711,13 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
  // lists, XF/draw calls), which would misorder that work relative to the stream.
  static void HleFifoWriteBurstChunked(const uint8_t* data, uint32_t sizeBytes) {
      uint32_t offset = 0;
@@ -5008,10 +5058,10 @@ index 0000000..cbb27eb
 +}
 +#endif
 diff --git a/runtime/src/hle/gx/gx_stream_common.h b/runtime/src/hle/gx/gx_stream_common.h
-index 006ab47..8ed9d12 100644
+index 006ab47..cbf18cc 100644
 --- a/runtime/src/hle/gx/gx_stream_common.h
 +++ b/runtime/src/hle/gx/gx_stream_common.h
-@@ -361,7 +361,54 @@ struct AuroraVtxPublishOptions {
+@@ -361,7 +361,78 @@ struct AuroraVtxPublishOptions {
      int fmtLoopLast;
  };
  
@@ -5022,16 +5072,40 @@ index 006ab47..8ed9d12 100644
 +extern "C" void GXSetVtxDescRun(const GXVtxDescList* list, u32 count);
 +extern "C" void GXSetVtxAttrFmtRun(GXVtxFmt vtxfmt, const GXVtxAttrFmtList* list, u32 count);
 +extern "C" int aurora_gx_g6_enabled(void);
++// P28 (switch phase 82; aurora gx_vtx_plan.inc): the same two publications decided from plans kept by
++// layout content. WIICOMPILED_GX_VTXPLAN=0 keeps the list-building code below.
++extern "C" int aurora_gx_vtxplan_enabled(void);
++extern "C" void GXSetVtxDescPlanRun(const uint32_t* hleDesc, int includeNbt);
++extern "C" void GXSetVtxAttrFmtPlanRun(GXVtxFmt vtxfmt, const void* row26, int first, int last, int includeNbt);
++static_assert(sizeof(GXAttrType) == sizeof(uint32_t) && sizeof(GXCompCnt) == sizeof(uint32_t) &&
++              sizeof(GXCompType) == sizeof(uint32_t) && sizeof(VtxAttrFmt) == 12 &&
++              offsetof(VtxAttrFmt, cnt) == 0 && offsetof(VtxAttrFmt, type) == 4 && offsetof(VtxAttrFmt, frac) == 8,
++              "aurora's gx_vtx_plan.inc RawFmt");
 +namespace GxStream {
++// Both switches, read once into a global (bit 0: G6 lists, bit 1: plans); -1 until the first draw.
++inline int g_publishFlags = -1;
++inline int PublishFlagsInit() noexcept {
++    g_publishFlags = (aurora_gx_g6_enabled() != 0 ? 1 : 0) | (aurora_gx_vtxplan_enabled() != 0 ? 2 : 0);
++    return g_publishFlags;
++}
 +inline bool PublishVtxStateBatched() noexcept {
-+    static const bool enabled = aurora_gx_g6_enabled() != 0;
-+    return enabled;
++    return ((g_publishFlags >= 0 ? g_publishFlags : PublishFlagsInit()) & 1) != 0;
++}
++inline bool PublishVtxStatePlanned() noexcept {
++    return ((g_publishFlags >= 0 ? g_publishFlags : PublishFlagsInit()) & 2) != 0;
 +}
 +#endif
 +
  inline void PublishAuroraVtxState(GXVtxFmt fmt, const AuroraVtxPublishOptions& options) {
 +#if defined(__SWITCH__)
 +    if (PublishVtxStateBatched()) {
++        if (PublishVtxStatePlanned() && fmt < GX_MAX_VTXFMT) {
++            // GXSetVtxDescRun, then GXSetVtxAttrFmtRun, over the lists built below, decided from plans.
++            GXSetVtxDescPlanRun(reinterpret_cast<const uint32_t*>(g_hleGxState.vtxDesc), options.includeNbt ? 1 : 0);
++            GXSetVtxAttrFmtPlanRun(fmt, g_hleGxState.vtxAttrFmt[fmt], options.fmtLoopFirst, options.fmtLoopLast,
++                                   options.includeNbt ? 1 : 0);
++            return;
++        }
 +        GXVtxDescList descs[26];
 +        u32 descCount = 0;
 +        for (int attr = 0; attr < 26; ++attr) {
@@ -5549,6 +5623,112 @@ index 80c9be0..fe9fba3 100644
  
      g_inGxBeginOrFifo = true;
      try {
+diff --git a/runtime/src/hle/gx/gx_vtx_f32.h b/runtime/src/hle/gx/gx_vtx_f32.h
+new file mode 100644
+index 0000000..3d000ca
+--- /dev/null
++++ b/runtime/src/hle/gx/gx_vtx_f32.h
+@@ -0,0 +1,100 @@
++#pragma once
++// P28 (switch phase 82, local/tmp/cpu/P28-vtx.py): per-layout caches for the immediate vertex stream.
++//
++// HleFifoWrite / TryDirectF32FifoWord / FinishDirectF32FifoAttribute ask, for every 32-bit word the
++// game writes between GXBegin and GXEnd, which attribute comes next (HleGxState::NextEnabledAttr:
++// a scan of the 26 descriptors, twice at the end of each vertex) and whether it is a direct float
++// position/normal/texture coordinate and how many components it has (a switch over the attribute,
++// the descriptor and the format row). Both are functions of vtxDesc / vtxAttrFmt[fmt] alone, which
++// only change through code that bumps HleGxState::vtxStateGeneration (GX__SetVtxDesc & co.,
++// ApplyCpRegWrite, display-list state restore: the contract gx_dl.cpp's applied-state mirror and
++// P17 already rely on), so they are kept per (generation, format).
++// WIICOMPILED_GX_VTXF32=0 keeps the scans (aurora's float writers have their own switch of the same name).
++#if defined(__SWITCH__)
++#include <cstdint>
++#include <cstdlib>
++#include "gx_stream_common.h"
++
++namespace GxVtxF32 {
++inline bool ReadSwitch() {
++    const char* v = std::getenv("WIICOMPILED_GX_VTXF32");
++    return !(v != nullptr && v[0] == '0');
++}
++inline const bool kEnabled = ReadSwitch(); // read once at startup
++// WIICOMPILED_GX_VCDKEY=0: gx_dl.cpp's "published nothing" memo of ApplyAuroraVtxDesc keyed by generation only.
++inline bool ReadVcdKeySwitch() {
++    const char* v = std::getenv("WIICOMPILED_GX_VCDKEY");
++    return !(v != nullptr && v[0] == '0');
++}
++inline const bool kVcdNoopByContent = ReadVcdKeySwitch();
++
++struct Cache {
++    // Bit i: vtxDesc[i] != GX_NONE.
++    bool maskValid = false;
++    uint32_t maskGeneration = 0;
++    uint32_t mask = 0;
++    // Components of the direct float POS / NRM / TEXn attribute of the current format (0: not one).
++    bool f32Valid = false;
++    uint32_t f32Generation = 0;
++    GXVtxFmt f32Fmt = GX_VTXFMT0;
++    uint8_t f32Expected[26] = {};
++};
++inline Cache g_cache;
++
++inline uint32_t EnabledMask(const HleGxState& g) {
++    Cache& c = g_cache;
++    if (!c.maskValid || c.maskGeneration != g.vtxStateGeneration) {
++        uint32_t mask = 0;
++        for (int i = 0; i < 26; ++i) {
++            if (g.vtxDesc[i] != GX_NONE) {
++                mask |= 1u << i;
++            }
++        }
++        c.mask = mask;
++        c.maskGeneration = g.vtxStateGeneration;
++        c.maskValid = true;
++    }
++    return c.mask;
++}
++
++// HleGxState::NextEnabledAttr from the mask.
++inline GXAttr NextEnabled(const HleGxState& g, int startAttr) {
++    const int first = startAttr + 1;
++    if (first >= 26) {
++        return GX_VA_NULL;
++    }
++    const uint32_t m = EnabledMask(g) & (first <= 0 ? ~0u : (~0u << first));
++    return m != 0 ? static_cast<GXAttr>(__builtin_ctz(m)) : GX_VA_NULL;
++}
++
++inline void RebuildF32(const HleGxState& g, Cache& c) {
++    const auto* row = g.vtxAttrFmt[g.currentVtxFmt];
++    for (int a = 0; a < 26; ++a) {
++        uint32_t expected = 0;
++        if (a == GX_VA_POS || a == GX_VA_NRM || (a >= GX_VA_TEX0 && a <= GX_VA_TEX7)) {
++            const VtxAttrFmt& f = row[a];
++            if (g.vtxDesc[a] == GX_DIRECT && f.type == GX_F32) {
++                expected = GxStream::AttrCompCount(static_cast<GXAttr>(a), f, 1u);
++                if (expected > 9) {
++                    expected = 0;
++                }
++            }
++        }
++        c.f32Expected[a] = static_cast<uint8_t>(expected);
++    }
++    c.f32Generation = g.vtxStateGeneration;
++    c.f32Fmt = g.currentVtxFmt;
++    c.f32Valid = true;
++}
++
++// Components of the direct float attribute `a` in the current vertex format, 0 when it is not one.
++// Requires currentVtxFmt < GX_MAX_VTXFMT (the caller checks) and a < 26.
++inline uint32_t F32Components(const HleGxState& g, GXAttr a) {
++    Cache& c = g_cache;
++    if (!c.f32Valid || c.f32Generation != g.vtxStateGeneration || c.f32Fmt != g.currentVtxFmt) {
++        RebuildF32(g, c);
++    }
++    return c.f32Expected[a];
++}
++} // namespace GxVtxF32
++#endif
 diff --git a/runtime/src/hle/input/wpad.cpp b/runtime/src/hle/input/wpad.cpp
 index b3985ff..f46ef94 100644
 --- a/runtime/src/hle/input/wpad.cpp
@@ -6093,10 +6273,10 @@ index 0000000..4e7543c
 +#endif
 diff --git a/runtime/src/hle/mlb/mix_natives.cpp b/runtime/src/hle/mlb/mix_natives.cpp
 new file mode 100644
-index 0000000..f3daee6
+index 0000000..8878531
 --- /dev/null
 +++ b/runtime/src/hle/mlb/mix_natives.cpp
-@@ -0,0 +1,1637 @@
+@@ -0,0 +1,1739 @@
 +// MLB Power Pros 2008 (RL8E54): a native MIXUpdateSettings (0x800BFB24, the AX MIX library),
 +// 1.8% of the Switch main thread in the stock match profile (run 3), plus the 1.1% of its
 +// per-voice callee __MIXRmtUpdateSettings (0x800C1264).
@@ -6131,6 +6311,7 @@ index 0000000..f3daee6
 +// the translator's contract analysis sees exactly the registers the translation itself uses.
 +#if defined(__SWITCH__)
 +#include <cstdint>
++#include <cstdlib>
 +#include <cstring>
 +
 +#include "abi_bridge.h"
@@ -6139,6 +6320,12 @@ index 0000000..f3daee6
 +extern "C" void func_800BFB24(CpuContext* ctx);  // the translation (kept: _AS registration)
 +
 +namespace mlb_mix {
++
++// WIICOMPILED_NATIVE_MIX_FAST=0 turns the idle-voice skip below off (read once at startup).
++const bool g_fast = [] {
++    const char* value = std::getenv("WIICOMPILED_NATIVE_MIX_FAST");
++    return !(value != nullptr && value[0] == '0');
++}();
 +
 +struct Regs {
 +    uint32_t r0, r1, r3, r4, r5, r6, r7, r8, r9, r11, r13, r26, r27, r28, r29, r30, r31;
@@ -6172,6 +6359,90 @@ index 0000000..f3daee6
 +[[gnu::always_inline]] inline void Write16(uint8_t* base, uint32_t a, uint32_t v) {
 +    if (MemoryInline::FlatWriteNeedsPolicy(a)) [[unlikely]] { MemoryInline::Write16Slow(a, static_cast<uint16_t>(v)); return; }
 +    Store16(base, a, v);
++}
++
++// ---- the idle-voice skip ----
++//
++// A voice is "idle" when its walk below does nothing but loads and the 4-word frame of the inlined
++// __MIXRmtUpdateSettings call: its channel entry has no AXVPB (word 0 == 0), or it has one and the entry
++// flags (+4) have none of 0xF0000000 (the 0x20000000 / 0x10000000 / 0x80000000 / 0x40000000 update
++// blocks) and the remote entry's first word has neither 0xC0000000 bit. That is nearly every voice of
++// nearly every call (one call per channel fader change, 64 voices each). The frame stores of an idle
++// voice with an AXVPB are the same four words for every voice (r1, LR = 0x800C1188, and the r30 / r31
++// the call saves, which the matching loads give back), so a run of idle voices stores them once.
++// Exact when none of the four words can be read by the run (no overlap with the globals, the channel
++// entries or the remote entries it loads: checked per run, else nothing is skipped) and the registers
++// the walk would leave are rebuilt: r5 / r4 / r3 of the last voice, r6 = r7 = 0 and r8 = the flags of
++// the last voice with an AXVPB (r6-r8 are untouched by a voice without one), r26 / r27 stepped.
++// CR0 / r0 are set by the loop test after it, and r1 / r30 / r31 / LR end as the epilogue loads them.
++struct Skipped {
++    uint32_t idx;      // first voice not skipped (the start voice when none was)
++    uint32_t chTab;    // r13-27112 as read
++    uint32_t rmTab;    // r13-27096 as read
++    uint32_t r3, r4;   // what the last skipped voice leaves in r3 / r4
++    uint32_t flags;    // r8 the last skipped voice with an AXVPB leaves
++    uint32_t any;      // a skipped voice had an AXVPB
++};
++
++[[gnu::always_inline]] inline uint32_t LoadP32(const uint8_t* p) {
++    uint32_t v; std::memcpy(&v, p, 4); return __builtin_bswap32(v);
++}
++
++// a if cond is nonzero else b, as one csel (no data-dependent branch per voice).
++[[gnu::always_inline]] inline const uint8_t* SelectIf(uint32_t cond, const uint8_t* a, const uint8_t* b) {
++    const uint8_t* r;
++    __asm__("cmp %w3, #0\n\tcsel %0, %1, %2, ne" : "=r"(r) : "r"(a), "r"(b), "r"(cond) : "cc");
++    return r;
++}
++
++[[gnu::noinline]] Skipped SkipIdleVoices(uint8_t* base, uint32_t r1, uint32_t r13, uint32_t r30, uint32_t r31,
++                                         uint32_t first, uint32_t n) {
++    Skipped s = {first, 0u, 0u, 0u, 0u, 0u, 0u};
++    const uint32_t chTab = Load32(base, r13 - 27112u);
++    const uint32_t rmTab = Load32(base, r13 - 27096u);
++    s.chTab = chTab;
++    s.rmTab = rmTab;
++    // The words the run loads that its frame stores must not touch, and the frame, as 64-bit ranges.
++    const uint64_t last = static_cast<uint64_t>(n) - 1u;
++    const uint64_t gLo = static_cast<uint32_t>(r13 - 27112u), gHi = gLo + 20u;           // n, mode, tables, init
++    const uint64_t fLo = static_cast<uint64_t>(r1) - 16u, fHi = static_cast<uint64_t>(r1) + 8u;
++    const uint64_t cLo = static_cast<uint64_t>(chTab) + 112ull * first, cHi = static_cast<uint64_t>(chTab) + 112ull * last + 8u;
++    const uint64_t mLo = static_cast<uint64_t>(rmTab) + 68ull * first, mHi = static_cast<uint64_t>(rmTab) + 68ull * last + 4u;
++    constexpr uint64_t k4G = 0x100000000ull;
++    if (r1 < 16u || fHi > k4G || gHi > k4G || cHi > k4G || mHi > k4G || first >= n) return s;
++    if ((fLo < gHi && gLo < fHi) || (fLo < cHi && cLo < fHi) || (fLo < mHi && mLo < fHi)) return s;
++    const uint8_t* e = base + cLo;
++    const uint8_t* m = base + mLo;
++    const uint8_t* lastE = nullptr;  // the last voice with an AXVPB the run passed
++    uint32_t i = first;
++    for (; i < n; ++i, e += 112, m += 68) {
++        // The words as loaded (little-endian view of the big-endian words): bits 31..28 of a flags word are bits 7..4 of
++        // its first byte, i.e. 0xF0 here, and bits 31..30 of a remote word 0xC0.
++        uint32_t v0, f, w;
++        std::memcpy(&v0, e, 4);
++        std::memcpy(&f, e + 4, 4);
++        const uint32_t mask = 0u - static_cast<uint32_t>(v0 != 0u);  // all ones for a voice with an AXVPB
++        std::memcpy(&w, SelectIf(mask, m, e), 4);                     // no remote word is read for a voice without an AXVPB
++        if ((((f & 0xF0u) | (w & 0xC0u)) & mask) != 0u) break;
++        lastE = mask ? e : lastE;
++    }
++    s.idx = i;
++    if (i == first) return s;
++    // What the last skipped voice leaves in r3 / r4 and the last voice with an AXVPB in r8, from the words again.
++    const uint32_t lastVoice = i - 1u - first;
++    const uint32_t v0 = LoadP32(base + cLo + 112ull * lastVoice);
++    s.r4 = v0;
++    s.r3 = v0 != 0u ? LoadP32(base + mLo + 68ull * lastVoice) : 0u;
++    const uint32_t any = lastE != nullptr;
++    s.any = any;
++    if (any) {
++        s.flags = LoadP32(lastE + 4);
++        Store32(base, r1 - 16u, r1);
++        Store32(base, r1 + 4u, 0x800c1188u);
++        Store32(base, r1 - 4u, r31);
++        Store32(base, r1 - 8u, r30);
++    }
++    return s;
 +}
 +
 +// The flat view only (GuestFlat::RequiresCheckedAccess() false).
@@ -7652,6 +7923,17 @@ index 0000000..f3daee6
 +    r26 = (r26 + 1u);
 +L_800C1190:
 +    r0 = LD32((r13 - 27104u));
++    if (g_fast && r26 < r0) {
++        const Skipped sk = SkipIdleVoices(base, r1, r13, r30, r31, r26, r0);
++        if (sk.idx != r26) {
++            r27 = r27 + 112u * (sk.idx - r26);
++            r26 = sk.idx;
++            r5 = sk.chTab + (r27 - 112u);
++            r3 = sk.r3;
++            r4 = sk.r4;
++            if (sk.any) { r6 = 0u; r7 = 0u; r8 = sk.flags; pfRt = sk.rmTab; }
++        }
++    }
 +    CMPU(r26, r0);
 +    if (LT) goto L_800BFB64;
 +L_800C119C:
@@ -8202,10 +8484,10 @@ index 0000000..13d29b8
 +#endif
 diff --git a/runtime/src/hle/mlb/reverb_natives.cpp b/runtime/src/hle/mlb/reverb_natives.cpp
 new file mode 100644
-index 0000000..1840a0d
+index 0000000..4876bf6
 --- /dev/null
 +++ b/runtime/src/hle/mlb/reverb_natives.cpp
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,454 @@
 +// MLB Power Pros 2008 (RL8E54): a native 0x800BC3AC, the AXFX "ReverbHi" processing callback
 +// (AXFXReverbHiCallback 0x800BC0E8 is a single branch to it). Run 11 profile: 4.2% of the Switch
 +// main thread, the hottest audio function.
@@ -8263,6 +8545,7 @@ index 0000000..1840a0d
 +// unity build: runtime/CMakeLists.txt); the FP ops are single instructions in asm anyway.
 +#if defined(__SWITCH__)
 +#include <cstdint>
++#include <cstdlib>
 +#include <cstring>
 +
 +#include "abi_bridge.h"
@@ -8272,6 +8555,12 @@ index 0000000..1840a0d
 +extern "C" void func_800BC3AC(CpuContext* ctx);  // the translation (kept: _AS registration)
 +
 +namespace mlb_reverb {
++
++// WIICOMPILED_NATIVE_MIX_FAST=0 turns the line prefetch in the sample loop off (read once at startup).
++const bool g_prefetch = [] {
++    const char* value = std::getenv("WIICOMPILED_NATIVE_MIX_FAST");
++    return !(value != nullptr && value[0] == '0');
++}();
 +
 +// ---- guest memory, flat view (ranges proven plain before use) ----
 +
@@ -8322,6 +8611,16 @@ index 0000000..1840a0d
 +}
 +
 +// ---- ranges ----
++
++// Cache hints (PRFM: no fault, no guest-visible effect). Run 26 profile: 78% of this function's samples sit on its
++// loads of the delay lines and sample buffers (about 40 streams, each one word per sample, each one new 64-byte line
++// per 16 samples, cold after the 3 ms the game runs between two calls). Every 16 samples the lines the next 16 need.
++[[gnu::always_inline]] inline void PfLine(uint32_t address) { __builtin_prefetch(MKW_FLAT_GUEST_BASE + address, 1, 3); }
++[[gnu::always_inline]] inline void PfAhead(uint32_t address, bool first) {
++    if (first) { PfLine(address); PfLine(address + 60u); }
++    PfLine(address + 64u);
++    PfLine(address + 124u);
++}
 +
 +struct Area { uint64_t lo, hi; };
 +
@@ -8460,6 +8759,20 @@ index 0000000..1840a0d
 +    uint32_t lastInt = 0, lastK1 = 0;
 +
 +    for (uint32_t s = 0; s < 96u; ++s) {
++        if (g_prefetch && (s & 15u) == 0u) {
++            const bool first = s == 0u;
++            for (uint32_t i = 0; i < 3; ++i) {
++                const Channel& h = ch[i];
++                PfAhead(h.early + (e0 << 2), first); PfAhead(h.early + (e1 << 2), first); PfAhead(h.early + (e2 << 2), first);
++                if (predelayLength != 0u) PfAhead(h.predelay + (pp << 2), first);
++                for (uint32_t k = 0; k < 3; ++k) PfAhead(h.comb[k] + (cj[k] << 2), first);
++                for (uint32_t k = 0; k < 2; ++k) PfAhead(h.allpass[k] + (ak[k] << 2), first);
++                PfAhead(h.last + (h.lastIndex << 2), first);
++                PfAhead(h.in, first);
++                if (busInDesc != 0u) PfAhead(h.busIn, first);
++            }
++            if (busOutDesc != 0u) { PfAhead(o3, first); PfAhead(o5, first); PfAhead(o6, first); }
++        }
 +#pragma GCC unroll 3
 +        for (uint32_t i = 0; i < 3; ++i) {
 +            Channel& h = ch[i];
@@ -10910,341 +11223,3 @@ index 5f029c0..0b51bbe 100644
  }
  enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
  struct Capture {
-diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
-index 7269747..796606b 100644
---- a/runtime/src/main.cpp
-+++ b/runtime/src/main.cpp
-@@ -83,6 +83,9 @@ extern std::atomic_bool g_auroraFrameActive;
- extern "C" int g_gxFrameCount;
- extern "C" const char* DVDResolveHostPathForTest(const char* dvdPath);
- bool OS_HLE_InterruptsEnabled() noexcept;
-+#if defined(__SWITCH__)
-+extern "C" void GX_HLE_OffloadStop();
-+#endif
- 
- namespace {
- 
-@@ -429,6 +432,9 @@ std::string ReadInstalledSetupVersion() {
-     return text.substr(open + 1, close - open - 1);
- }
- 
-+#if defined(__SWITCH__)
-+extern "C" bool SwitchStdioToNxlink();  // platform/switch/switch_stdio.cpp
-+#endif
- void InitializeProcessTranscript(int argc, char** argv) {
-     auto& state = GetProcessTranscriptState();
-     if (state.initialized.exchange(true, std::memory_order_acq_rel)) {
-@@ -469,6 +475,19 @@ void InitializeProcessTranscript(int argc, char** argv) {
-         state.file.flush();
-     }
- 
-+#if defined(__SWITCH__)
-+    // Horizon has no pipes to tee the standard streams through: they go to nxlink's console on the
-+    // PC when it started the game, else straight into this file.
-+    state.file.close();
-+    state.enabled = false;
-+    if (!SwitchStdioToNxlink()) {
-+        (void)std::freopen(path.string().c_str(), "a", stdout);
-+        (void)std::freopen(path.string().c_str(), "a", stderr);
-+    }
-+    std::setvbuf(stdout, nullptr, _IONBF, 0);
-+    std::setvbuf(stderr, nullptr, _IONBF, 0);
-+    return;
-+#endif
-     state.savedStdoutFd = DuplicateFileDescriptor(GetFileDescriptor(stdout));
-     state.savedStderrFd = DuplicateFileDescriptor(GetFileDescriptor(stderr));
- 
-@@ -1133,6 +1152,9 @@ void InstallSehLogger() {
-         SetUnhandledExceptionFilter(UnhandledSehFilter);
-     }
- }
-+#elif defined(__SWITCH__)
-+// Horizon delivers no signals: a crash ends in Atmosphère's crash report instead.
-+void InstallPosixMemoryFaultHandler() {}
- #else
- // POSIX counterpart to SehLogger above. Unlike Windows' AddVectoredExceptionHandler, which lets
- // GuestFlat and this module each install their own handler and defensively re-check each other,
-@@ -1322,6 +1344,11 @@ static void TerminateHandler() {
-     } else {
-         terminateDetails = "std::terminate() without current exception.";
-     }
-+#if defined(__SWITCH__)
-+    std::fprintf(stderr, "[terminate] %s\n", terminateDetails.c_str());
-+    std::fflush(stderr);
-+    __builtin_trap();
-+#endif
-     ShowRuntimeFatalPopup("an unhandled C++ exception occurred", terminateDetails);
-     const std::string hostStackSummary = FormatHostStackTrace(1);
-     if (!hostStackSummary.empty()) {
-@@ -1441,6 +1468,10 @@ int RuntimeMain(int argc, char** argv) {
-             {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
-             {"null", BACKEND_NULL},
-         }};
-+#elif defined(__SWITCH__)
-+        static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
-+            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"null", BACKEND_NULL},
-+        }};
- #elif defined(_WIN32)
-         static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
-             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN}, {"d3d11", BACKEND_D3D11},
-@@ -1547,6 +1578,9 @@ int RuntimeMain(int argc, char** argv) {
-         RT_LOG(RT_TAG_RUNTIME) << label << " => 0x" << std::hex << result << std::dec << " (" << result << ")" << std::endl;
-         
-         // Shutdown fiber system
-+        #if defined(__SWITCH__)
-+        GX_HLE_OffloadStop();
-+        #endif
-         Fiber::GuestFiberManager::Shutdown();
-         WindowPlacementPersistence::Flush(true);
-         aurora_shutdown();
-@@ -1565,6 +1599,9 @@ int RuntimeMain(int argc, char** argv) {
-         ShowRuntimeFatalPopup("a guest memory access was out of bounds", details.str());
-         WriteFatalLogImpl("access_violation", details.str());
-         SetRuntimeExitCodeImpl(1);
-+        #if defined(__SWITCH__)
-+        GX_HLE_OffloadStop();
-+        #endif
-         Fiber::GuestFiberManager::Shutdown();
-         WindowPlacementPersistence::Flush(true);
-         aurora_shutdown();
-@@ -1577,6 +1614,9 @@ int RuntimeMain(int argc, char** argv) {
-         ShowRuntimeFatalPopup("a runtime exception occurred", ex.what());
-         WriteFatalLogImpl("exception");
-         SetRuntimeExitCodeImpl(1);
-+        #if defined(__SWITCH__)
-+        GX_HLE_OffloadStop();
-+        #endif
-         Fiber::GuestFiberManager::Shutdown();
-         WindowPlacementPersistence::Flush(true);
-         aurora_shutdown();
-@@ -1587,6 +1627,15 @@ int RuntimeMain(int argc, char** argv) {
- }
- 
- int main(int argc, char** argv) {
-+#if defined(__SWITCH__)
-+    for (int i = 1; i < argc; ++i) {
-+        const char* equals = std::strchr(argv[i], '=');
-+        if (std::strncmp(argv[i], "WIICOMPILED_", 12) == 0 && equals != nullptr) {
-+            setenv(std::string(argv[i], equals - argv[i]).c_str(), equals + 1, 1);
-+        }
-+    }
-+    argc = 1;
-+#endif
-     return RuntimeMain(argc, argv);
- }
- extern "C" bool g_dynamicAspectRatioEnabled = false;
-diff --git a/runtime/src/match_benchmark_overlay.inc b/runtime/src/match_benchmark_overlay.inc
-index 280cfd6..6a4e529 100644
---- a/runtime/src/match_benchmark_overlay.inc
-+++ b/runtime/src/match_benchmark_overlay.inc
-@@ -1,4 +1,7 @@
- // Included inside settings_overlay's private namespace: reuse its live graphics setters.
-+#if defined(__SWITCH__)
-+extern "C" const char* SwitchClocks();  // platform/switch/switch_profiler.cpp
-+#endif
- // CPU, threads, RAM, GPU and OS, one per line, for the panel and the saved report.
- std::string BenchmarkDeviceInfo() {
-     char cpu[49] = {};
-@@ -14,7 +17,11 @@ std::string BenchmarkDeviceInfo() {
-     std::string name = cpu;
-     name.erase(name.find_last_not_of(' ') + 1);
-     name.erase(0, name.find_first_not_of(' '));
-+#if defined(__SWITCH__)
-+    const std::string gpu = SwitchUsesDeko3d() ? std::string("Tegra X1 (deko3d)") : std::string(aurora_get_adapter_name());
-+#else
-     const std::string gpu = aurora_get_adapter_name();
-+#endif
-     char ram[32];
-     std::snprintf(ram, sizeof(ram), "%.1f GB", SDL_GetSystemRAM() / 1024.0);
-     return "CPU: " + (name.empty() ? std::string("desconocida") : name) + " (" + std::to_string(SDL_GetNumLogicalCPUCores()) +
-@@ -156,6 +163,10 @@ void DrawMatchBenchmark() {
-         std::error_code ec;
-         std::filesystem::create_directories(folder, ec);
-         report = folder / ("match-" + std::to_string(id));
-+#if defined(__SWITCH__)
-+        static char csvBuffer[4 << 20];  // flush to the SD card at the end, not every few frames (90 s ~ 1 MB)
-+        csv.rdbuf()->pubsetbuf(csvBuffer, sizeof csvBuffer);
-+#endif
-         csv.open(report.string() + ".csv");
-         if (!csv) { message = "No se pudo crear el informe"; return; }
-         csv << "utc_unix_ms,elapsed_s,frame_ms,draws,scale,force_16_9,backend,shader_queue,gpu_render_ms,gpu_samples,cpu_encode_ms,efb_copies,efb_source_pixels,efb_snapshots,efb_readbacks,efb_readback_wait_ms,presents,process_cpu_pct,gpu_3d_pct,process_ram_mb,vram_mb,system_ram_used_gb\n";
-@@ -163,6 +174,7 @@ void DrawMatchBenchmark() {
-         start = last = now;
-         base = previous = waits;
-         gpuBase = gpuPrevious = gpu;
-+        aurora_gx_fifo_stats_mark();
-         intervals.clear();
-         valid = true;
-         recordedScale = g_resolutionScale;
-@@ -172,10 +184,18 @@ void DrawMatchBenchmark() {
-         recording = true;
-         message = "Midiendo";
-         std::fprintf(stderr, "[match-bench] recording %s scale=%.0f force169=%d\n", report.string().c_str(), g_resolutionScale, g_forceAspect169);
-+#if defined(__SWITCH__)
-+        SwitchProfilerStart();
-+#endif
-     };
-     const auto finish = [&] {
-         recording = false;
-         completed = true;
-+#if defined(__SWITCH__)
-+        // The profile ends with the last recorded frame: the report's files below (the CSV's one
-+        // write of ~0.5 MB, the summary) are no frame of the match. The later call does nothing.
-+        SwitchProfilerDump();
-+#endif
-         csv.close();
-         auto sorted = intervals;
-         std::sort(sorted.begin(), sorted.end());
-@@ -185,6 +205,9 @@ void DrawMatchBenchmark() {
-         std::ofstream summary(report.string() + ".txt");
-         summary << "Yankees vs Colorado; CPU vs CPU; Coors Field; seeded start\n"
-                 << device << '\n'
-+#if defined(__SWITCH__)
-+                << SwitchClocks() << '\n'
-+#endif
-                 << "valid=" << valid << " start_unix_ms=" << report.filename().string().substr(6) << '\n'
-                 << "scale=" << g_resolutionScale << " force_16_9=" << g_forceAspect169 << " backend=" << GraphicsApiDisplayName() << '\n'
-                 << "seconds=" << elapsed << " presented_frames=" << frames << " fps=" << (elapsed > 0 ? frames/elapsed : 0) << '\n'
-@@ -201,9 +224,17 @@ void DrawMatchBenchmark() {
-             if (loadCount[i]) summary << loadNames[i] << "_mean=" << loadSum[i] / loadCount[i] << ' ' << loadNames[i] << "_peak=" << loadPeak[i] << '\n';
-             else summary << loadNames[i] << "=unavailable\n";
-         }
-+        {
-+            char fifo[2048];
-+            if (aurora_gx_fifo_stats_report(fifo, sizeof fifo) > 0) summary << fifo;
-+        }
-         summary << "process_cpu_pct is over all logical cores, like Task Manager. GPU/VRAM from Windows GPU counters.\n"
-                 << "GPU markers exclude presenter work and demanded EFB prefixes. CPU autoplay is not a bit-exact replay.\n";
-         summary.close();
-+#if defined(__SWITCH__)
-+        if (std::ifstream echo(report.string() + ".txt"); echo) std::cerr << echo.rdbuf() << std::flush;
-+        SwitchProfilerDump();  // platform/switch/switch_profiler.cpp (step 17)
-+#endif
-         message = "Informe guardado en UserData/Benchmarks";
-         std::fprintf(stderr, "[match-bench] saved %s.txt\n", report.string().c_str());
-     };
-@@ -219,6 +250,9 @@ void DrawMatchBenchmark() {
-     if (recording) {
-         const double ms = std::chrono::duration<double, std::milli>(now - last).count();
-         intervals.push_back(ms);
-+#if defined(__SWITCH__)
-+        SwitchProfilerFrame();
-+#endif
-         const uint64_t samples = gpu.samples - gpuPrevious.samples;
-         csv << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ','
-             << std::chrono::duration<double>(now - start).count() << ',' << ms << ',' << stats->drawCallCount << ','
-diff --git a/runtime/src/memory.cpp b/runtime/src/memory.cpp
-index 88a484e..ba4576b 100644
---- a/runtime/src/memory.cpp
-+++ b/runtime/src/memory.cpp
-@@ -188,6 +188,34 @@ void Memory::ClearDeferredReads() {
- }
- 
- bool MemoryInline::ResolveDeferredReads(uint32_t addr, size_t length) {
-+#if defined(__SWITCH__)
-+    // P24: every slow-path guest read (the top megabyte of MEM1 with the OS threads and stacks, the
-+    // locked cache, ...) took DeferredReadMutex only to find the list had nothing over its pages.
-+    // g_deferredReadCoveredPages has a byte set for every page any registered range touches (set and
-+    // cleared under the mutex, RefreshDeferredReadPage), so with none set over [addr, addr + length)
-+    // no range can overlap and the walk below would match nothing. WIICOMPILED_ALLOC_FAST=0 restores
-+    // the unconditional walk.
-+    static const bool fastEnabled = [] {
-+        const char* v = std::getenv("WIICOMPILED_ALLOC_FAST");
-+        return !(v != nullptr && v[0] == '0');
-+    }();
-+    if (fastEnabled && length != 0) {
-+        const uint64_t last = static_cast<uint64_t>(addr) + (length - 1);
-+        const uint32_t firstPage = addr >> kPageShift;
-+        const uint32_t lastPage = static_cast<uint32_t>(
-+            std::min<uint64_t>(last >> kPageShift, kPageCount - 1));
-+        bool covered = false;
-+        for (uint32_t page = firstPage; page <= lastPage; ++page) {
-+            if (__atomic_load_n(&g_deferredReadCoveredPages[page], __ATOMIC_ACQUIRE) != 0) {
-+                covered = true;
-+                break;
-+            }
-+        }
-+        if (!covered) {
-+            return true;
-+        }
-+    }
-+#endif
-     std::vector<DeferredRead> matches;
-     std::vector<uint32_t> affectedPages;
-     {
-@@ -765,7 +793,11 @@ uint8_t* Memory::GetPointer(uint32_t addr) {
-     return GetPointer(addr, 1);
- }
- 
-+#if defined(__SWITCH__)
-+uint8_t* Memory::GetPointerSlow(uint32_t addr, size_t length) {
-+#else
- uint8_t* Memory::GetPointer(uint32_t addr, size_t length) {
-+#endif
-     if (auto* ptr = MemoryInline::GetPointerFast(addr, length)) {
-         return ptr;
-     }
-@@ -774,7 +806,11 @@ uint8_t* Memory::GetPointer(uint32_t addr, size_t length) {
-     return region.storagePtr + offset;
- }
- 
-+#if defined(__SWITCH__)
-+bool Memory::ContainsSlow(uint32_t addr, size_t length) {
-+#else
- bool Memory::Contains(uint32_t addr, size_t length) {
-+#endif
-     if (MemoryInline::GetPointerFast(addr, length)) {
-         return true;
-     }
-diff --git a/runtime/src/platform/switch/switch_crash.cpp b/runtime/src/platform/switch/switch_crash.cpp
-new file mode 100644
-index 0000000..a133027
---- /dev/null
-+++ b/runtime/src/platform/switch/switch_crash.cpp
-@@ -0,0 +1,46 @@
-+// A CPU exception on Horizon (data abort, undefined instruction...): libnx calls this handler instead
-+// of letting the system close the program with a bare "an error has occurred". It prints the fault
-+// to stdout (nxlink's console on the PC, else the log file) and exits. PC and LR are printed against
-+// the address of this function, so `nm WiiCompiled.elf` turns them into names.
-+#if defined(__SWITCH__)
-+#include <cstdio>
-+#include <switch.h>
-+
-+#include "guest_flat_memory.h"
-+
-+extern "C" {
-+alignas(16) u8 __nx_exception_stack[0x4000];
-+u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
-+u32 __nx_exception_ignoredebug = 1;
-+
-+void __libnx_exception_handler(ThreadExceptionDump* ctx) {
-+    const auto anchor = reinterpret_cast<u64>(&__libnx_exception_handler);
-+    std::printf("\n[crash] CPU exception 0x%x esr=0x%x far=0x%lx\n", ctx->error_desc, ctx->esr, ctx->far.x);
-+    // In the flat view, far - base is the guest address the translated code touched.
-+    if (const auto flat = reinterpret_cast<u64>(GuestFlat::g_flatBase); flat != 0) {
-+        std::printf("[crash] far - flat base = 0x%lx%s (flat base 0x%lx)\n", ctx->far.x - flat,
-+                    ctx->far.x - flat < GuestFlat::kGuestSpaceSize ? " (guest address)" : "", flat);
-+    }
-+    std::printf("[crash] pc=0x%lx lr=0x%lx sp=0x%lx fp=0x%lx (__libnx_exception_handler at 0x%lx)\n",
-+                ctx->pc.x, ctx->lr.x, ctx->sp.x, ctx->fp.x, anchor);
-+    for (int i = 0; i < 29; ++i) {
-+        std::printf("[crash] x%-2d=0x%016lx%s", i, ctx->cpu_gprs[i].x, i % 4 == 3 ? "\n" : "  ");
-+    }
-+    // Return addresses on the stack: words that point into the program's code (within 256 MB of here).
-+    // ponytail: a scan, not an unwinder; enough to name the callers.
-+    std::printf("\n[crash] stack:");
-+    const auto* stack = reinterpret_cast<const u64*>(ctx->sp.x);
-+    for (int i = 0, shown = 0; i < 256 && shown < 24; ++i) {
-+        const u64 word = stack[i];
-+        if (word + 0x10000000 > anchor && word < anchor + 0x10000000) {
-+            std::printf(" 0x%lx", word);
-+            ++shown;
-+        }
-+    }
-+    std::printf("\n");
-+    std::fflush(stdout);
-+    svcSleepThread(500'000'000);  // let nxlink's socket send it
-+    svcExitProcess();
-+}
-+}
-+#endif

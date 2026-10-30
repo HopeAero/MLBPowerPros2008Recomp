@@ -859,7 +859,7 @@ index dfa305b..f77455d 100644
      *left = g_gxState.boundingBox[0];
    }
 diff --git a/aurora-main/lib/dolphin/gx/GXGeometry.cpp b/aurora-main/lib/dolphin/gx/GXGeometry.cpp
-index 2e54e10..6bf30da 100644
+index 2e54e10..bcd514b 100644
 --- a/aurora-main/lib/dolphin/gx/GXGeometry.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXGeometry.cpp
 @@ -3,6 +3,32 @@
@@ -1046,13 +1046,13 @@ index 2e54e10..6bf30da 100644
    // Write array base
    GX_WRITE_AURORA(GX_LOAD_AURORA_ARRAYBASE | cpIdx);
    GX_WRITE_U64(reinterpret_cast<u64>(data));
-@@ -290,7 +411,104 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
+@@ -290,8 +411,105 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
  
    // Write array stride
    GX_WRITE_CP_REG(CP_REG_ARRAYSTRIDE_ID | cpIdx, stride);
 +  aurora::gx::fifo::note_array(cpAttr, data, size); // WIICOMPILED_GX_FIFO_CHECK only
-+}
-+
+ }
+ 
 +#if defined(__SWITCH__)
 +// G6 (switch phase 44): the runtime republishes its whole vertex layout before each immediate-mode
 +// draw (PublishAuroraVtxState: 25-26 GXSetVtxDesc and 16-17 GXSetVtxAttrFmt calls). These run the
@@ -1146,11 +1146,21 @@ index 2e54e10..6bf30da 100644
 +      gx->dirtyVAT |= bit;
 +    }
 +  }
- }
++}
 +#endif
- 
++
  void GXSetTexCoordGen2(GXTexCoordID dst, GXTexGenType type, GXTexGenSrc src, u32 mtx, GXBool normalize, u32 postMtx) {
    CHECK(dst >= GX_TEXCOORD0 && dst <= GX_TEXCOORD7, "invalid tex coord {}", underlying(dst));
+ 
+@@ -453,3 +671,8 @@ void GXEnableTexOffsets(GXTexCoordID coord, GXBool line_enable, GXBool point_ena
+   __gx->bpSent = 1;
+ }
+ }
++
++#if defined(__SWITCH__)
++// P28: vertex-state publish plans (GXSetVtxDescPlanRun / GXSetVtxAttrFmtPlanRun).
++#include "gx_vtx_plan.inc"
++#endif
 diff --git a/aurora-main/lib/dolphin/gx/GXGet.cpp b/aurora-main/lib/dolphin/gx/GXGet.cpp
 index ccefbbc..dbf4dee 100644
 --- a/aurora-main/lib/dolphin/gx/GXGet.cpp
@@ -1925,10 +1935,88 @@ index b881d38..1b5dca9 100644
    const u32 reg = 0x59000000u | (((static_cast<u32>(y_off + 0x156) * 0x200u) & 0x000ffc00u)) |
                    ((static_cast<u32>(x_off + 0x156) >> 1) & 0x000003ffu);
 diff --git a/aurora-main/lib/dolphin/gx/GXVert.cpp b/aurora-main/lib/dolphin/gx/GXVert.cpp
-index 6f71945..0ca5c7d 100644
+index 6f71945..c1f07a9 100644
 --- a/aurora-main/lib/dolphin/gx/GXVert.cpp
 +++ b/aurora-main/lib/dolphin/gx/GXVert.cpp
-@@ -570,7 +570,7 @@ void GXEnd() {
+@@ -6,6 +6,8 @@
+ #include <array>
+ #include <cmath>
+ #include <cstdint>
++#include <cstdlib>
++#include <cstring>
+ #include <limits>
+ 
+ // Track vertex count between GXBegin/GXEnd for mismatch detection
+@@ -497,6 +499,68 @@ static void write_tex_attr(const std::array<Scalar, N>& values) {
+   write_numeric_attr(attr, values);
+ }
+ 
++#if defined(__SWITCH__)
++// P28 (switch phase 82): GXPosition*f32 / GXNormal3f32 / GXTexCoord*f32 for float components, the same
++// bytes and the same writer state as write_numeric_attr / write_tex_attr over scalar_f32 values:
++// the vertex cache, the explicit or implicit attribute and the component bookkeeping are the same
++// calls, but a float component of a float attribute (everything but the 8/16-bit integer types, whose
++// conversion keeps the loop below) is stored as its four big-endian bytes, the whole attribute in one
++// buffer append, instead of one Scalar, one conversion switch and one append per component. A display
++// list being recorded keeps the per-component appends (their overflow behaviour is per append).
++// WIICOMPILED_GX_VTXF32=0 keeps the old functions.
++static int8_t sVtxF32State = -1; // read once on first use
++static inline bool vtxf32_enabled() {
++  if (sVtxF32State < 0) UNLIKELY {
++    const char* v = std::getenv("WIICOMPILED_GX_VTXF32");
++    sVtxF32State = (v != nullptr && v[0] == '0') ? 0 : 1;
++  }
++  return sVtxF32State != 0;
++}
++
++// The per-component conversions (8/16-bit integer formats, or a display list being recorded).
++static __attribute__((noinline)) void write_f32_components_slow(const ActiveAttrFmt& fmt, const float* values, u32 count) {
++  for (u32 i = 0; i < count; ++i) {
++    write_numeric_component(fmt, scalar_f32(values[i]));
++  }
++}
++
++template <bool Tex, size_t N>
++static inline void write_f32_attr(GXAttr attr, const float (&values)[N]) {
++  ensure_vtx_cache(sBeginVtxFmt);
++  if constexpr (Tex) {
++    attr = select_implicit_attr(GX_VA_TEX0, GX_VA_TEX7);
++  }
++  align_explicit_attr(attr);
++  const AttrCacheEntry& entry = attr_cache(attr);
++  if (entry.type == GX_NONE) {
++    return;
++  }
++  if (entry.type == GX_INDEX8 || entry.type == GX_INDEX16) {
++    return;
++  }
++  const u32 expected = entry.expected;
++  const u32 remaining = expected > sWriteAttrComps ? expected - sWriteAttrComps : expected;
++  const u32 count = std::min<u32>(static_cast<u32>(N), remaining);
++  const GXCompType type = entry.fmt.type;
++  if (type != GX_U8 && type != GX_S8 && type != GX_U16 && type != GX_S16 && !aurora::gx::fifo::in_display_list()) LIKELY {
++    uint32_t out[N];
++    for (u32 i = 0; i < N; ++i) {
++      uint32_t bits;
++      std::memcpy(&bits, &values[i], sizeof(bits));
++      out[i] = __builtin_bswap32(bits);
++    }
++    if (count == N) LIKELY {
++      aurora::gx::fifo::write_data(out, static_cast<u32>(N) * 4u);
++    } else if (count != 0) {
++      aurora::gx::fifo::write_data(out, count * 4u);
++    }
++  } else {
++    write_f32_components_slow(entry.fmt, values, count);
++  }
++  advance_attr(attr, count);
++}
++#endif
++
+ static void write_index_attr(GXAttr attr, u16 index, bool index16) {
+   ensure_vtx_cache(sBeginVtxFmt);
+   if (attr == GX_VA_TEX0) {
+@@ -570,11 +634,18 @@ void GXEnd() {
      sWriteAttrComps = 0;
    }
    if (!aurora::gx::fifo::in_display_list()) {
@@ -1936,6 +2024,77 @@ index 6f71945..0ca5c7d 100644
 +    aurora::gx::fifo::publish_draw(); // sync: drain()
    }
  }
+ 
+ void GXPosition3f32(f32 x, f32 y, f32 z) {
++#if defined(__SWITCH__)
++  if (vtxf32_enabled()) LIKELY {
++    const float v[3] = {x, y, z};
++    write_f32_attr<false, 3>(GX_VA_POS, v);
++    return;
++  }
++#endif
+   write_numeric_attr(GX_VA_POS, std::array{scalar_f32(x), scalar_f32(y), scalar_f32(z)});
+ }
+ 
+@@ -595,6 +666,13 @@ void GXPosition3s8(s8 x, s8 y, s8 z) {
+ }
+ 
+ void GXPosition2f32(f32 x, f32 y) {
++#if defined(__SWITCH__)
++  if (vtxf32_enabled()) LIKELY {
++    const float v[2] = {x, y};
++    write_f32_attr<false, 2>(GX_VA_POS, v);
++    return;
++  }
++#endif
+   write_numeric_attr(GX_VA_POS, std::array{scalar_f32(x), scalar_f32(y)});
+ }
+ 
+@@ -619,6 +697,13 @@ void GXPosition1x16(u16 idx) { write_index_attr(GX_VA_POS, idx, true); }
+ void GXPosition1x8(u8 idx) { write_index_attr(GX_VA_POS, idx, false); }
+ 
+ void GXNormal3f32(f32 x, f32 y, f32 z) {
++#if defined(__SWITCH__)
++  if (vtxf32_enabled()) LIKELY {
++    const float v[3] = {x, y, z};
++    write_f32_attr<false, 3>(GX_VA_NRM, v);
++    return;
++  }
++#endif
+   write_numeric_attr(GX_VA_NRM, std::array{scalar_f32(x), scalar_f32(y), scalar_f32(z)});
+ }
+ 
+@@ -671,6 +756,13 @@ void GXColor1x16(u16 index) { write_index_attr(GX_VA_CLR0, index, true); }
+ void GXColor1x8(u8 index) { write_index_attr(GX_VA_CLR0, index, false); }
+ 
+ void GXTexCoord2f32(f32 s, f32 t) {
++#if defined(__SWITCH__)
++  if (vtxf32_enabled()) LIKELY {
++    const float v[2] = {s, t};
++    write_f32_attr<true, 2>(GX_VA_TEX0, v);
++    return;
++  }
++#endif
+   write_tex_attr(std::array{scalar_f32(s), scalar_f32(t)});
+ }
+ 
+@@ -690,7 +782,16 @@ void GXTexCoord2s8(s8 s, s8 t) {
+   write_tex_attr(std::array{scalar_s32(s), scalar_s32(t)});
+ }
+ 
+-void GXTexCoord1f32(f32 s) { write_tex_attr(std::array{scalar_f32(s)}); }
++void GXTexCoord1f32(f32 s) {
++#if defined(__SWITCH__)
++  if (vtxf32_enabled()) LIKELY {
++    const float v[1] = {s};
++    write_f32_attr<true, 1>(GX_VA_TEX0, v);
++    return;
++  }
++#endif
++  write_tex_attr(std::array{scalar_f32(s)});
++}
+ 
+ void GXTexCoord1u16(u16 s) { write_tex_attr(std::array{scalar_u32(s)}); }
  
 diff --git a/aurora-main/lib/dolphin/gx/__gx.h b/aurora-main/lib/dolphin/gx/__gx.h
 index 460791e..aa518c9 100644
@@ -2146,6 +2305,437 @@ index 0000000..c0bcf68
 +  invalidate();
 +#endif
 +  return resolve_tlut_identity_uncached(data, format, entries);
++}
+diff --git a/aurora-main/lib/dolphin/gx/gx_vtx_plan.inc b/aurora-main/lib/dolphin/gx/gx_vtx_plan.inc
+new file mode 100644
+index 0000000..7710422
+--- /dev/null
++++ b/aurora-main/lib/dolphin/gx/gx_vtx_plan.inc
+@@ -0,0 +1,425 @@
++// P28: vertex-state publish plans (switch phase 82, local/tmp/cpu/P28-vtx.py).
++//
++// The runtime republishes its whole vertex layout before every immediate-mode draw, display-list
++// call and raw-FIFO draw (GxStream::PublishAuroraVtxState): 25-26 descriptor entries and 12-17
++// attribute-format entries through GXSetVtxDescRun / GXSetVtxAttrFmtRun, ~600 times a frame in a
++// match. The layout is almost always the one published before, so the entries are decided from a
++// plan built once per distinct layout (kept by content, a few per format):
++//   - forced (the dirty bit is already set): the entries only store; the plan's masks store the
++//     same final registers in one step and count the same elisions;
++//   - unforced and nothing would change (every entry is a fixed point of the live registers): every
++//     entry queues its probe; the plan queues the same probes as one record append and sets 0x20;
++//   - anything else (an entry changes, unsafe values, not the A3 asynchronous mode): the run
++//     functions above, entry by entry, exactly as before.
++// WIICOMPILED_GX_VTXPLAN=0 skips this file's paths (the runtime then builds the lists itself).
++// Included by GXGeometry.cpp at namespace scope after the extern "C" block.
++#include <cstdlib>
++#include <cstring>
++
++extern "C" uint64_t aurora_gx_vtxplan_counters[8]; // [0]/[1] desc hit/slow, [2]/[3] fmt hit/slow, [4] plan builds
++uint64_t aurora_gx_vtxplan_counters[8] = {};
++
++namespace {
++namespace vtxplan {
++
++int8_t gEnabled = -1; // WIICOMPILED_GX_VTXPLAN, read once on first use
++inline bool enabled() {
++  if (gEnabled < 0) UNLIKELY {
++    const char* v = std::getenv("WIICOMPILED_GX_VTXPLAN");
++    gEnabled = (v != nullptr && v[0] == '0') ? 0 : 1;
++  }
++  return gEnabled != 0;
++}
++
++// The decision GXSetVtxDescRun / GXSetVtxAttrFmtRun take first (A3's asynchronous path).
++inline bool a3_path(bool checkFmt, GXVtxFmt vtxfmt) {
++  return aurora::gx::fifo::async_mode() && aurora::gx::fifo::a3_enabled() && !aurora::gx::fifo::in_display_list() &&
++         (!checkFmt || (vtxfmt >= GX_VTXFMT0 && vtxfmt < GX_MAX_VTXFMT));
++}
++
++// ---- VCD -----------------------------------------------------------------------------------
++
++struct VcdPlan {
++  bool valid = false;
++  bool safe = false;
++  u32 includeNbt = 0;
++  u32 hle[GX_VA_MAX_ATTR]{}; // the key: the runtime's descriptor types as given
++  u32 count = 0;
++  GXVtxDescList list[GX_VA_MAX_ATTR]{};
++  u8 probes[2 * GX_VA_MAX_ATTR]{};
++  // Entries other than GX_VA_NRM / GX_VA_NBT: one mask/value pair per register (disjoint fields).
++  u32 loMask = 0, loVal = 0, hiMask = 0, hiVal = 0;
++  bool hasNrm = false, hasNbt = false;
++  GXAttrType nrmT = GX_NONE, nbtT = GX_NONE;
++};
++
++constexpr u32 kVcdWays = 16;
++VcdPlan gVcd[kVcdWays];
++u32 gVcdMru = 0;
++u32 gVcdNext = 0;
++
++u32 build_desc_list(const u32* hle, bool includeNbt, GXVtxDescList* list) {
++  u32 count = 0;
++  for (u32 attr = 0; attr < GX_VA_MAX_ATTR; ++attr) {
++    if (!includeNbt && attr == GX_VA_NBT) {
++      continue;
++    }
++    u32 type = hle[attr];
++    if (type == GX_INDEX8 || type == GX_INDEX16) {
++      type = GX_DIRECT;
++    }
++    list[count].attr = static_cast<GXAttr>(attr);
++    list[count].type = static_cast<GXAttrType>(type);
++    ++count;
++  }
++  return count;
++}
++
++// The registers SETVCDATTR touches for one entry, found by running it on all-zero and all-one
++// registers (the update is x -> (x & ~mask) | value, whatever the values): bits that come out the
++// same are written, the others pass through.
++struct EntryEffect {
++  u32 loMask, loVal, hiMask, hiVal;
++};
++
++EntryEffect vcd_entry_effect(GXAttr attr, GXAttrType type) {
++  auto* const gx = __gx;
++  const u32 saveLo = gx->vcdLo, saveHi = gx->vcdHi;
++  const u8 saveN = gx->hasNrms, saveB = gx->hasBiNrms;
++  const GXAttrType saveT = gx->nrmType;
++  u32 out[2][2];
++  for (int pass = 0; pass < 2; ++pass) {
++    gx->vcdLo = gx->vcdHi = pass ? 0xFFFFFFFFu : 0u;
++    SETVCDATTR(attr, type);
++    out[pass][0] = gx->vcdLo;
++    out[pass][1] = gx->vcdHi;
++  }
++  gx->vcdLo = saveLo;
++  gx->vcdHi = saveHi;
++  gx->hasNrms = saveN;
++  gx->hasBiNrms = saveB;
++  gx->nrmType = saveT;
++  EntryEffect e;
++  e.loMask = ~(out[0][0] ^ out[1][0]);
++  e.loVal = out[0][0] & e.loMask;
++  e.hiMask = ~(out[0][1] ^ out[1][1]);
++  e.hiVal = out[0][1] & e.hiMask;
++  return e;
++}
++
++void build_vcd_plan(VcdPlan& p, const u32* hle, bool includeNbt) {
++  ++aurora_gx_vtxplan_counters[4];
++  p = VcdPlan{};
++  p.valid = true;
++  p.includeNbt = includeNbt ? 1u : 0u;
++  std::memcpy(p.hle, hle, sizeof(p.hle));
++  p.count = build_desc_list(hle, includeNbt, p.list);
++  // Only the values GXSetVtxDesc stores unambiguously (GX_NONE / GX_DIRECT after the index
++  // conversion); anything else keeps the entry-by-entry run.
++  p.safe = true;
++  for (u32 i = 0; i < p.count; ++i) {
++    p.probes[2 * i] = static_cast<u8>(p.list[i].attr);
++    p.probes[2 * i + 1] = static_cast<u8>(p.list[i].type);
++    if (static_cast<u32>(p.list[i].type) > 1u) {
++      p.safe = false;
++    }
++  }
++  if (!p.safe) {
++    return;
++  }
++  u32 usedLo = 0, usedHi = 0;
++  for (u32 i = 0; i < p.count && p.safe; ++i) {
++    const GXAttr attr = p.list[i].attr;
++    if (attr == GX_VA_NRM) {
++      p.hasNrm = true;
++      p.nrmT = p.list[i].type;
++    } else if (attr == GX_VA_NBT) {
++      p.hasNbt = true;
++      p.nbtT = p.list[i].type;
++    } else {
++      const EntryEffect e = vcd_entry_effect(attr, p.list[i].type);
++      if ((usedLo & e.loMask) != 0 || (usedHi & e.hiMask) != 0) {
++        p.safe = false; // overlapping fields: the order of the entries would matter
++      }
++      usedLo |= e.loMask;
++      usedHi |= e.hiMask;
++      p.loMask |= e.loMask;
++      p.loVal |= e.loVal;
++      p.hiMask |= e.hiMask;
++      p.hiVal |= e.hiVal;
++    }
++  }
++  // The normal-type field (bits 11-12 of vcdLo) is rewritten from hasNrms / nrmType after every entry.
++  if ((p.loMask & 0x1800u) != 0) {
++    p.safe = false;
++  }
++}
++
++VcdPlan& find_vcd_plan(const u32* hle, bool includeNbt) {
++  const u32 inb = includeNbt ? 1u : 0u;
++  VcdPlan* mru = &gVcd[gVcdMru];
++  if (mru->valid && mru->includeNbt == inb && std::memcmp(mru->hle, hle, sizeof(mru->hle)) == 0) {
++    return *mru;
++  }
++  for (u32 i = 0; i < kVcdWays; ++i) {
++    VcdPlan& p = gVcd[i];
++    if (p.valid && p.includeNbt == inb && std::memcmp(p.hle, hle, sizeof(p.hle)) == 0) {
++      gVcdMru = i;
++      return p;
++    }
++  }
++  const u32 slot = gVcdNext++ % kVcdWays;
++  build_vcd_plan(gVcd[slot], hle, includeNbt);
++  gVcdMru = slot;
++  return gVcd[slot];
++}
++
++// GXSetVtxDescRun's behaviour for this plan, or false (nothing done) when the entry-by-entry run is needed.
++bool run_vcd_plan(const VcdPlan& p) {
++  auto* const gx = __gx;
++  const u32 lo = gx->vcdLo, hi = gx->vcdHi;
++  const u8 hn = gx->hasNrms, hb = gx->hasBiNrms;
++  const u32 nt = static_cast<u32>(gx->nrmType);
++  if (nt > 3u) UNLIKELY {
++    return false;
++  }
++  if ((gx->dirtyState & 8) != 0) {
++    // Forced: every entry stores, none queues a probe (P11).
++    u8 nhn = hn, nhb = hb;
++    u32 nnt = nt;
++    if (p.hasNrm) {
++      nhn = p.nrmT != GX_NONE;
++      if (p.nrmT != GX_NONE) nnt = static_cast<u32>(p.nrmT);
++    }
++    if (p.hasNbt) {
++      nhb = p.nbtT != GX_NONE;
++      if (p.nbtT != GX_NONE) nnt = static_cast<u32>(p.nbtT);
++    }
++    gx->vcdLo = (((lo & ~p.loMask) | p.loVal) & ~(3u << 11)) | (((nhn || nhb) ? nnt : 0u) << 11);
++    gx->vcdHi = (hi & ~p.hiMask) | p.hiVal;
++    gx->hasNrms = nhn;
++    gx->hasBiNrms = nhb;
++    gx->nrmType = static_cast<GXAttrType>(nnt);
++    aurora_gx_a3_counters[aurora::gx::fifo::kA3VtxProbesElided] += p.count;
++    return true;
++  }
++  // Unforced: only when no entry changes anything.
++  if (((lo >> 11) & 3u) != ((hn || hb) ? nt : 0u) || ((lo ^ p.loVal) & p.loMask) != 0 ||
++      ((hi ^ p.hiVal) & p.hiMask) != 0) {
++    return false;
++  }
++  u8 sn = hn, sb = hb;
++  u32 st = nt;
++  if (p.hasNrm) {
++    const u8 n2 = p.nrmT != GX_NONE;
++    const u32 t2 = p.nrmT != GX_NONE ? static_cast<u32>(p.nrmT) : st;
++    if (n2 != sn || t2 != st) return false;
++  }
++  if (p.hasNbt) {
++    const u8 b2 = p.nbtT != GX_NONE;
++    const u32 t2 = p.nbtT != GX_NONE ? static_cast<u32>(p.nbtT) : st;
++    if (b2 != sb || t2 != st) return false;
++  }
++  aurora::gx::fifo::probe_vtx_desc_batch(p.probes, p.count);
++  gx->dirtyState |= 0x20;
++  return true;
++}
++
++// ---- VAT -----------------------------------------------------------------------------------
++
++struct RawFmt { // the runtime's VtxAttrFmt (static_assert there)
++  u32 cnt;
++  u32 type;
++  u8 frac;
++};
++
++struct VatPlan {
++  bool valid = false;
++  bool safe = false;
++  u32 first = 0, last = 0, includeNbt = 0;
++  u32 count = 0;
++  GXVtxAttrFmtList list[GX_VA_MAX_ATTR]{};
++  u8 attrs[GX_VA_MAX_ATTR]{};
++  u8 probes[5 * GX_VA_MAX_ATTR]{}; // fmt, attr, cnt, type, frac per entry
++  u32 restMask[3]{}, restVal[3]{}; // entries other than GX_VA_NRM / GX_VA_NBT
++  u32 allMask[3]{}, allVal[3]{};   // the whole sequence
++  u32 nrmCount = 0;
++  u32 nrmIdx[2]{};
++};
++
++constexpr u32 kVatWays = 6;
++VatPlan gVat[GX_MAX_VTXFMT][kVatWays];
++u32 gVatMru[GX_MAX_VTXFMT] = {};
++u32 gVatNext[GX_MAX_VTXFMT] = {};
++
++inline bool vat_same(const VatPlan& p, const RawFmt* row) {
++  for (u32 i = 0; i < p.count; ++i) {
++    const RawFmt& r = row[p.attrs[i]];
++    const GXVtxAttrFmtList& e = p.list[i];
++    if (r.cnt != static_cast<u32>(e.cnt) || r.type != static_cast<u32>(e.type) || r.frac != e.frac) {
++      return false;
++    }
++  }
++  return true;
++}
++
++void vat_apply(u32* v, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
++  SETVAT(&v[0], &v[1], &v[2], attr, cnt, type, frac);
++}
++
++void build_vat_plan(VatPlan& p, GXVtxFmt fmt, const RawFmt* row, u32 first, u32 last, bool includeNbt) {
++  ++aurora_gx_vtxplan_counters[4];
++  p = VatPlan{};
++  p.valid = true;
++  p.first = first;
++  p.last = last;
++  p.includeNbt = includeNbt ? 1u : 0u;
++  p.safe = true;
++  for (u32 attr = first; attr <= last; ++attr) {
++    if (!includeNbt && attr == GX_VA_NBT) continue;
++    if (attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX)) continue;
++    const RawFmt& r = row[attr];
++    const u32 i = p.count++;
++    p.attrs[i] = static_cast<u8>(attr);
++    p.list[i] = GXVtxAttrFmtList{static_cast<GXAttr>(attr), static_cast<GXCompCnt>(r.cnt),
++                                 static_cast<GXCompType>(r.type), r.frac};
++    p.probes[5 * i + 0] = static_cast<u8>(fmt);
++    p.probes[5 * i + 1] = static_cast<u8>(attr);
++    p.probes[5 * i + 2] = static_cast<u8>(r.cnt);
++    p.probes[5 * i + 3] = static_cast<u8>(r.type);
++    p.probes[5 * i + 4] = static_cast<u8>(r.frac);
++    // Field widths SETVAT stores without masking: 1/2-bit counts (NBT3 handled by SETVAT), 3-bit
++    // types, 5-bit fractions. Other values keep the entry-by-entry run.
++    if (attr >= GX_VA_POS && attr <= GX_VA_TEX7 && (r.cnt > 2u || r.type > 7u || r.frac > 31u)) {
++      p.safe = false;
++    }
++  }
++  if (!p.safe) {
++    return;
++  }
++  // Per entry the fields it writes (SETVAT on all-zero and all-one registers, as for the VCD);
++  // allZ / allO are the whole sequence applied to those two register sets.
++  u32 used[3] = {0, 0, 0};
++  u32 allZ[3] = {0, 0, 0}, allO[3] = {~0u, ~0u, ~0u};
++  u32 nrmMask[2][3] = {};
++  for (u32 i = 0; i < p.count; ++i) {
++    const GXVtxAttrFmtList& e = p.list[i];
++    u32 z[3] = {0, 0, 0}, o[3] = {~0u, ~0u, ~0u};
++    vat_apply(z, e.attr, e.cnt, e.type, e.frac);
++    vat_apply(o, e.attr, e.cnt, e.type, e.frac);
++    vat_apply(allZ, e.attr, e.cnt, e.type, e.frac);
++    vat_apply(allO, e.attr, e.cnt, e.type, e.frac);
++    const bool nrm = e.attr == GX_VA_NRM || e.attr == GX_VA_NBT;
++    if (nrm) {
++      for (int k = 0; k < 3; ++k) nrmMask[p.nrmCount][k] = ~(z[k] ^ o[k]);
++      p.nrmIdx[p.nrmCount++] = i;
++      continue;
++    }
++    for (int k = 0; k < 3; ++k) {
++      const u32 mask = ~(z[k] ^ o[k]);
++      if ((used[k] & mask) != 0) p.safe = false; // overlapping fields: the order would matter
++      used[k] |= mask;
++      p.restMask[k] |= mask;
++      p.restVal[k] |= z[k] & mask;
++    }
++  }
++  for (int k = 0; k < 3; ++k) {
++    p.allMask[k] = ~(allZ[k] ^ allO[k]);
++    p.allVal[k] = allZ[k] & p.allMask[k];
++    // The two normal entries may overlap each other (GX_VA_NBT stores like GX_VA_NRM), nothing else.
++    for (u32 n = 0; n < p.nrmCount; ++n) {
++      if ((p.restMask[k] & nrmMask[n][k]) != 0) p.safe = false;
++    }
++  }
++}
++
++VatPlan& find_vat_plan(GXVtxFmt fmt, const RawFmt* row, u32 first, u32 last, bool includeNbt) {
++  const u32 inb = includeNbt ? 1u : 0u;
++  VatPlan* mru = &gVat[fmt][gVatMru[fmt]];
++  if (mru->valid && mru->first == first && mru->last == last && mru->includeNbt == inb && vat_same(*mru, row)) {
++    return *mru;
++  }
++  for (u32 i = 0; i < kVatWays; ++i) {
++    VatPlan& p = gVat[fmt][i];
++    if (p.valid && p.first == first && p.last == last && p.includeNbt == inb && vat_same(p, row)) {
++      gVatMru[fmt] = i;
++      return p;
++    }
++  }
++  const u32 slot = gVatNext[fmt]++ % kVatWays;
++  build_vat_plan(gVat[fmt][slot], fmt, row, first, last, includeNbt);
++  gVatMru[fmt] = slot;
++  return gVat[fmt][slot];
++}
++
++bool run_vat_plan(const VatPlan& p, GXVtxFmt vtxfmt) {
++  auto* const gx = __gx;
++  u32 v[3] = {gx->vatA[vtxfmt], gx->vatB[vtxfmt], gx->vatC[vtxfmt]};
++  const u8 bit = static_cast<u8>(1u << vtxfmt);
++  if ((gx->dirtyState & 0x10) != 0 && (gx->dirtyVAT & bit) != 0) {
++    // Forced: every entry stores and counts an elision.
++    gx->vatA[vtxfmt] = (v[0] & ~p.allMask[0]) | p.allVal[0];
++    gx->vatB[vtxfmt] = (v[1] & ~p.allMask[1]) | p.allVal[1];
++    gx->vatC[vtxfmt] = (v[2] & ~p.allMask[2]) | p.allVal[2];
++    aurora_gx_a3_counters[aurora::gx::fifo::kA3VtxProbesElided] += p.count;
++    return true;
++  }
++  for (int k = 0; k < 3; ++k) {
++    if (((v[k] ^ p.restVal[k]) & p.restMask[k]) != 0) return false;
++  }
++  u32 t[3] = {v[0], v[1], v[2]};
++  for (u32 n = 0; n < p.nrmCount; ++n) {
++    const GXVtxAttrFmtList& e = p.list[p.nrmIdx[n]];
++    vat_apply(t, e.attr, e.cnt, e.type, e.frac);
++    if (t[0] != v[0] || t[1] != v[1] || t[2] != v[2]) return false;
++  }
++  aurora::gx::fifo::probe_vtx_attr_fmt_batch(static_cast<u32>(vtxfmt), p.probes, p.count);
++  gx->dirtyState |= 0x20;
++  return true;
++}
++
++} // namespace vtxplan
++} // namespace
++
++extern "C" int aurora_gx_vtxplan_enabled(void) { return vtxplan::enabled() ? 1 : 0; }
++
++// The runtime's vtxDesc[26] (as GXAttrType values) in, GXSetVtxDescRun's effect out.
++extern "C" void GXSetVtxDescPlanRun(const u32* hleDesc, int includeNbt) {
++  if (!vtxplan::enabled() || !vtxplan::a3_path(false, GX_VTXFMT0)) UNLIKELY {
++    GXVtxDescList list[GX_VA_MAX_ATTR];
++    const u32 count = vtxplan::build_desc_list(hleDesc, includeNbt != 0, list);
++    GXSetVtxDescRun(list, count);
++    return;
++  }
++  vtxplan::VcdPlan& plan = vtxplan::find_vcd_plan(hleDesc, includeNbt != 0);
++  if (plan.safe && vtxplan::run_vcd_plan(plan)) LIKELY {
++    ++aurora_gx_vtxplan_counters[0];
++    return;
++  }
++  ++aurora_gx_vtxplan_counters[1];
++  GXSetVtxDescRun(plan.list, plan.count);
++}
++
++// The runtime's vtxAttrFmt[vtxfmt][26] in, GXSetVtxAttrFmtRun's effect for attributes first..last out.
++extern "C" void GXSetVtxAttrFmtPlanRun(GXVtxFmt vtxfmt, const void* row26, int first, int last, int includeNbt) {
++  const auto* row = static_cast<const vtxplan::RawFmt*>(row26);
++  if (!vtxplan::enabled() || !vtxplan::a3_path(true, vtxfmt) || first < 0 || last >= GX_VA_MAX_ATTR) UNLIKELY {
++    GXVtxAttrFmtList list[GX_VA_MAX_ATTR];
++    u32 count = 0;
++    for (int attr = first; attr <= last; ++attr) {
++      if (includeNbt == 0 && attr == GX_VA_NBT) continue;
++      if (attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX)) continue;
++      list[count++] = GXVtxAttrFmtList{static_cast<GXAttr>(attr), static_cast<GXCompCnt>(row[attr].cnt),
++                                       static_cast<GXCompType>(row[attr].type), row[attr].frac};
++    }
++    GXSetVtxAttrFmtRun(vtxfmt, list, count);
++    return;
++  }
++  vtxplan::VatPlan& plan = vtxplan::find_vat_plan(vtxfmt, row, static_cast<u32>(first), static_cast<u32>(last), includeNbt != 0);
++  if (plan.safe && vtxplan::run_vat_plan(plan, vtxfmt)) LIKELY {
++    ++aurora_gx_vtxplan_counters[2];
++    return;
++  }
++  ++aurora_gx_vtxplan_counters[3];
++  GXSetVtxAttrFmtRun(vtxfmt, plan.list, plan.count);
 +}
 diff --git a/aurora-main/lib/gfx/auto_mips.hpp b/aurora-main/lib/gfx/auto_mips.hpp
 index 58190c7..23620e7 100644
@@ -3498,7 +4088,7 @@ index 9818084..ef23e67 100644
 +
 +#include "fifo_async.inc"
 diff --git a/aurora-main/lib/gx/fifo.hpp b/aurora-main/lib/gx/fifo.hpp
-index b01ea45..8d7f5fc 100644
+index b01ea45..4e106d7 100644
 --- a/aurora-main/lib/gx/fifo.hpp
 +++ b/aurora-main/lib/gx/fifo.hpp
 @@ -16,6 +16,48 @@ extern uint32_t sDlSize;
@@ -3550,7 +4140,7 @@ index b01ea45..8d7f5fc 100644
  void init();
  
  // Out-of-line slow path: grows internal buffer then appends data
-@@ -76,14 +118,160 @@ inline void write_f32(const float val) {
+@@ -76,14 +118,165 @@ inline void write_f32(const float val) {
  // Display list recording
  void begin_display_list(uint8_t* buf, uint32_t size);
  uint32_t end_display_list();
@@ -3602,6 +4192,11 @@ index b01ea45..8d7f5fc 100644
 +void probe_vtx_desc(uint32_t attr, uint32_t type);
 +void probe_vtx_attr_fmt(uint32_t fmt, uint32_t attr, uint32_t cnt, uint32_t type, uint32_t frac);
 +uint32_t vtx_probes() noexcept;
++#if defined(__SWITCH__)
++// P28: n probes as one record append (fifo_async.inc).
++void probe_vtx_desc_batch(const uint8_t* pairs, uint32_t n);
++void probe_vtx_attr_fmt_batch(uint32_t fmt, const uint8_t* rows, uint32_t n);
++#endif
 +void queue_vtx_cond(uint32_t start, uint32_t vcdEnd, bool vcdForce, uint8_t vatForce);
 +// GX_LOAD_AURORA subcommand carrying queue_vtx_cond's flush (never in a sync-mode stream).
 +constexpr uint16_t kAuroraVtxCondSubCmd = 0x00F0;
@@ -3714,10 +4309,10 @@ index b01ea45..8d7f5fc 100644
 +#endif
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 new file mode 100644
-index 0000000..0e20651
+index 0000000..cb9cc36
 --- /dev/null
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -0,0 +1,1195 @@
+@@ -0,0 +1,1216 @@
 +// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
 +// at the end of fifo.cpp.
 +//
@@ -4750,6 +5345,27 @@ index 0000000..0e20651
 +}
 +
 +uint32_t vtx_probes() noexcept { return sVtxProbes; }
++
++#if defined(__SWITCH__)
++// P28 (GXGeometry.cpp's vertex-state plans): n probes of one kind as one record append, the same
++// bytes (and the same counters and flags) n calls above would leave. `pairs` holds attr,type per
++// probe; `rows` holds fmt,attr,cnt,type,frac per probe, all of format `fmt`.
++void probe_vtx_desc_batch(const uint8_t* pairs, uint32_t n) {
++  if (n == 0) return;
++  aurora_gx_a3_counters[kA3VtxProbes] += n;
++  uint8_t* out = open_record(kRecProbeVcd, 0, 2u * n, true, sNextCondId);
++  std::memcpy(out, pairs, 2u * n);
++  sVtxProbes |= 0x100u;
++}
++
++void probe_vtx_attr_fmt_batch(uint32_t fmt, const uint8_t* rows, uint32_t n) {
++  if (n == 0) return;
++  aurora_gx_a3_counters[kA3VtxProbes] += n;
++  uint8_t* out = open_record(kRecProbeVat, 0, 5u * n, true, sNextCondId);
++  std::memcpy(out, rows, 5u * n);
++  sVtxProbes |= 1u << fmt;
++}
++#endif
 +
 +// GXManage.cpp's __GXSetDirtyState has just written the VCD block [start, vcdEnd) and the VAT
 +// blocks of every candidate format [vcdEnd, end) as sync would have. They are wrapped, in place,
@@ -9563,10 +10179,10 @@ index 0000000..01d4e89
 +}
 diff --git a/runtime/src/hle/gx/gx_batch_fifo.inc b/runtime/src/hle/gx/gx_batch_fifo.inc
 new file mode 100644
-index 0000000..7657460
+index 0000000..42929ba
 --- /dev/null
 +++ b/runtime/src/hle/gx/gx_batch_fifo.inc
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,82 @@
 +// GX batch2: consume direct F32 attributes without serializing each component through
 +// the command ring. Keep scratch bytes/buffers, call boundaries and vertex completion identical.
 +static inline int DirectF32FifoRemaining() {
@@ -9574,6 +10190,13 @@ index 0000000..7657460
 +    if (!g.inBegin || !g.auroraBeginCalled || g.fifoByteCount!=0 || g.fifoReadOffset!=0 ||
 +        g.currentVtxFmt>=GX_MAX_VTXFMT) return 0;
 +    const GXAttr a=g.currentAttr;
++    if (GxVtxF32::kEnabled) {
++        // P28: the checks below, answered per (generation, format) by GxVtxF32::F32Components.
++        if (static_cast<unsigned>(a)>=26u) return 0;
++        const uint32_t e=GxVtxF32::F32Components(g,a);
++        if (static_cast<unsigned>(g.currentComp)>=e) return 0;
++        return static_cast<int>(e)-g.currentComp;
++    }
 +    if (a!=GX_VA_POS && a!=GX_VA_NRM && !(a>=GX_VA_TEX0 && a<=GX_VA_TEX7)) return 0;
 +    const auto& f=g.vtxAttrFmt[g.currentVtxFmt][a];
 +    if (g.vtxDesc[a]!=GX_DIRECT || f.type!=GX_F32) return 0;
