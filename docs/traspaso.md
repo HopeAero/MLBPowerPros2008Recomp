@@ -455,6 +455,8 @@ no es un replay del mismo estado ni una prueba causal aislada: las ventanas
 mezclan escenas y el número de pasadas difiere. No quedaron relojes registrados
 y no se compararon capturas píxel a píxel. No atribuir estos números a 60 fps
 sostenidos, mayor cobertura recomp ni progreso de partido. Ambas conexiones
-nxlink terminaron; no queda un monitor corriendo. La última NRO enviada a la
-SD es el control: para dejar la modificada, reenviar `P30-compression.nro`
-cuando el usuario confirme netloader listo.
+nxlink terminaron; no queda un monitor corriendo. Tras otra confirmación de
+netloader, se reenvió `P30-compression.nro` a
+`mlbpowerpros2008/MLBPowerPros2008.nro` con los diagnósticos apagados y
+`--no-server`; transferencia completada (exit 0). La SD queda con la versión
+modificada, sin iniciar otra captura de rendimiento.
