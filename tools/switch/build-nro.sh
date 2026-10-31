@@ -238,5 +238,6 @@ cp -f "$build/MLBPowerPros2008.nro" "$out/MLBPowerPros2008$pgo_nro_suffix.nro"
 rm -rf "$out/wii_bootstrap"
 cp -rf "$build"/{dsp_coef.bin,cacert.pem,initial_pipeline_cache.db,wii_bootstrap} "$out/"
 echo "built: local/switch/build/MLBPowerPros2008$pgo_nro_suffix.nro ($(du -h "$out/MLBPowerPros2008$pgo_nro_suffix.nro" | cut -f1))"
-[[ $pgo_mode == gen ]] && echo "PGO: run it on the Switch, play ~10 min, press L+R+ZL+ZR+Minus (1 s) with tools/switch/pgo/pgo_recv.py <dir> running on the PC"
-[[ $pgo_mode == use ]] && echo "PGO: check what was consumed: python tools/switch/pgo/pgo_check.py local/switch/work/mlb/build-$graphics-pgo ${MLB_SWITCH_PGO#use:} --sample 3"
+if [[ $pgo_mode == gen ]]; then echo "PGO: run it on the Switch, play ~10 min, press L+R+ZL+ZR+Minus (1 s) with tools/switch/pgo/pgo_recv.py <dir> running on the PC"
+fi
+if [[ $pgo_mode == use ]]; then echo "PGO: check what was consumed: python tools/switch/pgo/pgo_check.py local/switch/work/mlb/build-$graphics-pgo ${MLB_SWITCH_PGO#use:} --sample 3"; fi

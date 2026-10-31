@@ -1,5 +1,2205 @@
+diff --git a/runtime/src/hle/mlb/thp_natives.cpp b/runtime/src/hle/mlb/thp_natives.cpp
+new file mode 100644
+index 0000000..47d869a
+--- /dev/null
++++ b/runtime/src/hle/mlb/thp_natives.cpp
+@@ -0,0 +1,1107 @@
++// MLB Power Pros 2008 (RL8E54): native 8x8 inverse DCTs of the THP movie decoder (Dolphin SDK
++// THPDec: __THPInverseDCTNoYPos 0x80084C7C and __THPInverseDCTY8 0x80085108). The game plays THP
++// video; its MCU-row decoders (__THPDecompressiMCURow512x448 0x80084A30, 0x8008559C, 0x800857EC) call
++// one of these per 8x8 block: six per MCU (4 Y, U, V), four NoYPos and two Y8. Stock-match window
++// profile (local/switch/logs/nxlink-MLBPowerPros2008-20261028-130311.log, windows with the camera
++// on many players): 1.61 + 0.93 ms/frame of the main thread.
++//
++// void IDCT(const s16 coef[64] /* r3 */, u32 xPos /* r4 */): dequantize row by row with the
++// table at *(r13-28672) (64 singles, 8 per coefficient row), a 1-D 8-point transform per row into
++// the 64-float workspace at 0x802B6860 (rows whose coefficients 4-7 / 2-3 / 1 are zero take
++// shortcuts, as many branches of the original), a 1-D transform per column pair out of the
++// workspace (4 iterations of two columns), and u8 stores (psq_st, GQR6 = 0x3D043D04: x * 1/8,
++// truncated, clamped to 0..255; NaN -> 0) into the plane at *(r13-28608): rows of 8 bytes, the
++// 8 rows of the block as two 4-row halves at r6 and r7. Per-plane stride *(r13-28640) is 512 (Y)
++// or 256 (U, V) in the 512x448 decoder. NoYPos: out + (xPos << 2); Y8 adds 8 rows of the stride
++// (stride << 3). Constants (singles at r2-30792: f29 f28 f27 f26 f25) are the IDCT's rotation
++// factors and the rounding/level bias f25 added to the DC terms.
++//
++// The translation computes every pair with the ps helpers (a NaN resolver per op), checks and
++// resolves each memory range, byte-swaps each access, and keeps CR0 and the 24 temporaries
++// through its register file. Here pass 1 (the eight row transforms, with the branches, CR0 and
++// registers of the original: a transliteration) is the same operations in the same order as single
++// NEON instructions on float32x2_t (lane 1 = ps0, lane 0 = ps1 as ppc_isa_float.h), and pass 2
++// does the translation's four column-pair iterations at once on float32x4_t (the ops are
++// lane-wise: a column's result does not depend on its neighbours) with the 8 output rows stored as
++// 8-byte vectors. Guest memory goes through the flat view with one rev per access, the constants
++// are hoisted, and the exit state the translation leaves is reproduced: r0, r3-r8, r10, CR0, CTR,
++// f0-f13 (r1 and f25-f31 return unchanged; the translation never writes the callee-saved slots,
++// only the back chain at r1-128). Instruction count per call (qemu, a typical sparse block): 4240
++// translated -> 1220 here, dense block 5600 -> 1660.
++//
++// Why plain NEON gives the translation's bits: every pair op is IEEE single arithmetic per lane
++// (vadd/vsub/vmul, vfma for ps_madd/msub/nmsub as PpcFmaddPairInline/PpcFmsubPairInline); the
++// translation's NaN resolver acts only on NaN lanes. A NaN or infinity cannot arise from finite
++// bounded inputs (|s16| <= 2^15, |table| < 2^23, |constant| < 2^8: no intermediate exceeds 2^105),
++// so the fast path requires exactly that of the 64 table entries and the 5 constants (a
++// constant must also not be subnormal: PsFromScalar's double -> single narrowing flushes it under
++// FZ, a compiler-dependent detail) and runs the translation otherwise. Subnormal products are
++// left to the hardware as in the translation (same FPCR.FZ). The workspace holds singles through
++// psq_st type 0 (subnormal -> signed zero), the output goes through the U8 scale-61 quantizer.
++//
++// Fast path conditions, checked at entry (else the translation runs the whole call; the back
++// chain store it starts with has been done and is idempotent): flat view, GQR0 = 0, no wrap of
++// any source range (constants, parameter block, coefficients, table), none of them overlaps the
++// workspace, both output ranges (rows of the two halves, 38 bytes) are inside no wrap, outside
++// the MMIO window (0xCC000000-0xCDFFFFFF), disjoint from each other and from the workspace (so the
++// order of the 64 output stores, which differs from the translation's, is immaterial). Table: only its
++// 256 bytes are read, all of them (the translation reads fewer when rows are zero; a table in
++// readable memory is a given for the game).
++//
++// This file builds like the translated code (-O2 -fno-fast-math -ffp-contract=off, outside the
++// unity build: runtime/CMakeLists.txt, as mtx_natives.cpp).
++#if defined(__SWITCH__)
++#include <arm_neon.h>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++
++extern "C" void func_80084C7C(CpuContext* ctx);  // the translations (kept: _AS registration)
++extern "C" void func_80085108(CpuContext* ctx);
++
++namespace mlb_thp {
++[[gnu::noinline, gnu::cold]] void TranslatedNoYPos(CpuContext& ctx) { func_80084C7C(&ctx); }
++[[gnu::noinline, gnu::cold]] void TranslatedY8(CpuContext& ctx) { func_80085108(&ctx); }
++}  // namespace mlb_thp
++
++namespace mlb_thp {
++
++using V = float32x2_t;
++
++constexpr uint32_t kWorkspace = 0x802B6860u;  // 64 singles, row-major, 32 bytes per row
++
++[[gnu::always_inline]] inline uint8_t* Host(uint32_t address) { return MKW_FLAT_GUEST_BASE + address; }
++
++[[gnu::always_inline]] inline uint32_t Rd32(uint32_t address) {
++    uint32_t value;
++    std::memcpy(&value, Host(address), sizeof value);
++    return __builtin_bswap32(value);
++}
++[[gnu::always_inline]] inline uint32_t Rd16(uint32_t address) {
++    uint16_t value;
++    std::memcpy(&value, Host(address), sizeof value);
++    return __builtin_bswap16(value);
++}
++[[gnu::always_inline]] inline void Wr32(uint32_t address, uint32_t value) {
++    value = __builtin_bswap32(value);
++    std::memcpy(Host(address), &value, sizeof value);
++}
++
++// psq_l, GQR0 = 0: two singles, ps0 first in memory. Lane 1 = ps0, lane 0 = ps1: a 64-bit
++// byte reversal. NaN lanes are quieted by the translation; none reach here (see the header).
++[[gnu::always_inline]] inline V LdF(uint32_t address) {
++    return vreinterpret_f32_u8(vrev64_u8(vld1_u8(Host(address))));
++}
++
++// psq_l, GQR5 = 0x00070007: two signed 16-bit integers (ps0 first), scale 0, converted exactly.
++[[gnu::always_inline]] inline V LdS16(uint32_t address) {
++    const uint32_t packed = Rd32(address);
++    const int32x2_t lanes = {static_cast<int16_t>(packed), static_cast<int16_t>(packed >> 16)};
++    return vcvt_f32_s32(lanes);
++}
++
++// psq_st, GQR0 = 0: a single below the normal range keeps only its sign (the translation's
++// PpcStorePsqFloatBitsInline; NaN quieting never applies).
++[[gnu::always_inline]] inline void StF(uint32_t address, V value) {
++    const uint32x2_t bits = vreinterpret_u32_f32(value);
++    const uint32x2_t tiny = vclt_u32(vand_u32(bits, vdup_n_u32(0x7FFFFFFFu)), vdup_n_u32(0x00800000u));
++    const uint32x2_t stored = vbsl_u32(tiny, vand_u32(bits, vdup_n_u32(0x80000000u)), bits);
++    vst1_u8(Host(address), vrev64_u8(vreinterpret_u8_u32(stored)));
++}
++
++// The big-endian image psq_st type 0 writes for a pair (StF without the store), for a value stored more than once.
++[[gnu::always_inline]] inline uint8x8_t Img(V value) {
++    const uint32x2_t bits = vreinterpret_u32_f32(value);
++    const uint32x2_t tiny = vclt_u32(vand_u32(bits, vdup_n_u32(0x7FFFFFFFu)), vdup_n_u32(0x00800000u));
++    return vrev64_u8(vreinterpret_u8_u32(vbsl_u32(tiny, vand_u32(bits, vdup_n_u32(0x80000000u)), bits)));
++}
++[[gnu::always_inline]] inline void StI(uint32_t address, uint8x8_t image) { vst1_u8(Host(address), image); }
++
++[[gnu::always_inline]] inline V PAdd(V a, V b) { return vadd_f32(a, b); }
++[[gnu::always_inline]] inline V PSub(V a, V b) { return vsub_f32(a, b); }
++[[gnu::always_inline]] inline V PMul(V a, V b) { return vmul_f32(a, b); }
++[[gnu::always_inline]] inline V PMadd(V a, V c, V b) { return vfma_f32(b, a, c); }
++[[gnu::always_inline]] inline V PMsub(V a, V c, V b) { return vfma_f32(vneg_f32(b), a, c); }
++[[gnu::always_inline]] inline V PNmsub(V a, V c, V b) { return vneg_f32(vfma_f32(vneg_f32(b), a, c)); }
++[[gnu::always_inline]] inline V PMerge00(V a, V b) { return vtrn2_f32(b, a); }             // {a.ps0, b.ps0}
++[[gnu::always_inline]] inline V PMerge01(V a, V b) { return vcopy_lane_f32(b, 1, a, 1); }  // {a.ps0, b.ps1}
++[[gnu::always_inline]] inline V PMerge10(V a, V b) { return vext_f32(b, a, 1); }           // {a.ps1, b.ps0}
++[[gnu::always_inline]] inline V PMerge11(V a, V b) { return vtrn1_f32(b, a); }             // {a.ps1, b.ps1}
++
++[[gnu::always_inline]] inline V Bc(uint32_t bits) { return vreinterpret_f32_u32(vdup_n_u32(bits)); }
++
++inline uint64_t Raw(V pair) { return vget_lane_u64(vreinterpret_u64_f32(pair), 0); }
++
++inline bool Wraps(uint32_t address, uint32_t length) { return address > UINT32_MAX - (length - 1u); }
++inline bool Overlap(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen) {
++    return uint64_t{a} < uint64_t{b} + blen && uint64_t{b} < uint64_t{a} + alen;
++}
++inline bool Mmio(uint32_t address) { return (address & 0xFE000000u) == 0xCC000000u; }
++
++// The 5 constants (f29 f28 f27 f26 f25 at k): each zero or normal, magnitude below 2^8.
++[[gnu::always_inline]] inline bool GoodConstants(uint32_t k) {
++    const uint32x4_t first = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(Host(k))));
++    const uint32x4_t fifth = vdupq_n_u32(Rd32(k + 16u));
++    const uint32x4_t any = vdupq_n_u32(0x7FFFFFFFu), limit = vdupq_n_u32(0x43800000u), normal = vdupq_n_u32(0x00800000u);
++    const uint32x4_t m1 = vandq_u32(first, any), m2 = vandq_u32(fifth, any);
++    const uint32x4_t ok1 = vandq_u32(vcltq_u32(m1, limit), vorrq_u32(vceqzq_u32(m1), vcgeq_u32(m1, normal)));
++    const uint32x4_t ok2 = vandq_u32(vcltq_u32(m2, limit), vorrq_u32(vceqzq_u32(m2), vcgeq_u32(m2, normal)));
++    return vminvq_u32(vandq_u32(ok1, ok2)) != 0u;
++}
++
++// The 64 dequantization singles: none NaN, infinite or of magnitude 2^23 or more. vld4 splits the
++// big-endian singles by byte; byte 0 holds the sign and the top 7 exponent bits: <= 74 means a
++// biased exponent below 150.
++[[gnu::always_inline]] inline bool GoodTable(uint32_t table) {
++    const uint8_t* const host = Host(table);
++    const uint8x16_t mask = vdupq_n_u8(0x7F);
++    const uint8x16_t a = vandq_u8(vld4q_u8(host).val[0], mask), b = vandq_u8(vld4q_u8(host + 64).val[0], mask),
++                     c = vandq_u8(vld4q_u8(host + 128).val[0], mask), d = vandq_u8(vld4q_u8(host + 192).val[0], mask);
++    return vmaxvq_u8(vmaxq_u8(vmaxq_u8(a, b), vmaxq_u8(c, d))) <= 74u;
++}
++
++// What the entry checks leave to the body.
++struct Plane {
++    uint32_t stride;  // *(r13-28640)
++    uint32_t out;     // *(r13-28608)
++};
++
++// The registers the natives read, and write on the fast path. The registered functions copy them from
++// and to the CpuContext with literal indexes (the translator derives the call contract from those).
++struct In {
++    uint32_t r1, r2, r3, r4, r13, cr, xer, gqr0;
++};
++struct Out {
++    uint32_t r0, r3, r4, r5, r6, r7, r8, r10, cr, ctr;
++    uint64_t f[14];  // f0-f13
++};
++
++// The entry checks. On success the back chain is stored; the body re-reads what it needs.
++[[gnu::always_inline]] inline bool Check(const In& in, bool y8, Plane& plane) {
++    if (GuestFlat::RequiresCheckedAccess() || in.gqr0 != 0u) return false;
++    const uint32_t r1 = in.r1;
++    Wr32(r1 - 128u, r1);  // stwu r1, -128(r1): the translation's first action (idempotent when it runs after us)
++    const uint32_t k = in.r2 - 30792u, g = in.r13 - 28672u, coef = in.r3;
++    if (Wraps(k, 20u) || Wraps(g, 68u) || Wraps(coef, 144u)) return false;
++    if (Overlap(g, 68u, kWorkspace, 256u) || Overlap(coef, 144u, kWorkspace, 256u)) return false;
++    const uint32_t table = Rd32(g);
++    if (Wraps(table, 264u) || Overlap(table, 264u, kWorkspace, 256u)) return false;
++    if (!GoodConstants(k) || !GoodTable(table)) return false;
++    const uint32_t stride = Rd32(g + 32u), out = Rd32(g + 64u);
++    const uint32_t first = (y8 ? (stride << 3) : 0u) + (in.r4 << 2);
++    const uint32_t o6 = out + first, o7 = o6 + (stride << 2);
++    if (Wraps(o6, 38u) || Wraps(o7, 38u) || Mmio(o6) || Mmio(o6 + 37u) || Mmio(o7) || Mmio(o7 + 37u)) return false;
++    if (Overlap(o6, 38u, kWorkspace, 256u) || Overlap(o7, 38u, kWorkspace, 256u) || Overlap(o6, 38u, o7, 38u)) return false;
++    plane = {stride, out};
++    return true;
++}
++
++using Q = float32x4_t;
++
++// Four columns of the second 1-D transform at once (the translation does two columns per iteration, in
++// the same operations: every op is lane-wise, so a column's results do not depend on its neighbours).
++// Memory order lanes: lane c = the column at ws + 4c. Rows are 32 bytes apart in the workspace.
++[[gnu::always_inline]] inline Q LdQ(const uint8_t* host) {
++    return vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(host)));
++}
++[[gnu::always_inline]] inline Q QMsub(Q a, Q c, Q b) { return vfmaq_f32(vnegq_f32(b), a, c); }
++
++// The columns' 8 results, row i of the block (rows 0-3 go to the first half, 4-7 to the second).
++struct Columns {
++    Q out[8];
++    Q f[14];  // f0-f13 as the translation's last iteration leaves them (this group's lanes)
++};
++
++[[gnu::always_inline]] inline Columns Transform(const uint8_t* ws, Q k25, Q k26, Q k27, Q k28, Q k29) {
++    Columns r;
++    Q f10 = LdQ(ws + 0 * 32), f11 = LdQ(ws + 4 * 32), f12 = LdQ(ws + 2 * 32), f13 = LdQ(ws + 6 * 32);
++    Q f6 = vaddq_f32(f10, f11);
++    Q f8 = vsubq_f32(f10, f11);
++    f6 = vaddq_f32(f6, k25);
++    Q f7 = vaddq_f32(f12, f13);
++    Q f9 = vsubq_f32(f12, f13);
++    f8 = vaddq_f32(f8, k25);
++    Q f0 = vaddq_f32(f6, f7);
++    f9 = QMsub(f9, k29, f7);
++    Q f4 = LdQ(ws + 1 * 32);
++    Q f3 = vsubq_f32(f6, f7);
++    Q f5 = LdQ(ws + 3 * 32);
++    f6 = LdQ(ws + 5 * 32);
++    f7 = LdQ(ws + 7 * 32);
++    Q f1 = vaddq_f32(f8, f9);
++    Q f2 = vsubq_f32(f8, f9);
++    f8 = vaddq_f32(f6, f5);
++    f9 = vaddq_f32(f4, f7);
++    f6 = vsubq_f32(f6, f5);
++    f4 = vsubq_f32(f4, f7);
++    f7 = vaddq_f32(f9, f8);
++    f5 = vsubq_f32(f9, f8);
++    f8 = vaddq_f32(f6, f4);
++    f9 = vaddq_f32(f0, f7);
++    const Q f30 = vsubq_f32(f0, f7);
++    r.out[0] = f9;
++    r.out[7] = f30;
++    f8 = vmulq_f32(f8, k28);
++    f6 = vfmaq_f32(f8, f6, k26);
++    f4 = QMsub(f4, k27, f8);
++    f6 = vsubq_f32(f6, f7);
++    f9 = vaddq_f32(f1, f6);
++    f5 = QMsub(f5, k29, f6);
++    const Q f31 = vsubq_f32(f1, f6);
++    r.out[1] = f9;
++    r.out[6] = f31;
++    f8 = vaddq_f32(f2, f5);
++    f4 = vaddq_f32(f4, f5);
++    r.out[2] = f8;
++    f9 = vsubq_f32(f3, f4);
++    f0 = vaddq_f32(f3, f4);
++    r.out[3] = f9;
++    f1 = vsubq_f32(f2, f5);
++    r.out[4] = f0;
++    r.out[5] = f1;
++    r.f[0] = f0; r.f[1] = f1; r.f[2] = f2; r.f[3] = f3; r.f[4] = f4; r.f[5] = f5; r.f[6] = f6;
++    r.f[7] = f7; r.f[8] = f8; r.f[9] = f9; r.f[10] = f10; r.f[11] = f11; r.f[12] = f12; r.f[13] = f13;
++    return r;
++}
++
++// One row of the block: 8 columns, x * 0.125 truncated and clamped to 0..255 (PpcQuantizePsqU8Scale61Inline;
++// FCVTZU gives 0 for negatives and NaN and saturates, the saturating narrows clamp at 255).
++[[gnu::always_inline]] inline void StoreRow(uint32_t address, Q left, Q right) {
++    const uint16x4_t lo = vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(left, 0.125f)));
++    const uint16x4_t hi = vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(right, 0.125f)));
++    vst1_u8(Host(address), vqmovn_u16(vcombine_u16(lo, hi)));
++}
++
++// The pair (columns 6, 7) a column group's last two lanes hold, as the translation's f register.
++[[gnu::always_inline]] inline V LastPair(Q q) { return vrev64_f32(vget_high_f32(q)); }
++
++[[gnu::noinline]] bool RunNoYPos(const In& in, Out& out) {
++    Plane plane;
++    if (!Check(in, false, plane)) return false;
++    uint32_t r0 = 0, r3 = in.r3, r4 = in.r4, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r10 = 0;
++    const uint32_t r2 = in.r2, r13 = in.r13;
++    uint32_t cr = in.cr, ctr = 0;
++    const uint32_t xer = in.xer;
++    V f0 = vdup_n_f32(0), f1 = f0, f2 = f0, f3 = f0, f4 = f0, f5 = f0, f6 = f0, f7 = f0, f8 = f0, f9 = f0,
++      f10 = f0, f11 = f0, f12 = f0, f13 = f0, f30 = f0, f31 = f0;
++    uint32_t gr_1 = 0, gr_10 = 0, gr_2 = 0, gr_3 = 0, gr_4 = 0, gr_5 = 0, gr_6 = 0, gr_7 = 0, gr_8 = 0, gr_9 = 0, r10_psq_ea_10 = 0, r10_psq_ea_11 = 0, r10_psq_ea_12 = 0, r10_psq_ea_13 = 0, r10_psq_ea_14 = 0, r10_psq_ea_15 = 0, r10_psq_ea_3 = 0, r10_psq_ea_4 = 0, r10_psq_ea_5 = 0, r10_psq_ea_6 = 0, r10_psq_ea_7 = 0, r10_psq_ea_8 = 0, r10_psq_ea_9 = 0, r10_psq_tmp_3 = 0, r10_psq_tmp_4 = 0, r10_psq_tmp_5 = 0, r3_psq_addr_3 = 0, r3_psq_addr_4 = 0, r3_psq_tmp_3 = 0, r3_psq_tmp_4 = 0, r3_psq_tmp_5 = 0, r3_psq_tmp_6 = 0, r3_psq_tmp_7 = 0, r5_psq_addr_3 = 0, r5_psq_addr_4 = 0, r5_psq_addr_5 = 0, r5_psq_tmp_3 = 0, r5_psq_tmp_4 = 0, r5_psq_tmp_5 = 0, r5_psq_tmp_6 = 0;
++    uint8x8_t im0 = vdup_n_u8(0);
++    // The constants (f29 f28 f27 f26 f25), as the broadcast pairs PsFromScalar makes of them.
++    const uint32_t gr_0 = r2 - 30792u;
++    const V k29 = Bc(Rd32(gr_0 + 0u)), k28 = Bc(Rd32(gr_0 + 4u)), k27 = Bc(Rd32(gr_0 + 8u)),
++            k26 = Bc(Rd32(gr_0 + 12u)), k25 = Bc(Rd32(gr_0 + 16u));
++    r5 = 0x802B6860u;
++    r10 = r5 - 8u;
++    gr_1 = r13 - 28672u;
++    r5 = Rd32(gr_1 + 0u);
++    ctr = 8;
++    goto loc_80084CE4;
++
++    loc_80084CE4:
++    {
++    gr_2 = r3;
++    f10 = LdS16(gr_2 + 0u);
++    f11 = LdF(r5);
++    r0 = Rd32(gr_2 + 8u + 4u);
++    r8 = Rd32(gr_2 + 8u + 0u);
++    f10 = PMul(f10, f11);
++    r6 = Rd32(gr_2 + 4u);
++    r0 = (r0 | r8);
++    r7 = Rd16(gr_2 + 2u);
++    }
++    
++    loc_80084D04:
++    {
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r0), static_cast<int32_t>(0));
++    }
++    
++    loc_80084D08:
++    {
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_80084E44;
++    }
++    }
++    
++    loc_80084D0C:
++    {
++    f0 = PMerge00(f10, f10);
++    im0 = Img(f0);
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r6), static_cast<int32_t>(0));
++    }
++    
++    loc_80084D14:
++    {
++    r10_psq_tmp_3 = (r10 + 8);
++    StI(r10_psq_tmp_3, im0);
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_80084DB0;
++    }
++    }
++    
++    loc_80084D1C:
++    {
++    r10_psq_tmp_4 = (r10 + 16);
++    StI(r10_psq_tmp_4, im0);
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r7), static_cast<int32_t>(0));
++    }
++    
++    loc_80084D24:
++    {
++    r10_psq_tmp_5 = (r10 + 24);
++    StI(r10_psq_tmp_5, im0);
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_80084D40;
++    }
++    }
++    
++    loc_80084D2C:
++    {
++    r10_psq_ea_3 = (r10 + 32);
++    StI(r10_psq_ea_3, im0);
++    r10 = r10_psq_ea_3;
++    r3 = (r3 + 16);
++    r5 = (r5 + 32);
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80084CE4;
++    }
++    }
++    
++    loc_80084D3C:
++    {
++    goto loc_80084F04;
++    }
++    
++    loc_80084D40:
++    {
++    f2 = PMsub(f10, k28, f10);
++    r5_psq_addr_3 = (r5 + 32);
++    f11 = LdF(r5_psq_addr_3);
++    r5 = r5_psq_addr_3;
++    f1 = PSub(k28, k27);
++    gr_3 = (r3 + 16);
++    r6 = Rd32(gr_3 + 4u);
++    f9 = PMerge00(f10, f10);
++    r7 = Rd16(gr_3 + 2u);
++    f3 = PMsub(f10, k29, f2);
++    f5 = PMerge11(f10, f2);
++    f4 = PNmsub(f10, f1, f3);
++    f7 = PAdd(f9, f5);
++    r3_psq_tmp_3 = (r3 + 16);
++    f10 = LdS16(gr_3 + 0u);
++    r0 = Rd32(gr_3 + 12u);
++    f5 = PSub(f9, f5);
++    f6 = PMerge11(f3, f4);
++    r8 = Rd32(gr_3 + 8u);
++    f8 = PAdd(f9, f6);
++    f6 = PSub(f9, f6);
++    r10_psq_ea_4 = (r10 + 8);
++    gr_4 = r10_psq_ea_4;
++    StF(gr_4 + 0u, f7);
++    r10 = r10_psq_ea_4;
++    f6 = PMerge10(f6, f6);
++    r10_psq_ea_5 = (r10 + 8);
++    StF(gr_4 + 8u, f8);
++    r10 = r10_psq_ea_5;
++    f5 = PMerge10(f5, f5);
++    r0 = (r0 | r8);
++    r10_psq_ea_6 = (r10 + 8);
++    StF(gr_4 + 16u, f6);
++    r10 = r10_psq_ea_6;
++    f10 = PMul(f10, f11);
++    r10_psq_ea_7 = (r10 + 8);
++    StF(gr_4 + 24u, f5);
++    r10 = r10_psq_ea_7;
++    r3 = (r3 + 16);
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80084D04;
++    }
++    }
++    
++    loc_80084DAC:
++    {
++    goto loc_80084F04;
++    }
++    
++    loc_80084DB0:
++    {
++    r3_psq_tmp_4 = (r3 + 4);
++    gr_5 = r3_psq_tmp_4;
++    f1 = LdS16(gr_5 + 0u);
++    r5_psq_tmp_3 = (r5 + 8);
++    gr_6 = r5_psq_tmp_3;
++    f9 = LdF(gr_6 + 0u);
++    r0 = Rd32(gr_5 + 24u);
++    f1 = PMul(f1, f9);
++    r8 = Rd32(gr_5 + 16u + 4u);
++    r6 = Rd32(gr_5 + 16u + 0u);
++    r7 = Rd16(gr_5 + 14u);
++    f3 = PSub(f10, f1);
++    f2 = PAdd(f10, f1);
++    f8 = PMul(f3, k28);
++    f4 = PMadd(f1, k29, f3);
++    f5 = PNmsub(f1, k29, f2);
++    f6 = PNmsub(f1, k26, f8);
++    f7 = PNmsub(f10, k27, f8);
++    f4 = PMerge00(f2, f4);
++    f6 = PSub(f6, f2);
++    f5 = PMerge00(f5, f3);
++    f8 = PMsub(f3, k29, f6);
++    f2 = PMerge11(f2, f6);
++    r3_psq_addr_3 = (r3 + 16);
++    f10 = LdS16(gr_5 + 12u);
++    r3 = r3_psq_addr_3;
++    r5_psq_addr_4 = (r5 + 32);
++    f11 = LdF(gr_6 + 24u);
++    r5 = r5_psq_addr_4;
++    f7 = PSub(f7, f8);
++    f9 = PAdd(f4, f2);
++    f4 = PSub(f4, f2);
++    f3 = PMerge11(f8, f7);
++    r10_psq_ea_8 = (r10 + 8);
++    gr_7 = r10_psq_ea_8;
++    StF(gr_7 + 0u, f9);
++    r10 = r10_psq_ea_8;
++    r0 = (r0 | r8);
++    f0 = PAdd(f5, f3);
++    f1 = PSub(f5, f3);
++    r10_psq_ea_9 = (r10 + 8);
++    StF(gr_7 + 8u, f0);
++    r10 = r10_psq_ea_9;
++    f4 = PMerge10(f4, f4);
++    f1 = PMerge10(f1, f1);
++    r10_psq_ea_10 = (r10 + 8);
++    StF(gr_7 + 16u, f1);
++    r10 = r10_psq_ea_10;
++    f10 = PMul(f10, f11);
++    r10_psq_ea_11 = (r10 + 8);
++    StF(gr_7 + 24u, f4);
++    r10 = r10_psq_ea_11;
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80084D04;
++    }
++    }
++    
++    loc_80084E40:
++    {
++    goto loc_80084F04;
++    }
++    
++    loc_80084E44:
++    {
++    r3_psq_tmp_5 = (r3 + 4);
++    gr_8 = r3_psq_tmp_5;
++    f9 = LdS16(gr_8 + 0u);
++    r5_psq_tmp_4 = (r5 + 8);
++    gr_9 = r5_psq_tmp_4;
++    f5 = LdF(gr_9 + 0u);
++    f9 = PMul(f9, f5);
++    r3_psq_tmp_6 = (r3 + 8);
++    f2 = LdS16(gr_8 + 4u);
++    r5_psq_tmp_5 = (r5 + 16);
++    f6 = LdF(gr_9 + 8u);
++    f0 = PMerge01(f10, f9);
++    r3_psq_tmp_7 = (r3 + 12);
++    f3 = LdS16(gr_8 + 8u);
++    f1 = PMerge01(f9, f10);
++    r5_psq_tmp_6 = (r5 + 24);
++    f7 = LdF(gr_9 + 16u);
++    r0 = Rd32(gr_8 + 24u);
++    f4 = PMadd(f2, f6, f0);
++    f5 = PNmsub(f2, f6, f0);
++    r8 = Rd32(gr_8 + 20u);
++    f6 = PMadd(f3, f7, f1);
++    r6 = Rd32(gr_8 + 16u);
++    f7 = PNmsub(f3, f7, f1);
++    r7 = Rd16(gr_8 + 14u);
++    f0 = PAdd(f4, f6);
++    f8 = PSub(f7, f5);
++    f2 = PMsub(f7, k29, f6);
++    f3 = PSub(f4, f6);
++    f8 = PMul(f8, k28);
++    f1 = PAdd(f5, f2);
++    f2 = PSub(f5, f2);
++    f6 = PNmsub(f5, k26, f8);
++    f4 = PMsub(f7, k27, f8);
++    f1 = PMerge00(f0, f1);
++    f6 = PSub(f6, f0);
++    f2 = PMerge00(f2, f3);
++    f5 = PMadd(f3, k29, f6);
++    f7 = PMerge11(f0, f6);
++    r3_psq_addr_4 = (r3 + 16);
++    f10 = LdS16(gr_8 + 12u);
++    r3 = r3_psq_addr_4;
++    r5_psq_addr_5 = (r5 + 32);
++    f11 = LdF(gr_9 + 24u);
++    r5 = r5_psq_addr_5;
++    f4 = PSub(f4, f5);
++    f3 = PAdd(f1, f7);
++    f0 = PSub(f1, f7);
++    f4 = PMerge11(f5, f4);
++    f10 = PMul(f10, f11);
++    f5 = PAdd(f2, f4);
++    f6 = PSub(f2, f4);
++    f5 = PMerge10(f5, f5);
++    r10_psq_ea_12 = (r10 + 8);
++    gr_10 = r10_psq_ea_12;
++    StF(gr_10 + 0u, f3);
++    r10 = r10_psq_ea_12;
++    f0 = PMerge10(f0, f0);
++    r10_psq_ea_13 = (r10 + 8);
++    StF(gr_10 + 8u, f6);
++    r10 = r10_psq_ea_13;
++    r10_psq_ea_14 = (r10 + 8);
++    StF(gr_10 + 16u, f5);
++    r10 = r10_psq_ea_14;
++    r0 = (r0 | r8);
++    r10_psq_ea_15 = (r10 + 8);
++    StF(gr_10 + 24u, f0);
++    r10 = r10_psq_ea_15;
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80084D04;
++    }
++    }
++
++loc_80084F04:
++    {
++        // The second transform, four columns at a time; then the exit state of the translation's last
++        // iteration (r4-r7 advanced by 2 per loop iteration, three iterations; r10 likewise by 8).
++        const uint32_t stride = plane.stride;
++        r0 = plane.out;
++        r3 = 3;
++        r4 = r4 << 2;
++        r5 = r4 + (stride << 2);
++        r6 = r0 + r4;
++        r7 = r0 + r5;
++        const uint8_t* const ws = Host(kWorkspace);
++        const Q q25 = vdupq_lane_f32(k25, 0), q26 = vdupq_lane_f32(k26, 0), q27 = vdupq_lane_f32(k27, 0),
++                q28 = vdupq_lane_f32(k28, 0), q29 = vdupq_lane_f32(k29, 0);
++        const Columns left = Transform(ws, q25, q26, q27, q28, q29);
++        const Columns right = Transform(ws + 16, q25, q26, q27, q28, q29);
++        for (int i = 0; i < 4; ++i) {
++            StoreRow(r6 + 8u * static_cast<uint32_t>(i), left.out[i], right.out[i]);
++            StoreRow(r7 + 8u * static_cast<uint32_t>(i), left.out[4 + i], right.out[4 + i]);
++        }
++        r4 += 6;
++        r5 += 6;
++        r6 += 6;
++        r7 += 6;
++        r10 = kWorkspace + 24u;
++        ctr = 0;
++        f0 = LastPair(right.f[0]); f1 = LastPair(right.f[1]); f2 = LastPair(right.f[2]); f3 = LastPair(right.f[3]);
++        f4 = LastPair(right.f[4]); f5 = LastPair(right.f[5]); f6 = LastPair(right.f[6]); f7 = LastPair(right.f[7]);
++        f8 = LastPair(right.f[8]); f9 = LastPair(right.f[9]); f10 = LastPair(right.f[10]); f11 = LastPair(right.f[11]);
++        f12 = LastPair(right.f[12]); f13 = LastPair(right.f[13]);
++
++    }
++
++    out.r0 = r0;
++    out.r3 = r3;
++    out.r4 = r4;
++    out.r5 = r5;
++    out.r6 = r6;
++    out.r7 = r7;
++    out.r8 = r8;
++    out.r10 = r10;
++    out.f[0] = Raw(f0);
++    out.f[1] = Raw(f1);
++    out.f[2] = Raw(f2);
++    out.f[3] = Raw(f3);
++    out.f[4] = Raw(f4);
++    out.f[5] = Raw(f5);
++    out.f[6] = Raw(f6);
++    out.f[7] = Raw(f7);
++    out.f[8] = Raw(f8);
++    out.f[9] = Raw(f9);
++    out.f[10] = Raw(f10);
++    out.f[11] = Raw(f11);
++    out.f[12] = Raw(f12);
++    out.f[13] = Raw(f13);
++    out.cr = cr;
++    out.ctr = ctr;
++    return true;
++}
++
++[[gnu::noinline]] bool RunY8(const In& in, Out& out) {
++    Plane plane;
++    if (!Check(in, true, plane)) return false;
++    uint32_t r0 = 0, r3 = in.r3, r4 = in.r4, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r10 = 0;
++    const uint32_t r2 = in.r2, r13 = in.r13;
++    uint32_t cr = in.cr, ctr = 0;
++    const uint32_t xer = in.xer;
++    V f0 = vdup_n_f32(0), f1 = f0, f2 = f0, f3 = f0, f4 = f0, f5 = f0, f6 = f0, f7 = f0, f8 = f0, f9 = f0,
++      f10 = f0, f11 = f0, f12 = f0, f13 = f0, f30 = f0, f31 = f0;
++    uint32_t gr_1 = 0, gr_10 = 0, gr_2 = 0, gr_3 = 0, gr_4 = 0, gr_5 = 0, gr_6 = 0, gr_7 = 0, gr_8 = 0, gr_9 = 0, r10_psq_ea_10 = 0, r10_psq_ea_11 = 0, r10_psq_ea_12 = 0, r10_psq_ea_13 = 0, r10_psq_ea_14 = 0, r10_psq_ea_15 = 0, r10_psq_ea_3 = 0, r10_psq_ea_4 = 0, r10_psq_ea_5 = 0, r10_psq_ea_6 = 0, r10_psq_ea_7 = 0, r10_psq_ea_8 = 0, r10_psq_ea_9 = 0, r10_psq_tmp_3 = 0, r10_psq_tmp_4 = 0, r10_psq_tmp_5 = 0, r3_psq_addr_3 = 0, r3_psq_addr_4 = 0, r3_psq_tmp_3 = 0, r3_psq_tmp_4 = 0, r3_psq_tmp_5 = 0, r3_psq_tmp_6 = 0, r3_psq_tmp_7 = 0, r5_psq_addr_3 = 0, r5_psq_addr_4 = 0, r5_psq_addr_5 = 0, r5_psq_tmp_3 = 0, r5_psq_tmp_4 = 0, r5_psq_tmp_5 = 0, r5_psq_tmp_6 = 0;
++    uint8x8_t im0 = vdup_n_u8(0);
++    // The constants (f29 f28 f27 f26 f25), as the broadcast pairs PsFromScalar makes of them.
++    const uint32_t gr_0 = r2 - 30792u;
++    const V k29 = Bc(Rd32(gr_0 + 0u)), k28 = Bc(Rd32(gr_0 + 4u)), k27 = Bc(Rd32(gr_0 + 8u)),
++            k26 = Bc(Rd32(gr_0 + 12u)), k25 = Bc(Rd32(gr_0 + 16u));
++    r5 = 0x802B6860u;
++    r10 = r5 - 8u;
++    gr_1 = r13 - 28672u;
++    r5 = Rd32(gr_1 + 0u);
++    ctr = 8;
++    goto loc_80085170;
++
++    loc_80085170:
++    {
++    gr_2 = r3;
++    f10 = LdS16(gr_2 + 0u);
++    f11 = LdF(r5);
++    r0 = Rd32(gr_2 + 8u + 4u);
++    r8 = Rd32(gr_2 + 8u + 0u);
++    f10 = PMul(f10, f11);
++    r6 = Rd32(gr_2 + 4u);
++    r7 = Rd16(gr_2 + 2u);
++    r0 = (r0 | r8);
++    }
++    
++    loc_80085190:
++    {
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r0), static_cast<int32_t>(0));
++    }
++    
++    loc_80085194:
++    {
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_800852D0;
++    }
++    }
++    
++    loc_80085198:
++    {
++    f0 = PMerge00(f10, f10);
++    im0 = Img(f0);
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r6), static_cast<int32_t>(0));
++    }
++    
++    loc_800851A0:
++    {
++    r10_psq_tmp_3 = (r10 + 8);
++    StI(r10_psq_tmp_3, im0);
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_8008523C;
++    }
++    }
++    
++    loc_800851A8:
++    {
++    r10_psq_tmp_4 = (r10 + 16);
++    StI(r10_psq_tmp_4, im0);
++    SetCRResident(cr, xer, 0, static_cast<int32_t>(r7), static_cast<int32_t>(0));
++    }
++    
++    loc_800851B0:
++    {
++    r10_psq_tmp_5 = (r10 + 24);
++    StI(r10_psq_tmp_5, im0);
++    if (((cr & 0x20000000u) == 0)) {
++    goto loc_800851CC;
++    }
++    }
++    
++    loc_800851B8:
++    {
++    r10_psq_ea_3 = (r10 + 32);
++    StI(r10_psq_ea_3, im0);
++    r10 = r10_psq_ea_3;
++    r3 = (r3 + 16);
++    r5 = (r5 + 32);
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80085170;
++    }
++    }
++    
++    loc_800851C8:
++    {
++    goto loc_80085390;
++    }
++    
++    loc_800851CC:
++    {
++    f2 = PMsub(f10, k28, f10);
++    r5_psq_addr_3 = (r5 + 32);
++    f11 = LdF(r5_psq_addr_3);
++    r5 = r5_psq_addr_3;
++    f1 = PSub(k28, k27);
++    gr_3 = (r3 + 16);
++    r6 = Rd32(gr_3 + 4u);
++    f9 = PMerge00(f10, f10);
++    r7 = Rd16(gr_3 + 2u);
++    f3 = PMsub(f10, k29, f2);
++    f5 = PMerge11(f10, f2);
++    f4 = PNmsub(f10, f1, f3);
++    f7 = PAdd(f9, f5);
++    r3_psq_tmp_3 = (r3 + 16);
++    f10 = LdS16(gr_3 + 0u);
++    r0 = Rd32(gr_3 + 12u);
++    f5 = PSub(f9, f5);
++    f6 = PMerge11(f3, f4);
++    r8 = Rd32(gr_3 + 8u);
++    f8 = PAdd(f9, f6);
++    f6 = PSub(f9, f6);
++    r10_psq_ea_4 = (r10 + 8);
++    gr_4 = r10_psq_ea_4;
++    StF(gr_4 + 0u, f7);
++    r10 = r10_psq_ea_4;
++    f6 = PMerge10(f6, f6);
++    r10_psq_ea_5 = (r10 + 8);
++    StF(gr_4 + 8u, f8);
++    r10 = r10_psq_ea_5;
++    f5 = PMerge10(f5, f5);
++    r0 = (r0 | r8);
++    r10_psq_ea_6 = (r10 + 8);
++    StF(gr_4 + 16u, f6);
++    r10 = r10_psq_ea_6;
++    f10 = PMul(f10, f11);
++    r10_psq_ea_7 = (r10 + 8);
++    StF(gr_4 + 24u, f5);
++    r10 = r10_psq_ea_7;
++    r3 = (r3 + 16);
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80085190;
++    }
++    }
++    
++    loc_80085238:
++    {
++    goto loc_80085390;
++    }
++    
++    loc_8008523C:
++    {
++    r3_psq_tmp_4 = (r3 + 4);
++    gr_5 = r3_psq_tmp_4;
++    f1 = LdS16(gr_5 + 0u);
++    r5_psq_tmp_3 = (r5 + 8);
++    gr_6 = r5_psq_tmp_3;
++    f9 = LdF(gr_6 + 0u);
++    r0 = Rd32(gr_5 + 24u);
++    f1 = PMul(f1, f9);
++    r8 = Rd32(gr_5 + 16u + 4u);
++    r6 = Rd32(gr_5 + 16u + 0u);
++    r7 = Rd16(gr_5 + 14u);
++    f3 = PSub(f10, f1);
++    f2 = PAdd(f10, f1);
++    f8 = PMul(f3, k28);
++    f4 = PMadd(f1, k29, f3);
++    f5 = PNmsub(f1, k29, f2);
++    f6 = PNmsub(f1, k26, f8);
++    f7 = PNmsub(f10, k27, f8);
++    f4 = PMerge00(f2, f4);
++    f6 = PSub(f6, f2);
++    f5 = PMerge00(f5, f3);
++    f8 = PMsub(f3, k29, f6);
++    f2 = PMerge11(f2, f6);
++    r3_psq_addr_3 = (r3 + 16);
++    f10 = LdS16(gr_5 + 12u);
++    r3 = r3_psq_addr_3;
++    r5_psq_addr_4 = (r5 + 32);
++    f11 = LdF(gr_6 + 24u);
++    r5 = r5_psq_addr_4;
++    f7 = PSub(f7, f8);
++    f9 = PAdd(f4, f2);
++    f4 = PSub(f4, f2);
++    f3 = PMerge11(f8, f7);
++    r10_psq_ea_8 = (r10 + 8);
++    gr_7 = r10_psq_ea_8;
++    StF(gr_7 + 0u, f9);
++    r10 = r10_psq_ea_8;
++    r0 = (r0 | r8);
++    f0 = PAdd(f5, f3);
++    f1 = PSub(f5, f3);
++    r10_psq_ea_9 = (r10 + 8);
++    StF(gr_7 + 8u, f0);
++    r10 = r10_psq_ea_9;
++    f4 = PMerge10(f4, f4);
++    f1 = PMerge10(f1, f1);
++    r10_psq_ea_10 = (r10 + 8);
++    StF(gr_7 + 16u, f1);
++    r10 = r10_psq_ea_10;
++    f10 = PMul(f10, f11);
++    r10_psq_ea_11 = (r10 + 8);
++    StF(gr_7 + 24u, f4);
++    r10 = r10_psq_ea_11;
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80085190;
++    }
++    }
++    
++    loc_800852CC:
++    {
++    goto loc_80085390;
++    }
++    
++    loc_800852D0:
++    {
++    r3_psq_tmp_5 = (r3 + 4);
++    gr_8 = r3_psq_tmp_5;
++    f9 = LdS16(gr_8 + 0u);
++    r5_psq_tmp_4 = (r5 + 8);
++    gr_9 = r5_psq_tmp_4;
++    f5 = LdF(gr_9 + 0u);
++    f9 = PMul(f9, f5);
++    r3_psq_tmp_6 = (r3 + 8);
++    f2 = LdS16(gr_8 + 4u);
++    r5_psq_tmp_5 = (r5 + 16);
++    f6 = LdF(gr_9 + 8u);
++    f0 = PMerge01(f10, f9);
++    r3_psq_tmp_7 = (r3 + 12);
++    f3 = LdS16(gr_8 + 8u);
++    f1 = PMerge01(f9, f10);
++    r5_psq_tmp_6 = (r5 + 24);
++    f7 = LdF(gr_9 + 16u);
++    r0 = Rd32(gr_8 + 24u);
++    f4 = PMadd(f2, f6, f0);
++    f5 = PNmsub(f2, f6, f0);
++    r8 = Rd32(gr_8 + 20u);
++    f6 = PMadd(f3, f7, f1);
++    r6 = Rd32(gr_8 + 16u);
++    f7 = PNmsub(f3, f7, f1);
++    r7 = Rd16(gr_8 + 14u);
++    f0 = PAdd(f4, f6);
++    f8 = PSub(f7, f5);
++    f2 = PMsub(f7, k29, f6);
++    f3 = PSub(f4, f6);
++    f8 = PMul(f8, k28);
++    f1 = PAdd(f5, f2);
++    f2 = PSub(f5, f2);
++    f6 = PNmsub(f5, k26, f8);
++    f4 = PMsub(f7, k27, f8);
++    f1 = PMerge00(f0, f1);
++    f6 = PSub(f6, f0);
++    f2 = PMerge00(f2, f3);
++    f5 = PMadd(f3, k29, f6);
++    f7 = PMerge11(f0, f6);
++    r3_psq_addr_4 = (r3 + 16);
++    f10 = LdS16(gr_8 + 12u);
++    r3 = r3_psq_addr_4;
++    r5_psq_addr_5 = (r5 + 32);
++    f11 = LdF(gr_9 + 24u);
++    r5 = r5_psq_addr_5;
++    f4 = PSub(f4, f5);
++    f3 = PAdd(f1, f7);
++    f0 = PSub(f1, f7);
++    f4 = PMerge11(f5, f4);
++    f10 = PMul(f10, f11);
++    f5 = PAdd(f2, f4);
++    f6 = PSub(f2, f4);
++    f5 = PMerge10(f5, f5);
++    r10_psq_ea_12 = (r10 + 8);
++    gr_10 = r10_psq_ea_12;
++    StF(gr_10 + 0u, f3);
++    r10 = r10_psq_ea_12;
++    f0 = PMerge10(f0, f0);
++    r10_psq_ea_13 = (r10 + 8);
++    StF(gr_10 + 8u, f6);
++    r10 = r10_psq_ea_13;
++    r10_psq_ea_14 = (r10 + 8);
++    StF(gr_10 + 16u, f5);
++    r10 = r10_psq_ea_14;
++    r0 = (r0 | r8);
++    r10_psq_ea_15 = (r10 + 8);
++    StF(gr_10 + 24u, f0);
++    r10 = r10_psq_ea_15;
++    ctr = (ctr + -1);
++    if ((ctr != 0)) {
++    goto loc_80085190;
++    }
++    }
++
++loc_80085390:
++    {
++        // The second transform, four columns at a time; then the exit state of the translation's last
++        // iteration (r4-r7 advanced by 2 per loop iteration, three iterations; r10 likewise by 8).
++        const uint32_t stride = plane.stride;
++        r0 = plane.out;
++        r3 = 3;
++        r4 = (stride << 3) + (r4 << 2);
++        r5 = r4 + (stride << 2);
++        r6 = r0 + r4;
++        r7 = r0 + r5;
++        const uint8_t* const ws = Host(kWorkspace);
++        const Q q25 = vdupq_lane_f32(k25, 0), q26 = vdupq_lane_f32(k26, 0), q27 = vdupq_lane_f32(k27, 0),
++                q28 = vdupq_lane_f32(k28, 0), q29 = vdupq_lane_f32(k29, 0);
++        const Columns left = Transform(ws, q25, q26, q27, q28, q29);
++        const Columns right = Transform(ws + 16, q25, q26, q27, q28, q29);
++        for (int i = 0; i < 4; ++i) {
++            StoreRow(r6 + 8u * static_cast<uint32_t>(i), left.out[i], right.out[i]);
++            StoreRow(r7 + 8u * static_cast<uint32_t>(i), left.out[4 + i], right.out[4 + i]);
++        }
++        r4 += 6;
++        r5 += 6;
++        r6 += 6;
++        r7 += 6;
++        r10 = kWorkspace + 24u;
++        ctr = 0;
++        f0 = LastPair(right.f[0]); f1 = LastPair(right.f[1]); f2 = LastPair(right.f[2]); f3 = LastPair(right.f[3]);
++        f4 = LastPair(right.f[4]); f5 = LastPair(right.f[5]); f6 = LastPair(right.f[6]); f7 = LastPair(right.f[7]);
++        f8 = LastPair(right.f[8]); f9 = LastPair(right.f[9]); f10 = LastPair(right.f[10]); f11 = LastPair(right.f[11]);
++        f12 = LastPair(right.f[12]); f13 = LastPair(right.f[13]);
++
++    }
++
++    out.r0 = r0;
++    out.r3 = r3;
++    out.r4 = r4;
++    out.r5 = r5;
++    out.r6 = r6;
++    out.r7 = r7;
++    out.r8 = r8;
++    out.r10 = r10;
++    out.f[0] = Raw(f0);
++    out.f[1] = Raw(f1);
++    out.f[2] = Raw(f2);
++    out.f[3] = Raw(f3);
++    out.f[4] = Raw(f4);
++    out.f[5] = Raw(f5);
++    out.f[6] = Raw(f6);
++    out.f[7] = Raw(f7);
++    out.f[8] = Raw(f8);
++    out.f[9] = Raw(f9);
++    out.f[10] = Raw(f10);
++    out.f[11] = Raw(f11);
++    out.f[12] = Raw(f12);
++    out.f[13] = Raw(f13);
++    out.cr = cr;
++    out.ctr = ctr;
++    return true;
++}
++
++
++}  // namespace mlb_thp
++
++// The registered functions. The translator derives a native's guest-state contract (what callers sync
++// around the call, and through it every ancestor's ABI) from the literal ctx->gpr/fpr/cr/xer/ctr accesses
++// of its body (RuntimeNativeGuestEffectAnalyzer). These bodies declare exactly the translation's own ABI
++// (RECOMP_GUEST_ABI gpr_read 0x25FF gpr_write 0x5FB fpr_read 0xFE000FFF fpr_write 0xFE003FFF, CR, XER read)
++// so the generated callers do not change: reads of r0-r8, r10, r13 and f0-f11, f25-f31 and writes of
++// r0, r1, r3-r8, r10 and f0-f13, f25-f31 (the callee-saved registers the translation reads and writes back
++// unchanged), CR and CTR. The context pointer is not passed on (a pointer argument makes the contract
++// complete-context and ripples through every ancestor): the translation is reached through a reference,
++// GQR0 is read as (*ctx).gqr[0] (a member other than gpr/fpr/cr/xer/ctr/lr would do the same).
++namespace {
++const bool g_thpEnabled = [] {
++    const char* value = std::getenv("WIICOMPILED_NATIVE_THPIDCT");  // 0: always the translation
++    return !(value != nullptr && value[0] == '0');
++}();
++}  // namespace
++
++extern "C" void MLB_THPInverseDCTNoYPos_80084C7C(CpuContext* ctx) {
++    HleTraceCall("MLB_THPInverseDCTNoYPos_80084C7C");
++    const mlb_thp::In in = {ctx->gpr[1], ctx->gpr[2], ctx->gpr[3], ctx->gpr[4], ctx->gpr[13], ctx->cr, ctx->xer,
++                            (*ctx).gqr[0]};
++    // Declared reads (the translation's contract; the fast path reads none of them).
++    [[maybe_unused]] const uint32_t declaredGprReads[] = {ctx->gpr[0], ctx->gpr[5], ctx->gpr[6], ctx->gpr[7], ctx->gpr[8],
++                                                          ctx->gpr[10]};
++    [[maybe_unused]] const uint64_t declaredFprReads[] = {
++        ctx->fpr[0].raw, ctx->fpr[1].raw, ctx->fpr[2].raw, ctx->fpr[3].raw, ctx->fpr[4].raw, ctx->fpr[5].raw,
++        ctx->fpr[6].raw, ctx->fpr[7].raw, ctx->fpr[8].raw, ctx->fpr[9].raw, ctx->fpr[10].raw, ctx->fpr[11].raw};
++    // f25-f31 are the translation's callee-saved registers: read at entry, written back unchanged.
++    const uint64_t f25 = ctx->fpr[25].raw, f26 = ctx->fpr[26].raw, f27 = ctx->fpr[27].raw, f28 = ctx->fpr[28].raw,
++                   f29 = ctx->fpr[29].raw, f30 = ctx->fpr[30].raw, f31 = ctx->fpr[31].raw;
++    mlb_thp::Out out;
++    if (g_thpEnabled && mlb_thp::RunNoYPos(in, out)) [[likely]] {
++        ctx->gpr[0] = out.r0;
++        ctx->gpr[1] = in.r1;
++        ctx->gpr[3] = out.r3;
++        ctx->gpr[4] = out.r4;
++        ctx->gpr[5] = out.r5;
++        ctx->gpr[6] = out.r6;
++        ctx->gpr[7] = out.r7;
++        ctx->gpr[8] = out.r8;
++        ctx->gpr[10] = out.r10;
++        ctx->fpr[0].raw = out.f[0];
++        ctx->fpr[1].raw = out.f[1];
++        ctx->fpr[2].raw = out.f[2];
++        ctx->fpr[3].raw = out.f[3];
++        ctx->fpr[4].raw = out.f[4];
++        ctx->fpr[5].raw = out.f[5];
++        ctx->fpr[6].raw = out.f[6];
++        ctx->fpr[7].raw = out.f[7];
++        ctx->fpr[8].raw = out.f[8];
++        ctx->fpr[9].raw = out.f[9];
++        ctx->fpr[10].raw = out.f[10];
++        ctx->fpr[11].raw = out.f[11];
++        ctx->fpr[12].raw = out.f[12];
++        ctx->fpr[13].raw = out.f[13];
++        ctx->fpr[25].raw = f25;
++        ctx->fpr[26].raw = f26;
++        ctx->fpr[27].raw = f27;
++        ctx->fpr[28].raw = f28;
++        ctx->fpr[29].raw = f29;
++        ctx->fpr[30].raw = f30;
++        ctx->fpr[31].raw = f31;
++        ctx->cr = out.cr;
++        ctx->ctr = out.ctr;
++        return;
++    }
++    mlb_thp::TranslatedNoYPos(*ctx);
++}
++
++extern "C" void MLB_THPInverseDCTY8_80085108(CpuContext* ctx) {
++    HleTraceCall("MLB_THPInverseDCTY8_80085108");
++    const mlb_thp::In in = {ctx->gpr[1], ctx->gpr[2], ctx->gpr[3], ctx->gpr[4], ctx->gpr[13], ctx->cr, ctx->xer,
++                            (*ctx).gqr[0]};
++    // Declared reads (the translation's contract; the fast path reads none of them).
++    [[maybe_unused]] const uint32_t declaredGprReads[] = {ctx->gpr[0], ctx->gpr[5], ctx->gpr[6], ctx->gpr[7], ctx->gpr[8],
++                                                          ctx->gpr[10]};
++    [[maybe_unused]] const uint64_t declaredFprReads[] = {
++        ctx->fpr[0].raw, ctx->fpr[1].raw, ctx->fpr[2].raw, ctx->fpr[3].raw, ctx->fpr[4].raw, ctx->fpr[5].raw,
++        ctx->fpr[6].raw, ctx->fpr[7].raw, ctx->fpr[8].raw, ctx->fpr[9].raw, ctx->fpr[10].raw, ctx->fpr[11].raw};
++    // f25-f31 are the translation's callee-saved registers: read at entry, written back unchanged.
++    const uint64_t f25 = ctx->fpr[25].raw, f26 = ctx->fpr[26].raw, f27 = ctx->fpr[27].raw, f28 = ctx->fpr[28].raw,
++                   f29 = ctx->fpr[29].raw, f30 = ctx->fpr[30].raw, f31 = ctx->fpr[31].raw;
++    mlb_thp::Out out;
++    if (g_thpEnabled && mlb_thp::RunY8(in, out)) [[likely]] {
++        ctx->gpr[0] = out.r0;
++        ctx->gpr[1] = in.r1;
++        ctx->gpr[3] = out.r3;
++        ctx->gpr[4] = out.r4;
++        ctx->gpr[5] = out.r5;
++        ctx->gpr[6] = out.r6;
++        ctx->gpr[7] = out.r7;
++        ctx->gpr[8] = out.r8;
++        ctx->gpr[10] = out.r10;
++        ctx->fpr[0].raw = out.f[0];
++        ctx->fpr[1].raw = out.f[1];
++        ctx->fpr[2].raw = out.f[2];
++        ctx->fpr[3].raw = out.f[3];
++        ctx->fpr[4].raw = out.f[4];
++        ctx->fpr[5].raw = out.f[5];
++        ctx->fpr[6].raw = out.f[6];
++        ctx->fpr[7].raw = out.f[7];
++        ctx->fpr[8].raw = out.f[8];
++        ctx->fpr[9].raw = out.f[9];
++        ctx->fpr[10].raw = out.f[10];
++        ctx->fpr[11].raw = out.f[11];
++        ctx->fpr[12].raw = out.f[12];
++        ctx->fpr[13].raw = out.f[13];
++        ctx->fpr[25].raw = f25;
++        ctx->fpr[26].raw = f26;
++        ctx->fpr[27].raw = f27;
++        ctx->fpr[28].raw = f28;
++        ctx->fpr[29].raw = f29;
++        ctx->fpr[30].raw = f30;
++        ctx->fpr[31].raw = f31;
++        ctx->cr = out.cr;
++        ctx->ctr = out.ctr;
++        return;
++    }
++    mlb_thp::TranslatedY8(*ctx);
++}
++
++REGISTER_NATIVE_FUNCTION_AS(0x80084C7C, MLB_THPInverseDCTNoYPos_80084C7C, "THPInverseDCTNoYPos");
++REGISTER_NATIVE_FUNCTION_AS(0x80085108, MLB_THPInverseDCTY8_80085108, "THPInverseDCTY8");
++#endif
+diff --git a/runtime/src/hle/mlb/two_way.cpp b/runtime/src/hle/mlb/two_way.cpp
+index 83faaac..15fb008 100644
+--- a/runtime/src/hle/mlb/two_way.cpp
++++ b/runtime/src/hle/mlb/two_way.cpp
+@@ -36,6 +36,10 @@
+ #include "runtime_config.h"
+ #include "season_cap.h"
+ 
++// The atlas below may still be read by queued GX draws (WIICOMPILED_GX_FIFO=deferred|thread):
++// wait for the decoder before writing it. Nothing to wait for in sync mode.
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason); // aurora gx/fifo_async.inc
++
+ namespace two_way {
+ namespace {
+ 
+@@ -305,6 +309,7 @@ void SetTexel(int x, int y, uint8_t v) { Memory::Write8(g_texels + season_cap::C
+ 
+ void Restore() {
+     if (!g_texels) return;
++    aurora_gx_fifo_quiesce(0);
+     for (int y = 0; y < kTitleH; ++y)
+         for (int x = 0; x < kTitleW; ++x) SetTexel(g_titleU + x, g_titleV + y, g_titleBackup[y * kTitleW + x]);
+     for (int y = 0; y < kButtonH; ++y)
+@@ -328,6 +333,7 @@ void Paint(CpuContext* ctx) {
+         !Picture(ctx, kPitcherButton + 3 * 0x48, kButtonW, kButtonH, sourceTexels, su, sv) ||
+         pitcherTexels != texels || sourceTexels != texels || !Memory::Contains(texels, kAtlasWidth * 256 + 512))
+         return;
++    aurora_gx_fifo_quiesce(0);
+     g_texels = texels;
+     g_titleBackup.resize(kTitleW * kTitleH);
+     g_buttonBackup.resize(kButtonW * kButtonH);
+diff --git a/runtime/src/hle/net/network_deferred.cpp b/runtime/src/hle/net/network_deferred.cpp
+index be4b7c2..61ee3fd 100644
+--- a/runtime/src/hle/net/network_deferred.cpp
++++ b/runtime/src/hle/net/network_deferred.cpp
+@@ -133,6 +133,12 @@ using DeferredConnectPreparation =
+ struct DeferredNetworkStore {
+     std::mutex completedMutex;
+     std::deque<DeferredDnsCompletion> completed;
++#if defined(__SWITCH__)
++    // P24: completed.size(), kept under completedMutex, so the completion pump (run on every alarm
++    // pass, thousands a second) can tell "nothing completed" without a std::deque, its two
++    // allocations and the lock.
++    std::atomic<uint32_t> completedCount{0};
++#endif
+     // Pending polls are submitted and probed only by the emulation scheduler
+     // thread, so unlike DNS worker completions they need no cross-thread lock.
+     std::vector<DeferredPollWork> pendingPolls;
+@@ -165,14 +171,41 @@ void AbortPendingDeferredConnects(uint32_t wiiFd, int32_t result) {
+     }
+ }
+ 
++#if defined(__SWITCH__)
++// P24: WIICOMPILED_ALLOC_FAST=0 restores the allocation/lock heavy originals of the pump entry points.
++static bool NetworkAllocFastEnabled() {
++    static const bool enabled = [] {
++        const char* v = std::getenv("WIICOMPILED_ALLOC_FAST");
++        return !(v != nullptr && v[0] == '0');
++    }();
++    return enabled;
++}
++#endif
++
+ static void NoteDeferredNetworkSchedulerThread(const char* operation) {
++#if defined(__SWITCH__)
++    // P24: schedulerThread is set once and never reset, so a thread that matched it once matches
++    // for good: no mutex and no std::thread::id on the hot path of every completion pump.
++    static thread_local bool matchedScheduler = false;
++    if (matchedScheduler) {
++        return;
++    }
++#endif
+     DeferredNetworkStore& store = GetDeferredNetworkStore();
+     const std::thread::id current = std::this_thread::get_id();
+     std::lock_guard<std::mutex> lock(store.schedulerThreadMutex);
+     if (!store.schedulerThread) {
+         store.schedulerThread = current;
++#if defined(__SWITCH__)
++        matchedScheduler = NetworkAllocFastEnabled();
++#endif
+         return;
+     }
++#if defined(__SWITCH__)
++    if (*store.schedulerThread == current) {
++        matchedScheduler = NetworkAllocFastEnabled();
++    }
++#endif
+     if (*store.schedulerThread != current) {
+         RT_LOGF(RT_TAG_NET,
+                      "deferred network %s ran off the emulation thread\n",
+@@ -199,6 +232,9 @@ static void QueueDeferredDnsCompletion(DeferredDnsCompletion completion) {
+     DeferredNetworkStore& store = GetDeferredNetworkStore();
+     std::lock_guard<std::mutex> lock(store.completedMutex);
+     store.completed.push_back(std::move(completion));
++#if defined(__SWITCH__)
++    store.completedCount.store(static_cast<uint32_t>(store.completed.size()), std::memory_order_release);
++#endif
+ }
+ 
+ static DeferredDnsCompletion ResolveDeferredDns(DeferredDnsWork work) {
+@@ -950,17 +986,16 @@ static std::optional<int32_t> ProbeDeferredConnect(
+     return ClassifySettledConnect(work.nativeFd);
+ }
+ 
+-bool Network_HLE_ProcessCompletions(CpuContext* cpu) {
+-    if (!cpu) {
+-        return false;
+-    }
+-    NoteDeferredNetworkSchedulerThread("completion pump");
+-
++// The completed DNS lookups, delivered. Its own function so the pump below constructs the
++// std::deque (two allocations) only when there is something to deliver.
++static bool DeliverCompletedDns(CpuContext* cpu, DeferredNetworkStore& store) {
+     std::deque<DeferredDnsCompletion> ready;
+-    DeferredNetworkStore& store = GetDeferredNetworkStore();
+     {
+         std::lock_guard<std::mutex> lock(store.completedMutex);
+         ready.swap(store.completed);
++#if defined(__SWITCH__)
++        store.completedCount.store(0, std::memory_order_relaxed);
++#endif
+     }
+     bool handledAny = false;
+ 
+@@ -989,7 +1024,35 @@ bool Network_HLE_ProcessCompletions(CpuContext* cpu) {
+         DeliverDeferredNetworkResult(cpu, store, route, result);
+         handledAny = true;
+     }
++    return handledAny;
++}
++
++bool Network_HLE_ProcessCompletions(CpuContext* cpu) {
++    if (!cpu) {
++        return false;
++    }
++    NoteDeferredNetworkSchedulerThread("completion pump");
++
++    DeferredNetworkStore& store = GetDeferredNetworkStore();
++    bool handledAny = false;
++#if defined(__SWITCH__)
++    // P24: with nothing completed (the usual case) the original swapped the queue into a local
++    // std::deque that had just allocated its map and first node (two mallocs, two frees, a lock) on
++    // every alarm pass. A completion queued right after this load is taken by the next pass, as one
++    // queued right after the swap was.
++    if (!NetworkAllocFastEnabled() || store.completedCount.load(std::memory_order_acquire) != 0) {
++        handledAny = DeliverCompletedDns(cpu, store);
++    }
++#else
++    handledAny = DeliverCompletedDns(cpu, store);
++#endif
+ 
++#if defined(__SWITCH__)
++    // P24: both loops below do nothing on empty tables; skip the clock read they would share.
++    if (NetworkAllocFastEnabled() && store.pendingPolls.empty() && store.pendingConnects.empty()) {
++        return handledAny;
++    }
++#endif
+     const auto now = NetworkPollContract::Timeout::Clock::now();
+     for (auto it = store.pendingPolls.begin(); it != store.pendingPolls.end();) {
+         DeferredPollWork& work = *it;
+diff --git a/runtime/src/hle/os/os_internal.h b/runtime/src/hle/os/os_internal.h
+index a5ae604..34c478d 100644
+--- a/runtime/src/hle/os/os_internal.h
++++ b/runtime/src/hle/os/os_internal.h
+@@ -132,6 +132,21 @@ void CancelSleepTimer(uint32_t threadPtr);
+ void ClearOutstandingPark(uint32_t threadPtr);
+ bool ProcessSleepTimers(CpuContext* cpu);
+ bool SleepTimerOverdue();
++#if defined(__SWITCH__)
++// Where a sleep timer fires from, for WIICOMPILED_SOUND_TICK_STATS: the scheduler (a blocking
++// switch or an interrupt-return preemption point), the idle loop, a host pacing wait, or a compute
++// preemption point (T8, phase 51: compute_preempt.h). A one-shot
++// tag: the next ProcessSleepTimers call takes it and resets it (no scope may span a fiber switch).
++enum class SleepFireSite : uint8_t { Scheduler, Idle, Pace, Compute };
++void SetNextSleepFireSite(SleepFireSite site);
++#endif
++
++#if defined(__SWITCH__)
++// T8 (switch phase 51): the earliest sleep deadline as a CNTPCT value for the compute preemption
++// points (os_scheduler.cpp, compute_preempt.h). deadline: steady_clock ticks, max = none pending.
++void PublishSleepDueTick(std::chrono::steady_clock::rep deadline);
++void RepublishSleepDueTick();  // os_sleep.cpp: publishes gEarliestSleepDeadline
++#endif
+ 
+ // Defined in os_alarm.cpp.
+ bool ProcessAlarmQueue(CpuContext* cpu, int maxToProcess);
+diff --git a/runtime/src/hle/os/os_scheduler.cpp b/runtime/src/hle/os/os_scheduler.cpp
+index d1384fc..29c523f 100644
+--- a/runtime/src/hle/os/os_scheduler.cpp
++++ b/runtime/src/hle/os/os_scheduler.cpp
+@@ -10,6 +10,11 @@
+ #include "fiber_manager.h"
+ #include "runtime_log.h"
+ #include "os_internal.h"
++#if defined(__SWITCH__)
++#include "compute_preempt.h"
++#include <cstdlib>
++#include <limits>
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -195,10 +200,248 @@ extern "C" void OS_HLE_PreemptionPoint()
+     cpu->gpr[3] = savedR3;
+ }
+ 
++#if defined(__SWITCH__)
++extern "C" void OS_HLE_NoteHostPaceService();
++
++// The host pacing wait in GXCopyDisp (vi.cpp PaceToRetraceBoundary) stands in for the guest's
++// VIWaitForRetrace: the main thread's frame loop (0x800472B4) only blocks when no retrace elapsed,
++// and the pacer delivers that retrace itself. On hardware the 5 ms sound ticker's alarm interrupt
++// fires on time while the main thread waits; here the guest threads are fibers on this host thread,
++// so a sleep that came due during the wait only ran at the preemption point after it, up to a whole
++// display period late (the anchored catch-up in ScheduleSleepTimer then repaid the debt later from the
++// main thread's compute). The pacer calls this when an OSSleepTicks deadline is due: exactly the
++// interrupt-return preemption of OS_HLE_PreemptionPoint (due sleepers resumed, a higher-priority READY
++// thread switched to, the main thread resumed once they block again). Returns false when the
++// preemption point is not allowed (interrupts off, scheduler disabled, inside a retrace), so the
++// pacer stops trying for this wait.
++extern "C" bool OS_HLE_PaceRunDueSleepers()
++{
++    if (!OS_HLE_InterruptsEnabled() || ::Memory::Read32(kSchedulerIdleFlagAddr) != 0 ||
++        VI_HLE_IsAdvancingRetrace()) {
++        return false;
++    }
++    OS_HLE_NoteHostPaceService();
++    SetNextSleepFireSite(SleepFireSite::Pace);  // SelectThread's first step is ProcessSleepTimers
++    OS_HLE_PreemptionPoint();
++    return true;
++}
++#endif
++
++#if defined(__SWITCH__)
++// T8 (switch phase 51): compute preemption points (compute_preempt.h). WIICOMPILED_COMPUTE_PREEMPT=1
++// turns them on; read at the first slow poll after SelectThread has run, long after main() set the
++// environment from the nxlink arguments.
++//
++// Why T7b's bctrl point (run 17b) corrupted a thread: OS_HLE_PreemptionPoint was written for calls
++// into OS functions (OSRestoreInterrupts, GXCopyDisp), where the EABI lets the callee clobber r0,
++// r4-r12, f0-f13, CR, CTR, LR and XER; it keeps only r3. On its way to the switch the scheduler
++// writes into the shared CpuContext before SwitchToThread snapshots it: TryInvokeSwitchCallback sets
++// r3 = old thread, r4 = new thread and calls the guest switch callback, ProcessSleepTimers sets
++// r3 = the woken sleeper. Resumed, the preempted thread got that file back (r3 restored). At a bctrl
++// entry r4-r10 and f1-f8 are the live arguments of the call: in run 17b the call at 0x80068820
++// (func_80068434, object list walk, r4 = *(*(r25 + 752) + 36), r5 = 0) reached its callee with
++// r4 = 0x80242ba0, the ticker thread it had just switched to, and the callee's virtual call through
++// it jumped to 0 (pc 0, ctr 0, r3 = 0x80242ba0, lr = 0x80068824 still the caller's). Here the whole
++// register file is saved before and put back after, as the hardware's interrupt does.
++// Run 17's points inside GXBegin/GXCallDisplayList let the idle loop's retrace service (Aurora frame
++// work) run in the middle of a primitive or list: these points are never inside a GX call.
++uint32_t g_mkwComputePreemptCountdown = 1;
++uint32_t g_mkwComputePreemptHold = 0;
++
++extern "C" bool GX_HLE_MidCommand();  // hle/gx/gx_fifo.cpp
++
++namespace {
++thread_local char tSchedulerHostThreadMarker;
++std::atomic<const char*> gSchedulerHostThread{nullptr};
++
++constexpr uint32_t kComputePreemptInterval = 8;
++constexpr int64_t kSystemTickHz = 19200000;
++constexpr int64_t kComputePreemptRetryTicks = kSystemTickHz / 50000;  // 20 us
++enum : uint8_t { kComputePreemptUnresolved, kComputePreemptOff, kComputePreemptOn };
++uint8_t gComputePreemptState = kComputePreemptUnresolved;
++// CNTPCT of the earliest OSSleepTicks deadline; 0 until resolved (the first slow poll resolves).
++int64_t gComputePreemptDueTick = 0;
++// S9: CNTPCT at which the next 3 ms AI DMA block is due (audio.cpp Audio_HLE_Tick publishes it through
++// MkwAiPreemptPublishDue). INT64_MAX: none (AI points off, DMA stopped, or a tick about to publish).
++int64_t gAiPreemptDueTick = INT64_MAX;
++bool gAiPreemptOn = false;  // WIICOMPILED_AI_PREEMPT (on unless =0), resolved with the compute points
++
++struct ComputePreemptStats {
++    uint64_t taken = 0;
++    uint64_t refused[9] = {};
++    uint64_t aiTaken = 0, aiRefused = 0;
++    int64_t windowStart = 0;
++} gComputePreemptStats;
++
++inline int64_t SwitchSystemTick() {
++    int64_t tick;
++    asm volatile("mrs %0, cntpct_el0" : "=r"(tick));
++    return tick;
++}
++
++void ReportComputePreemptStats(int64_t now) {
++    ComputePreemptStats& s = gComputePreemptStats;
++    if (s.windowStart == 0) {
++        s.windowStart = now;
++        return;
++    }
++    if (now - s.windowStart < 5 * kSystemTickHz) {
++        return;
++    }
++    RT_LOGF(RT_TAG_OS,
++            "[compute-preempt] %.1f s: taken %llu; refused: held %llu, private context %llu, interrupts off "
++            "%llu, scheduler disabled %llu, retrace %llu, GX mid-command %llu, not running %llu; AI DMA %llu "
++            "(refused %llu)\n",
++            static_cast<double>(now - s.windowStart) / kSystemTickHz, (unsigned long long)s.taken,
++            (unsigned long long)s.refused[2], (unsigned long long)s.refused[3], (unsigned long long)s.refused[4],
++            (unsigned long long)s.refused[5], (unsigned long long)s.refused[6], (unsigned long long)s.refused[7], (unsigned long long)s.refused[8],
++            (unsigned long long)s.aiTaken, (unsigned long long)s.aiRefused);
++    s = ComputePreemptStats{};
++    s.windowStart = now;
++}
++} // namespace
++
++// Callers: os_sleep.cpp NoteSleepDeadline / RefreshEarliestSleepDeadline (under gSleepTimerMutex)
++// and the slow poll. The steady_clock deadline goes over as the remaining time (no epoch assumed).
++void OsHleInternal::PublishSleepDueTick(std::chrono::steady_clock::rep deadline)
++{
++    if (gComputePreemptState != kComputePreemptOn) {
++        return;
++    }
++    int64_t tick = INT64_MAX;
++    if (deadline != std::numeric_limits<std::chrono::steady_clock::rep>::max()) {
++        const int64_t remainingNs = static_cast<int64_t>(
++            std::chrono::nanoseconds(std::chrono::steady_clock::duration(
++                                         deadline - std::chrono::steady_clock::now().time_since_epoch().count()))
++                .count());
++        tick = SwitchSystemTick() + remainingNs * 12 / 625;  // ns -> 19.2 MHz ticks
++    }
++    __atomic_store_n(&gComputePreemptDueTick, tick, __ATOMIC_RELAXED);
++}
++
++extern "C" void MkwAiPreemptService();  // S9: audio.cpp
++
++// S9: audio.cpp Audio_HLE_Tick, at the end of every tick (the game's host thread): the CNTPCT at which
++// the AI DMA interrupt is next due (the accumulator completes a block). Ignored while the AI points are
++// off or not yet resolved (gAiPreemptDueTick stays INT64_MAX).
++extern "C" void MkwAiPreemptPublishDue(int64_t tick)
++{
++    if (gAiPreemptOn) {
++        __atomic_store_n(&gAiPreemptDueTick, tick, __ATOMIC_RELAXED);
++    }
++}
++
++extern "C" void MkwComputePreemptSlow()
++{
++    __atomic_store_n(&g_mkwComputePreemptCountdown, kComputePreemptInterval, __ATOMIC_RELAXED);
++    const int64_t now = SwitchSystemTick();
++    if (now < __atomic_load_n(&gComputePreemptDueTick, __ATOMIC_RELAXED) &&
++        now < __atomic_load_n(&gAiPreemptDueTick, __ATOMIC_RELAXED)) [[likely]] {
++        return;
++    }
++    // Guest threads run on the scheduler's host thread only; a poll anywhere else does nothing.
++    if (gSchedulerHostThread.load(std::memory_order_relaxed) != &tSchedulerHostThreadMarker) {
++        return;
++    }
++    if (gComputePreemptState != kComputePreemptOn) {
++        if (gComputePreemptState == kComputePreemptUnresolved) {
++            const char* v = std::getenv("WIICOMPILED_COMPUTE_PREEMPT");
++            gComputePreemptState = v != nullptr && v[0] == '0' ? kComputePreemptOff : kComputePreemptOn;  // on unless =0 (run 21: 200 wakes/s, 0 resets, no crash)
++            const char* ai = std::getenv("WIICOMPILED_AI_PREEMPT");  // S9: on unless =0
++            gAiPreemptOn = gComputePreemptState == kComputePreemptOn && !(ai != nullptr && ai[0] == '0');
++        }
++        if (gComputePreemptState == kComputePreemptOff) {
++            __atomic_store_n(&gComputePreemptDueTick, INT64_MAX, __ATOMIC_RELAXED);
++            __atomic_store_n(&g_mkwComputePreemptCountdown, UINT32_MAX, __ATOMIC_RELAXED);
++            return;
++        }
++        RT_LOG(RT_TAG_OS) << "compute preemption points on (WIICOMPILED_COMPUTE_PREEMPT=0 turns them off); AI DMA "
++                          << (gAiPreemptOn ? "blocks serviced there too (WIICOMPILED_AI_PREEMPT=0 turns that off)"
++                                           : "blocks not serviced there (WIICOMPILED_AI_PREEMPT=0)")
++                          << std::endl;
++        RepublishSleepDueTick();
++        return;
++    }
++    ReportComputePreemptStats(now);
++    // Which interrupt is pending: an OSSleepTicks alarm, the AI DMA block (S9), or both.
++    bool sleepDue = false;
++    if (now >= __atomic_load_n(&gComputePreemptDueTick, __ATOMIC_RELAXED)) {
++        sleepDue = SleepTimerOverdue();
++        if (!sleepDue) {
++            RepublishSleepDueTick();  // the tick conversion rounded early, or a cancelled timer
++        }
++    }
++    const bool aiDue = now >= __atomic_load_n(&gAiPreemptDueTick, __ATOMIC_RELAXED);
++    if (!sleepDue && !aiDue) {
++        return;
++    }
++
++    CpuContext* cpu = TryGetCpuContext();
++    MkwComputePreemptState state{};
++    state.schedulerThread = true;
++    state.hold = __atomic_load_n(&g_mkwComputePreemptHold, __ATOMIC_RELAXED);
++    state.sharedContext = cpu != nullptr && cpu == &GetPersistentCpuContext();
++    state.interruptsEnabled = OS_HLE_InterruptsEnabled();
++    state.schedulerDisableCount = ::Memory::Read32(kSchedulerIdleFlagAddr);
++    state.inRetrace = VI_HLE_IsAdvancingRetrace();
++    state.gxMidCommand = GX_HLE_MidCommand();
++    state.runningThread = ::Memory::Read32(kOSRunningContextAddr);
++    state.currentContext = ::Memory::Read32(kOSCurrentContextAddr);
++    state.runningState = state.runningThread != 0 ? ::Memory::Read16(state.runningThread + kThreadStateOffset) : 0;
++    const MkwComputePreemptVerdict verdict = MkwComputePreemptDecide(state);
++    if (verdict != MkwComputePreemptVerdict::Take) {
++        ++gComputePreemptStats.refused[static_cast<uint8_t>(verdict)];
++        if (sleepDue) {
++            __atomic_store_n(&gComputePreemptDueTick, now + kComputePreemptRetryTicks, __ATOMIC_RELAXED);
++        }
++        if (aiDue) {
++            ++gComputePreemptStats.aiRefused;
++            __atomic_store_n(&gAiPreemptDueTick, now + kComputePreemptRetryTicks, __ATOMIC_RELAXED);
++        }
++        return;
++    }
++
++    // The alarm interrupt, taken between two guest instructions with MSR[EE] set: the register file
++    // is saved, the scheduler runs (due sleepers resumed, an outranking thread switched to; this one
++    // resumes when they block), and the register file and MSR[EE] come back. Guest memory is shared.
++    ++gComputePreemptStats.taken;
++    const uint32_t self = state.runningThread;
++    const CpuContext saved = *cpu;
++    if (aiDue) {
++        // S9: the AI DMA interrupt (every 3 ms on hardware, wherever the guest computes with MSR[EE]
++        // set). One due block goes out as from the pace wait (audio.cpp MkwAiPreemptService): the AI
++        // callback (__AXOutNewFrame and the AX frame) on a private register file seeded from this one,
++        // thread switches deferred; the sound thread it woke runs at the interrupt return below. The
++        // tick publishes the next due time.
++        ++gComputePreemptStats.aiTaken;
++        __atomic_store_n(&gAiPreemptDueTick, INT64_MAX, __ATOMIC_RELAXED);
++        MkwAiPreemptService();
++    }
++    SetNextSleepFireSite(SleepFireSite::Compute);  // SelectThread's first step is ProcessSleepTimers
++    OS_HLE_PreemptionPoint();
++    const bool fpscrChanged = cpu->fpscr != saved.fpscr;
++    *cpu = saved;
++    if (fpscrChanged) {
++        MkwApplyHostNiMode(cpu->fpscr);
++    }
++    // Back as the scheduled thread (not the fiber manager's resume-without-schedule fallback): the
++    // thread that switched back may have left guest interrupts off; this one was interrupted with them on.
++    if (::Memory::Read32(kOSRunningContextAddr) == self && ::Memory::Read32(kOSCurrentContextAddr) == self &&
++        !OS_HLE_InterruptsEnabled()) {
++        OS__RestoreInterrupts_801a65d4(1);
++    }
++}
++#endif
++
+ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
+ {
+     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+     const uint32_t forceSwitch = cpu->gpr[3];
++#if defined(__SWITCH__)
++    if (gSchedulerHostThread.load(std::memory_order_relaxed) == nullptr) [[unlikely]] {
++        gSchedulerHostThread.store(&tSchedulerHostThreadMarker, std::memory_order_relaxed);
++    }
++#endif
+ 
+     ProcessSleepTimers(cpu);
+ 
+@@ -295,6 +538,9 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
+             OS__EnableInterrupts_801a65c0();
+ 
+             while (::Memory::Read32(kSchedulerPendingFlagAddr) == 0) {
++#if defined(__SWITCH__)
++                SetNextSleepFireSite(SleepFireSite::Idle);
++#endif
+                 ProcessSleepTimers(cpu);
+                 // Dolphin models DSP audio DMA as an independent 4 kHz timing
+                 // event.  Poll it from the guest scheduler instead of batching
+@@ -302,6 +548,20 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
+                 // block wakes SoundThread and sets the scheduler pending mask.
+                 Audio_HLE_Poll(cpu);
+                 if (::Memory::Read32(kSchedulerPendingFlagAddr) != 0) {
++#if defined(__SWITCH__)
++                    // S9, opt-in (WIICOMPILED_IDLE_RETRACE=1): both interrupts pending; the hardware
++                    // takes the VI one too before the reschedule. Otherwise, while AI blocks are owed,
++                    // every pass wakes the sound thread and the retrace the main thread waits for waits
++                    // for the whole audio debt (run 22b: 36-96 ms). Only retraces already due by wall
++                    // time are delivered.
++                    static const bool retraceWithAudio = [] {
++                        const char* v = std::getenv("WIICOMPILED_IDLE_RETRACE");
++                        return v != nullptr && v[0] == '1';
++                    }();
++                    if (retraceWithAudio) {
++                        VI_HLE_PollRetrace(cpu);
++                    }
++#endif
+                     break;
+                 }
+                 VI_HLE_PollRetrace(cpu);
+diff --git a/runtime/src/hle/os/os_sleep.cpp b/runtime/src/hle/os/os_sleep.cpp
+index b155a20..244abc5 100644
+--- a/runtime/src/hle/os/os_sleep.cpp
++++ b/runtime/src/hle/os/os_sleep.cpp
+@@ -4,7 +4,10 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <iostream>
++#include <iterator>
+ #include <limits>
+ #include <mutex>
+ #include <unordered_map>
+@@ -29,12 +32,206 @@ std::vector<SleepTimerEntry> gSleepTimers;
+ std::atomic<std::chrono::steady_clock::rep> gEarliestSleepDeadline{
+     std::numeric_limits<std::chrono::steady_clock::rep>::max()};
+ 
++#if defined(__SWITCH__)
++// WIICOMPILED_SOUND_TICK_STATS=1: cadence of every short OSSleepTicks loop (MLB's 5 ms sound ticker
++// 0x80027BF8 above all: each wake is one sound pass, +5 on the commentary phrase clocks), printed
++// every 5 s per sleeping thread: wakes/s against the ideal 1/period, how late each wake fired past
++// the deadline OSSleepTicks armed (mean, max, histogram), the debt against the hardware alarm grid
++// (anchor), catch-up sleeps and the debt dropped by the 50 ms cap (resets, lost ms), how many of
++// those deadlines fell inside a host pacing wait (vi.cpp PaceToRetraceBoundary) and where the wake
++// fired from (pace wait, idle loop, other scheduler passes).
++thread_local SleepFireSite tSleepFireSite = SleepFireSite::Scheduler;
++void SetNextSleepFireSite(SleepFireSite site) { tSleepFireSite = site; }
++
++namespace {
++using TickClock = std::chrono::steady_clock;
++
++bool SoundTickStatsEnabled()
++{
++    static const bool enabled = [] {
++        const char* v = std::getenv("WIICOMPILED_SOUND_TICK_STATS");
++        return v != nullptr && *v == '1';
++    }();
++    return enabled;
++}
++
++struct TickStats {
++    uint64_t ticks = 0;
++    TickClock::duration period{};
++    TickClock::time_point armed{};   // the timer deadline the last OSSleepTicks set
++    TickClock::time_point ideal{};   // where the hardware alarm grid puts that wake (anchor)
++    bool pending = false;
++    uint64_t wakes = 0, catchUps = 0, resets = 0;
++    double lostMs = 0, lateSumMs = 0, lateMaxMs = 0, debtMaxMs = 0;
++    uint64_t lateHist[6] = {};  // < 0.5, < 1, < 2, < 4, < 8, >= 8 ms
++    uint64_t dueInPace = 0, firedPace = 0, firedIdle = 0, firedCompute = 0, firedOther = 0;
++};
++std::mutex gTickStatsMutex;
++std::unordered_map<uint32_t, TickStats> gTickStats;
++TickClock::time_point gTickStatsStart{};
++struct PaceWindow { TickClock::time_point begin, end; };
++PaceWindow gPaceWindows[16] = {};
++unsigned gPaceNext = 0;
++bool gPaceActive = false;
++TickClock::time_point gPaceBegin{};
++uint64_t gPaceWaits = 0, gPaceServices = 0;
++double gPaceMs = 0;
++
++bool DeadlineInPace(TickClock::time_point deadline)
++{
++    if (gPaceActive && deadline >= gPaceBegin) {
++        return true;
++    }
++    for (const PaceWindow& w : gPaceWindows) {
++        if (deadline >= w.begin && deadline < w.end) {
++            return true;
++        }
++    }
++    return false;
++}
++
++constexpr auto kTickStatsMaxPeriod = std::chrono::milliseconds(20);
++
++// Called from ScheduleSleepTimer under gSleepTimerMutex (lock order: timers, then stats).
++void NoteTickScheduled(uint32_t threadPtr, uint64_t ticks, TickClock::duration period, TickClock::time_point now,
++                       TickClock::time_point anchor, TickClock::time_point deadline, bool reset,
++                       TickClock::duration lost)
++{
++    if (period > kTickStatsMaxPeriod) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(gTickStatsMutex);
++    TickStats& s = gTickStats[threadPtr];
++    s.ticks = ticks;
++    s.period = period;
++    s.armed = deadline;
++    s.ideal = anchor;
++    s.pending = true;
++    if (anchor < now + period) {
++        ++s.catchUps;
++    }
++    if (reset) {
++        ++s.resets;
++        s.lostMs += std::chrono::duration<double, std::milli>(lost).count();
++    }
++}
++
++void NoteTickFired(uint32_t threadPtr, SleepFireSite site)
++{
++    const auto now = TickClock::now();
++    std::lock_guard<std::mutex> lock(gTickStatsMutex);
++    const auto it = gTickStats.find(threadPtr);
++    if (it != gTickStats.end() && it->second.pending) {
++        TickStats& s = it->second;
++        s.pending = false;
++        ++s.wakes;
++        const double lateMs = std::chrono::duration<double, std::milli>(now - s.armed).count();
++        const double debtMs = std::chrono::duration<double, std::milli>(now - s.ideal).count();
++        s.lateSumMs += lateMs;
++        s.lateMaxMs = std::max(s.lateMaxMs, lateMs);
++        s.debtMaxMs = std::max(s.debtMaxMs, debtMs);
++        const int bucket = lateMs < 0.5 ? 0 : lateMs < 1 ? 1 : lateMs < 2 ? 2 : lateMs < 4 ? 3 : lateMs < 8 ? 4 : 5;
++        ++s.lateHist[bucket];
++        if (DeadlineInPace(s.armed)) {
++            ++s.dueInPace;
++        }
++        switch (site) {
++        case SleepFireSite::Pace: ++s.firedPace; break;
++        case SleepFireSite::Idle: ++s.firedIdle; break;
++        case SleepFireSite::Compute: ++s.firedCompute; break;
++        default: ++s.firedOther; break;
++        }
++    }
++    if (gTickStatsStart == TickClock::time_point{}) {
++        gTickStatsStart = now;
++        return;
++    }
++    const double windowS = std::chrono::duration<double>(now - gTickStatsStart).count();
++    if (windowS < 5.0) {
++        return;
++    }
++    for (auto& [thread, s] : gTickStats) {
++        if (s.wakes != 0) {
++            const double periodMs = std::chrono::duration<double, std::milli>(s.period).count();
++            RT_LOGF(RT_TAG_OS,
++                    "[sound-tick] %.1f s thread 0x%08x period %.3f ms: %llu wakes = %.1f/s (ideal %.1f/s); late ms "
++                    "mean %.2f max %.2f [<0.5 %llu | <1 %llu | <2 %llu | <4 %llu | <8 %llu | >=8 %llu]; debt max %.2f ms, "
++                    "catch-ups %llu, resets %llu (lost %.1f ms); deadline in host pace %llu; fired: pace %llu idle %llu "
++                    "compute %llu other %llu\n",
++                    windowS, thread, periodMs, (unsigned long long)s.wakes, s.wakes / windowS,
++                    periodMs > 0 ? 1000.0 / periodMs : 0.0, s.lateSumMs / s.wakes, s.lateMaxMs,
++                    (unsigned long long)s.lateHist[0], (unsigned long long)s.lateHist[1],
++                    (unsigned long long)s.lateHist[2], (unsigned long long)s.lateHist[3],
++                    (unsigned long long)s.lateHist[4], (unsigned long long)s.lateHist[5], s.debtMaxMs,
++                    (unsigned long long)s.catchUps, (unsigned long long)s.resets, s.lostMs,
++                    (unsigned long long)s.dueInPace, (unsigned long long)s.firedPace,
++                    (unsigned long long)s.firedIdle, (unsigned long long)s.firedCompute,
++                    (unsigned long long)s.firedOther);
++        }
++        const bool pending = s.pending;
++        const auto armed = s.armed, ideal = s.ideal;
++        const auto ticks = s.ticks;
++        const auto period = s.period;
++        s = TickStats{};
++        s.ticks = ticks, s.period = period, s.armed = armed, s.ideal = ideal, s.pending = pending;
++    }
++    RT_LOGF(RT_TAG_OS, "[sound-tick] host pace waits %llu, %.1f ms (%.1f%%), guest-timer services in pace %llu\n",
++            (unsigned long long)gPaceWaits, gPaceMs, gPaceMs / (windowS * 10.0),
++            (unsigned long long)gPaceServices);
++    gPaceWaits = gPaceServices = 0;
++    gPaceMs = 0;
++    gTickStatsStart = now;
++}
++} // namespace
++
++// vi.cpp: a host pacing wait (PaceToRetraceBoundary) begins or ends; a guest-timer service ran in it.
++extern "C" void OS_HLE_NoteHostPace(bool begin)
++{
++    if (!SoundTickStatsEnabled()) {
++        return;
++    }
++    const auto now = TickClock::now();
++    std::lock_guard<std::mutex> lock(gTickStatsMutex);
++    if (begin) {
++        gPaceActive = true;
++        gPaceBegin = now;
++        return;
++    }
++    if (!gPaceActive) {
++        return;
++    }
++    gPaceActive = false;
++    gPaceWindows[gPaceNext++ % std::size(gPaceWindows)] = {gPaceBegin, now};
++    ++gPaceWaits;
++    gPaceMs += std::chrono::duration<double, std::milli>(now - gPaceBegin).count();
++}
++
++extern "C" void OS_HLE_NoteHostPaceService()
++{
++    if (!SoundTickStatsEnabled()) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(gTickStatsMutex);
++    ++gPaceServices;
++}
++
++// Earliest pending OSSleepTicks deadline (steady_clock ticks; never later than the real one, may be
++// stale early: a scheduler pass refreshes it). Max when none is pending.
++extern "C" int64_t OS_HLE_EarliestSleepDeadline()
++{
++    return static_cast<int64_t>(gEarliestSleepDeadline.load(std::memory_order_relaxed));
++}
++#endif
++
+ // Callers hold gSleepTimerMutex.
+ void NoteSleepDeadline(std::chrono::steady_clock::time_point deadline)
+ {
+     const auto value = deadline.time_since_epoch().count();
+     if (value < gEarliestSleepDeadline.load(std::memory_order_relaxed)) {
+         gEarliestSleepDeadline.store(value, std::memory_order_relaxed);
++#if defined(__SWITCH__)
++        PublishSleepDueTick(value);  // T8: compute preemption points (os_scheduler.cpp)
++#endif
+     }
+ }
+ 
+@@ -45,8 +242,18 @@ void RefreshEarliestSleepDeadline()
+         earliest = std::min(earliest, entry.deadline.time_since_epoch().count());
+     }
+     gEarliestSleepDeadline.store(earliest, std::memory_order_relaxed);
++#if defined(__SWITCH__)
++    PublishSleepDueTick(earliest);  // T8: compute preemption points (os_scheduler.cpp)
++#endif
+ }
+ 
++#if defined(__SWITCH__)
++void RepublishSleepDueTick()
++{
++    PublishSleepDueTick(gEarliestSleepDeadline.load(std::memory_order_relaxed));
++}
++#endif
++
+ bool SleepTimerOverdue()
+ {
+     return std::chrono::steady_clock::now().time_since_epoch().count() >=
+@@ -125,7 +332,11 @@ void ScheduleSleepTimer(uint32_t threadPtr, uint64_t ticks)
+     // a different length or long after the last deadline starts from now, as in the SDK.
+     struct LastSleep { uint64_t ticks; Clock::time_point deadline; };
+     static std::unordered_map<uint32_t, LastSleep> lastSleeps;
++#if defined(__SWITCH__)
++    constexpr auto kMaxCatchUp = std::chrono::milliseconds(250);
++#else
+     constexpr auto kMaxCatchUp = std::chrono::milliseconds(50);
++#endif
+ 
+     std::lock_guard<std::mutex> lock(gSleepTimerMutex);
+     LastSleep& last = lastSleeps[threadPtr];
+@@ -136,6 +347,13 @@ void ScheduleSleepTimer(uint32_t threadPtr, uint64_t ticks)
+         // finishes parking. The anchor keeps the full debt so it is still caught up later.
+         deadline = std::max(anchor, now + duration / 4);
+     }
++#if defined(__SWITCH__)
++    if (SoundTickStatsEnabled()) {
++        const bool reset = last.ticks == ticks && last.deadline <= now && now - last.deadline > kMaxCatchUp;
++        NoteTickScheduled(threadPtr, ticks, duration, now, anchor, deadline, reset,
++                          reset ? now - last.deadline : Clock::duration{});
++    }
++#endif
+     last = {ticks, anchor};
+     std::erase_if(gSleepTimers, [threadPtr](const SleepTimerEntry& entry) {
+         return entry.threadPtr == threadPtr;
+@@ -156,6 +374,10 @@ bool ProcessSleepTimers(CpuContext* cpu)
+     // 100ms late, followed by a "sleep-timer stale" drop when this fiber finally resumes.
+     // Leaving unprocessed timers in the table keeps them visible to every other pump (idle
+     // loop, other threads' SelectThread) while this one is switched away.
++#if defined(__SWITCH__)
++    const SleepFireSite fireSite = tSleepFireSite;
++    tSleepFireSite = SleepFireSite::Scheduler;
++#endif
+     bool processedAny = false;
+     constexpr size_t kMaxTimersPerCall = 64;
+     size_t processedCount = 0;
+@@ -220,6 +442,11 @@ bool ProcessSleepTimers(CpuContext* cpu)
+         }
+ 
+         ClearOutstandingPark(threadPtr);
++#if defined(__SWITCH__)
++        if (SoundTickStatsEnabled()) {
++            NoteTickFired(threadPtr, fireSite);
++        }
++#endif
+         cpu->gpr[3] = threadPtr;
+         OSResumeThread_HLE_801aa58c(cpu);
+ 
+diff --git a/runtime/src/hle/storage/dvd.cpp b/runtime/src/hle/storage/dvd.cpp
+index 8f4c9b4..c8b80bb 100644
+--- a/runtime/src/hle/storage/dvd.cpp
++++ b/runtime/src/hle/storage/dvd.cpp
+@@ -15,6 +15,9 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size);
+ #include "runtime_config.h"
+ #include "runtime_log.h"
+ #include "runtime_product.h"
++#if defined(__SWITCH__)
++#include "compute_preempt.h"
++#endif
+ 
+ #include <cstdint>
+ #include <cstdlib>
+@@ -112,7 +115,42 @@ extern "C" uint32_t g_dvdFstReservedBase;
+ extern "C" uint32_t g_dvdFstReservedSize;
+ 
+ // Byte-wise copy into guest RAM plus the DMA notification the GX caches need.
++#if defined(__SWITCH__)
++// P24: a DVD read stored its bytes one Memory::Write8 at a time (a byte-wide guest store each: a
++// millisecond or more per MiB on the main thread, on top of the read itself). Whole 1 MiB pages
++// that are plain writable RAM (g_fullWritablePageBias != 0: what Write8 itself stores through with no
++// further checks, the same test as mlb_msl::FillPlainRam) take one memcpy per page instead. All or
++// nothing: a range touching any other page keeps the byte loop and its policy, MMIO and fault
++// handling. WIICOMPILED_DVD_FAST_COPY=0 disables it.
++static bool CopyToGuestPlainRam(uint32_t dest, const uint8_t* data, size_t size) {
++    static const bool enabled = [] {
++        const char* v = std::getenv("WIICOMPILED_DVD_FAST_COPY");
++        return !(v != nullptr && v[0] == '0');
++    }();
++    if (!enabled || size == 0 || size - 1u > static_cast<size_t>(UINT32_MAX - dest)) {
++        return false;
++    }
++    const uint32_t last = dest + static_cast<uint32_t>(size - 1u);
++    for (uint32_t page = dest >> MemoryInline::kPageShift; page <= (last >> MemoryInline::kPageShift); ++page) {
++        if (MemoryInline::g_fullWritablePageBias[page] == 0) {
++            return false;
++        }
++    }
++    for (uint32_t at = dest;;) {
++        const uint32_t end = std::min(last, at | MemoryInline::kPageMask);
++        const uintptr_t bias = MemoryInline::g_fullWritablePageBias[at >> MemoryInline::kPageShift];
++        std::memcpy(reinterpret_cast<uint8_t*>((bias - 1u) + at), data + (at - dest), end - at + 1u);
++        if (end == last) break;
++        at = end + 1u;
++    }
++    return true;
++}
++#endif
++
+ static void CopyToGuestAsDma(uint32_t dest, const uint8_t* data, size_t size) {
++#if defined(__SWITCH__)
++    if (!CopyToGuestPlainRam(dest, data, size))
++#endif
+     for (size_t i = 0; i < size; ++i) {
+         Memory::Write8(dest + static_cast<uint32_t>(i), data[i]);
+     }
+@@ -191,6 +229,9 @@ static void InvokeDvdCallback(uint32_t callbackPtr, int32_t result, uint32_t fil
+     auto& cpu = GetPersistentCpuContext();
+     cpu.gpr[3] = static_cast<uint32_t>(result);
+     cpu.gpr[4] = fileInfoPtr;
++#if defined(__SWITCH__)
++    MkwComputePreemptHoldScope interruptLevel;  // T8: the DI interrupt's callback
++#endif
+     InvokeIndirectCpu(callbackPtr, &cpu);
+ }
+ 
+@@ -205,6 +246,9 @@ static void InvokeDvdLowCallback(uint32_t callbackPtr, int32_t result) {
+     }
+     auto& cpu = GetPersistentCpuContext();
+     cpu.gpr[3] = static_cast<uint32_t>(result);
++#if defined(__SWITCH__)
++    MkwComputePreemptHoldScope interruptLevel;  // T8: the DI interrupt's callback
++#endif
+     InvokeIndirectCpu(callbackPtr, &cpu);
+ }
+ 
+@@ -501,10 +545,17 @@ static void ScanDirectory(const fs::path& root, const std::string& virtualPrefix
+             return;
+         }
+ 
++#if defined(__SWITCH__)
++        const fs::path relative = entry.path().lexically_relative(root);
++        if (relative.empty()) {
++            return;
++        }
++#else
+         const fs::path relative = fs::relative(entry.path(), root, entryEc);
+         if (entryEc) {
+             return;
+         }
++#endif
+ 
+         std::string prefix = virtualPrefix.empty() ? "/" : virtualPrefix;
+         if (prefix.back() != '/' && prefix.back() != '\\') {
+diff --git a/runtime/src/hle/storage/nand_async.cpp b/runtime/src/hle/storage/nand_async.cpp
+index aeb1962..a9fce54 100644
+--- a/runtime/src/hle/storage/nand_async.cpp
++++ b/runtime/src/hle/storage/nand_async.cpp
+@@ -4,6 +4,9 @@
+ // Shared state and helpers live in nand_internal.h.
+ 
+ #include "nand_internal.h"
++#if defined(__SWITCH__)
++#include <atomic>
++#endif
+ 
+ // Guest callback dispatch: host NAND work completes synchronously, so an "async" call just
+ // queues its guest completion callback here and an HLE pump dispatches it later.
+@@ -16,6 +19,19 @@ struct PendingNandCallback {
+ 
+ static std::mutex g_pendingNandCallbackMutex;
+ static std::deque<PendingNandCallback> g_pendingNandCallbacks;
++#if defined(__SWITCH__)
++// P24: g_pendingNandCallbacks.size(), kept under the mutex. The alarm pass that pumps the queue runs
++// thousands of times a second with the queue empty; it no longer takes the lock to find that out.
++// WIICOMPILED_ALLOC_FAST=0 restores the locked check.
++static std::atomic<uint32_t> g_pendingNandCallbackCount{0};
++static bool NandAllocFastEnabled() {
++    static const bool enabled = [] {
++        const char* v = std::getenv("WIICOMPILED_ALLOC_FAST");
++        return !(v != nullptr && v[0] == '0');
++    }();
++    return enabled;
++}
++#endif
+ 
+ static void DispatchNandCallback(CpuContext* cpu, uint32_t callbackPtr, int32_t result, uint32_t commandBlock) {
+     if (callbackPtr == 0) {
+@@ -54,6 +70,9 @@ static void InvokeNandCallback(uint32_t callbackPtr, int32_t result, uint32_t co
+ 
+     std::lock_guard<std::mutex> lock(g_pendingNandCallbackMutex);
+     g_pendingNandCallbacks.push_back({callbackPtr, result, commandBlock});
++#if defined(__SWITCH__)
++    g_pendingNandCallbackCount.store(static_cast<uint32_t>(g_pendingNandCallbacks.size()), std::memory_order_release);
++#endif
+ }
+ 
+ void NandQueueIosCallback(uint32_t callbackPtr, int32_t result, uint32_t callbackArg) {
+@@ -73,6 +92,12 @@ bool NandProcessPendingCallbacks(CpuContext* cpu, int maxToProcess) {
+     if (g_nandCallbackDrainDepth != 0) {
+         return false;
+     }
++#if defined(__SWITCH__)
++    // P24: with nothing queued the loop below would lock, see an empty deque and return false.
++    if (NandAllocFastEnabled() && g_pendingNandCallbackCount.load(std::memory_order_acquire) == 0) {
++        return false;
++    }
++#endif
+     struct DrainScope {
+         DrainScope() { ++g_nandCallbackDrainDepth; }
+         ~DrainScope() { --g_nandCallbackDrainDepth; }
+@@ -92,6 +117,10 @@ bool NandProcessPendingCallbacks(CpuContext* cpu, int maxToProcess) {
+             }
+             cb = g_pendingNandCallbacks.front();
+             g_pendingNandCallbacks.pop_front();
++#if defined(__SWITCH__)
++            g_pendingNandCallbackCount.store(static_cast<uint32_t>(g_pendingNandCallbacks.size()),
++                                             std::memory_order_release);
++#endif
+         }
+         DispatchNandCallback(cpu, cb.callbackPtr, cb.result, cb.commandBlock);
+         ++processed;
+diff --git a/runtime/src/hle/vi.cpp b/runtime/src/hle/vi.cpp
+index b1feb54..3eeccb8 100644
+--- a/runtime/src/hle/vi.cpp
++++ b/runtime/src/hle/vi.cpp
+@@ -18,6 +18,7 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <iostream>
+ #include <mutex>
+ #include <thread>
+@@ -31,6 +32,10 @@
+ 
+ #include <aurora/aurora.h>
+ 
++// aurora gx/fifo_async.inc: the GX decoder maps viewports with the configured size, so queued GX
++// work (WIICOMPILED_GX_FIFO=deferred|thread) is decoded before VIConfigure changes it.
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason);
++
+ // Forward declaration for OSWakeupThread - used to wake threads on VI retrace queue
+ extern "C" void OSWakeupThread_HLE_801aaaa4(CpuContext* ctx);
+ 
+@@ -454,6 +459,28 @@ void VI_HLE_ProcessRetracesDeferred(int maxToProcess) {
+     OS_HLE_EndDeferredGuestCallbacks();
+ }
+ 
++#if defined(__SWITCH__)
++// hle/os: guest sleep timers during host waits (os_scheduler.cpp OS_HLE_PaceRunDueSleepers explains).
++extern "C" bool OS_HLE_PaceRunDueSleepers();
++extern "C" int64_t OS_HLE_EarliestSleepDeadline();
++extern "C" void OS_HLE_NoteHostPace(bool begin);
++
++namespace {
++// WIICOMPILED_PACE_GUEST_TIMERS=0 restores the waits below that ignore guest OSSleepTicks deadlines.
++bool PaceGuestTimersEnabled() {
++    static const bool enabled = [] {
++        const char* v = std::getenv("WIICOMPILED_PACE_GUEST_TIMERS");
++        return !(v != nullptr && *v == '0');
++    }();
++    return enabled;
++}
++
++Clock::time_point EarliestGuestSleepDeadline() {
++    return Clock::time_point{Clock::duration{OS_HLE_EarliestSleepDeadline()}};
++}
++} // namespace
++#endif
++
+ void VI_HLE_WaitForNextRetracePoll() {
+     Clock::time_point retraceDeadline;
+     {
+@@ -466,6 +493,19 @@ void VI_HLE_WaitForNextRetracePoll() {
+     if (now >= retraceDeadline) {
+         return;
+     }
++#if defined(__SWITCH__)
++    // The idle loop fires sleep timers on every pass: end this wait at the next OSSleepTicks
++    // deadline instead of up to 1 ms past it (the 5 ms sound ticker's wakes).
++    if (PaceGuestTimersEnabled()) {
++        const auto guestDue = EarliestGuestSleepDeadline();
++        if (guestDue < retraceDeadline && guestDue < now + 1ms) {
++            if (guestDue > now) {
++                SleepPreciselyUntil(guestDue);
++            }
++            return;
++        }
++    }
++#endif
+     // Audio DMA and alarm queues still need regular service even when the VI
+     // deadline is farther away. The high-resolution wait removes the 1 ms
+     // scheduler overshoot when retrace is the next event.
+@@ -490,11 +530,39 @@ uint64_t s_lastPresentAnchorNanos = 0;
+ // DMA and timers keep running, then delivers that retrace so guest logic starts exactly on the grid.
+ void PaceToRetraceBoundary(Clock::time_point deadline) {
+     constexpr auto kServiceSlice = 1ms;
++#if defined(__SWITCH__)
++    OS_HLE_NoteHostPace(true);
++    // This wait is the main thread's VIWaitForRetrace (os_scheduler.cpp OS_HLE_PaceRunDueSleepers):
++    // a guest OSSleepTicks deadline that falls in it (the 5 ms sound ticker, 3-4 per frame) is woken
++    // at that deadline, as the alarm interrupt does on hardware, instead of after the wait. Deadlines
++    // in the final spin window are left to the preemption point after the present. Bounded: at most
++    // 64 services per wait, and none after the preemption point refuses.
++    int guestTimerServices = PaceGuestTimersEnabled() ? 64 : 0;
++#endif
+     for (;;) {
+         const auto now = Clock::now();
+         if (now >= deadline) {
+             break;
+         }
++#if defined(__SWITCH__)
++        if (guestTimerServices > 0) {
++            const auto guestDue = EarliestGuestSleepDeadline();
++            if (guestDue < deadline - kFinalSpinWindow) {
++                if (guestDue > now) {
++                    SleepPreciselyUntil(std::min(guestDue, now + kServiceSlice));
++                }
++                OS_HLE_ProcessAlarmsDeferred(8);
++                Audio_HLE_PollDeferred();
++                if (Clock::now() >= guestDue) {
++                    --guestTimerServices;
++                    if (!OS_HLE_PaceRunDueSleepers()) {
++                        guestTimerServices = 0;
++                    }
++                }
++                continue;
++            }
++        }
++#endif
+         if (deadline - now > kServiceSlice + kFinalSpinWindow) {
+             SleepPreciselyUntil(now + kServiceSlice);
+             OS_HLE_ProcessAlarmsDeferred(8);
+@@ -508,6 +576,9 @@ void PaceToRetraceBoundary(Clock::time_point deadline) {
+         SleepPreciselyUntil(deadline, true, kFinalSpinWindow);
+         break;
+     }
++#if defined(__SWITCH__)
++    OS_HLE_NoteHostPace(false);
++#endif
+     VI_HLE_ProcessRetracesDeferred(1);
+ }
+ 
+@@ -752,6 +823,7 @@ extern "C" void VIConfigure_HLE_801b9f6c(CpuContext* ctx)
+             renderMode.xfbHeight != 0 ? renderMode.xfbHeight : renderMode.efbHeight;
+     }
+ 
++    aurora_gx_fifo_quiesce(1);
+     ::VIConfigure(&renderMode);
+ 
+     ViSetR3(ctx, 0);
+diff --git a/runtime/src/host_context.cpp b/runtime/src/host_context.cpp
+index 502f72c..885f8bb 100644
+--- a/runtime/src/host_context.cpp
++++ b/runtime/src/host_context.cpp
+@@ -14,7 +14,7 @@
+ 
+ extern "C" void mkw_co_switch(void** targetSp, void** sourceSp);
+ extern "C" void* mkw_co_init(void* stackTop, void (*entry)(void*), void* argument);
+-#elif defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
++#elif defined(__linux__) || defined(__SWITCH__) || (defined(__APPLE__) && defined(__x86_64__))
+ #include <libco.h>
+ 
+ #include <cstdlib>
+@@ -158,7 +158,7 @@ void Switch(Handle target)
+     g_current = source;
+ }
+ 
+-#elif defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
++#elif defined(__linux__) || defined(__SWITCH__) || (defined(__APPLE__) && defined(__x86_64__))
+ 
+ namespace {
+ struct Context {
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index 4eef06f..6e0b7f9 100644
+index 4eef06f..e210da0 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
 @@ -47,6 +47,8 @@
@@ -43,6 +2243,73 @@ index 4eef06f..6e0b7f9 100644
  #else
      setenv("WIICOMPILED_SKIP_LAUNCHER", "1", 1);
      std::vector<char*> args(g_argv, g_argv + g_argc);
+@@ -958,8 +971,55 @@ Result Run(int argc, char** argv) {
+                      "for a second position (two-way player)."),
+                   YesNo(), RuntimeConfigFile::TwoWayPlayer(false) ? 1 : 0};
+     twoWay.experimental = true;
++    // Lighter graphics (hle/mlb/gfx_options.cpp): for weaker machines and the Switch, where batting with
++    // runners on and fouls or flies behind the catcher (the camera facing the stands) cost the most.
++    constexpr std::array<const char*, 3> kShadowModes{"full", "simple", "off"};
++    constexpr std::array<const char*, 3> kCrowdLevels{"full", "less", "off"};
++    constexpr std::array<uint32_t, 5> kFieldingFovs{100, 90, 80, 70, 60};
++    Option shadows{Tr("SOMBRAS DE JUGADORES", "PLAYER SHADOWS"),
++                   Tr("La sombra que cada jugador proyecta en el campo. Completas es la del juego; Simples deja "
++                      "solo una mancha redonda bajo cada jugador; Sin sombras las quita. Aligera las escenas con "
++                      "muchos jugadores a la vista (batear con corredores en base) en equipos modestos y en Switch. "
++                      "Solo cambia cómo se ve el partido, nunca cómo se juega.",
++                      "The shadow each player casts on the field. Full is the game's; Simple leaves only a round "
++                      "patch under each player; Off removes them. It lightens scenes with many players in view "
++                      "(batting with runners on base) on modest computers and on the Switch. It only changes how "
++                      "the game looks, never how it plays."),
++                   {Tr("Completas (original)", "Full (original)"), Tr("Simples", "Simple"), Tr("Sin sombras", "Off")}};
++    for (size_t i = 0; i < kShadowModes.size(); ++i) {
++        if (RuntimeConfigFile::PlayerShadows("full") == kShadowModes[i]) shadows.value = static_cast<int>(i);
++    }
++    shadows.experimental = true;
++    Option crowd{Tr("PÚBLICO", "CROWD"),
++                 Tr("El público de las gradas. Menos deja la mitad de la gente que el juego pone en las gradas; Sin "
++                    "público las deja vacías. Aligera las jugadas en las que la cámara mira a las gradas (faltas y "
++                    "elevados detrás del receptor). Solo cambia cómo se ve el partido, nunca cómo se juega.",
++                    "The crowd in the stands. Less keeps half of the people the game puts in the stands; Off leaves "
++                    "them empty. It lightens the plays where the camera faces the stands (fouls and flies behind "
++                    "the catcher). It only changes how the game looks, never how it plays."),
++                 {Tr("Completo (original)", "Full (original)"), Tr("Menos", "Less"), Tr("Sin público", "Off")}};
++    for (size_t i = 0; i < kCrowdLevels.size(); ++i) {
++        if (RuntimeConfigFile::CrowdLevel("full") == kCrowdLevels[i]) crowd.value = static_cast<int>(i);
++    }
++    crowd.experimental = true;
++    Option playFov{Tr("CÁMARA DE JUGADA", "PLAY CAMERA"),
++                   Tr("Ángulo de visión de la cámara que sigue la bola tras el batazo. 100 % es el del juego; con "
++                      "menos la cámara se cierra y deja fuera parte del estadio, lo que aligera esas jugadas. Con "
++                      "valores bajos, al fildear a mano la bola o el jugador pueden quedar cerca del borde o fuera "
++                      "de la imagen.",
++                      "Field of view of the camera that follows the ball after it is hit. 100% is the game's; with "
++                      "less the camera closes in and leaves part of the stadium out, which lightens those plays. "
++                      "At low values, when fielding by hand the ball or the fielder can end up near the edge or "
++                      "out of the picture."),
++                   {"100% (original)", "90%", "80%", "70%", "60%"}};
++    for (size_t i = 0; i < kFieldingFovs.size(); ++i) {
++        // The closest choice to the saved percent (Config.toml takes any value from 60 to 100).
++        const auto distance = [&](size_t k) { return std::abs(static_cast<int>(kFieldingFovs[k]) - static_cast<int>(RuntimeConfigFile::FieldingFov(100))); };
++        if (distance(i) < distance(static_cast<size_t>(playFov.value))) playFov.value = static_cast<int>(i);
++    }
++    playFov.experimental = true;
+     std::vector<Tab> tabs{
+-        {"VIDEO", {api, quality, display, resolution, fsr, filtering, mipmaps, msaa, aspect, fill, interpolation, fps}},
++        {"VIDEO", {api, quality, display, resolution, fsr, filtering, mipmaps, msaa, aspect, fill, interpolation, fps, shadows, crowd, playFov}},
+         {"AUDIO", {volume, mute}},
+         {Tr("CONTROLES", "CONTROLS"), {wiimote}},
+         {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
+@@ -1077,6 +1137,9 @@ Result Run(int argc, char** argv) {
+         if (label == universalDh.label) RuntimeConfigFile::SetUniversalDh(o.value != 0);
+         if (label == modernLeagues.label) RuntimeConfigFile::SetModernLeagues(o.value != 0);
+         if (label == twoWay.label) RuntimeConfigFile::SetTwoWayPlayer(o.value != 0);
++        if (label == shadows.label) RuntimeConfigFile::SetPlayerShadows(kShadowModes[static_cast<size_t>(o.value)]);
++        if (label == crowd.label) RuntimeConfigFile::SetCrowdLevel(kCrowdLevels[static_cast<size_t>(o.value)]);
++        if (label == playFov.label) RuntimeConfigFile::SetFieldingFov(kFieldingFovs[static_cast<size_t>(o.value)]);
+         if (label == language.label) {
+             const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
+             RuntimeConfigFile::SetUiLanguage(code);
 diff --git a/runtime/src/launcher_controls.cpp b/runtime/src/launcher_controls.cpp
 index 5f029c0..0b51bbe 100644
 --- a/runtime/src/launcher_controls.cpp
@@ -1735,6 +4002,32 @@ index 7a2f7dd..074d20c 100644
      // Wait for the frame worker's DONE phase: it has replayed the previous frame's ImGui draw lists
      // and started the next ImGui frame, so all overlay callers can now safely issue ImGui commands.
      aurora_wait_for_frame_worker();
+diff --git a/runtime/tests/runtime_config_tests.cpp b/runtime/tests/runtime_config_tests.cpp
+index 749652e..ca4bd15 100644
+--- a/runtime/tests/runtime_config_tests.cpp
++++ b/runtime/tests/runtime_config_tests.cpp
+@@ -42,6 +42,21 @@ int main() {
+         std::istringstream input("[season]\nmax_seasons = 15\n");
+         if (!Require(!RuntimeConfigFile::ParseConfig(input, "seasons.toml").maxSeasons, "15 seasons accepted")) return 1;
+     }
++    {
++        // Lighter graphics: [video] shadows / crowd take their named levels, fielding_fov 60-100; anything else
++        // is ignored (the game then runs as on the Wii).
++        std::istringstream input("[video]\nshadows = \"simple\"\ncrowd = \"off\"\nfielding_fov = 75\n");
++        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "gfx.toml");
++        if (!Require(config.playerShadows == std::optional<std::string>{"simple"}, "shadows level not loaded")) return 1;
++        if (!Require(config.crowdLevel == std::optional<std::string>{"off"}, "crowd level not loaded")) return 1;
++        if (!Require(config.fieldingFov == std::optional<uint32_t>{75}, "fielding_fov not loaded")) return 1;
++        std::istringstream bad("[video]\nshadows = \"none\"\ncrowd = true\nfielding_fov = 50\n");
++        const RuntimeUserConfig rejected = RuntimeConfigFile::ParseConfig(bad, "gfx.toml");
++        if (!Require(!rejected.playerShadows && !rejected.crowdLevel && !rejected.fieldingFov,
++                     "an invalid lighter-graphics setting was accepted")) return 1;
++        std::istringstream wide("[video]\nfielding_fov = 120\n");
++        if (!Require(!RuntimeConfigFile::ParseConfig(wide, "gfx.toml").fieldingFov, "fielding_fov 120 accepted")) return 1;
++    }
+     {
+         // The match benchmark and the stadium viewer must leave the player's Config.toml alone.
+         _putenv("WIICOMPILED_MATCH_BENCH=");
 diff --git a/runtime/third_party/libco/settings.h b/runtime/third_party/libco/settings.h
 index 418c00a..d61eb79 100644
 --- a/runtime/third_party/libco/settings.h
