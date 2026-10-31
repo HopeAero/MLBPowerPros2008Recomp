@@ -2,7 +2,7 @@
 
 *Español: [../../roadmap/switch.md](../../roadmap/switch.md)*
 
-**Status:** in progress: ARM64 on Linux · [Roadmap](../../../ROADMAP.md)
+**Status:** v0.1.0 released (31 October 2026) · [Roadmap](../../../ROADMAP.md)
 
 ## Why
 Power Pros is a console game at heart. A homebrew Switch build would let people play it on the couch and on the go, built from their own copy like on PC.
@@ -36,7 +36,22 @@ Two bugs that only showed up on ARM, fixed in `tools/patches/wiicompiled-aarch64
 
 For the Switch this means the translated code works on ARM64 and the CPU matters: at 1 GHz the Switch's A57s are roughly as fast as the phone's A55s or slower (not measured), and those A55s run at about 12 fps with the null backend. Libraries the build needs to start: libpng16, libz, libfreetype (with libbz2 and libbrotlidec/libbrotlicommon), libm, libstdc++, libgcc_s and libc; SDL3 and Dawn are linked in. SDL and Dawn also load the system's video and audio libraries when present (Vulkan, EGL/GLES, Wayland/X11, PipeWire/PulseAudio/ALSA, udev, D-Bus).
 
+## Switch version 0.1.0 (31 October 2026)
+
+Published in a separate repository: [MLBPR2008-NX v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0). Story and photos in [Discussion #8](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/8). Code on branch `switch-arm64` (phases 1–103 of `tools/patches/wiicompiled-switch*.patch`).
+
+- **Own deko3d renderer** (the Switch's native graphics API), built with devkitPro/libnx.
+- **60 fps handheld without overclock** for almost the whole match. What helped most: the translator only writes back registers that changed (CPU-late frames from ~13% to 6.5%), and the graphics front end spread over the three cores (to 3.6%); with the Low preset, 1.3–1.5%.
+- **Launcher** like the PC one (controller and touch), with Low / Medium / High presets and VIDEO options: player and bat shadows, crowd, reflections, play camera.
+- **Mods** with a virtual `project.bin` (no 406 MB copy to the SD card), Success passwords in `UserData/Players`, and **direct reading of the player's ISO** (checked once, decrypted with hardware AES).
+- Tested on the project owner's console (Atmosphère, handheld, stock clocks), with roster, uniform and stadium mods.
+
 ## Checklist
 - [ ] OpenGL ES backend working
 - [x] ARM64 build running (Linux ARM64, on a phone; see above)
-- [ ] Switch prototype boots to the main menu
+- [x] Switch prototype boots to the main menu
+- [x] Full matches at 60 fps handheld without overclock (almost always)
+- [x] Launcher, mods and direct ISO reading
+- [x] First public release (v0.1.0)
+- [ ] Test direct ISO reading on a console
+- [ ] ABS and the rest of the PC features on Switch too, in every release

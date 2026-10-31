@@ -6,9 +6,9 @@
 
 Para comentarlo: [discusión del roadmap](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/7).
 
-Actualizado: 24 de octubre de 2026 · última versión [v0.1.5](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.5).
+Actualizado: 31 de octubre de 2026 · última versión [v0.1.5](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.5) (PC) y [Switch v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0).
 
-Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto** (lo que cambie el juego se activa en el launcher), y **nunca se distribuyen archivos del juego**: cada jugador lo compila desde su propio disco.
+Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto** (lo que cambie el juego se activa en el launcher), y **nunca se distribuyen archivos del juego**: en PC cada jugador lo compila desde su propio disco; en Switch se publica el NRO y el jugador pone su propio disco (ver [decisiones](docs/decisiones.md)).
 
 ## Ahora
 
@@ -22,6 +22,7 @@ Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto
 
 | Línea de trabajo | Qué | Estado |
 |---|---|---|
+| [ABS: desafíos de bola y strike](docs/roadmap/abs.md) | El sistema de desafíos de MLB 2026 (2 por equipo, umpire automático), opcional en todos los modos | Planificado: investigación hecha |
 | [Postemporada moderna](docs/roadmap/postemporada.md) | La postemporada de 12 equipos (Wild Card Series) en Temporada y MLB Life, opcional | Investigación |
 | [Herramientas de modding](docs/roadmap/herramientas-modding.md) | Mejoras al Texture Studio, al Editor de temporada, a los rosters y estadios; estadios propios en Temporada y MLB Life | Continuo |
 
@@ -30,12 +31,12 @@ Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto
 | Línea de trabajo | Qué | Estado |
 |---|---|---|
 | [Mods de código](docs/roadmap/mods-de-codigo.md) | Mods que cambian la lógica del juego (torneos, reglas, pantallas nuevas) con una API de mods documentada, no solo datos | Investigación |
-| [Nintendo Switch](docs/roadmap/switch.md) | Una versión homebrew para Switch, desde la copia del propio jugador, como la de PC | En curso: ARM64 en Linux llega al primer lanzamiento en un teléfono (aún sin gráficos) |
 
 ## Hecho
 
 | Versión | Lo principal |
 |---|---|
+| [Switch v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0) | [Nintendo Switch](docs/roadmap/switch.md): homebrew nativo a 60 fps en portátil sin overclock, launcher con perfiles gráficos, mods, ISO directa ([repo de releases](https://github.com/HopeAero/MLBPR2008-NX)) |
 | [v0.1.5](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.5) | Jugadores de dos vías (regla Ohtani) en todos los modos; charla de rol con el mánager en MLB Life; escalado con IA y packs de Dolphin en el Texture Studio |
 | [v0.1.4.1](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.4.1) | Corrección de los controles |
 | [v0.1.4](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.4) | Calendarios reales de MLB (2002–2026), año de inicio, DH en ambas ligas, ligas 15/15, Editor de temporada, contraseñas de jugador como texto |

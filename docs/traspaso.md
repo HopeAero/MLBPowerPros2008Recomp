@@ -4,12 +4,23 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
 
 ## Dónde estamos
 
-- **Rendimiento (2026-10-30, stock, portátil):** frames tarde por CPU 6,5 % (T2, fase 87) → **3,6 %** con el front end de Aurora repartido en 3 núcleos (fases 90 + 92, **predeterminado en Switch desde la fase 94**; `WIICOMPILED_GXF_AURORA=0` lo apaga). Uso por núcleo en partido: 0 ≈ 92 %, 1 (decodificador FIFO) ≈ 74 %, 2 (front end GXF, grabación deko3d, audio) ≈ 20 %. Con sombras apagadas y cámara de jugada al 80 %: 1,3–1,5 %; el usuario: "60 FPS". Lo que queda tarde en esas sesiones es GPU (toma inicial en portátil).
-- **Opciones gráficas** (fase 91 + 93, pestaña VIDEO del launcher, `Config.toml` `[video]`, apagadas por defecto; en consola `WIICOMPILED_GFX_SHADOWS=off|simple`, `_CROWD=off|less`, `_FOV=60..100`): sombras de jugadores y bate (la de la pelota se queda), público, campo de visión de la toma de jugada. El público casi no cuesta (medido); sombras + cámara sí. RE en `docs/ingenieria-inversa.md` §20.
-- **Descartado hoy:** PGO (fase 88, herramienta en `tools/switch/pgo/`, `MLB_SWITCH_PGO=gen|use:<dir>`): sin ganancia en partido.
-- **Verificación de GXF:** banco en PC `local/tmp/cpu/GXF2/` (`run.py`): off/thread/deferred/split idénticos byte a byte (entrada del decodificador, estado, lecturas, escrituras guest), 20/20 mutantes. Contadores en la línea `gxf_per_frame`.
-- **Siguiente:** análisis del núcleo 1 en `local/tmp/cpu/GXW/` (D1–D9: estado sucio, memo de pipeline por valor, poda de caché de texturas que cuesta ~2 ms en picos) por si el núcleo 1 se satura; agente GFXOPT4 midiendo otros costes visuales (composición de texturas por jugador `0x806CE608`, reflejos, piezas animadas del estadio, HUD).
-- **El usuario no quiere más pruebas de diagnóstico en consola:** diagnosticar con los logs existentes y pedir solo una prueba final por tanda.
+- **Publicado:** Switch v0.1.0 en el repo aparte [MLBPR2008-NX](https://github.com/HopeAero/MLBPR2008-NX) (solo README, LICENSE y releases; el zip trae el NRO con el icono genérico de libnx, los archivos del runtime y `UserData/Config.toml`, nunca datos del juego). Anuncio: [Discussion #8](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/8). Empaquetado en `local/release-nx/` (repo/, pkg/, notas). Construido desde 225e9f8 (fases 1–103).
+- **Rendimiento (stock, portátil):** frames tarde por CPU 3,6 % con el front end de Aurora repartido (fases 90/92, por defecto desde la 94; `WIICOMPILED_GXF_AURORA=0` lo apaga); 1,3–1,5 % con el perfil Bajo. Nativa exacta de colores de luz (fase 95) y atajo de shader TEV para operandos 1,0 (`WIICOMPILED_DK_EOF_FIX`, modo 1 por defecto). Los pasos 2–3 de GXF (fase 96, `WIICOMPILED_GXF_TEX`/`_STREAM`, opción «Gráficos en paralelo», experimental) quitan ~1,3–1,6 ms al núcleo 0 pero dan tirones en el video de la intro: apagados por defecto.
+- **Launcher en Switch** (fases 98–101): siempre se muestra; perfiles Bajo/Medio/Alto; lo que pide reinicio (mods, roster, gráficos en paralelo) se guarda y se aplica la próxima vez (el reinicio por el cargador dejaba pantalla negra).
+- **Mods en Switch** (fase 102): `project.bin` virtual en la capa DVD (antes copiaba 406 MB a la SD antes del primer frame: pantalla negra y consola trabada). Probado con PowerUp2025, LogosUniformes, Polo Grounds y otro estadio.
+- **ISO directa** (fase 103): sin `Data/`, busca `game.iso` (o un `*.iso` RL8E54), lo monta como `mlbdisc:/`, descifra con AES de libnx y comprueba el contenido una vez (`UserData/DiscImageCheck.txt`). **Probado solo en PC**; con `Data/` en consola sigue igual.
+- **Icono propio:** `MLB_SWITCH_ICON=<jpeg 256x256>` en `build-nro.sh` (fase 100). El icono con portada del dueño está en `local/switch/icon/` y nunca va a un release.
+- **Opciones gráficas** (fases 91, 93, 97; pestaña VIDEO, `[video]` en Config.toml, `WIICOMPILED_GFX_*`): sombras (jugadores y bate; la pelota se queda), público (casi no pesa), reflejos, campo de visión de la toma de jugada.
+
+## Siguiente
+
+- **ABS** (pedido del dueño): investigación hecha, plan con fases en [docs/roadmap/abs.md](roadmap/abs.md), RE en `docs/ingenieria-inversa.md` §21. Antes de implementar, el dueño decide: ¿error del umpire para que el bateador gane desafíos, o solo zona de reglamento? ¿qué botón?
+- Probar la ISO directa en consola. Núcleo 1 con estado sucio si hace falta (`local/tmp/cpu/GXW/`, D1–D9).
+
+## Cómo se trabajó (para repetirlo)
+
+- Cada cambio: un agente edita el árbol de compilación y entrega un snippet en `local/tmp/cpu/*.py` (formato `T2-codegen.py`); se integra con `python local/tmp/cpu/phase-integrate.py <snippet> <n> "<título>"`, luego `local/tmp/mkswitch.sh` y `local/tmp/P11-verify.sh`, y `tools/switch/build-nro.sh --graphics vulkan` (~15 min; ~40 con re-traducción). **Nunca ejecutar `local/tmp/switch_edit.py` sobre el árbol de compilación**: si pasa, `rm src/runtime/include/game_natives_rebound.h` y recompilar (rehace el árbol desde los parches).
+- **El dueño no quiere pruebas de diagnóstico en consola:** diagnosticar con los logs existentes y pedir una sola prueba final por tanda. Pruebas por nxlink: `python tools/switch/nxlink.py 192.168.0.105 <nro> --path mlbpowerpros2008/MLBPowerPros2008.nro --wait 300 [VARIABLES]`.
 
 ## GX-F1 (2026-10-28): factibilidad, sin cambios de runtime
 

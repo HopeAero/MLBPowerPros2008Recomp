@@ -2,7 +2,7 @@
 
 *English: [../en/roadmap/switch.md](../en/roadmap/switch.md)*
 
-**Estado:** en curso: ARM64 en Linux · [Roadmap](../../ROADMAP.es.md)
+**Estado:** publicada la v0.1.0 (31 de octubre de 2026) · [Roadmap](../../ROADMAP.es.md)
 
 ## Por qué
 Power Pros es, en el fondo, un juego de consola. Una versión homebrew para Switch permitiría jugarlo en el sofá y fuera de casa, compilado desde la copia de cada uno como en PC.
@@ -36,7 +36,22 @@ Dos fallos que solo aparecieron en ARM, ya arreglados en `tools/patches/wiicompi
 
 Para la Switch esto significa que el código traducido funciona en ARM64 y que la CPU importa: a 1 GHz, los A57 de la Switch rinden, a ojo, como los A55 del teléfono o menos (sin medir), y esos A55 se quedan en unos 12 FPS con el backend nulo. Bibliotecas que necesita la compilación al arrancar: libpng16, libz, libfreetype (con libbz2 y libbrotlidec/libbrotlicommon), libm, libstdc++, libgcc_s y libc; SDL3 y Dawn van enlazados. SDL y Dawn cargan además, si existen, las de vídeo y sonido del sistema (Vulkan, EGL/GLES, Wayland/X11, PipeWire/PulseAudio/ALSA, udev, D-Bus).
 
+## Versión 0.1.0 para Switch (31 de octubre de 2026)
+
+Publicada en un repositorio aparte: [MLBPR2008-NX v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0). Historia y fotos en la [Discussion #8](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/8). Código en la rama `switch-arm64` (fases 1–103 de `tools/patches/wiicompiled-switch*.patch`; resumen técnico y siguiente paso en [docs/traspaso.md](../traspaso.md)).
+
+- **Renderer propio en deko3d** (la API gráfica nativa de la Switch), compilado con devkitPro/libnx.
+- **60 fps en portátil sin overclock** en casi todo el partido. Lo que más ayudó: el traductor solo guarda los registros que cambiaron (frames tarde por CPU de ~13 % a 6,5 %), y el front end de gráficos repartido en los tres núcleos (a 3,6 %); con el perfil Bajo, 1,3–1,5 %.
+- **Launcher** como el de PC (mando y táctil), con perfiles Bajo / Medio / Alto y opciones de VIDEO: sombras de jugadores y del bate, público, reflejos, cámara de jugada.
+- **Mods** con `project.bin` virtual (sin copiar 406 MB a la SD), contraseñas de Success en `UserData/Players`, y **lectura directa de la ISO** del jugador (comprobada una vez, descifrada con AES por hardware).
+- Probado en la consola del dueño del proyecto (Atmosphère, portátil, relojes de fábrica), con mods de roster, uniformes y estadios.
+
 ## Casillas
 - [ ] Backend OpenGL ES funcionando
 - [x] Versión ARM64 funcionando (Linux ARM64, en un teléfono; ver arriba)
-- [ ] El prototipo de Switch llega al menú principal
+- [x] El prototipo de Switch llega al menú principal
+- [x] Partidos completos a 60 fps en portátil sin overclock (casi siempre)
+- [x] Launcher, mods y lectura directa de la ISO
+- [x] Primera versión pública (v0.1.0)
+- [ ] Probar la lectura directa de la ISO en consola
+- [ ] ABS y lo demás de PC también en Switch, en cada versión
