@@ -5434,7 +5434,7 @@ index 502f72c..885f8bb 100644
  namespace {
  struct Context {
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index 4eef06f..3bd622b 100644
+index 4eef06f..4ab7c0e 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
 @@ -47,6 +47,14 @@
@@ -5961,16 +5961,17 @@ index 4eef06f..3bd622b 100644
          if (label == language.label) {
              const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
              RuntimeConfigFile::SetUiLanguage(code);
-@@ -1103,11 +1375,19 @@ Result Run(int argc, char** argv) {
+@@ -1103,11 +1375,20 @@ Result Run(int argc, char** argv) {
      settings_overlay::PrepareLauncherControllers();
      const auto savedNavFlags = ImGui::GetIO().ConfigFlags;
      ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 +#if defined(__SWITCH__)
 +    const bool savedNavSwap = ImGui::GetIO().ConfigNavSwapGamepadButtons;
 +    ImGui::GetIO().ConfigNavSwapGamepadButtons = true;  // ImGui's own navigation too: A accepts, B goes back
-+    // Restart-only settings (mods, roster players, parallel graphics) restart the game through the
-+    // homebrew loader when it can; otherwise they apply the next time the game opens.
-+    const bool canRelaunch = SwitchUiCanRelaunch();
++    // Restart-only settings (mods, roster players, parallel graphics) are saved and apply the next time the
++    // game opens: restarting through the homebrew loader left a black screen on the console (2026-10-31),
++    // and forwarders cannot rely on it either.
++    const bool canRelaunch = false;
 +#endif
      const Art art = LoadArt();
  
@@ -5981,7 +5982,7 @@ index 4eef06f..3bd622b 100644
      if (const char* select = std::getenv("WIICOMPILED_LAUNCHER_SELECT"); select != nullptr && *select != '\0') {
          for (size_t i = 0; i < apis.size(); ++i) {
              if (std::strcmp(apis[i].configName, select) == 0 && option(0, 0).value != static_cast<int>(i)) {
-@@ -1117,6 +1397,7 @@ Result Run(int argc, char** argv) {
+@@ -1117,6 +1398,7 @@ Result Run(int argc, char** argv) {
          }
          choice = Choice::Play;
      }
@@ -5989,7 +5990,7 @@ index 4eef06f..3bd622b 100644
      // WIICOMPILED_LAUNCHER_PAGE=settings opens the settings panel (screenshots).
      const char* page = std::getenv("WIICOMPILED_LAUNCHER_PAGE");
      // (=mods / =tools open the MODS screen on its MODS or HERRAMIENTAS tab.)
-@@ -1136,8 +1417,8 @@ Result Run(int argc, char** argv) {
+@@ -1136,8 +1418,8 @@ Result Run(int argc, char** argv) {
      // rebuilt on the same page; the rebuilt one finds the language already set and does nothing).
      if (testAction != nullptr && std::strncmp(testAction, "language-", 9) == 0) {
          for (size_t i = 0; i < kLanguageCodes.size(); ++i) {
@@ -6000,7 +6001,7 @@ index 4eef06f..3bd622b 100644
                  apply(3, 1);
              }
          }
-@@ -1147,6 +1428,7 @@ Result Run(int argc, char** argv) {
+@@ -1147,6 +1429,7 @@ Result Run(int argc, char** argv) {
      int menu = 0;
      int tab = page && std::strcmp(page, "controls") == 0 ? 2 : page && std::strcmp(page, "enhancements") == 0 ? 4 : toolsPage ? kModsTab + 1 : modsOnly ? kModsTab : 0;
      if (tab == 2 || tab == 4) settingsOpen = true;  // =controls, =enhancements (MEJORAS)
@@ -6008,15 +6009,15 @@ index 4eef06f..3bd622b 100644
      int row = 0;
      // Long lists use the rows that fit at the current size; page controls stay
      // below the scrollable list. Q/E and L1/R1 switch settings categories.
-@@ -1165,6 +1447,21 @@ Result Run(int argc, char** argv) {
+@@ -1165,6 +1448,21 @@ Result Run(int argc, char** argv) {
          return value && std::strcmp(value, "nav") == 0 && RuntimeConfigFile::PortableRootDirectory().has_value();
      }();
  #include "../tests/launcher_nav_probe.inc"
 +#if defined(__SWITCH__)
 +    const char* restartNote = canRelaunch ? Tr("Ajustes cambiados: JUGAR reinicia el juego para aplicarlos.",
 +                                               "Settings changed: PLAY restarts the game to apply them.")
-+                                          : Tr("Ajustes cambiados: algunos se aplican la próxima vez que abras el juego.",
-+                                               "Settings changed: some apply the next time you open the game.");
++                                          : Tr("Guardado. Este cambio se aplica la próxima vez que abras el juego.",
++                                               "Saved. This change applies the next time you open the game.");
 +    const char* settingsLine = Tr("Gráficos, audio, controles e idioma.", "Graphics, audio, controls and language.");
 +    const char* settingsPill = Tr("Cambia los gráficos, el audio, los controles y el idioma.",
 +                                  "Changes the graphics, audio, controls and language.");
@@ -6030,7 +6031,7 @@ index 4eef06f..3bd622b 100644
      using Clock = std::chrono::steady_clock;
      const auto start = Clock::now();
      auto nextFrame = start;
-@@ -1177,6 +1474,9 @@ Result Run(int argc, char** argv) {
+@@ -1177,6 +1475,9 @@ Result Run(int argc, char** argv) {
              continue;
          }
          aurora_wait_for_frame_worker();
@@ -6040,7 +6041,7 @@ index 4eef06f..3bd622b 100644
          ImGui::GetIO().ConfigFlags = savedNavFlags | ImGuiConfigFlags_NavEnableKeyboard;
          if (launcher_controls::Capturing())
              ImGui::GetIO().ConfigFlags &= ~(ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard);
-@@ -1279,8 +1579,7 @@ Result Run(int argc, char** argv) {
+@@ -1279,8 +1580,7 @@ Result Run(int argc, char** argv) {
                  }
                  // Info box (its baked example text was erased from main.png).
                  const char* lines[] = {Tr("¡A jugar! Arranca MLB Power Pros 2008.", "Play ball! Starts MLB Power Pros 2008."),
@@ -6050,7 +6051,7 @@ index 4eef06f..3bd622b 100644
                                         Tr("Activa o desactiva mods de texturas y archivos.", "Switches texture and file mods on or off."),
                                         Tr("Cierra el juego.", "Closes the game.")};
                  ShadowedText(dl, g_text, 31 * s, at(100, 777), IM_COL32_WHITE, lines[menu]);
-@@ -1296,7 +1595,7 @@ Result Run(int argc, char** argv) {
+@@ -1296,7 +1596,7 @@ Result Run(int argc, char** argv) {
                  ShadowedText(dl, g_text, 22 * s, ImVec2(at(1578, 0).x - vw, at(0, 822).y), Rgba(200, 225, 255),
                               version.c_str());
                  if (restart) {
@@ -6059,7 +6060,7 @@ index 4eef06f..3bd622b 100644
                      const float nw = TextSize(g_text, 22 * s, note).x;
                      ShadowedText(dl, g_text, 22 * s, ImVec2(at(1578, 0).x - nw, at(0, 782).y), Rgba(255, 224, 110), note);
                  }
-@@ -1338,7 +1637,7 @@ Result Run(int argc, char** argv) {
+@@ -1338,7 +1638,7 @@ Result Run(int argc, char** argv) {
                  {Tr("JUGAR", "PLAY"), Rgba(255, 206, 96), Rgba(240, 112, 18), Rgba(150, 50, 0),
                   Tr("¡A jugar! Arranca MLB Power Pros 2008.", "Play ball! Starts MLB Power Pros 2008."), nullptr},
                  {Tr("AJUSTES", "SETTINGS"), Rgba(160, 244, 120), Rgba(34, 164, 58), Rgba(10, 90, 30),
@@ -6068,7 +6069,7 @@ index 4eef06f..3bd622b 100644
                   Tr("Los cambios se guardan al momento.", "Changes are saved right away.")},
                  {Tr("SALIR", "EXIT"), Rgba(244, 160, 244), Rgba(168, 64, 200), Rgba(90, 20, 120), Tr("Cierra el juego.", "Closes the game."), nullptr},
              }};
-@@ -1404,7 +1703,7 @@ Result Run(int argc, char** argv) {
+@@ -1404,7 +1704,7 @@ Result Run(int argc, char** argv) {
              ShadowedText(dl, g_text, 20 * u, ImVec2(ib.x - 28 * u - vs.x, ib.y - 40 * u), Rgba(190, 225, 255),
                           version.c_str());
              if (restart) {
@@ -6077,7 +6078,7 @@ index 4eef06f..3bd622b 100644
                  const ImVec2 ns = TextSize(g_text, 20 * u, note);
                  ShadowedText(dl, g_text, 20 * u, ImVec2(ib.x - 28 * u - ns.x, ia.y + 22 * u), Rgba(255, 224, 120), note);
              }
-@@ -1439,10 +1738,16 @@ Result Run(int argc, char** argv) {
+@@ -1439,10 +1739,16 @@ Result Run(int argc, char** argv) {
  
      aurora_set_skip_unready_pipelines(savedSkipPipelines);
      ImGui::GetIO().ConfigFlags = savedNavFlags;
@@ -6094,7 +6095,7 @@ index 4eef06f..3bd622b 100644
          return restart && again == Result::Play ? Result::Relaunch : again;
      }
      if (choice == Choice::Quit) {
-@@ -1451,8 +1756,17 @@ Result Run(int argc, char** argv) {
+@@ -1451,8 +1757,17 @@ Result Run(int argc, char** argv) {
      if (!restart) {
          return Result::Play;
      }
