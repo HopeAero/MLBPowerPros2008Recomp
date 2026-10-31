@@ -1405,3 +1405,23 @@ but only sample beyond 17 ms; physics earlier in the same frame cannot be
 excluded. Mixed windows have no contact/flight markers. The ball's
 contribution versus fielding/camera/rendering remains unresolved;
 trajectories, collisions and simulation frequency are unchanged.
+
+## 20. Lighter graphics options (GFXOPT, phase 1, 2026-10-30)
+
+`RL8E54`; static analysis (dtk asm and the translation). REA does not open PowerPC. Profile: `nxlink-MLBPowerPros2008-20261029-223358.log` with `elf-syms-P29.txt`; scripts in `local/tmp/cpu/GFXOPT/`.
+
+- **Cost per draw (measured, correlation):** over 9 match spans of 30 s, 165 to 425 display-list calls per frame against 6.4–14.4 ms of main thread: 28.7 µs per call (game 12.3, GX 13.7, rest 2.8). This is the all-in cost per drawn mesh, not only the draw itself.
+- **Player shadows:** real projected shadows.
+  - The character (constructor `0x806D83F0`, vtable `0x80D5EFF8`) has its body at `+0x3E0` (`0x806E2704`), 13 parts at `+0x550`..`+0x13D0`, a round shadow at `+0x14F0` and three shadow projectors at `+0x1600`, `+0x17D0` and `+0x19A0` (class `0x80146308`, constructor `0x8000EC70`).
+  - The projector stores the light direction at `+0x150` (default (0, −1, 0)) and the flattening matrix at `+0x194`, rows (1, −Lx/Ly, 0, 0), (0, 0, 0, 0), (0, −Lz/Ly, 1, 0). It follows the skeleton of the model at `+0x160`, draws with `0x8000F400` and loads matrices with `0x8000F574` → `0x80046198`.
+- **Shadow mode:** `0x806DA22C(character, mode)` detaches the four shadows and stores the mode at `+0x3A8`: 0 none; 1 round shadow (`PWM_mdl_main_Common.pack` `+0x38`, 4 triangles); 2 and 3 projected body shadow (`+0x4E8`, 690 triangles, skinned) plus two items (`+0x52D4`/`+0x6514` or `+0x5BF4`/`+0x6ED4`, 72–80 triangles); 3 also sets bit 7 of `+0x148` (`0x8000EB54`). Only `0x806DA4E8` (visibility) and `0x806DAF80` (shadow placement) read `+0x3A8`. No caller uses the return value.
+- **The 28 small per-player passes are not shadows:** `0x806CE608` (object at body `+0x148`) composes each character's textures in 2D with `0x806CC2EC`/`0x806CC9DC` and copies them at 128 × 128 (RGBA8, then RGB565).
+- **Crowd:** `0x80C5DA4C(scene, level)` does not depend on attendance.
+  - The level is kept at `+0x7B8`; it is 2 when scene `+0x6B0` is 0. Level 0 hides types `0x14`/`0x16` (F); level 1 hides `0x13`/`0x17` (S); level 2 hides all crowd; 3 or more shows everything.
+  - With `config+0xD == 3` (`0x8080B548`), `0x80C5EC94` sets level 2: empty stadium.
+  - Every frame `0x80C60A94` decides each placement: tree A (`0x80C86068`), table `+0x6B8` and frustum sphere test (`0x80CCB2F4`), applied through the node's virtual `+0x10` (`+0x5F0`). Other functions write fixed table entries (`0x80C5D520`, `0x80C60D2C`, `0x80C782D8`…).
+  - In the 40 stadiums with a table: 28 to 45 crowd meshes per stadium (S 469, F 421 and C 246 in total). The stadium's own shadow pieces (`0x06`) are 68 meshes in total.
+- **Effects:** `game_effect.pack` (record `0x461`, loaded by `0x80877D98`) holds 6 single-mesh models. Effect class `0x80145F08` (`0x8000B040`, allocation `0x8000AD2C`, setup `0x8000AF28`). The 21 effect spawners (`0x8088FBF8`..`0x80892CB0`) first ask `0x8088FBC0`, which returns 0 when `common+0x22` is set and `config+0xD != 3`. `common+0x22` is a general match flag (about 70 readers). `0x80AA4650` clears it briefly to force `0x80891A50`. `0x80891520` does not ask.
+- **Camera:** `0x80054BEC(camera, degrees)` sets the field of view (`+0x1D8`, focal `+0x1C4`, bit `+0x80 |= 2`). The play shot `0x808F1C5C` computes it once per shot from `[0x8103E708]+0x6C`, and the copy `0x80055300` carries it to the main camera. Still unknown: which shot is used for fouls and fly balls behind the catcher.
+- **Engine:** `0x80022840` queues nodes by priority (`0x8031ABD8`) and `0x80023188` draws them (virtual `+0x1C`). Generic model draw: `0x80015C10`; per mesh: `0x800614A8` → `0x80061150`. Per-mesh colours: `0x80061220`, with the flag `0x8031AFD0` from `0x80060C60`. `0x8001EAE0` draws the 2D/sprite class (`0x80146A88`; orthographic in `0x80048D74`).
+- **Randomness:** LCG `0x41C64E6D` in `0x8001926C`..`0x800195E4` and `0x8012466C`; not reachable (direct calls, 4 levels) from the shadow, crowd or effect code.

@@ -1418,3 +1418,23 @@ modelos y FIFO, pero muestrean después de 17 ms: no permiten descartar física
 ejecutada antes en el mismo frame. Las ventanas mixtas no tienen marcas de
 contacto/vuelo. Sigue sin atribuirse cuánto aporta la pelota frente a defensa,
 cámara y dibujo; no se cambian trayectorias, colisiones ni simulación.
+
+## 20. Opciones gráficas ligeras (GFXOPT, fase 1, 2026-10-30)
+
+`RL8E54`; análisis estático (asm de dtk y traducción). REA no abre PowerPC. Perfil: `nxlink-MLBPowerPros2008-20261029-223358.log` con `elf-syms-P29.txt`; scripts en `local/tmp/cpu/GFXOPT/`.
+
+- **Coste por dibujo (medido, correlación):** en 9 tramos de 30 s de partido, de 165 a 425 llamadas a display list por fotograma frente a 6,4–14,4 ms de hilo principal: 28,7 µs por llamada (juego 12,3, GX 13,7, resto 2,8). Es el coste total por malla dibujada, no solo el del dibujo.
+- **Sombras de los jugadores:** son sombras proyectadas de verdad.
+  - El personaje (constructor `0x806D83F0`, vtable `0x80D5EFF8`) tiene el cuerpo en `+0x3E0` (`0x806E2704`), 13 piezas en `+0x550`..`+0x13D0`, una sombra redonda en `+0x14F0` y tres proyectores de sombra en `+0x1600`, `+0x17D0` y `+0x19A0` (clase `0x80146308`, constructor `0x8000EC70`).
+  - El proyector guarda la dirección de la luz en `+0x150` (por defecto (0, −1, 0)) y la matriz de aplanado en `+0x194`, con filas (1, −Lx/Ly, 0, 0), (0, 0, 0, 0) y (0, −Lz/Ly, 1, 0). Sigue el esqueleto del modelo de `+0x160`. Dibuja con `0x8000F400` y carga las matrices con `0x8000F574` → `0x80046198`.
+- **Modo de sombra:** `0x806DA22C(personaje, modo)` desengancha las cuatro sombras y guarda el modo en `+0x3A8`: 0 sin sombra; 1 sombra redonda (`PWM_mdl_main_Common.pack` `+0x38`, 4 triángulos); 2 y 3 sombra proyectada del cuerpo (`+0x4E8`, 690 triángulos, con esqueleto) y de dos objetos (`+0x52D4`/`+0x6514` o `+0x5BF4`/`+0x6ED4`, de 72 a 80 triángulos); el 3 activa el bit 7 de `+0x148` (`0x8000EB54`). Solo leen `+0x3A8` `0x806DA4E8` (visibilidad) y `0x806DAF80` (colocación de las sombras). Ningún llamador usa el valor devuelto.
+- **Las 28 pasadas pequeñas por jugador no son sombras:** `0x806CE608` (objeto en cuerpo `+0x148`) compone en 2D las texturas de cada personaje con `0x806CC2EC`/`0x806CC9DC` y las copia a 128 × 128 (RGBA8 y luego RGB565).
+- **Público:** `0x80C5DA4C(escena, nivel)` no depende de la asistencia.
+  - El nivel queda en `+0x7B8` y es 2 si escena `+0x6B0` vale 0. Nivel 0: oculta los tipos `0x14`/`0x16` (F); nivel 1: oculta `0x13`/`0x17` (S); nivel 2: oculta todo el público; 3 o más: lo muestra todo.
+  - Con `config+0xD == 3` (`0x8080B548`), `0x80C5EC94` pone el nivel 2: estadio vacío.
+  - Cada fotograma, `0x80C60A94` decide cada colocación: árbol A (`0x80C86068`), tabla `+0x6B8` y esfera en el frustum (`0x80CCB2F4`), y lo aplica con el virtual `+0x10` del nodo (`+0x5F0`). Otras funciones escriben entradas fijas de la tabla (`0x80C5D520`, `0x80C60D2C`, `0x80C782D8`…).
+  - En los 40 estadios con tabla: de 28 a 45 mallas de público por estadio (S 469, F 421 y C 246 en total). Las piezas de sombra del estadio (`0x06`) son 68 mallas en total.
+- **Efectos:** `game_effect.pack` (registro `0x461`, lo carga `0x80877D98`) contiene 6 modelos de una malla. Clase de efecto `0x80145F08` (`0x8000B040`, reserva `0x8000AD2C`, preparación `0x8000AF28`). Los 21 creadores de efectos (`0x8088FBF8`..`0x80892CB0`) preguntan primero a `0x8088FBC0`, que devuelve 0 si `common+0x22` está activo y `config+0xD != 3`. `common+0x22` es un indicador general del partido (unos 70 lectores). `0x80AA4650` lo borra un momento para forzar `0x80891A50`. `0x80891520` no pregunta.
+- **Cámara:** `0x80054BEC(cámara, grados)` fija el campo de visión (`+0x1D8`, focal `+0x1C4`, bit `+0x80 |= 2`). La toma de jugada `0x808F1C5C` lo calcula una vez por toma a partir de `[0x8103E708]+0x6C` y la copia `0x80055300` lo pasa a la cámara principal. Sin determinar: qué toma se usa en los fouls y elevados detrás del receptor.
+- **Motor:** `0x80022840` encola nodos por prioridad (`0x8031ABD8`) y `0x80023188` los dibuja (virtual `+0x1C`). Dibujo de modelo genérico: `0x80015C10`; por malla: `0x800614A8` → `0x80061150`. Colores por malla: `0x80061220`, con el indicador `0x8031AFD0` de `0x80060C60`. `0x8001EAE0` dibuja la clase 2D/sprite (`0x80146A88`; ortográfica en `0x80048D74`).
+- **Aleatoriedad:** generador LCG `0x41C64E6D` en `0x8001926C`..`0x800195E4` y `0x8012466C`; no se alcanza (llamadas directas, 4 niveles) desde el código de sombras, público ni efectos.
