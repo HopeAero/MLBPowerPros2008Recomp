@@ -1,3 +1,485 @@
+diff --git a/runtime/src/hle/mlb/reverb_natives.cpp b/runtime/src/hle/mlb/reverb_natives.cpp
+new file mode 100644
+index 0000000..4876bf6
+--- /dev/null
++++ b/runtime/src/hle/mlb/reverb_natives.cpp
+@@ -0,0 +1,454 @@
++// MLB Power Pros 2008 (RL8E54): a native 0x800BC3AC, the AXFX "ReverbHi" processing callback
++// (AXFXReverbHiCallback 0x800BC0E8 is a single branch to it). Run 11 profile: 4.2% of the Switch
++// main thread, the hottest audio function.
++//
++// void Reverb(int32_t** bufs /* r3: L, R, S */, Work* w /* r4 */) runs once per AX aux frame
++// (__AXOutNewFrame 0x800BA0D4, from the audio DMA callback: 96 samples = 3 ms, ~5.6 calls per
++// video frame). If w+0x10C is nonzero it clears bit 1 there and returns. Otherwise, per sample
++// and per channel (L, R, S): x = (float)(in + busIn), a 3-tap early line, an optional predelay
++// line, 3 parallel combs, 2 shared-index all-passes, a one-pole low-pass, a per-channel last
++// all-pass; then a crosstalk mix between the three channels written back in place as integers
++// (fctiwz, times w+0x140) and, with a bus-out descriptor, to the bus (times w+0x144). Every line
++// index steps once per sample and wraps at its length. docs/en/reverse-engineering.md section 4
++// ("MIX mixer and reverb") has the work-area layout.
++//
++// The translation emulates every single-precision op (operand rounded to 25 bits, the double
++// result narrowed through fcvt), turns each stfs into the Gekko narrowing routine plus the MMIO
++// check, keeps every index, pointer and scratch value on the guest stack or in the work area
++// with a reload per channel, and converts each input integer through the 0x43300000 double trick
++// on the stack. Here a sample is the same loads and stores of the sample arrays in the same
++// order, the arithmetic in host single precision, the work-area fields and stack slots in
++// registers, written once at the end.
++//
++// Why host singles give the translation's bits (FPCR.FZ on or off as it is; any rounding mode):
++// every operand is a single (lfs loads, single results, the exact int -> float conversion), so
++// PpcForce25BitInline is the identity, a single product is exact in a double, and a double sum
++// or product of singles narrowed once equals the single op (53 >= 2*24 + 2). FZ flushes subnormal
++// inputs and tiny results alike in both. stfs of a single is its own bits in
++// ConvertPpcDoubleToSingleBits. fctiwz of a single equals FCVTZS (saturating, toward zero) but
++// for NaN (0x80000000), kept. NaNs are where the two could part: an op with two NaN operands
++// returns one of them, and which one depends on the operand order the compiler picked for the
++// translation. Every NaN that arises in a call reaches a stored float (the integer conversions
++// do not depend on payloads), so the fast path checks every float it stores (an fmax chain:
++// fmax propagates NaN), and a call that stores a NaN is undone and run by the translation.
++//
++// Fast path conditions, checked at entry (else the translation runs the whole call): the flat
++// view, w+0x10C zero, the magic double at r2-30248 is 0x4330000080000000, and no access of the
++// call can see the deferred state: the stack frame [r1-112, r1+8), the work area [w, w+0x148)
++// and the constants [r2-30268, r2-30240) must not overlap one another, and every sample array
++// range the call can touch (in/out buffers, bus-in and bus-out buffers, every line from its index
++// over 96 steps, conservatively) must neither overlap them nor wrap nor touch the MMIO window
++// (0xCC000000-0xCDFFFFFF), nor may the buffer descriptors overlap the stack frame. The sample
++// arrays may overlap one another: their loads and stores keep the program order.
++//
++// Rollback: each sample-array store goes through an undo log (the value it replaces, which the
++// lines read just before the store); on a NaN the log is replayed backwards and nothing else has
++// been written yet (stack slots, work-area fields and the context are written after the loop).
++//
++// Kept exactly on the fast path (cross-checked with the translation in qemu-aarch64, see the
++// snippet header local/tmp/cpu/C5-reverb.py): every guest store (frame, saved registers, LR slot,
++// scratch slots, the pointer slots, the conversion double, the lines, the outputs, the work-area
++// indices and low-pass states) and the whole register state the translation leaves (r0-r12,
++// r25-r31, f0-f13, CR, CTR, LR).
++//
++// This file builds like the translated code (-O2 -fno-fast-math -ffp-contract=off, outside the
++// unity build: runtime/CMakeLists.txt); the FP ops are single instructions in asm anyway.
++#if defined(__SWITCH__)
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++
++extern "C" void func_800BC3AC(CpuContext* ctx);  // the translation (kept: _AS registration)
++
++namespace mlb_reverb {
++
++// WIICOMPILED_NATIVE_MIX_FAST=0 turns the line prefetch in the sample loop off (read once at startup).
++const bool g_prefetch = [] {
++    const char* value = std::getenv("WIICOMPILED_NATIVE_MIX_FAST");
++    return !(value != nullptr && value[0] == '0');
++}();
++
++// ---- guest memory, flat view (ranges proven plain before use) ----
++
++[[gnu::always_inline]] inline uint8_t* Host(uint32_t address) { return MKW_FLAT_GUEST_BASE + address; }
++
++[[gnu::always_inline]] inline uint32_t Bits(float value) {
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof bits);
++    return bits;
++}
++
++[[gnu::always_inline]] inline float Float(uint32_t bits) {
++    float value;
++    std::memcpy(&value, &bits, sizeof value);
++    return value;
++}
++
++[[gnu::always_inline]] inline uint32_t Load32(uint32_t address) {
++    uint32_t raw;
++    std::memcpy(&raw, Host(address), sizeof raw);
++    return __builtin_bswap32(raw);
++}
++
++[[gnu::always_inline]] inline uint64_t Load64(uint32_t address) {
++    uint64_t raw;
++    std::memcpy(&raw, Host(address), sizeof raw);
++    return __builtin_bswap64(raw);
++}
++
++[[gnu::always_inline]] inline void Store32(uint32_t address, uint32_t value) {
++    const uint32_t raw = __builtin_bswap32(value);
++    std::memcpy(Host(address), &raw, sizeof raw);
++}
++
++// One instruction each, so nothing can be fused, reassociated or widened.
++[[gnu::always_inline]] inline float Mul(float a, float b) { float r; __asm__("fmul %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++[[gnu::always_inline]] inline float Add(float a, float b) { float r; __asm__("fadd %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++[[gnu::always_inline]] inline float Sub(float a, float b) { float r; __asm__("fsub %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++// fmax returns a NaN when either operand is one: the running "any NaN stored" test.
++[[gnu::always_inline]] inline float Max(float a, float b) { float r; __asm__("fmax %s0, %s1, %s2" : "=w"(r) : "w"(a), "w"(b)); return r; }
++[[gnu::always_inline]] inline float FromInt(uint32_t v) { float r; __asm__("scvtf %s0, %w1" : "=w"(r) : "r"(v)); return r; }
++[[gnu::always_inline]] inline double Widen(float a) { double r; __asm__("fcvt %d0, %s1" : "=w"(r) : "w"(a)); return r; }
++// fctiwz of a single: saturating, toward zero, NaN -> 0x80000000 (PpcClampIntegerWordInline).
++[[gnu::always_inline]] inline uint32_t Fctiwz(float a) {
++    uint32_t r;
++    __asm__("fcvtzs %w0, %s1" : "=r"(r) : "w"(a));
++    return a != a ? 0x80000000u : r;
++}
++
++// ---- ranges ----
++
++// Cache hints (PRFM: no fault, no guest-visible effect). Run 26 profile: 78% of this function's samples sit on its
++// loads of the delay lines and sample buffers (about 40 streams, each one word per sample, each one new 64-byte line
++// per 16 samples, cold after the 3 ms the game runs between two calls). Every 16 samples the lines the next 16 need.
++[[gnu::always_inline]] inline void PfLine(uint32_t address) { __builtin_prefetch(MKW_FLAT_GUEST_BASE + address, 1, 3); }
++[[gnu::always_inline]] inline void PfAhead(uint32_t address, bool first) {
++    if (first) { PfLine(address); PfLine(address + 60u); }
++    PfLine(address + 64u);
++    PfLine(address + 124u);
++}
++
++struct Area { uint64_t lo, hi; };
++
++inline bool Plain(uint64_t lo, uint64_t hi) {
++    return hi <= 0x100000000ull && (hi <= 0xCC000000ull || lo >= 0xCE000000ull);
++}
++inline bool Overlap(uint64_t lo, uint64_t hi, const Area& a) { return lo < a.hi && a.lo < hi; }
++
++struct Guard {
++    Area stack, work, consts;
++    bool ok;
++    void Range(uint64_t lo, uint64_t hi) {
++        if (lo >= hi) return;
++        ok = ok && Plain(lo, hi) && !Overlap(lo, hi, stack) && !Overlap(lo, hi, work) && !Overlap(lo, hi, consts);
++    }
++    // The slots a line indexed by `index` (wrapping at `length`) touches over 96 samples.
++    void Line(uint32_t base, uint32_t index, uint32_t length) {
++        const uint64_t b = base;
++        if (index < length) {
++            if (length - index >= 96u) Range(b + 4ull * index, b + 4ull * index + 384u);
++            else Range(b, b + 4ull * length);
++        } else {  // index, then 0, 1, ... (only 0 when the length is 0)
++            Range(b + 4ull * index, b + 4ull * index + 4u);
++            Range(b, b + 4ull * (length == 0u ? 1u : (length < 96u ? length : 96u)));
++        }
++    }
++};
++
++[[gnu::always_inline]] inline uint32_t Step(uint32_t index, uint32_t length) {
++    const uint32_t next = index + 1u;
++    return next < length ? next : 0u;
++}
++
++// ---- rollback ----
++
++struct UndoEntry { uint32_t address, old; };
++constexpr uint32_t kUndoCapacity = 96u * 30u;  // per sample: 3 x (early, predelay, 3 combs, 3 all-passes) + 6 outputs
++UndoEntry g_undo[kUndoCapacity];
++
++// ---- the call ----
++
++struct Channel {
++    uint32_t early, predelay, comb[3], allpass[2], last;  // line base addresses
++    uint32_t lastIndex, lastLength;
++    float lowpass;
++    uint32_t in, busIn, out;                              // sample pointers
++    float scratch;                                        // [sp+20+4ch]
++};
++
++[[gnu::noinline, gnu::cold]] void Translated(CpuContext& context) { func_800BC3AC(&context); }
++
++// Returns false, with nothing written, when the translation must run the call.
++bool Run(CpuContext& c) {
++    const uint32_t r1 = c.gpr[1], r2 = c.gpr[2], r3 = c.gpr[3], w = c.gpr[4];
++    if (r1 < 112u || r2 < 30268u) return false;
++    const uint32_t sp = r1 - 112u;
++    const uint32_t kc = r2 - 30268u;
++    Guard g{{sp, uint64_t(sp) + 120u}, {w, uint64_t(w) + 0x148u}, {kc, uint64_t(kc) + 28u}, true};
++    if (!Plain(g.stack.lo, g.stack.hi) || !Plain(g.work.lo, g.work.hi) || !Plain(g.consts.lo, g.consts.hi)) return false;
++    if (Overlap(g.stack.lo, g.stack.hi, g.work) || Overlap(g.stack.lo, g.stack.hi, g.consts) ||
++        Overlap(g.work.lo, g.work.hi, g.consts))
++        return false;
++    if (Load32(w + 268u) != 0u) return false;  // the bypass path (clears bit 1): rare, translation
++    if (Load64(kc + 20u) != 0x4330000080000000ull) return false;
++
++    const uint32_t busInDesc = Load32(w + 312u), busOutDesc = Load32(w + 316u);
++    const auto descriptorOk = [&](uint32_t d) {
++        return Plain(d, uint64_t(d) + 12u) && !Overlap(d, uint64_t(d) + 12u, g.stack);
++    };
++    if (!descriptorOk(r3) || (busInDesc != 0u && !descriptorOk(busInDesc)) ||
++        (busOutDesc != 0u && !descriptorOk(busOutDesc)))
++        return false;
++
++    // Work area (struct offsets in the doc).
++    const uint32_t earlyLength = Load32(w + 24u), predelayLength = Load32(w + 60u);
++    const uint32_t combLength[3] = {Load32(w + 116u), Load32(w + 120u), Load32(w + 124u)};
++    const uint32_t allpassLength[2] = {Load32(w + 184u), Load32(w + 188u)};
++    uint32_t e0 = Load32(w + 12u), e1 = Load32(w + 16u), e2 = Load32(w + 20u);
++    uint32_t pp = Load32(w + 56u);
++    uint32_t cj[3] = {Load32(w + 104u), Load32(w + 108u), Load32(w + 112u)};
++    uint32_t ak[2] = {Load32(w + 176u), Load32(w + 180u)};
++    const float earlyCoef[3] = {Float(Load32(w + 32u)), Float(Load32(w + 36u)), Float(Load32(w + 40u))};
++    const float combCoef[3] = {Float(Load32(w + 140u)), Float(Load32(w + 144u)), Float(Load32(w + 148u))};
++    const float allpassCoef = Float(Load32(w + 248u));
++    const float lpf = Float(Load32(w + 264u));
++    const float crosstalk = Float(Load32(w + 300u)), fused = Float(Load32(w + 308u));
++    const float outGain = Float(Load32(w + 320u)), sendGain = Float(Load32(w + 324u));
++    const float kZero = Float(Load32(kc)), kOne = Float(Load32(kc + 4u));
++    const float k06 = Float(Load32(kc + 8u)), k05 = Float(Load32(kc + 12u));
++
++    Channel ch[3];
++    for (uint32_t i = 0; i < 3; ++i) {
++        Channel& h = ch[i];
++        h.early = Load32(w + 4u * i);
++        h.predelay = Load32(w + 44u + 4u * i);
++        for (uint32_t k = 0; k < 3; ++k) h.comb[k] = Load32(w + 68u + 12u * i + 4u * k);
++        for (uint32_t k = 0; k < 2; ++k) h.allpass[k] = Load32(w + 152u + 8u * i + 4u * k);
++        h.last = Load32(w + 200u + 4u * i);
++        h.lastIndex = Load32(w + 212u + 4u * i);
++        h.lastLength = Load32(w + 224u + 4u * i);
++        h.lowpass = Float(Load32(w + 252u + 4u * i));
++        h.in = Load32(r3 + 4u * i);
++        h.busIn = busInDesc != 0u ? Load32(busInDesc + 4u * i) : 0u;
++        h.scratch = 0.0f;
++        g.Line(h.early, e0, earlyLength);
++        g.Line(h.early, e1, earlyLength);
++        g.Line(h.early, e2, earlyLength);
++        if (predelayLength != 0u) g.Line(h.predelay, pp, predelayLength);
++        for (uint32_t k = 0; k < 3; ++k) g.Line(h.comb[k], cj[k], combLength[k]);
++        for (uint32_t k = 0; k < 2; ++k) g.Line(h.allpass[k], ak[k], allpassLength[k]);
++        g.Line(h.last, h.lastIndex, h.lastLength);
++        g.Range(h.in, uint64_t(h.in) + 384u);
++        if (busInDesc != 0u) g.Range(h.busIn, uint64_t(h.busIn) + 384u);
++    }
++    // r3, r5, r6 as the translation leaves them before the loop: the bus-out pointers.
++    uint32_t o3 = r3, o5 = ch[1].in, o6 = ch[0].in;
++    if (busInDesc != 0u) { o5 = ch[0].busIn; o3 = ch[1].busIn; }
++    if (busOutDesc != 0u) {
++        o3 = Load32(busOutDesc); o5 = Load32(busOutDesc + 4u); o6 = Load32(busOutDesc + 8u);
++        g.Range(o3, uint64_t(o3) + 384u); g.Range(o5, uint64_t(o5) + 384u); g.Range(o6, uint64_t(o6) + 384u);
++    }
++    if (!g.ok) return false;
++
++    const float oneMinusLpf = Sub(kOne, lpf);  // f4
++    const float fusedGain = Mul(k06, fused);   // f5
++    const float cross = Mul(k05, crosstalk);   // f6
++
++    UndoEntry* undo = g_undo;
++    const auto logged = [&undo](uint32_t address, uint32_t old, uint32_t value) {
++        *undo++ = UndoEntry{address, old};
++        Store32(address, value);
++    };
++    float nan = 0.0f;  // becomes NaN once any stored float is one
++    uint32_t convWord = 0;
++    float lp = 0.0f, rp = 0.0f, sp2 = 0.0f;  // the crosstalk results (f9, f8, f7) of the last sample
++    uint32_t lastInt = 0, lastK1 = 0;
++
++    for (uint32_t s = 0; s < 96u; ++s) {
++        if (g_prefetch && (s & 15u) == 0u) {
++            const bool first = s == 0u;
++            for (uint32_t i = 0; i < 3; ++i) {
++                const Channel& h = ch[i];
++                PfAhead(h.early + (e0 << 2), first); PfAhead(h.early + (e1 << 2), first); PfAhead(h.early + (e2 << 2), first);
++                if (predelayLength != 0u) PfAhead(h.predelay + (pp << 2), first);
++                for (uint32_t k = 0; k < 3; ++k) PfAhead(h.comb[k] + (cj[k] << 2), first);
++                for (uint32_t k = 0; k < 2; ++k) PfAhead(h.allpass[k] + (ak[k] << 2), first);
++                PfAhead(h.last + (h.lastIndex << 2), first);
++                PfAhead(h.in, first);
++                if (busInDesc != 0u) PfAhead(h.busIn, first);
++            }
++            if (busOutDesc != 0u) { PfAhead(o3, first); PfAhead(o5, first); PfAhead(o6, first); }
++        }
++#pragma GCC unroll 3
++        for (uint32_t i = 0; i < 3; ++i) {
++            Channel& h = ch[i];
++            // Input: in (+ bus in), the int32 sum as a float.
++            uint32_t v;
++            if (busInDesc != 0u) {
++                const uint32_t b = Load32(h.busIn);
++                h.busIn += 4u;
++                v = Load32(h.in) + b;
++            } else {
++                v = Load32(h.in);
++            }
++            convWord = v ^ 0x80000000u;
++            const float x = FromInt(v);
++            const uint32_t xb = Bits(x);
++            // Early reflections: three taps, the input written at the third.
++            const uint32_t t0 = Load32(h.early + (e0 << 2)), t1 = Load32(h.early + (e1 << 2));
++            const uint32_t a2 = h.early + (e2 << 2);
++            const uint32_t t2 = Load32(a2);
++            logged(a2, t2, xb);
++            float early = Add(Mul(earlyCoef[0], Float(t0)), Mul(earlyCoef[1], Float(t1)));
++            early = Add(Mul(earlyCoef[2], Float(t2)), early);
++            // Predelay.
++            float d = x;
++            if (predelayLength != 0u) {
++                const uint32_t a = h.predelay + (pp << 2);
++                const uint32_t old = Load32(a);
++                logged(a, old, xb);
++                d = Float(old);
++            }
++            // Three combs in parallel, their outputs summed.
++            float sum = kZero;
++#pragma GCC unroll 3
++            for (uint32_t k = 0; k < 3; ++k) {
++                const uint32_t a = h.comb[k] + (cj[k] << 2);
++                const uint32_t old = Load32(a);
++                const float cv = Float(old);
++                const float fb = Mul(cv, combCoef[k]);
++                sum = Add(sum, cv);
++                const float stored = Add(d, fb);
++                nan = Max(nan, stored);
++                logged(a, old, Bits(stored));
++            }
++            // Two all-passes.
++            float y = sum;
++#pragma GCC unroll 2
++            for (uint32_t k = 0; k < 2; ++k) {
++                const uint32_t a = h.allpass[k] + (ak[k] << 2);
++                const uint32_t old = Load32(a);
++                const float av = Float(old);
++                const float t = Add(y, Mul(av, allpassCoef));
++                nan = Max(nan, t);
++                logged(a, old, Bits(t));
++                y = Sub(av, Mul(t, allpassCoef));
++            }
++            // Low-pass.
++            const float lowpass = Add(Mul(oneMinusLpf, y), Mul(lpf, h.lowpass));
++            nan = Max(nan, lowpass);
++            h.lowpass = lowpass;
++            // The channel's own last all-pass.
++            {
++                const uint32_t a = h.last + (h.lastIndex << 2);
++                const uint32_t old = Load32(a);
++                const float cv = Float(old);
++                const float t = Add(lowpass, Mul(cv, allpassCoef));
++                nan = Max(nan, t);
++                logged(a, old, Bits(t));
++                const float out = Sub(cv, Mul(t, allpassCoef));
++                h.lastIndex = Step(h.lastIndex, h.lastLength);
++                h.scratch = Add(Mul(out, fusedGain), early);
++            }
++        }
++        // Crosstalk between L, R, S; written back in place and to the bus.
++        const float l = ch[0].scratch, r = ch[1].scratch, sv = ch[2].scratch;
++        lp = Add(l, Mul(Add(r, sv), cross));
++        rp = Add(r, Mul(Add(l, sv), cross));
++        sp2 = Add(sv, Mul(Add(l, r), cross));
++        nan = Max(nan, Max(lp, Max(rp, sp2)));
++        logged(ch[0].in, Load32(ch[0].in), Fctiwz(Mul(lp, outGain)));
++        logged(ch[1].in, Load32(ch[1].in), Fctiwz(Mul(rp, outGain)));
++        lastInt = Fctiwz(Mul(sp2, outGain));
++        logged(ch[2].in, Load32(ch[2].in), lastInt);
++        ch[0].in += 4u; ch[1].in += 4u; ch[2].in += 4u;
++        if (busOutDesc != 0u) {
++            logged(o3, Load32(o3), Fctiwz(Mul(lp, sendGain)));
++            logged(o5, Load32(o5), Fctiwz(Mul(rp, sendGain)));
++            lastInt = Fctiwz(Mul(sp2, sendGain));
++            logged(o6, Load32(o6), lastInt);
++            o3 += 4u; o5 += 4u; o6 += 4u;
++        }
++        e0 = Step(e0, earlyLength); e1 = Step(e1, earlyLength); e2 = Step(e2, earlyLength);
++        if (predelayLength != 0u) pp = Step(pp, predelayLength);
++        cj[0] = Step(cj[0], combLength[0]); cj[1] = Step(cj[1], combLength[1]); cj[2] = Step(cj[2], combLength[2]);
++        lastK1 = ak[1];
++        ak[0] = Step(ak[0], allpassLength[0]); ak[1] = Step(ak[1], allpassLength[1]);
++    }
++
++    if (nan != nan) [[unlikely]] {
++        while (undo != g_undo) {
++            --undo;
++            Store32(undo->address, undo->old);
++        }
++        return false;
++    }
++
++    // The stack frame as the translation leaves it.
++    Store32(sp, r1);
++    Store32(sp + 116u, c.lr);
++    for (uint32_t reg = 25; reg <= 31; ++reg) Store32(sp + 84u + 4u * (reg - 25u), c.gpr[reg]);
++    if (busInDesc != 0u) {
++        for (uint32_t i = 0; i < 3; ++i) Store32(sp + 8u + 4u * i, ch[i].busIn);
++        Store32(sp + 56u, 0x43300000u);
++        Store32(sp + 60u, convWord);
++    } else {
++        Store32(sp + 64u, 0x43300000u);
++        Store32(sp + 68u, convWord);
++    }
++    for (uint32_t i = 0; i < 3; ++i) Store32(sp + 20u + 4u * i, Bits(ch[i].scratch));
++    Store32(sp + 32u, Bits(lp));
++    Store32(sp + 36u, Bits(rp));
++    Store32(sp + 40u, Bits(sp2));
++    for (uint32_t i = 0; i < 3; ++i) Store32(sp + 44u + 4u * i, ch[i].in);
++    // The work-area fields it steps.
++    Store32(w + 12u, e0); Store32(w + 16u, e1); Store32(w + 20u, e2);
++    if (predelayLength != 0u) Store32(w + 56u, pp);
++    Store32(w + 104u, cj[0]); Store32(w + 108u, cj[1]); Store32(w + 112u, cj[2]);
++    Store32(w + 176u, ak[0]); Store32(w + 180u, ak[1]);
++    for (uint32_t i = 0; i < 3; ++i) {
++        Store32(w + 212u + 4u * i, ch[i].lastIndex);
++        Store32(w + 252u + 4u * i, Bits(ch[i].lowpass));
++    }
++
++    // Registers.
++    const uint32_t lr = c.lr;
++    c.gpr[0] = lr;
++    c.gpr[3] = o3; c.gpr[5] = o5; c.gpr[6] = o6;
++    c.gpr[7] = allpassLength[1];
++    c.gpr[8] = lastK1 + 1u;
++    c.gpr[9] = w + 8u;
++    c.gpr[10] = ch[1].in - 4u;
++    c.gpr[11] = r1;
++    c.gpr[12] = ch[0].in - 4u;
++    c.ctr = 0u;
++    SetCRResident(c.cr, c.xer, 0, uint32_t(96u), uint32_t(96u));
++    c.fpr[0].raw = 0x4330000080000000ull;
++    c.fpr[1].d = Widen(lpf);
++    c.fpr[2].raw = lastInt;
++    c.fpr[3].d = Widen(allpassCoef);
++    c.fpr[4].d = Widen(oneMinusLpf);
++    c.fpr[5].d = Widen(fusedGain);
++    c.fpr[6].d = Widen(cross);
++    c.fpr[7].d = Widen(sp2);
++    c.fpr[8].d = Widen(rp);
++    c.fpr[9].d = Widen(lp);
++    c.fpr[10].d = Widen(ch[0].scratch);
++    c.fpr[11].d = Widen(ch[2].scratch);
++    c.fpr[12].d = Widen(ch[1].scratch);
++    c.fpr[13].d = Widen(Add(ch[0].scratch, ch[1].scratch));
++    return true;
++}
++
++}  // namespace mlb_reverb
++
++extern "C" void MLB_ReverbHi_800BC3AC(CpuContext* ctx) {
++    if (GuestFlat::RequiresCheckedAccess() || !mlb_reverb::Run(*ctx)) [[unlikely]]
++        mlb_reverb::Translated(*ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x800BC3AC, MLB_ReverbHi_800BC3AC, "AXFXReverbHiProcess");
++#endif
+diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
+index eeedef2..a6fb804 100644
+--- a/runtime/src/hle/mlb/season_cap.cpp
++++ b/runtime/src/hle/mlb/season_cap.cpp
+@@ -15,6 +15,9 @@
+ #include "mods.h"
+ #include "runtime_config.h"
+ 
++// The year atlas may still be read by queued GX draws (WIICOMPILED_GX_FIFO=deferred|thread).
++extern "C" void aurora_gx_fifo_quiesce(uint32_t reason); // aurora gx/fifo_async.inc
++
+ namespace season_cap {
+ 
+ namespace {
+@@ -558,6 +561,7 @@ bool PaintYearPicture(CpuContext* ctx, int year) {
+     }
+     if (!PictureTexels(ctx, kFirstPictureYear, texels, u0, v0)) return false;
+     const YearPicture picture = ComposeYearPicture(year, units);
++    aurora_gx_fifo_quiesce(0);
+     for (int y = 0; y < kYearPictureHeight; ++y)
+         for (int x = 0; x < kYearPictureWidth; ++x)
+             Memory::Write8(texels + C8Offset(u0 + x, v0 + y, 512), picture[y * kYearPictureWidth + x]);
 diff --git a/runtime/src/hle/mlb/thp_natives.cpp b/runtime/src/hle/mlb/thp_natives.cpp
 new file mode 100644
 index 0000000..47d869a
@@ -3912,10 +4394,10 @@ index 0000000..624bd23
 +#endif
 diff --git a/runtime/src/platform/switch/switch_threads.cpp b/runtime/src/platform/switch/switch_threads.cpp
 new file mode 100644
-index 0000000..e8aa273
+index 0000000..5114af1
 --- /dev/null
 +++ b/runtime/src/platform/switch/switch_threads.cpp
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,38 @@
 +// Core and priority for threads that libnx would start at 0x3B on the default core
 +// (aurora.cpp's frame worker and presenter, the AX mixer). Lower number = higher priority;
 +// the game's main thread runs at 0x2C on core 0.
@@ -3925,6 +4407,33 @@ index 0000000..e8aa273
 +extern "C" void SwitchPinCurrentThread(int core, int priority) {
 +    svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
 +    svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
++}
++
++// A libnx thread (threadCreate: no pthread, nothing to detach) at `priority` on `core`, running
++// entry(arg) for the life of the process (aurora's GXF split front end). Returns an id for
++// SwitchThreadCpuNs, 0 on failure.
++extern "C" uintptr_t SwitchStartThread(void (*entry)(void*), void* arg, size_t stack, int priority, int core) {
++    auto* thread = new Thread{};
++    if (R_FAILED(threadCreate(thread, entry, arg, nullptr, stack, priority, core))) {
++        delete thread;
++        return 0;
++    }
++    if (R_FAILED(threadStart(thread))) {
++        threadClose(thread);
++        delete thread;
++        return 0;
++    }
++    return reinterpret_cast<uintptr_t>(thread);
++}
++
++// CPU time a SwitchStartThread thread has run, on any core (0 when unknown).
++extern "C" uint64_t SwitchThreadCpuNs(uintptr_t thread) {
++    u64 ticks = 0;
++    if (thread == 0 ||
++        R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, reinterpret_cast<Thread*>(thread)->handle, u64(-1)))) {
++        return 0;
++    }
++    return armTicksToNs(ticks);
 +}
 +#endif
 diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp

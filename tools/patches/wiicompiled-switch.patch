@@ -5387,7 +5387,7 @@ index 9818084..ef23e67 100644
 +
 +#include "fifo_async.inc"
 diff --git a/aurora-main/lib/gx/fifo.hpp b/aurora-main/lib/gx/fifo.hpp
-index b01ea45..469feb9 100644
+index b01ea45..cbeac66 100644
 --- a/aurora-main/lib/gx/fifo.hpp
 +++ b/aurora-main/lib/gx/fifo.hpp
 @@ -3,6 +3,8 @@
@@ -5471,7 +5471,7 @@ index b01ea45..469feb9 100644
    if (!detail::sInDisplayList)
      LIKELY {
        if (detail::sBufferSize < detail::sBufferCapacity)
-@@ -76,14 +130,262 @@ inline void write_f32(const float val) {
+@@ -76,14 +130,268 @@ inline void write_f32(const float val) {
  // Display list recording
  void begin_display_list(uint8_t* buf, uint32_t size);
  uint32_t end_display_list();
@@ -5620,6 +5620,11 @@ index b01ea45..469feb9 100644
 +namespace detail {
 +extern bool sGxf;       // set once by resolve_mode (main thread), never changed after
 +extern bool sGxfThread; // GXF with its worker thread (WIICOMPILED_GX_FIFO=thread); else deferred
++// WIICOMPILED_GXF_SPLIT=1 (with sGxfThread; default off): the GXF worker runs on its own core-2
++// thread as the producer of the thread mode (Mode::Thread), and the FIFO worker (core 1) decodes
++// its segments; a sync point waits for both (front end, then decoder). Off: sGxfThread's worker
++// is the deferred-mode producer and decoder in one core-1 thread.
++extern bool sGxfSplit;
 +} // namespace detail
 +// True on the GXF worker, and on the main thread inside a GxfDirect scope (or while it runs the
 +// records itself in deferred mode): Aurora runs the call there instead of recording it.
@@ -5633,7 +5638,8 @@ index b01ea45..469feb9 100644
 +              bool kick = false);
 +// Payloads above this run at a sync point instead (gxf_sync, then the call).
 +constexpr uint32_t kGxfMaxPayload = 128u << 10;
-+// Main thread: returns when every record is run and every segment it pushed is decoded.
++// Main thread: returns when every record is run and every segment it pushed is decoded (split:
++// the front-end thread has run them, then the FIFO worker has decoded what it pushed).
 +void gxf_sync();
 +bool gxf_direct_begin(const char* site);
 +void gxf_direct_end() noexcept;
@@ -5737,10 +5743,10 @@ index b01ea45..469feb9 100644
 +#endif
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 new file mode 100644
-index 0000000..4f4b01d
+index 0000000..e8e56dd
 --- /dev/null
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -0,0 +1,1622 @@
+@@ -0,0 +1,1763 @@
 +// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
 +// at the end of fifo.cpp.
 +//
@@ -5783,6 +5789,9 @@ index 0000000..4f4b01d
 +#if defined(__SWITCH__)
 +extern "C" void SwitchPinCurrentThread(int core, int priority); // runtime platform/switch
 +extern "C" void SwitchProfilerRegisterGxThread();
++// GXF split (runtime platform/switch/switch_threads.cpp): a libnx threadCreate thread, and its CPU time.
++extern "C" uintptr_t SwitchStartThread(void (*entry)(void*), void* arg, size_t stack, int priority, int core);
++extern "C" uint64_t SwitchThreadCpuNs(uintptr_t thread);
 +#endif
 +
 +namespace aurora::gx::fifo {
@@ -5800,6 +5809,10 @@ index 0000000..4f4b01d
 +#endif
 +bool sGxf = false;
 +bool sGxfThread = false;
++bool sGxfSplit = false;
++// Below the frame worker, presenter and audio threads that share core 2 (0x2C, the AX mixer
++// 0x2B): they preempt the front end, never the reverse. WIICOMPILED_GXF_SPLIT_PRIO overrides.
++int sGxfSplitPriority = 0x2D;
 +
 +Mode resolve_mode() noexcept {
 +#if defined(__SWITCH__)
@@ -5840,8 +5853,23 @@ index 0000000..4f4b01d
 +    } else {
 +      sGxf = true;
 +      sGxfThread = mode == Mode::Thread;
-+      mode = Mode::Deferred;
-+      Log.info("GXF: Aurora front end on the FIFO worker ({})", sGxfThread ? "thread" : "deferred");
++      // WIICOMPILED_GXF_SPLIT=1: the front end gets a thread of its own (core 2) and is the
++      // producer of this file's thread mode; the FIFO worker (core 1) only decodes.
++      const char* split = std::getenv("WIICOMPILED_GXF_SPLIT");
++      sGxfSplit = sGxfThread && split != nullptr && split[0] == '1';
++      if (const char* prio = std::getenv("WIICOMPILED_GXF_SPLIT_PRIO"); sGxfSplit && prio != nullptr) {
++        const long value = std::strtol(prio, nullptr, 0);
++        if (value >= 0x20 && value <= 0x3F) {
++          sGxfSplitPriority = static_cast<int>(value);
++        }
++      }
++      if (!sGxfSplit) {
++        mode = Mode::Deferred;
++      }
++      Log.info("GXF: Aurora front end on the FIFO worker ({})", sGxfSplit ? "split" : sGxfThread ? "thread" : "deferred");
++      if (sGxfSplit) {
++        Log.info("GXF: split, front end on core 2 at priority 0x{:x}, decoding on core 1", sGxfSplitPriority);
++      }
 +    }
 +  }
 +  sMode = mode;
@@ -5900,8 +5928,16 @@ index 0000000..4f4b01d
 +  std::atomic<uint64_t> errors{0};
 +  std::atomic<uint64_t> foreignWrites{0}; // FIFO producer state moved between two worker batches
 +  std::atomic<uint64_t> checkViolations{0};
++  // Split (WIICOMPILED_GXF_SPLIT=1): the front-end thread's waits for the decoder and the segments
++  // it handed over; the main thread's waits for the decoder at sync points (after the front end's).
++  std::atomic<uint64_t> execWaits{0};
++  std::atomic<uint64_t> execWaitNs{0};
++  std::atomic<uint64_t> execSegments{0};
++  uint64_t decWaits = 0;   // main
++  uint64_t decWaitNs = 0;  // main
 +};
 +GxfStats sGxfStats;
++uintptr_t sGxfExecThread = 0; // split on the console: the front-end thread (SwitchStartThread)
 +
 +struct Snapshot {
 +  uint64_t drains[static_cast<size_t>(DrainReason::Count)]{};
@@ -5910,6 +5946,8 @@ index 0000000..4f4b01d
 +           arrayHazards = 0, decodeErrors = 0, copiesQueued = 0, copiesInline = 0;
 +  uint64_t gxfRecords = 0, gxfBytes = 0, gxfSyncs = 0, gxfWaitNs = 0, gxfRingWaits = 0, gxfExecNs = 0,
 +           gxfErrors = 0, gxfForeign = 0, gxfCheck = 0;
++  uint64_t gxfExecWaits = 0, gxfExecWaitNs = 0, gxfExecSegments = 0, gxfDecWaits = 0, gxfDecWaitNs = 0,
++           gxfExecCpuNs = 0;
 +#if defined(__SWITCH__)
 +  uint64_t a3[kA3CounterCount]{};
 +  uint64_t g6[kG6CounterCount]{};
@@ -5947,6 +5985,15 @@ index 0000000..4f4b01d
 +  s.gxfErrors = sGxfStats.errors.load(std::memory_order_relaxed);
 +  s.gxfForeign = sGxfStats.foreignWrites.load(std::memory_order_relaxed);
 +  s.gxfCheck = sGxfStats.checkViolations.load(std::memory_order_relaxed);
++  s.gxfExecWaits = sGxfStats.execWaits.load(std::memory_order_relaxed);
++  s.gxfExecWaitNs = sGxfStats.execWaitNs.load(std::memory_order_relaxed);
++  s.gxfExecSegments = sGxfStats.execSegments.load(std::memory_order_relaxed);
++  s.gxfDecWaits = sGxfStats.decWaits;
++  s.gxfDecWaitNs = sGxfStats.decWaitNs;
++#if defined(__SWITCH__)
++  // One kernel call per stats mark/report (never per frame): the thread's CPU time on any core.
++  s.gxfExecCpuNs = sGxfExecThread != 0 ? SwitchThreadCpuNs(sGxfExecThread) : 0;
++#endif
 +#if defined(__SWITCH__)
 +  std::memcpy(s.a3, aurora_gx_a3_counters, sizeof(s.a3));
 +  std::memcpy(s.g6, aurora_gx_g6_counters, sizeof(s.g6));
@@ -6061,6 +6108,10 @@ index 0000000..4f4b01d
 +bool sStarted = false;
 +thread_local bool tWorker = false;
 +thread_local bool tStreamCall = false; // decoding a stream-ordered call (GXCopyTex/GXCopyDisp)
++// GXF (fifo.hpp): this thread runs front-end calls itself; the GXF worker; the split decoder.
++thread_local bool tGxfExec = false;
++thread_local bool tGxfWorker = false;
++thread_local bool tGxfDecoder = false;
 +// The guest's alarm/retrace/audio pump the frame-worker waits run (aurora_set_frame_worker_wait_callback).
 +std::atomic<void (*)()> sWaitService{nullptr};
 +
@@ -6321,6 +6372,12 @@ index 0000000..4f4b01d
 +
 +void worker_main() noexcept {
 +  tWorker = true;
++  if (detail::sGxf) {
++    // GXF split: the decoder re-enters front-end entry points (CopyTexOnDecoder -> GXCopyTex) and
++    // must run them, as the GXF worker that decoded inline did, never record them into the ring.
++    tGxfExec = true;
++    tGxfDecoder = true;
++  }
 +#if defined(__SWITCH__)
 +  // Core 1 at the game's priority; the frame worker moves to core 2 in this mode (aurora.cpp).
 +  SwitchPinCurrentThread(1, 0x2C);
@@ -6453,15 +6510,21 @@ index 0000000..4f4b01d
 +      });
 +      shared.mainWaitTarget.store(0, std::memory_order_relaxed);
 +    }
-+    if (!reached) {
++    if (!reached && !tWorker) {
 +      // As the frame-worker waits do: keep the guest's VI/alarm/audio timing alive. This thread
-+      // runs the guest; the worker never calls it (aurora.cpp checks on_worker_thread()).
++      // runs the guest; the worker never calls it (aurora.cpp checks on_worker_thread()), nor does
++      // the GXF split front end, the producer here then (the main thread pumps while waiting for it).
 +      if (const auto service = sWaitService.load(std::memory_order_acquire)) {
 +        service();
 +      }
 +    }
 +  }
-+  sStats.waitNs += nanos_since(start);
++  const uint64_t waited = nanos_since(start);
++  sStats.waitNs += waited;
++  if (tGxfWorker) {
++    sGxfStats.execWaits.fetch_add(1, std::memory_order_relaxed);
++    sGxfStats.execWaitNs.fetch_add(waited, std::memory_order_relaxed);
++  }
 +}
 +
 +void wait_idle() { wait_processed(sPushed); }
@@ -6923,8 +6986,6 @@ index 0000000..4f4b01d
 +uint64_t sGxfDoneSeen = 0;  // main: a GxfShared::done value read earlier
 +uint64_t sGxfInlineDone = 0; // deferred: bytes the main thread has run
 +std::atomic<uint64_t> sGxfDirectEpoch{0};
-+thread_local bool tGxfExec = false;
-+thread_local bool tGxfWorker = false;
 +
 +constexpr uint32_t align16(uint32_t v) noexcept { return (v + 15u) & ~15u; }
 +
@@ -6955,6 +7016,15 @@ index 0000000..4f4b01d
 +    }
 +    from += header.size;
 +  }
++  if (detail::sGxfSplit) {
++    // Split: the decoder is the FIFO worker (core 1). The calls above ended in kick() as the
++    // thread mode's producer; anything still unpublished is handed over before the batch counts
++    // as done (the main thread may take the producer state right after).
++    if (sStarted) {
++      publish_pushed();
++    }
++    return;
++  }
 +  gxf_decode_pushed();
 +}
 +
@@ -6972,9 +7042,15 @@ index 0000000..4f4b01d
 +  tGxfExec = true;
 +  tGxfWorker = true;
 +#if defined(__SWITCH__)
-+  // Core 1, as the FIFO worker it replaces; the frame worker is on core 2 (aurora.cpp).
-+  SwitchPinCurrentThread(1, 0x2C);
-+  SwitchProfilerRegisterGxThread();
++  if (detail::sGxfSplit) {
++    // Split: core 2 under the frame worker (deko3d recording), presenter and audio, which preempt
++    // it; the FIFO worker it feeds keeps core 1 (and the profiler's GX thread slot).
++    SwitchPinCurrentThread(2, detail::sGxfSplitPriority);
++  } else {
++    // Core 1, as the FIFO worker it replaces; the frame worker is on core 2 (aurora.cpp).
++    SwitchPinCurrentThread(1, 0x2C);
++    SwitchProfilerRegisterGxThread();
++  }
 +#endif
 +  GxfShared& shared = *sGxfShared;
 +  uint64_t done = shared.done.load(std::memory_order_acquire);
@@ -7009,9 +7085,11 @@ index 0000000..4f4b01d
 +      }
 +    }
 +    const auto start = Clock::now();
++    const uint64_t pushedBefore = sPushed;
 +    gxf_run(done, available);
 +    done = available;
 +    sGxfStats.execNs.fetch_add(nanos_since(start), std::memory_order_relaxed);
++    sGxfStats.execSegments.fetch_add(sPushed - pushedBefore, std::memory_order_relaxed);
 +    mark = gxf_producer_mark();
 +    shared.done.store(done, std::memory_order_seq_cst);
 +    const uint64_t target = shared.mainWaitTarget.load(std::memory_order_seq_cst);
@@ -7038,7 +7116,17 @@ index 0000000..4f4b01d
 +  sGxfShared = new GxfShared();
 +  sGxfRing = static_cast<uint8_t*>(malloc(kGxfCapacity));
 +  ASSERT(sGxfRing != nullptr, "GXF: cannot allocate {} bytes", kGxfCapacity);
-+  if (detail::sGxfThread) {
++  if (detail::sGxfSplit) {
++#if defined(__SWITCH__)
++    // A libnx thread (threadCreate, never a detached pthread) on core 2; lives as long as the process.
++    sGxfExecThread = SwitchStartThread([](void*) { gxf_worker_main(); }, nullptr, 512u << 10,
++                                       detail::sGxfSplitPriority, 2);
++    ASSERT(sGxfExecThread != 0, "GXF: cannot start the front-end thread");
++#else
++    static auto* worker = new std::thread(gxf_worker_main);
++    (void)worker;
++#endif
++  } else if (detail::sGxfThread) {
 +    // Lives as long as the process (see ensure_started).
 +    static auto* worker = new std::thread(gxf_worker_main);
 +    (void)worker;
@@ -7120,6 +7208,51 @@ index 0000000..4f4b01d
 +  tGxfExec = wasExec;
 +}
 +
++// Split, main thread, front end idle (done == head): until the FIFO worker has decoded every
++// segment the front end pushed. The main thread is the producer meanwhile (it wakes the worker as
++// any thread-mode wait does). Returns false after running the guest pump, whose GX calls append
++// records and so wake the front end again: the caller waits for it first, then comes back.
++bool gxf_wait_decoded() {
++  if (!sStarted) {
++    return true;
++  }
++  Shared& shared = *sShared;
++  const uint64_t target = sPushed;
++  if (shared.processed.load(std::memory_order_acquire) >= target) {
++    return true;
++  }
++  ZoneScopedN("GXF decoder wait");
++  const auto start = Clock::now();
++  ++sGxfStats.decWaits;
++  kick(true);
++  bool pumped = false;
++  const auto spinUntil = start + kMainSpin;
++  for (uint32_t i = 1; shared.processed.load(std::memory_order_acquire) < target; ++i) {
++    if ((i & 63) != 0 || Clock::now() < spinUntil) {
++      cpu_relax();
++      continue;
++    }
++    bool reached;
++    {
++      std::unique_lock lock(shared.mutex);
++      shared.mainWaitTarget.store(target, std::memory_order_seq_cst);
++      reached = shared.mainCv.wait_for(lock, std::chrono::milliseconds(1), [&] {
++        return shared.processed.load(std::memory_order_seq_cst) >= target;
++      });
++      shared.mainWaitTarget.store(0, std::memory_order_relaxed);
++    }
++    if (!reached) {
++      if (const auto service = sWaitService.load(std::memory_order_acquire)) {
++        service();
++        pumped = true;
++        break;
++      }
++    }
++  }
++  sGxfStats.decWaitNs += nanos_since(start);
++  return !pumped;
++}
++
 +// Room for `bytes` contiguous bytes; returns their ring offset after any padding record. A wait
 +// may run the guest pump, whose calls append records: the offsets are read again after it.
 +uint32_t gxf_reserve(uint32_t bytes) {
@@ -7191,11 +7324,14 @@ index 0000000..4f4b01d
 +    gxf_run_inline();
 +    return;
 +  }
-+  // A record appended by the guest pump while waiting is waited for too.
-+  while (sGxfShared->done.load(std::memory_order_acquire) != sGxfHead) {
-+    gxf_wait_done(sGxfHead);
-+  }
-+  sGxfDoneSeen = sGxfHead;
++  // A record appended by the guest pump while waiting is waited for too. Split: both stages, the
++  // front end first (its done publishes the segments it pushed), then the decoder.
++  do {
++    while (sGxfShared->done.load(std::memory_order_acquire) != sGxfHead) {
++      gxf_wait_done(sGxfHead);
++    }
++    sGxfDoneSeen = sGxfHead;
++  } while (detail::sGxfSplit && !gxf_wait_decoded());
 +}
 +
 +bool gxf_direct_begin(const char* site) {
@@ -7226,6 +7362,12 @@ index 0000000..4f4b01d
 +  if (detail::sGxf && !tGxfExec) UNLIKELY {
 +    if (sGxfStats.checkViolations.fetch_add(1, std::memory_order_relaxed) < 8) {
 +      std::fprintf(stderr, "GXF check: %s on a thread that does not own the front end\n", site);
++    }
++  }
++  if (tGxfDecoder) UNLIKELY {
++    // Split: the decoder runs front-end calls (tGxfExec) but must never produce FIFO bytes.
++    if (sGxfStats.checkViolations.fetch_add(1, std::memory_order_relaxed) < 8) {
++      std::fprintf(stderr, "GXF check: %s on the split decoder thread\n", site);
 +    }
 +  }
 +}
@@ -7294,7 +7436,9 @@ index 0000000..4f4b01d
 +      "gx_fifo_array_hazards=%.0f gx_fifo_decode_errors=%.0f\n"
 +      "gx_fifo_copies_per_frame queued=%.2f inline=%.2f\n"
 +      "gxf_per_frame enabled=%d thread=%d records=%.1f record_kib=%.1f syncs=%.2f main_wait_ms=%.3f "
-+      "ring_waits=%.2f worker_exec_ms=%.3f errors=%.0f foreign_writes=%.0f check_violations=%.0f\n"
++      "ring_waits=%.2f worker_exec_ms=%.3f errors=%.0f foreign_writes=%.0f check_violations=%.0f "
++      "split=%d exec_cpu_ms=%.3f exec_dec_wait_ms=%.3f exec_dec_waits=%.2f exec_segments=%.1f "
++      "main_dec_wait_ms=%.3f main_dec_waits=%.2f\n"
 +#if defined(__SWITCH__)
 +      "gx_a3_per_frame enabled=%d vtx_probes=%.1f vtx_probes_elided=%.1f tlut_digests=%.1f "
 +      "tlut_digests_skipped=%.1f dl_front_hits=%.1f layout_hashes=%.1f layout_rows_hashed=%.1f\n"
@@ -7326,7 +7470,10 @@ index 0000000..4f4b01d
 +      delta(now.gxfBytes, base.gxfBytes) / frames / 1024.0, delta(now.gxfSyncs, base.gxfSyncs) / frames,
 +      delta(now.gxfWaitNs, base.gxfWaitNs) / frames / 1e6, delta(now.gxfRingWaits, base.gxfRingWaits) / frames,
 +      delta(now.gxfExecNs, base.gxfExecNs) / frames / 1e6, delta(now.gxfErrors, base.gxfErrors),
-+      delta(now.gxfForeign, base.gxfForeign), delta(now.gxfCheck, base.gxfCheck)
++      delta(now.gxfForeign, base.gxfForeign), delta(now.gxfCheck, base.gxfCheck), detail::sGxfSplit ? 1 : 0,
++      delta(now.gxfExecCpuNs, base.gxfExecCpuNs) / frames / 1e6, delta(now.gxfExecWaitNs, base.gxfExecWaitNs) / frames / 1e6,
++      delta(now.gxfExecWaits, base.gxfExecWaits) / frames, delta(now.gxfExecSegments, base.gxfExecSegments) / frames,
++      delta(now.gxfDecWaitNs, base.gxfDecWaitNs) / frames / 1e6, delta(now.gxfDecWaits, base.gxfDecWaits) / frames
 +#if defined(__SWITCH__)
 +      ,
 +      a3_enabled() ? 1 : 0, delta(now.a3[kA3VtxProbes], base.a3[kA3VtxProbes]) / frames,
@@ -10401,507 +10548,3 @@ index 0000000..24a4584
 +    InvokeIndirectCpuSlow(target, ctx);
 +}
 +#endif  // __SWITCH__
-diff --git a/runtime/src/audio_backend.cpp b/runtime/src/audio_backend.cpp
-index e65ecfb..540e8a2 100644
---- a/runtime/src/audio_backend.cpp
-+++ b/runtime/src/audio_backend.cpp
-@@ -8,14 +8,36 @@
- #include <cstdint>
- #include <cstdlib>
- #include <iostream>
-+#if defined(__SWITCH__)
-+#include <chrono>
-+#include <cstring>
-+#include <system_error>
-+extern "C" void SwitchPinCurrentThread(int core, int priority);  // platform/switch/switch_threads.cpp
-+#endif
- 
- #include <SDL3/SDL_init.h>
-+#if defined(__SWITCH__)
-+#include <SDL3/SDL_hints.h>
-+#endif
- 
- AudioBackend& AudioBackend::Instance() {
-     static AudioBackend instance;
-     return instance;
- }
- 
-+#if defined(__SWITCH__)
-+AudioBackend::~AudioBackend() {
-+    {
-+        std::lock_guard<std::mutex> lock(m_feedMutex);
-+        m_feederStop.store(true, std::memory_order_release);
-+    }
-+    m_feedCv.notify_one();
-+    if (m_feeder.joinable()) {
-+        m_feeder.join();
-+    }
-+}
-+#endif
-+
- float AudioBackend::EffectiveGainLocked() const {
-     return m_muted ? 0.0f : m_masterVolume;
- }
-@@ -42,11 +64,18 @@ bool AudioBackend::EnsureInitializedLocked(uint32_t sampleRate, uint32_t channel
-     if (m_initialized && m_sampleRate == sampleRate && m_channels == channels) {
-         return true;
-     }
-+#if defined(__SWITCH__)
-+    m_readyKey.store(0, std::memory_order_release);
-+#endif
- 
-     if (m_stream) {
-         SDL_DestroyAudioStream(m_stream);
-         m_stream = nullptr;
-     }
-+#if defined(__SWITCH__)
-+    // Blocks queued for the old stream are dropped with it, as a synchronous push would have lost them.
-+    m_ringTail.store(m_ringHead.load(std::memory_order_acquire), std::memory_order_release);
-+#endif
- 
-     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-         RT_LOG(RT_TAG_AUDIO) << "SDL_InitSubSystem(SDL_INIT_AUDIO) failed: " << SDL_GetError() << std::endl;
-@@ -58,6 +87,13 @@ bool AudioBackend::EnsureInitializedLocked(uint32_t sampleRate, uint32_t channel
-     spec.channels = static_cast<int>(channels);
-     spec.freq = static_cast<int>(sampleRate);
- 
-+#if defined(__SWITCH__)
-+    // A/B knob: SDL's device buffer in sample frames (default 1024 = 23 ms at 44.1 kHz). The Switch
-+    // driver double-buffers through audren, so SDL's device thread has one buffer of slack.
-+    if (const char* frames = std::getenv("WIICOMPILED_AUDIO_DEVICE_FRAMES"); frames && std::atoi(frames) > 0) {
-+        SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames);
-+    }
-+#endif
-     SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
-     if (!stream) {
-         RT_LOG(RT_TAG_AUDIO) << "SDL_OpenAudioDeviceStream failed: " << SDL_GetError() << std::endl;
-@@ -72,21 +108,39 @@ bool AudioBackend::EnsureInitializedLocked(uint32_t sampleRate, uint32_t channel
- 
-     m_stream = stream;
-     m_spec = spec;
-+#if defined(__SWITCH__)
-+    WatchDeviceLocked(stream);
-+#endif
-     m_sampleRate = sampleRate;
-     m_channels = channels;
-     m_initialized = true;
-     m_playing = false;
-     m_ratio = 1.0f;
-+#if defined(__SWITCH__)
-+    if (channels < (1u << 31)) {
-+        m_readyKey.store((1ull << 63) | (uint64_t(channels) << 32) | sampleRate, std::memory_order_release);
-+    }
-+#endif
-     return true;
- }
- 
- bool AudioBackend::Init(uint32_t sampleRate, uint32_t channels) {
-+#if defined(__SWITCH__)
-+    // EnsureInitializedLocked's first test, true for every block once the stream is open.
-+    if (channels < (1u << 31) &&
-+        m_readyKey.load(std::memory_order_acquire) == ((1ull << 63) | (uint64_t(channels) << 32) | sampleRate)) {
-+        return true;
-+    }
-+#endif
-     std::lock_guard<std::mutex> lock(m_mutex);
-     return EnsureInitializedLocked(sampleRate, channels);
- }
- 
- void AudioBackend::Shutdown() {
-     std::lock_guard<std::mutex> lock(m_mutex);
-+#if defined(__SWITCH__)
-+    m_readyKey.store(0, std::memory_order_release);
-+#endif
-     if (m_stream) {
-         SDL_DestroyAudioStream(m_stream);
-         m_stream = nullptr;
-@@ -101,6 +155,9 @@ void AudioBackend::Shutdown() {
-     m_playing = false;
-     m_ratio = 1.0f;
-     m_convertBuffer.clear();
-+#if defined(__SWITCH__)
-+    m_ringTail.store(m_ringHead.load(std::memory_order_acquire), std::memory_order_release);
-+#endif
- }
- 
- // The guest produces audio on its own thread and stalls for up to ~100 ms (loading, busy
-@@ -133,6 +190,9 @@ void AudioBackend::RegulateLocked() {
-     if (!m_playing) {
-         if (static_cast<uint32_t>(queued) >= target && SDL_ResumeAudioStreamDevice(m_stream)) {
-             m_playing = true;
-+#if defined(__SWITCH__)
-+            m_devEpoch.fetch_add(1, std::memory_order_release);  // the paused time is not a late pull
-+#endif
-         }
-         return;
-     }
-@@ -143,10 +203,106 @@ void AudioBackend::RegulateLocked() {
-     }
- }
- 
-+#if defined(__SWITCH__)
-+bool AudioBackend::StatsOn() {
-+    static const bool on = [] { const char* v = std::getenv("WIICOMPILED_AUDIO_STATS"); return v && *v == '1'; }();
-+    return on;
-+}
-+
-+namespace {
-+uint64_t AudioBackendNowNs() {
-+    return static_cast<uint64_t>(
-+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-+}
-+template <typename T>
-+void AudioBackendAtomicMax(std::atomic<T>& a, T v) {
-+    T cur = a.load(std::memory_order_relaxed);
-+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
-+    }
-+}
-+template <typename T>
-+void AudioBackendAtomicMin(std::atomic<T>& a, T v) {
-+    T cur = a.load(std::memory_order_relaxed);
-+    while (v < cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
-+    }
-+}
-+}  // namespace
-+
-+// Called with a new stream, before SDL's device thread can pull from it: the get callback below runs
-+// on that thread for every device buffer (it only counts; it never adds data).
-+void AudioBackend::WatchDeviceLocked(SDL_AudioStream* stream) {
-+    m_dropUntilTarget = false;
-+    m_deviceThreadSetUp.store(false, std::memory_order_relaxed);
-+    m_devBytesPerSec.store(static_cast<uint32_t>(m_spec.freq) * static_cast<uint32_t>(m_spec.channels) * 2u,
-+                           std::memory_order_relaxed);
-+    m_devEpoch.fetch_add(1, std::memory_order_release);
-+    if (!SDL_SetAudioStreamGetCallback(stream, &AudioBackend::DevicePullThunk, this)) {
-+        RT_LOG(RT_TAG_AUDIO) << "SDL_SetAudioStreamGetCallback failed: " << SDL_GetError() << std::endl;
-+    }
-+    SDL_AudioSpec device{};
-+    int frames = 0;
-+    if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &device, &frames) && device.freq > 0) {
-+        RT_LOGF(RT_TAG_AUDIO, "output device: %d Hz, %d channels, %d frames per buffer (%.1f ms; audren double-buffers)\n",
-+                device.freq, device.channels, frames, frames * 1000.0 / device.freq);
-+    }
-+}
-+
-+void SDLCALL AudioBackend::DevicePullThunk(void* userdata, SDL_AudioStream*, int additional, int total) {
-+    static_cast<AudioBackend*>(userdata)->OnDevicePull(additional, total);
-+}
-+
-+// SDL's device thread starts at libnx's 0x3B (the lowest of the audio chain, below the mixer, the
-+// feeder and the frame worker) with a deadline of one device buffer. On its first pull it moves to
-+// core 2 at 0x2C, where it takes ~0.2 ms per 23 ms (WIICOMPILED_AUDIO_DEVICE_BOOST=0 leaves it).
-+// `additional` is what the stream lacks for this buffer (input bytes; the resampler's rounding can
-+// ask for one frame more than it needs, hence the 8-byte slack).
-+void AudioBackend::OnDevicePull(int additional, int total) {
-+    if (!m_deviceThreadSetUp.exchange(true, std::memory_order_relaxed)) {
-+        const char* boost = std::getenv("WIICOMPILED_AUDIO_DEVICE_BOOST");
-+        if (!(boost && *boost == '0')) {
-+            SwitchPinCurrentThread(2, 0x2C);
-+        }
-+    }
-+    m_devPulls.fetch_add(1, std::memory_order_relaxed);
-+    if (additional > 8) {
-+        m_devUnderruns.fetch_add(1, std::memory_order_relaxed);
-+        m_devShortBytes.fetch_add(static_cast<uint64_t>(additional), std::memory_order_relaxed);
-+    }
-+    AudioBackendAtomicMin(m_devMinAtPull, std::max(total - additional, 0));
-+    const uint64_t now = AudioBackendNowNs();
-+    const uint32_t epoch = m_devEpoch.load(std::memory_order_acquire);
-+    const uint32_t bytesPerSec = m_devBytesPerSec.load(std::memory_order_relaxed);
-+    if (m_devLastPullNs != 0 && epoch == m_devLastEpoch && bytesPerSec != 0 && total > 0) {
-+        const uint64_t gap = now - m_devLastPullNs;
-+        const uint64_t pullNs = static_cast<uint64_t>(total) * 1000000000ull / bytesPerSec;
-+        m_devPullNs.store(pullNs, std::memory_order_relaxed);
-+        AudioBackendAtomicMax(m_devMaxGapNs, gap);
-+        if (gap * 2 > pullNs * 3) {
-+            m_devLatePulls.fetch_add(1, std::memory_order_relaxed);
-+        }
-+    }
-+    m_devLastPullNs = now;
-+    m_devLastEpoch = epoch;
-+}
-+#endif
-+
- AudioBackend::Stats AudioBackend::TakeStats() {
-     std::lock_guard<std::mutex> lock(m_mutex);
-     Stats s = m_stats;
-     s.ratio = m_ratio;
-+#if defined(__SWITCH__)
-+    s.drops += m_ringDrops.exchange(0, std::memory_order_relaxed);
-+#endif
-+#if defined(__SWITCH__)
-+    s.pulls = m_devPulls.exchange(0, std::memory_order_relaxed);
-+    s.underruns = m_devUnderruns.exchange(0, std::memory_order_relaxed);
-+    s.shortBytes = m_devShortBytes.exchange(0, std::memory_order_relaxed);
-+    s.latePulls = m_devLatePulls.exchange(0, std::memory_order_relaxed);
-+    s.minAtPull = m_devMinAtPull.exchange(1 << 30, std::memory_order_relaxed);
-+    s.maxPullGapMs = m_devMaxGapNs.exchange(0, std::memory_order_relaxed) / 1e6;
-+    s.pullMs = m_devPullNs.load(std::memory_order_relaxed) / 1e6;
-+    s.feeder = m_feeder.joinable() && !m_noFeeder;
-+#endif
-     m_stats = {};
-     return s;
- }
-@@ -164,6 +320,9 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
-         if (m_playing) {
-             SDL_PauseAudioStreamDevice(m_stream);
-             m_playing = false;
-+#if defined(__SWITCH__)
-+            m_devEpoch.fetch_add(1, std::memory_order_release);
-+#endif
-         }
-     }
-     m_stats.minQueued = std::min(m_stats.minQueued, queued);
-@@ -172,6 +331,19 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
-         return true;
-     }
-     const uint32_t maxQueued = QueueLimitBytesLocked();
-+#if defined(__SWITCH__)
-+    // An overflow is the catch-up after a stall (the blocks owed for it arrive on top of a queue that
-+    // already restarted at the target). Dropping only the blocks that do not fit leaves a splice in the
-+    // stream at every device pull (~23 ms) while it lasts; dropping until the queue is back at the
-+    // target leaves one.
-+    if (m_dropUntilTarget) {
-+        if (static_cast<uint32_t>(queued) > BytesForMsLocked(kTargetMs)) {
-+            ++m_stats.drops;
-+            return false;
-+        }
-+        m_dropUntilTarget = false;
-+    }
-+#endif
-     if (static_cast<uint64_t>(queued) + static_cast<uint64_t>(std::max(incomingBytes, 0)) > maxQueued) {
-         // Match Dolphin's FIFO overflow behavior: preserve the continuous audio
-         // already queued and discard the new block.  Clearing SDL's entire
-@@ -179,6 +351,10 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
-         // VI-batched DMA briefly outran playback).
-         // A drop is audible; report the first one so it is not invisible.
-         ++m_stats.drops;
-+#if defined(__SWITCH__)
-+        m_dropUntilTarget = true;
-+        ++m_stats.dropRuns;
-+#endif
-         if (!m_reportedDroppedBlock) {
-             m_reportedDroppedBlock = true;
-             RT_LOG(RT_TAG_AUDIO) << "output queue full (" << queued << "/" << maxQueued
-@@ -189,6 +365,152 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
-     return true;
- }
- 
-+#if defined(__SWITCH__)
-+// Game thread (Audio_HLE_Tick, one 3 ms AI block at a time): the answers of the synchronous push
-+// (false without data, without an open stream, for a 1-byte block, after a failed SDL put), then a
-+// copy of the guest block into the ring. The conversion and every SDL call (two queue walks, the
-+// put, the pace regulation) happen on the feeder thread, ~2 ms later, inside the 80 ms target.
-+bool AudioBackend::PushWiiAiSamplesBE16(const uint8_t* data, size_t bytes) {
-+    if (!data || bytes == 0) {
-+        return false;
-+    }
-+    // m_readyKey is nonzero exactly while m_initialized && m_stream (EnsureInitializedLocked, Shutdown).
-+    if (m_readyKey.load(std::memory_order_acquire) == 0 || bytes / sizeof(int16_t) == 0) {
-+        return false;
-+    }
-+    if (m_feedFailed.exchange(false, std::memory_order_relaxed)) {
-+        return false;  // a put failed since the last block: reported (and the block dropped) one block late
-+    }
-+    if (!m_feeder.joinable() && !m_noFeeder) {
-+        const char* feeder = std::getenv("WIICOMPILED_AUDIO_FEEDER");
-+        if (feeder && *feeder == '0') {
-+            m_noFeeder = true;
-+            RT_LOG(RT_TAG_AUDIO) << "audio feeder off (WIICOMPILED_AUDIO_FEEDER=0): pushing on the game thread" << std::endl;
-+        } else {
-+            try {
-+                m_feeder = std::thread([this] { FeederMain(); });
-+            } catch (const std::system_error&) {
-+                m_noFeeder = true;
-+                RT_LOG(RT_TAG_AUDIO) << "could not start the audio feeder thread; pushing on the game thread" << std::endl;
-+            }
-+        }
-+    }
-+    if (m_noFeeder) {  // the synchronous push
-+        std::lock_guard<std::mutex> lock(m_mutex);
-+        if (!m_initialized || !m_stream) {
-+            return false;
-+        }
-+        DrainRingLocked();
-+        ConvertAndQueueLocked(data, bytes);
-+        return !m_feedFailed.exchange(false, std::memory_order_relaxed);
-+    }
-+    uint32_t head = m_ringHead.load(std::memory_order_relaxed);
-+    const uint32_t tail = m_ringTail.load(std::memory_order_acquire);
-+    const size_t slots = (bytes + kRingSlotBytes - 1) / kRingSlotBytes;
-+    if (head - tail + slots > kRingSlots) {
-+        m_ringDrops.fetch_add(1, std::memory_order_relaxed);  // feeder 384 ms behind: drop, keep continuity
-+        return true;
-+    }
-+    const uint64_t stamp = StatsOn() ? AudioBackendNowNs() : 0;
-+    for (size_t offset = 0; offset < bytes; offset += kRingSlotBytes) {  // whole stereo frames per slot
-+        RingSlot& slot = m_ring[head % kRingSlots];
-+        slot.bytes = static_cast<uint32_t>(std::min<size_t>(kRingSlotBytes, bytes - offset));
-+        std::memcpy(slot.data, data + offset, slot.bytes);
-+        m_ringStampNs[head % kRingSlots] = stamp;
-+        ++head;
-+    }
-+    m_ringHead.store(head, std::memory_order_release);
-+    {
-+        std::lock_guard<std::mutex> lock(m_feedMutex);
-+        m_feedPending = true;
-+    }
-+    m_feedCv.notify_one();
-+    return true;
-+}
-+
-+// Woken by each push (no polling). Core 2 at 0x2C (WIICOMPILED_AUDIO_FEEDER_PRIO): below the AX mixer
-+// (0x2B) the game thread joins, equal to the frame worker (so at most one of its ~2 ms records ahead),
-+// above SDL's device thread; ~20 us per 3 ms block.
-+void AudioBackend::FeederMain() {
-+    int priority = 0x2C;
-+    if (const char* text = std::getenv("WIICOMPILED_AUDIO_FEEDER_PRIO")) {
-+        const long value = std::strtol(text, nullptr, 0);
-+        if (value >= 0x1C && value <= 0x3B) {
-+            priority = static_cast<int>(value);
-+        }
-+    }
-+    SwitchPinCurrentThread(2, priority);
-+    for (;;) {
-+        {
-+            std::unique_lock<std::mutex> lock(m_feedMutex);
-+            m_feedCv.wait(lock, [this] { return m_feedPending || m_feederStop.load(std::memory_order_acquire); });
-+            if (m_feederStop.load(std::memory_order_acquire)) {
-+                return;
-+            }
-+            m_feedPending = false;
-+        }
-+        std::lock_guard<std::mutex> lock(m_mutex);
-+        DrainRingLocked();
-+    }
-+}
-+
-+void AudioBackend::DrainRingLocked() {
-+    const uint32_t head = m_ringHead.load(std::memory_order_acquire);
-+    const uint64_t now = StatsOn() ? AudioBackendNowNs() : 0;
-+    for (uint32_t tail = m_ringTail.load(std::memory_order_relaxed); tail != head; ++tail) {
-+        const RingSlot& slot = m_ring[tail % kRingSlots];
-+        if (now != 0) {
-+            const uint64_t stamp = m_ringStampNs[tail % kRingSlots];
-+            if (stamp != 0 && now > stamp) {
-+                m_stats.maxFeedLagMs = std::max(m_stats.maxFeedLagMs, (now - stamp) / 1e6);
-+            }
-+            m_stats.maxRingDepth = std::max(m_stats.maxRingDepth, head - tail);
-+        }
-+        if (m_initialized && m_stream) {
-+            ConvertAndQueueLocked(slot.data, slot.bytes);
-+        }
-+        m_ringTail.store(tail + 1, std::memory_order_release);  // the slot is free for the producer
-+    }
-+}
-+
-+// The body of the synchronous push below, after its checks; a failed put sets m_feedFailed, which
-+// the next push reports as the synchronous one reported it (false: Audio_HLE_Tick stops the DMA).
-+void AudioBackend::ConvertAndQueueLocked(const uint8_t* data, size_t bytes) {
-+    const size_t sampleCount = bytes / sizeof(int16_t);
-+    if (sampleCount == 0) {
-+        return;
-+    }
-+    if (m_convertBuffer.size() < sampleCount) {
-+        m_convertBuffer.resize(sampleCount);
-+    }
-+    const size_t frameCount = sampleCount / 2;
-+    for (size_t frame = 0; frame < frameCount; ++frame) {
-+        const size_t rightOffset = frame * 4;
-+        const size_t leftOffset = rightOffset + 2;
-+        const uint16_t right = static_cast<uint16_t>(data[rightOffset]) << 8 |
-+                               static_cast<uint16_t>(data[rightOffset + 1]);
-+        const uint16_t left = static_cast<uint16_t>(data[leftOffset]) << 8 |
-+                              static_cast<uint16_t>(data[leftOffset + 1]);
-+        m_convertBuffer[frame * 2] = static_cast<int16_t>(left);
-+        m_convertBuffer[frame * 2 + 1] = static_cast<int16_t>(right);
-+    }
-+    const int lenBytes = static_cast<int>(frameCount * 2 * sizeof(int16_t));
-+    static FILE* dump = [] { const char* f = std::getenv("WIICOMPILED_AUDIO_DUMP"); return f && *f ? std::fopen(f, "wb") : nullptr; }();
-+    if (dump) {
-+        std::fwrite(m_convertBuffer.data(), 1, static_cast<size_t>(lenBytes), dump);
-+        std::fflush(dump);
-+    }
-+    if (!QueueHasCapacityLocked(lenBytes)) {
-+        return;
-+    }
-+    if (!SDL_PutAudioStreamData(m_stream, m_convertBuffer.data(), lenBytes)) {
-+        RT_LOG(RT_TAG_AUDIO) << "SDL_PutAudioStreamData failed: " << SDL_GetError() << std::endl;
-+        m_feedFailed.store(true, std::memory_order_relaxed);
-+        return;
-+    }
-+    RegulateLocked();
-+}
-+#else
- bool AudioBackend::PushWiiAiSamplesBE16(const uint8_t* data, size_t bytes) {
-     if (!data || bytes == 0) {
-         return false;
-@@ -238,6 +560,7 @@ bool AudioBackend::PushWiiAiSamplesBE16(const uint8_t* data, size_t bytes) {
- 
-     return true;
- }
-+#endif
- 
- bool AudioBackend::PushSamplesLE16(const int16_t* samples, size_t sampleCount) {
-     if (!samples || sampleCount == 0) {
-@@ -249,6 +572,9 @@ bool AudioBackend::PushSamplesLE16(const int16_t* samples, size_t sampleCount) {
-         return false;
-     }
- 
-+#if defined(__SWITCH__)
-+    DrainRingLocked();  // keep the stream in order behind the queued AI blocks
-+#endif
-     const int lenBytes = static_cast<int>(sampleCount * sizeof(int16_t));
-     if (!QueueHasCapacityLocked(lenBytes)) {
-         return true;
-diff --git a/runtime/src/discord_presence.cpp b/runtime/src/discord_presence.cpp
-index a7b9caa..1e4343a 100644
---- a/runtime/src/discord_presence.cpp
-+++ b/runtime/src/discord_presence.cpp
-@@ -21,7 +21,7 @@
- #define WIN32_LEAN_AND_MEAN
- #endif
- #include <windows.h>
--#else
-+#elif !defined(__SWITCH__)
- #include <sys/socket.h>
- #include <sys/un.h>
- #include <unistd.h>
-@@ -320,6 +320,12 @@ private:
-     }
- 
-     HANDLE handle_ = INVALID_HANDLE_VALUE;
-+#elif defined(__SWITCH__)
-+    // No Discord client to reach on the Switch.
-+    bool ConnectLocked() { return false; }
-+    bool WriteAllLocked(const uint8_t*, size_t) { return false; }
-+    bool ReadAllLocked(uint8_t*, size_t) { return false; }
-+    void CloseLocked() { connected_ = false; }
- #else
-     bool ConnectLocked() {
-         if (connected_) {
-diff --git a/runtime/src/fiber_manager.cpp b/runtime/src/fiber_manager.cpp
-index f2ad393..b3e5407 100644
---- a/runtime/src/fiber_manager.cpp
-+++ b/runtime/src/fiber_manager.cpp
-@@ -7,11 +7,20 @@ extern std::atomic<uint64_t> g_debugGxBeginCount;
- extern "C" void VI_DebugDump();
- extern "C" int g_gxFrameCount;
- 
-+#if defined(__SWITCH__)
-+extern const int g_hleTraceFrame = [] {
-+    const char* frame = std::getenv("WIICOMPILED_TRACE_NATIVES");
-+    return frame ? std::atoi(frame) : -1;
-+}();
-+void HleTraceCallSlow(const char* name) noexcept {
-+    const int traceFrame = g_hleTraceFrame;
-+#else
- void HleTraceCall(const char* name) noexcept {
-     static const int traceFrame = [] {
-         const char* frame = std::getenv("WIICOMPILED_TRACE_NATIVES");
-         return frame ? std::atoi(frame) : -1;
-     }();
-+#endif
-     if (traceFrame >= 0 && g_gxFrameCount == traceFrame) {
-         std::fprintf(stderr, "[trace] %d %s\n", g_gxFrameCount, name);
-     }
