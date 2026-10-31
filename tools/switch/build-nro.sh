@@ -11,6 +11,15 @@
 # image. Trees live in $MLB_SWITCH_WORK/mlb (default local/switch/work/mlb; the image sets its /cache
 # volume); the result is local/switch/build/MLBPowerPros2008.nro.
 # --graphics null builds the runtime without a GPU (Dawn's Null backend), for the headless console test.
+#
+# Profile-guided optimization (support files in tools/switch/pgo/: pgo-project-include.cmake, mlb_pgo_gen.cpp,
+# pgo_core.cpp/.h, pgo_recv.py, pgo_check.py):
+#   MLB_SWITCH_PGO=gen            instrumented NRO (build-<g>-pgogen, local/switch/build/MLBPowerPros2008-pgogen.nro):
+#                                 play it, its profile lands in sdmc:/switch/mlbpowerpros2008/pgo
+#   MLB_SWITCH_PGO=use:<dir>      optimized NRO (build-<g>-pgo, ...-pgo.nro) built with the .gcda files in <dir>
+#   MLB_SWITCH_PGO_UPDATE=single  gen only: plain (not atomic) counters outside the translated shards
+#                                 (faster instrumented game; worker threads may lose a few counts)
+# Both need the same translated tree (the profile belongs to the exact code it was recorded on).
 set -euo pipefail
 
 if [[ ! -d /opt/devkitpro ]]; then   # on the host: run this same script where devkitPro is
@@ -45,6 +54,56 @@ export DOTNET_ROLL_FORWARD=Major DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
 # MSYS2's login shell leaves out the Windows PATH, where .NET is; files .NET reads need Windows paths.
 command -v dotnet >/dev/null || PATH=$PATH:"/c/Program Files/dotnet"
 winpath() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
+
+# ---- PGO mode (MLB_SWITCH_PGO): its own build dir, NRO name and compile/link options ---------------
+pgo_dir=$root/tools/switch/pgo
+pgo_mode= pgo_args=() pgo_nro_suffix= pgo_link=
+case ${MLB_SWITCH_PGO:-} in
+    "") ;;
+    gen|use:*)
+        pgo_mode=${MLB_SWITCH_PGO%%:*}
+        [[ -f $pgo_dir/pgo-project-include.cmake ]] || fail "MLB_SWITCH_PGO: $pgo_dir is missing (copy local/tmp/cpu/PGO/{pgo-project-include.cmake,mlb_pgo_gen.cpp,pgo_core.cpp,pgo_core.h,pgo_recv.py,pgo_check.py} there)"
+        [[ $pgo_mode == gen ]] && pgo_nro_suffix=-pgogen || pgo_nro_suffix=-pgo
+        build=$work/build-$graphics$pgo_nro_suffix
+        # GCC (a native Windows program under MSYS2) names a profile after its working directory in
+        # Windows form (D:\...\build-vulkan-pgogen); -fprofile-prefix-path spelled exactly so strips it,
+        # which makes the .gcda names relative to the build dir and equal in the gen and the use build.
+        native_build=$build msys_rules=
+        if [[ $(uname -o) == Msys ]]; then
+            native_build=$(cygpath -w "$build")
+            msys_rules=$root/tools/switch/windows/msys-rules.cmake
+        fi
+        # The options go through add_compile_options (pgo-project-include.cmake: CMake quotes them for the
+        # shell); -DCMAKE_CXX_FLAGS would REPLACE the toolchain's -march/-mtp=soft/-D__SWITCH__ flags.
+        if [[ $pgo_mode == gen ]]; then
+            # -fno-profile-values: libgcov's indirect-call/topn profilers use TLS (tpidr_el0), which libnx
+            # never sets up (they would crash); the arc counters (block layout, inlining, branch
+            # probabilities) need none. "pgo" is a dummy directory: the runtime points every profile file
+            # at sdmc:/switch/mlbpowerpros2008/pgo (pgo_core.cpp), the baked '\' paths cannot be opened.
+            pgo_opts="-fprofile-generate=pgo;-fprofile-prefix-path=$native_build;-fprofile-update=${MLB_SWITCH_PGO_UPDATE:-atomic};-fno-profile-values"
+            pgo_link=-fprofile-generate   # links libgcov
+            # The translated shards only run on the main thread: plain counters there (an atomic update
+            # is a ldaxr/stlxr loop on the Cortex-A57, 3-5x a plain add). Default as in
+            # runtime/cmake/PublicProducts.cmake: keep in step with it.
+            shard=${MLB_SWITCH_SHARD_FLAGS-"-O3;-fwrapv;-fomit-frame-pointer"}
+            pgo_args+=(-DMLB_SWITCH_SHARD_FLAGS="${shard:+$shard;}-fprofile-update=single")
+        else
+            pgo_use=${MLB_SWITCH_PGO#use:}
+            [[ -d $pgo_use ]] || fail "MLB_SWITCH_PGO=use:<dir>: $pgo_use is not a directory"
+            compgen -G "$pgo_use/*.gcda" > /dev/null || fail "no .gcda files in $pgo_use"
+            # partial training: code the session never ran stays normally optimized (instead of for size);
+            # correction: counters of a multi-threaded run can be slightly inconsistent; the warnings stay
+            # off (the shards compile with -w anyway): tools/switch/pgo/pgo_check.py reports what is used.
+            pgo_opts="-fprofile-use=$(winpath "$pgo_use");-fprofile-prefix-path=$native_build;-fprofile-partial-training;-fprofile-correction;-Wno-missing-profile;-Wno-error=coverage-mismatch"
+            [[ -z ${MLB_SWITCH_HOT_ORDER:-} ]] || echo "warning: MLB_SWITCH_HOT_ORDER names .text.<fn> sections; PGO puts hot code in .text.hot.<fn> (it reorders by itself): unset it for the PGO build" >&2
+        fi
+        pgo_args+=(-DMLB_PGO_COMPILE_OPTIONS="$pgo_opts" -DMLB_PGO_LINK_OPTIONS="$pgo_link"
+                   -DCMAKE_PROJECT_INCLUDE="$pgo_dir/pgo-project-include.cmake" -DMLB_PGO_MSYS_RULES="$msys_rules"
+                   -DMLB_PGO_DIR="$pgo_dir" -DMLB_PGO_MODE="$pgo_mode" -DMLB_PGO_TARGETS=WiiCompiled)
+        ;;
+    *) echo "error: MLB_SWITCH_PGO must be gen or use:<dir>" >&2; exit 2 ;;
+esac
+tag=$graphics$pgo_nro_suffix   # log and result names
 # MSYS2 also hands native programs a trimmed environment: NuGet needs the Windows profile folders and
 # ProgramFiles(x86) (a name bash cannot export), and an MSBuild node left running would keep that
 # environment for later builds, even ones started from Windows.
@@ -151,12 +210,13 @@ msys+=(-DMLB_SWITCH_HOT_ORDER="${MLB_SWITCH_HOT_ORDER:-}")
 # earlier state, comes back from the cache instead of recompiling the translated shards.
 # MLB_SWITCH_CCACHE=0 leaves it out of a new build tree (one configured with it keeps it until
 # --fresh: passing an empty launcher would change every compile rule and rebuild everything).
-if [[ ${MLB_SWITCH_CCACHE:-1} != 0 ]] && command -v ccache > /dev/null; then
+# Never for the PGO builds: the result depends on the .gcda files, which ccache's key may not cover.
+if [[ ${MLB_SWITCH_CCACHE:-1} != 0 && -z $pgo_mode ]] && command -v ccache > /dev/null; then
     export CCACHE_DIR=${CCACHE_DIR:-$root/local/switch/ccache}
     ccache --max-size=25G > /dev/null
     msys+=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
 fi
-cmake -S "$src/runtime" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release "${msys[@]}" \
+cmake -S "$src/runtime" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release "${msys[@]}" "${pgo_args[@]}" \
     -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON \
     -DCMAKE_UNITY_BUILD_RELOCATABLE=ON \
     -DWIICOMPILED_GAME=RL8E54 -DMKW_TRANSLATED_COMPILE_JOBS="$jobs" \
@@ -164,17 +224,19 @@ cmake -S "$src/runtime" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release "${msys[
     -DMLB_SWITCH_DEKO_DIR="$root/tools/switch/deko" \
     -DAURORA_DAWN_PROVIDER=system -DDawn_DIR="$root/tools/switch/dawn" \
     -DAURORA_SDL3_PROVIDER=system -DAURORA_SDL3_VERSION=3.4.0 \
-    > "$logs/configure-$graphics.log" 2>&1 || { tail -n 30 "$logs/configure-$graphics.log"; fail "configure failed (local/switch/logs/configure-$graphics.log)"; }
+    > "$logs/configure-$tag.log" 2>&1 || { tail -n 30 "$logs/configure-$tag.log"; fail "configure failed (local/switch/logs/configure-$tag.log)"; }
 # aurora fetches its own Abseil (20240722.0): the same Horizon fixes as Dawn's.
 if [[ -d $build/_deps/abseil-cpp-src ]]; then
     python3 tools/switch/dawn/resolve-abseil-horizon.py "$build/_deps/abseil-cpp-src"
 fi
 step "Compiling (this takes the longest)"
-cmake --build "$build" --target WiiCompiled_nro --parallel "$jobs" -- -k 0 > "$logs/build-$graphics.log" 2>&1 || {
-    grep -m 25 "error" "$logs/build-$graphics.log" || tail -n 30 "$logs/build-$graphics.log"
-    fail "build failed (local/switch/logs/build-$graphics.log)"; }
-cp -f "$build/MLBPowerPros2008.nro" "$out/MLBPowerPros2008.nro"
+cmake --build "$build" --target WiiCompiled_nro --parallel "$jobs" -- -k 0 > "$logs/build-$tag.log" 2>&1 || {
+    grep -m 25 "error" "$logs/build-$tag.log" || tail -n 30 "$logs/build-$tag.log"
+    fail "build failed (local/switch/logs/build-$tag.log)"; }
+cp -f "$build/MLBPowerPros2008.nro" "$out/MLBPowerPros2008$pgo_nro_suffix.nro"
 # The runtime's own files go beside the NRO on the SD card, as beside the desktop executable.
 rm -rf "$out/wii_bootstrap"
 cp -rf "$build"/{dsp_coef.bin,cacert.pem,initial_pipeline_cache.db,wii_bootstrap} "$out/"
-echo "built: local/switch/build/MLBPowerPros2008.nro ($(du -h "$out/MLBPowerPros2008.nro" | cut -f1))"
+echo "built: local/switch/build/MLBPowerPros2008$pgo_nro_suffix.nro ($(du -h "$out/MLBPowerPros2008$pgo_nro_suffix.nro" | cut -f1))"
+[[ $pgo_mode == gen ]] && echo "PGO: run it on the Switch, play ~10 min, press L+R+ZL+ZR+Minus (1 s) with tools/switch/pgo/pgo_recv.py <dir> running on the PC"
+[[ $pgo_mode == use ]] && echo "PGO: check what was consumed: python tools/switch/pgo/pgo_check.py local/switch/work/mlb/build-$graphics-pgo ${MLB_SWITCH_PGO#use:} --sample 3"

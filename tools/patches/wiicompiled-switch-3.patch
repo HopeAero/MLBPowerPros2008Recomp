@@ -58,20 +58,22 @@ index 5f029c0..0b51bbe 100644
  enum class CaptureKind { None, Button, Key, KeyAxis, Axis };
  struct Capture {
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
-index 7269747..796606b 100644
+index 7269747..5d6cf41 100644
 --- a/runtime/src/main.cpp
 +++ b/runtime/src/main.cpp
-@@ -83,6 +83,9 @@ extern std::atomic_bool g_auroraFrameActive;
+@@ -83,6 +83,11 @@ extern std::atomic_bool g_auroraFrameActive;
  extern "C" int g_gxFrameCount;
  extern "C" const char* DVDResolveHostPathForTest(const char* dvdPath);
  bool OS_HLE_InterruptsEnabled() noexcept;
 +#if defined(__SWITCH__)
 +extern "C" void GX_HLE_OffloadStop();
++// PGO profile writer (tools/switch/pgo/mlb_pgo_gen.cpp), linked only into the instrumented build.
++extern "C" void MlbPgoStart() __attribute__((weak));
 +#endif
  
  namespace {
  
-@@ -429,6 +432,9 @@ std::string ReadInstalledSetupVersion() {
+@@ -429,6 +434,9 @@ std::string ReadInstalledSetupVersion() {
      return text.substr(open + 1, close - open - 1);
  }
  
@@ -81,7 +83,7 @@ index 7269747..796606b 100644
  void InitializeProcessTranscript(int argc, char** argv) {
      auto& state = GetProcessTranscriptState();
      if (state.initialized.exchange(true, std::memory_order_acq_rel)) {
-@@ -469,6 +475,19 @@ void InitializeProcessTranscript(int argc, char** argv) {
+@@ -469,6 +477,19 @@ void InitializeProcessTranscript(int argc, char** argv) {
          state.file.flush();
      }
  
@@ -101,7 +103,7 @@ index 7269747..796606b 100644
      state.savedStdoutFd = DuplicateFileDescriptor(GetFileDescriptor(stdout));
      state.savedStderrFd = DuplicateFileDescriptor(GetFileDescriptor(stderr));
  
-@@ -1133,6 +1152,9 @@ void InstallSehLogger() {
+@@ -1133,6 +1154,9 @@ void InstallSehLogger() {
          SetUnhandledExceptionFilter(UnhandledSehFilter);
      }
  }
@@ -111,7 +113,7 @@ index 7269747..796606b 100644
  #else
  // POSIX counterpart to SehLogger above. Unlike Windows' AddVectoredExceptionHandler, which lets
  // GuestFlat and this module each install their own handler and defensively re-check each other,
-@@ -1322,6 +1344,11 @@ static void TerminateHandler() {
+@@ -1322,6 +1346,11 @@ static void TerminateHandler() {
      } else {
          terminateDetails = "std::terminate() without current exception.";
      }
@@ -123,7 +125,19 @@ index 7269747..796606b 100644
      ShowRuntimeFatalPopup("an unhandled C++ exception occurred", terminateDetails);
      const std::string hostStackSummary = FormatHostStackTrace(1);
      if (!hostStackSummary.empty()) {
-@@ -1441,6 +1468,10 @@ int RuntimeMain(int argc, char** argv) {
+@@ -1353,6 +1382,11 @@ int RuntimeMain(int argc, char** argv) {
+     InstallPosixMemoryFaultHandler();
+ #endif
+     InitializeProcessTranscript(argc, argv);
++#if defined(__SWITCH__)
++    if (MlbPgoStart) {
++        MlbPgoStart();
++    }
++#endif
+     std::signal(SIGABRT, AbortSignalHandler);
+     // Install exit/terminate handlers to ensure we get crash info
+     std::atexit(AtExitHandler);
+@@ -1441,6 +1475,10 @@ int RuntimeMain(int argc, char** argv) {
              {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"opengles", BACKEND_OPENGLES},
              {"null", BACKEND_NULL},
          }};
@@ -134,7 +148,7 @@ index 7269747..796606b 100644
  #elif defined(_WIN32)
          static constexpr std::array<GraphicsBackendEntry, 4> kGraphicsBackends{{
              {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN}, {"d3d11", BACKEND_D3D11},
-@@ -1547,6 +1578,9 @@ int RuntimeMain(int argc, char** argv) {
+@@ -1547,6 +1585,9 @@ int RuntimeMain(int argc, char** argv) {
          RT_LOG(RT_TAG_RUNTIME) << label << " => 0x" << std::hex << result << std::dec << " (" << result << ")" << std::endl;
          
          // Shutdown fiber system
@@ -144,7 +158,7 @@ index 7269747..796606b 100644
          Fiber::GuestFiberManager::Shutdown();
          WindowPlacementPersistence::Flush(true);
          aurora_shutdown();
-@@ -1565,6 +1599,9 @@ int RuntimeMain(int argc, char** argv) {
+@@ -1565,6 +1606,9 @@ int RuntimeMain(int argc, char** argv) {
          ShowRuntimeFatalPopup("a guest memory access was out of bounds", details.str());
          WriteFatalLogImpl("access_violation", details.str());
          SetRuntimeExitCodeImpl(1);
@@ -154,7 +168,7 @@ index 7269747..796606b 100644
          Fiber::GuestFiberManager::Shutdown();
          WindowPlacementPersistence::Flush(true);
          aurora_shutdown();
-@@ -1577,6 +1614,9 @@ int RuntimeMain(int argc, char** argv) {
+@@ -1577,6 +1621,9 @@ int RuntimeMain(int argc, char** argv) {
          ShowRuntimeFatalPopup("a runtime exception occurred", ex.what());
          WriteFatalLogImpl("exception");
          SetRuntimeExitCodeImpl(1);
@@ -164,7 +178,7 @@ index 7269747..796606b 100644
          Fiber::GuestFiberManager::Shutdown();
          WindowPlacementPersistence::Flush(true);
          aurora_shutdown();
-@@ -1587,6 +1627,15 @@ int RuntimeMain(int argc, char** argv) {
+@@ -1587,6 +1634,15 @@ int RuntimeMain(int argc, char** argv) {
  }
  
  int main(int argc, char** argv) {
