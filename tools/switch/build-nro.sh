@@ -12,6 +12,8 @@
 # volume); the result is local/switch/build/MLBPowerPros2008.nro.
 # --graphics null builds the runtime without a GPU (Dawn's Null backend), for the headless console test.
 #
+# MLB_SWITCH_ICON=<path>: your own 256x256 JPEG as the home-menu / forwarder icon (keep it under local/: no
+# game art in the repository); without it the libnx default icon.
 # Profile-guided optimization (support files in tools/switch/pgo/: pgo-project-include.cmake, mlb_pgo_gen.cpp,
 # pgo_core.cpp/.h, pgo_recv.py, pgo_check.py):
 #   MLB_SWITCH_PGO=gen            instrumented NRO (build-<g>-pgogen, local/switch/build/MLBPowerPros2008-pgogen.nro):

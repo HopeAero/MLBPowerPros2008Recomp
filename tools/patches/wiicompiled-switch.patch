@@ -8853,7 +8853,7 @@ index 0063653..3587f77 100644
          target_compile_options(mkw_psq_helpers_tests PRIVATE -march=x86-64-v3)
      endif()
 diff --git a/runtime/cmake/PublicProducts.cmake b/runtime/cmake/PublicProducts.cmake
-index 251c83a..3e438b8 100644
+index 251c83a..49419c2 100644
 --- a/runtime/cmake/PublicProducts.cmake
 +++ b/runtime/cmake/PublicProducts.cmake
 @@ -18,6 +18,9 @@ if(EXISTS "${GUEST_SYMBOL_TABLE_FILE}")
@@ -8916,7 +8916,7 @@ index 251c83a..3e438b8 100644
      elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
          # mkw_runtime_common is an OBJECT library: WiiCompiled/RetroRewind only pull in its .o
          # files via $<TARGET_OBJECTS:>, which does not propagate mkw_runtime_common's own
-@@ -310,8 +330,81 @@ endfunction()
+@@ -310,8 +330,86 @@ endfunction()
  
  add_executable(WiiCompiled "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})
  mkw_configure_product(WiiCompiled)
@@ -8936,8 +8936,13 @@ index 251c83a..3e438b8 100644
 +        # devkitA64's prebuilt libstdc++ carries text relocations (nx-mod's port notes).
 +        -Wl,-z,notext)
 +    nx_generate_nacp(MLBPowerPros2008.nacp NAME "MLB Power Pros 2008" AUTHOR "HopeAero" VERSION "0.1.0")
++    # MLB_SWITCH_ICON: the player's own 256x256 JPEG for the home menu / forwarder (no game art is shipped).
++    set(MLB_NRO_ICON "$ENV{MLB_SWITCH_ICON}")
++    if(NOT MLB_NRO_ICON OR NOT EXISTS "${MLB_NRO_ICON}")
++        set(MLB_NRO_ICON "$ENV{DEVKITPRO}/libnx/default_icon.jpg")
++    endif()
 +    nx_create_nro(WiiCompiled OUTPUT MLBPowerPros2008.nro NACP MLBPowerPros2008.nacp
-+        ICON "$ENV{DEVKITPRO}/libnx/default_icon.jpg")
++        ICON "${MLB_NRO_ICON}")
 +endif()
 +if(MKW_PLATFORM_SWITCH)
 +    # Phase-66 GX HLE mailbox (WIICOMPILED_GX_HLE_WORKER, off at run time by default): the GNU ld
