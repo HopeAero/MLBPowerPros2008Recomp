@@ -1,3 +1,251 @@
+diff --git a/runtime/src/hle/mlb/mtx_natives.cpp b/runtime/src/hle/mlb/mtx_natives.cpp
+new file mode 100644
+index 0000000..13d29b8
+--- /dev/null
++++ b/runtime/src/hle/mlb/mtx_natives.cpp
+@@ -0,0 +1,242 @@
++// MLB Power Pros 2008 (RL8E54): a native leaf for PSMTXConcat (0x800A890C), 1.6% of the Switch
++// main thread in the stock match profile (42 translated call sites, bone and model matrices).
++//
++// void PSMTXConcat(const Mtx a, const Mtx b, Mtx ab): ab = a * b for 3x4 single matrices, 18
++// paired-single multiplies / fused multiply-adds over 13 psq_l pairs (a, b and the {0, 1} pair at
++// 0x8031A608) and 6 psq_st pairs, all with GQR0.
++//
++// The translation computes each pair with one NEON fmul/fmla (ppc_isa_float.h) and resolves NaN
++// lanes afterwards; loads quiet NaN lanes, stores flush single subnormals to their sign and quiet
++// NaN lanes. Every loaded lane flows into some stored lane, and a NaN lane propagates through
++// every later fmla of its chain, so a result with no NaN lane means no NaN was loaded or produced:
++// the resolver never acted and the load quieting changed nothing. The fast path below does the same
++// 18 instructions on that premise and, when any stored lane is NaN, discards its work (nothing was
++// stored yet) and runs the exact sequence of the translation (Exact), whose helpers it shares.
++// Exact also covers what the fast path does not: the checked access mode (no flat view), a GQR0
++// other than 0 (quantized psq), a destination range that touches the MMIO window or wraps, and
++// source ranges that wrap the 32-bit space.
++//
++// Kept exactly: every guest store (the back chain at r1-64, the 48 bytes of ab), r6 (the address
++// of the {0, 1} pair) and f0-f13 as the translation leaves them; f14, f15 and f31 are restored by
++// the original. r1 is unchanged. No CR, XER, LR or CTR access.
++//
++// This file builds like the translated code (-O2 -fno-fast-math -ffp-contract=off, outside the
++// unity build: runtime/CMakeLists.txt, next to MKW_PPC_SEMANTIC_RUNTIME_SOURCES): the helpers it
++// shares with the translation must compile to the same arithmetic, and -ffinite-math-only would
++// fold the NaN tests away.
++//
++// One call with ordinary matrices (qemu-aarch64 trace, the shard's flags): 742 instructions
++// translated (6 of its out-of-line PpcStorePairPsqFloatFastInline calls included), 152 here.
++#if defined(__SWITCH__)
++#include <arm_neon.h>
++#include <cstdint>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "compute_preempt.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++
++namespace mlb_mtx {
++
++constexpr uint32_t kUnit01 = 0x8031A608u;  // r6 = 0x80320000 - 23032: {0.0f, 1.0f}
++
++// One pair as the translation holds it: packed double, low word ps1, high word ps0.
++inline uint64_t Raw(double value) {
++    uint64_t raw;
++    std::memcpy(&raw, &value, sizeof raw);
++    return raw;
++}
++
++struct Outputs {
++    uint64_t f[14];  // f0-f13 as the translation leaves them
++};
++
++// The translation's sequence, helper for helper and in its order (loads, stores and the MMIO
++// policy of each store included).
++[[gnu::noinline, gnu::cold]] void Exact(uint32_t gqr, uint32_t a, uint32_t b, uint32_t ab, Outputs& out) {
++    double f0 = PPC_PsqLGqrInline<0u, 0u>(gqr, a);
++    const double f6 = PPC_PsqLGqrInline<0u, 0u>(gqr, b);
++    const double f7 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 8u);
++    const double f8 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 16u);
++    double f12 = PPC_PsMuls0Inline(f6, f0);
++    double f2 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 16u);
++    double f13 = PPC_PsMuls0Inline(f7, f0);
++    const double f31 = PPC_PsqLGqrInline<0u, 0u>(gqr, kUnit01);
++    double f14 = PPC_PsMuls0Inline(f6, f2);
++    const double f9 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 24u);
++    double f15 = PPC_PsMuls0Inline(f7, f2);
++    const double f1 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 8u);
++    f12 = PPC_PsMadds1Inline(f8, f0, f12);
++    const double f3 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 24u);
++    f14 = PPC_PsMadds1Inline(f8, f2, f14);
++    const double f10 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 32u);
++    f13 = PPC_PsMadds1Inline(f9, f0, f13);
++    const double f11 = PPC_PsqLGqrInline<0u, 0u>(gqr, b + 40u);
++    f15 = PPC_PsMadds1Inline(f9, f2, f15);
++    const double f4 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 32u);
++    const double f5 = PPC_PsqLGqrInline<0u, 0u>(gqr, a + 40u);
++    f12 = PPC_PsMadds0Inline(f10, f1, f12);
++    f13 = PPC_PsMadds0Inline(f11, f1, f13);
++    f14 = PPC_PsMadds0Inline(f10, f3, f14);
++    f15 = PPC_PsMadds0Inline(f11, f3, f15);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab, f12);
++    f2 = PPC_PsMuls0Inline(f6, f4);
++    f13 = PPC_PsMadds1Inline(f31, f1, f13);
++    f0 = PPC_PsMuls0Inline(f7, f4);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 16u, f14);
++    f15 = PPC_PsMadds1Inline(f31, f3, f15);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 8u, f13);
++    f2 = PPC_PsMadds1Inline(f8, f4, f2);
++    f0 = PPC_PsMadds1Inline(f9, f4, f0);
++    f2 = PPC_PsMadds0Inline(f10, f5, f2);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 24u, f15);
++    f0 = PPC_PsMadds0Inline(f11, f5, f0);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 32u, f2);
++    f0 = PPC_PsMadds1Inline(f31, f5, f0);
++    PPC_PsqStGqrInline<0u, 0u>(gqr, ab + 40u, f0);
++    const double regs[14] = {f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13};
++    for (int i = 0; i < 14; ++i) out.f[i] = Raw(regs[i]);
++}
++
++inline uint64_t Raw(float32x2_t pair) { return vget_lane_u64(vreinterpret_u64_f32(pair), 0); }
++
++// 16 guest bytes as two pairs in the packed layout: each 8-byte half byte-reversed, so the low
++// word of a pair is its second (ps1) float, exactly PpcLoadPairPsqFloatFromHostInline's bswap64.
++inline float32x4_t LoadPairs(const uint8_t* host) {
++    return vreinterpretq_f32_u8(vrev64q_u8(vld1q_u8(host)));
++}
++
++// psq_st's single narrowing of two pairs (PpcStorePsqFloatBitsInline per lane, NaN lanes excluded
++// by the caller): a subnormal or zero keeps only its sign. Then back to guest byte order.
++inline void StorePairs(uint8_t* host, float32x4_t pairs) {
++    const uint32x4_t bits = vreinterpretq_u32_f32(pairs);
++    const uint32x4_t tiny = vcltq_u32(vandq_u32(bits, vdupq_n_u32(0x7FFFFFFFu)), vdupq_n_u32(0x00800000u));
++    const uint32x4_t stored = vbslq_u32(tiny, vandq_u32(bits, vdupq_n_u32(0x80000000u)), bits);
++    vst1q_u8(host, vrev64q_u8(vreinterpretq_u8_u32(stored)));
++}
++
++inline bool Wraps(uint32_t address, uint32_t length) { return address > UINT32_MAX - (length - 1u); }
++
++// No store of ab[0..47] takes MemoryInline's policy path (each psq_st checks its first and last
++// byte against 0xCC000000-0xCDFFFFFF; the range test implies all twelve).
++inline bool PlainDestination(uint32_t ab) {
++    return !Wraps(ab, 48u) && (ab + 47u < 0xCC000000u || ab >= 0xCE000000u);
++}
++
++// False when a stored lane would be NaN: nothing is stored then and Exact runs instead.
++[[gnu::always_inline]] inline bool Fast(uint32_t a, uint32_t b, uint32_t ab, Outputs& out) {
++    uint8_t* const base = MKW_FLAT_GUEST_BASE;
++    const float32x4_t a01 = LoadPairs(base + a), a23 = LoadPairs(base + a + 16u),
++                      a45 = LoadPairs(base + a + 32u);
++    const float32x4_t b01 = LoadPairs(base + b), b23 = LoadPairs(base + b + 16u),
++                      b45 = LoadPairs(base + b + 32u);
++    uint64_t unitRaw;
++    std::memcpy(&unitRaw, base + kUnit01, sizeof unitRaw);
++    const float32x2_t f31 = vreinterpret_f32_u64(vdup_n_u64(__builtin_bswap64(unitRaw)));
++    const float32x2_t f0 = vget_low_f32(a01), f1 = vget_high_f32(a01), f2 = vget_low_f32(a23),
++                      f3 = vget_high_f32(a23), f4 = vget_low_f32(a45), f5 = vget_high_f32(a45);
++    const float32x2_t f6 = vget_low_f32(b01), f7 = vget_high_f32(b01), f8 = vget_low_f32(b23),
++                      f9 = vget_high_f32(b23), f10 = vget_low_f32(b45), f11 = vget_high_f32(b45);
++    // ps0 is lane 1, ps1 lane 0. ps_muls0 d,a,c = a * c.ps0; ps_madds1 d,a,c,b = fma(a, c.ps1, b).
++    float32x2_t r0 = vmul_lane_f32(f6, f0, 1);    // f12: ab row 0, columns 0-1
++    float32x2_t r1 = vmul_lane_f32(f7, f0, 1);    // f13: row 0, columns 2-3
++    float32x2_t r2 = vmul_lane_f32(f6, f2, 1);    // f14: row 1, columns 0-1
++    float32x2_t r3 = vmul_lane_f32(f7, f2, 1);    // f15: row 1, columns 2-3
++    float32x2_t r4 = vmul_lane_f32(f6, f4, 1);    // f2:  row 2, columns 0-1
++    float32x2_t r5 = vmul_lane_f32(f7, f4, 1);    // f0:  row 2, columns 2-3
++    r0 = vfma_lane_f32(r0, f8, f0, 0);
++    r1 = vfma_lane_f32(r1, f9, f0, 0);
++    r2 = vfma_lane_f32(r2, f8, f2, 0);
++    r3 = vfma_lane_f32(r3, f9, f2, 0);
++    r4 = vfma_lane_f32(r4, f8, f4, 0);
++    r5 = vfma_lane_f32(r5, f9, f4, 0);
++    r0 = vfma_lane_f32(r0, f10, f1, 1);
++    r1 = vfma_lane_f32(r1, f11, f1, 1);
++    r2 = vfma_lane_f32(r2, f10, f3, 1);
++    r3 = vfma_lane_f32(r3, f11, f3, 1);
++    r4 = vfma_lane_f32(r4, f10, f5, 1);
++    r5 = vfma_lane_f32(r5, f11, f5, 1);
++    r1 = vfma_lane_f32(r1, f31, f1, 0);
++    r3 = vfma_lane_f32(r3, f31, f3, 0);
++    r5 = vfma_lane_f32(r5, f31, f5, 0);
++    const float32x4_t row0 = vcombine_f32(r0, r1), row1 = vcombine_f32(r2, r3), row2 = vcombine_f32(r4, r5);
++    const uint32x4_t ordered = vandq_u32(vandq_u32(vceqq_f32(row0, row0), vceqq_f32(row1, row1)),
++                                         vceqq_f32(row2, row2));
++    if (vminvq_u32(ordered) == 0) [[unlikely]] return false;
++    StorePairs(base + ab, row0);
++    StorePairs(base + ab + 16u, row1);
++    StorePairs(base + ab + 32u, row2);
++    out.f[0] = Raw(r5);
++    out.f[1] = Raw(f1);
++    out.f[2] = Raw(r4);
++    out.f[3] = Raw(f3);
++    out.f[4] = Raw(f4);
++    out.f[5] = Raw(f5);
++    out.f[6] = Raw(f6);
++    out.f[7] = Raw(f7);
++    out.f[8] = Raw(f8);
++    out.f[9] = Raw(f9);
++    out.f[10] = Raw(f10);
++    out.f[11] = Raw(f11);
++    out.f[12] = Raw(r0);
++    out.f[13] = Raw(r1);
++    return true;
++}
++
++}  // namespace mlb_mtx
++
++// GQR0 is read as (*ctx).gqr: the translator's contract analysis knows gpr/fpr/cr/xer/ctr/lr only
++// and would make any other member a complete-context boundary, but no translated function holds a
++// GQR across a call (mtspr stores to ctx->gqr, every function reloads its copy after each call),
++// so this read needs no register sync.
++extern "C" void MLB_PSMTXConcat_800A890C(CpuContext* ctx) {
++    HleTraceCall("MLB_PSMTXConcat_800A890C");
++    MkwComputePreemptPoll();  // T8 (switch phase 51): a compute preemption point (compute_preempt.h)
++    const uint32_t sp = ctx->gpr[1];
++    const uint32_t a = ctx->gpr[3], b = ctx->gpr[4], ab = ctx->gpr[5];
++    const uint32_t gqr = (*ctx).gqr[0];
++    MemoryInline::FlatWriteRam32(sp - 64u, sp);  // stwu r1, -64(r1)
++    ctx->gpr[6] = mlb_mtx::kUnit01;
++    // Two blocks writing the same registers: the fast one's results stay in vector registers,
++    // which a single Outputs passed to the out-of-line Exact as well would not allow.
++    if (!GuestFlat::RequiresCheckedAccess() && gqr == 0 && !mlb_mtx::Wraps(a, 48u) && !mlb_mtx::Wraps(b, 48u) &&
++        mlb_mtx::PlainDestination(ab)) [[likely]] {
++        mlb_mtx::Outputs out;
++        if (mlb_mtx::Fast(a, b, ab, out)) [[likely]] {
++            ctx->fpr[0].raw = out.f[0];
++            ctx->fpr[1].raw = out.f[1];
++            ctx->fpr[2].raw = out.f[2];
++            ctx->fpr[3].raw = out.f[3];
++            ctx->fpr[4].raw = out.f[4];
++            ctx->fpr[5].raw = out.f[5];
++            ctx->fpr[6].raw = out.f[6];
++            ctx->fpr[7].raw = out.f[7];
++            ctx->fpr[8].raw = out.f[8];
++            ctx->fpr[9].raw = out.f[9];
++            ctx->fpr[10].raw = out.f[10];
++            ctx->fpr[11].raw = out.f[11];
++            ctx->fpr[12].raw = out.f[12];
++            ctx->fpr[13].raw = out.f[13];
++            return;
++        }
++    }
++    mlb_mtx::Outputs out;
++    mlb_mtx::Exact(gqr, a, b, ab, out);
++    ctx->fpr[0].raw = out.f[0];
++    ctx->fpr[1].raw = out.f[1];
++    ctx->fpr[2].raw = out.f[2];
++    ctx->fpr[3].raw = out.f[3];
++    ctx->fpr[4].raw = out.f[4];
++    ctx->fpr[5].raw = out.f[5];
++    ctx->fpr[6].raw = out.f[6];
++    ctx->fpr[7].raw = out.f[7];
++    ctx->fpr[8].raw = out.f[8];
++    ctx->fpr[9].raw = out.f[9];
++    ctx->fpr[10].raw = out.f[10];
++    ctx->fpr[11].raw = out.f[11];
++    ctx->fpr[12].raw = out.f[12];
++    ctx->fpr[13].raw = out.f[13];
++}
++REGISTER_NATIVE_FUNCTION(0x800A890C, MLB_PSMTXConcat_800A890C);
++#endif
 diff --git a/runtime/src/hle/mlb/reverb_natives.cpp b/runtime/src/hle/mlb/reverb_natives.cpp
 new file mode 100644
 index 0000000..4876bf6

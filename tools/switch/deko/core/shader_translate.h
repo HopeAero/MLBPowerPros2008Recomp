@@ -155,4 +155,40 @@ uint32_t tev_unit_rewrite(std::string* wgsl, bool textures);
 constexpr uint64_t kTevUnitSeed = 0x7465765f756e6974ull;      // "tev_unit" (textures too)
 constexpr uint64_t kTevUnitRegsSeed = 0x7465765f756e7267ull;  // "tev_unrg" (registers and konst only)
 
+// A regular TEV op whose C operand is exactly 1.0 at run time, as its own branch (2026-10-31, EOF; the
+// deko3d NRO applies it by default, WIICOMPILED_DK_EOF_FIX, core/shaders.cpp). Why: the game's
+// end-of-frame quad (0x8004BB54: the EFB copy drawn back over 939x480 host pixels) is GX_MODULATE
+// (texture x rasterized colour) then x tevreg0, with both colours white; at 307 MHz its fragment shader,
+// ~220 Maxwell instructions of exact TEV integer emulation per pixel, is what that pass's 1.4 ms is.
+// Most of them are spent on the C operand: its overflow emulation (FLOOR included), its byte
+// conversion, c + (c >> 7) and a 32-bit multiply (three XMADs) per channel. With C a literal 1.0 the
+// compiler folds all of that (byte 255, factor 256: a shift). Each line
+//   REG = vec4f(clamp(tev_regular_vec3f(A, B, W(X), D, bias, scale, sub), lo, hi), REG.a);
+//   REG.a = clamp(tev_regular_f32(A, B, W(X), D, bias, scale, sub), lo, hi);
+// (W = tev_overflow_* or tev_unit_*, after tev_unit_rewrite) becomes
+//   if (<X is 1.0>) { <the line with W(1.0) in place of W(X)> } else { <the line> }
+// when X is uniform over the draw (the branch never diverges):
+//   - a TEV register still holding its uniform (`var tevregN = ubuf.tevregN;`, not assigned since):
+//     tested as X == 1.0 itself. Exact by construction: in the taken branch X is the float 1.0 (only
+//     +1.0 compares equal to it), W(1.0) is the same pure function of the same value, the line's
+//     other operands are the same text evaluated in the same state, and its one side effect, the
+//     assignment, comes after. Whatever the compiler folds in W(1.0), every IEEE-conforming evaluation
+//     of the overflow or unit wrapper of 1.0 lies within 2^-22 of 1.0, so the byte conversion gives 255
+//     in both branches;
+//   - a konst colour (ubuf.kcolorN): the same, X == 1.0 itself;
+//   - with `rast` only (WIICOMPILED_DK_EOF_FIX=2): a rasterized colour whose vertex output is the
+//     material register alone (lighting off: lighting_func's round(material * 255) / 255 lines, the same
+//     value at every vertex), tested on the material uniform (ubuf.ccN_mat / ccNa_mat == 1.0) so that
+//     the branch is uniform. Exact when interpolating a value that is equal at every vertex returns it
+//     within 0.5 / 255 relative (the byte conversion of the overflow of 1.0 +- 1.9e-3 is 255): a
+//     property of the rasterizer, not of the text, hence a mode of its own. Testing the interpolated
+//     value itself would be exact by construction but diverges where perspective interpolation lands an
+//     ulp off 1.0.
+// Other C operands (registers written by earlier stages, textures, lit or vertex colours) are left as
+// they are. Returns the number of lines rewritten (0: unchanged).
+uint32_t tev_white_rewrite(std::string* wgsl, bool rast);
+// The XXH3 seeds of a GX module's key with tev_white_rewrite (xor'ed with the others' choices)
+constexpr uint64_t kTevWhiteSeed = 0x7465765f77686974ull;      // "tev_whit" (registers and konst)
+constexpr uint64_t kTevWhiteRastSeed = 0x7465765f77687432ull;  // "tev_wht2" (material rasterized colours too)
+
 }  // namespace swdk

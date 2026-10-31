@@ -777,4 +777,225 @@ uint32_t tev_unit_rewrite(std::string* wgsl, bool textures) {
 }
 // ---- tev_unit_rewrite (end)
 
+// ---- tev_white_rewrite (begin; shader_translate.h. Plain string work, no Tint: the host test compiles
+// the tev_unit part and this one on their own, local/tmp/cpu/EOF-test)
+namespace {
+
+// the braces of `fn <name>(`'s body: *open at '{', *close at its '}'
+bool tw_body(const std::string& w, const char* fnHead, size_t* open, size_t* close) {
+    const size_t fn = w.find(fnHead);
+    if (fn == std::string::npos) return false;
+    const size_t o = w.find('{', fn);
+    if (o == std::string::npos) return false;
+    int depth = 0;
+    for (size_t i = o; i < w.size(); i++) {
+        if (w[i] == '{') depth++;
+        if (w[i] == '}' && --depth == 0) {
+            *open = o;
+            *close = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+// `name` (an identifier or a dotted path) at pos as a whole: not inside a longer name or path
+bool tw_whole(const std::string& s, size_t pos, size_t len) {
+    if (pos > 0 && (ut_ident(s[pos - 1]) || s[pos - 1] == '.')) return false;
+    return pos + len >= s.size() || !ut_ident(s[pos + len]);
+}
+
+size_t tw_count(const std::string& s, const std::string& name) {
+    size_t n = 0;
+    for (size_t pos = 0; (pos = s.find(name, pos)) != std::string::npos; pos += name.size())
+        if (tw_whole(s, pos, name.size())) n++;
+    return n;
+}
+
+// an assignment to `name` or to one of its members in line t (=, +=, -=, *=, /=; not ==)
+bool tw_assigns(const std::string& t, const std::string& name) {
+    for (size_t pos = 0; (pos = t.find(name, pos)) != std::string::npos;) {
+        const size_t start = pos;
+        pos += name.size();
+        if (!tw_whole(t, start, name.size())) continue;
+        size_t j = pos;
+        while (j < t.size() && t[j] == '.') {
+            j++;
+            while (j < t.size() && ut_ident(t[j])) j++;
+        }
+        while (j < t.size() && t[j] == ' ') j++;
+        if (j < t.size() && ((t[j] == '=' && (j + 1 >= t.size() || t[j + 1] != '=')) ||
+                             (strchr("+-*/", t[j]) && j + 1 < t.size() && t[j + 1] == '=')))
+            return true;
+    }
+    return false;
+}
+
+// Rasterized colour N whose vertex output is lighting_func's two lines for lighting off and the
+// material colour from the register (colour and alpha) and nothing else, read by the fragment
+// stage as `var rastN = in.ccN;` and never assigned there: bit N. Its value is then the same at
+// every vertex, round(material * 255) / 255.
+uint32_t tw_material_rast(const std::string& vs, const std::string& fs) {
+    uint32_t bits = 0;
+    for (int i = 0; i < 2; i++) {
+        const std::string n = std::to_string(i);
+        const std::string out = "out.cc" + n;
+        const std::string rgbLine = out + " = vec4f(vec3f(vec3i(round(ubuf.cc" + n + "_mat.rgb * 255.0))) / 255.0, 1.0);";
+        const std::string aLine = out + ".a = f32(i32(round(ubuf.cc" + n + "a_mat.a * 255.0))) / 255.0;";
+        const std::string rast = "rast" + n;
+        const std::string rastVar = "var " + rast + " = in.cc" + n + ";";
+        uint32_t rgb = 0, a = 0, vars = 0;
+        bool assigned = false;
+        std::istringstream vsLines(vs);
+        for (std::string line; std::getline(vsLines, line);) {
+            const std::string t = ut_trim(line);
+            if (t == rgbLine) rgb++;
+            if (t == aLine) a++;
+        }
+        std::istringstream fsLines(fs);
+        for (std::string line; std::getline(fsLines, line);) {
+            const std::string t = ut_trim(line);
+            if (t == rastVar) {
+                vars++;
+                continue;
+            }
+            if (tw_assigns(t, rast)) assigned = true;
+        }
+        if (rgb == 1 && a == 1 && tw_count(vs, out) == 2 && vars == 1 && !assigned) bits |= 1u << i;
+    }
+    return bits;
+}
+
+// What gets tested against 1.0 for operand X (the argument of the C operand's overflow or unit
+// wrapper), or "" when X is not one of the shapes below. vec: X is a vec3f (a colour op's operand).
+//   tevregN.<sw>, vec3f(tevregN.<c>)        while tevregN still holds ubuf.tevregN (initial[N])
+//   ubuf.kcolorN.<sw>, vec3f(ubuf.kcolorN.<c>)
+//   rastN.<sw>, vec3f(rastN.<c>)            material rasterized colours (rastBits), only with `rast`:
+//                                           tested on the material uniforms ubuf.ccN_mat / ccNa_mat
+// cond receives the WGSL bool expression (a uniform value in every case: the branch never diverges).
+bool tw_condition(const std::string& x, bool vec, const bool initial[3], uint32_t rastBits, bool rast,
+                  std::string* cond) {
+    std::string e = x, inner;
+    bool splat = false;
+    if (vec && ut_call(e, "vec3f", &inner)) {
+        std::vector<std::pair<size_t, size_t>> args;
+        if (!ut_args(e, 5, e.size() - 1, &args) || args.size() != 1) return false;
+        e = ut_trim(inner);
+        splat = true;
+    }
+    const size_t dot = e.rfind('.');
+    if (dot == std::string::npos || dot == 0) return false;
+    const std::string base = e.substr(0, dot), sw = e.substr(dot + 1);
+    if (!ut_swizzle(sw) || sw.size() != ((vec && !splat) ? 3u : 1u)) return false;
+    const std::string one = (vec && !splat) ? "vec3f(1.0)" : "1.0";
+    const auto direct = [&] {
+        *cond = (vec && !splat) ? "all(" + e + " == vec3f(1.0))" : e + " == " + one;
+        return true;
+    };
+    if (base.size() == 7 && base.compare(0, 6, "tevreg") == 0 && base[6] >= '0' && base[6] <= '2')
+        return initial[base[6] - '0'] && direct();
+    if (base.size() == 12 && base.compare(0, 11, "ubuf.kcolor") == 0 && base[11] >= '0' && base[11] <= '3')
+        return direct();
+    if (rast && base.size() == 5 && base.compare(0, 4, "rast") == 0 && (base[4] == '0' || base[4] == '1') &&
+        (rastBits >> (base[4] - '0') & 1u)) {
+        const std::string n(1, base[4]);
+        std::vector<std::string> comps;
+        for (char c : sw) comps.push_back(c == 'a' ? "ubuf.cc" + n + "a_mat.a" : "ubuf.cc" + n + "_mat." + std::string(1, c));
+        *cond = comps.size() == 3 ? "all(vec3f(" + comps[0] + ", " + comps[1] + ", " + comps[2] + ") == vec3f(1.0))"
+                                  : comps[0] + " == 1.0";
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+uint32_t tev_white_rewrite(std::string* wgsl, bool rast) {
+    size_t fsOpen, fsClose, vsOpen, vsClose;
+    if (!tw_body(*wgsl, "\nfn fs_main(", &fsOpen, &fsClose)) return 0;
+    const std::string body = wgsl->substr(fsOpen + 1, fsClose - fsOpen - 1);
+    uint32_t rastBits = 0;
+    if (rast && tw_body(*wgsl, "\nfn vs_main(", &vsOpen, &vsClose))
+        rastBits = tw_material_rast(wgsl->substr(vsOpen + 1, vsClose - vsOpen - 1), body);
+    bool initial[3] = {false, false, false};
+    std::string out;
+    out.reserve(body.size() * 2);
+    uint32_t n = 0;
+    size_t at = 0;
+    while (at <= body.size()) {
+        size_t eol = body.find('\n', at);
+        if (eol == std::string::npos) eol = body.size();
+        std::string line = body.substr(at, eol - at);
+        const std::string t = ut_trim(line);
+        int decl = -1;
+        for (int r = 0; r < 3; r++) {
+            const std::string name = "tevreg" + std::to_string(r);
+            if (t == "var " + name + " = ubuf." + name + ";") decl = r;
+        }
+        if (decl >= 0) {
+            initial[decl] = true;
+        } else {
+            // REG = vec4f(clamp(tev_regular_vec3f(A, B, C, D, ...), lo, hi), REG.a);
+            // REG.a = clamp(tev_regular_f32(A, B, C, D, ...), lo, hi);
+            const size_t eq = t.find(" = ");
+            const bool alpha = eq != std::string::npos && eq > 2 && t.compare(eq - 2, 2, ".a") == 0 &&
+                               ut_reg(t.substr(0, eq - 2)) >= 0;
+            const bool color = eq != std::string::npos && ut_reg(t.substr(0, eq)) >= 0;
+            const char* fn = alpha ? "tev_regular_f32(" : "tev_regular_vec3f(";
+            const size_t call = (alpha || color) ? t.find(fn) : std::string::npos;
+            std::string rhs = (alpha || color) && t.back() == ';' ? t.substr(eq + 3, t.size() - eq - 4) : std::string();
+            std::string inner;
+            const std::string reg = color ? t.substr(0, eq) : alpha ? t.substr(0, eq - 2) : std::string();
+            const std::string keepA = ", " + reg + ".a)";
+            bool shape = false;
+            if (color && ut_call(rhs, "vec4f", &inner) && rhs.size() > 6 + keepA.size() &&
+                rhs.compare(rhs.size() - keepA.size(), keepA.size(), keepA) == 0)
+                rhs = ut_trim(rhs.substr(6, rhs.size() - 6 - keepA.size()));
+            else if (color)
+                rhs.clear();
+            if (!rhs.empty() && ut_call(rhs, "clamp", &inner)) {
+                std::vector<std::pair<size_t, size_t>> cl;
+                std::string callInner;
+                shape = ut_args(rhs, 5, rhs.size() - 1, &cl) && cl.size() == 3 &&
+                        ut_call(ut_trim(rhs.substr(cl[0].first, cl[0].second - cl[0].first)),
+                                alpha ? "tev_regular_f32" : "tev_regular_vec3f", &callInner);
+            }
+            // (one combiner call in the line, at the place the shape says)
+            if (shape && call != std::string::npos && t.find(fn, call + 1) == std::string::npos &&
+                (call == 0 || !ut_ident(t[call - 1]))) {
+                const size_t open = call + strlen(fn) - 1;
+                const size_t close = ut_close(t, open);
+                std::vector<std::pair<size_t, size_t>> args;
+                if (close != std::string::npos && ut_args(t, open, close, &args) && args.size() == 7) {
+                    const std::string arg = t.substr(args[2].first, args[2].second - args[2].first);
+                    const std::string c = ut_trim(arg);
+                    const size_t cAt = args[2].first + arg.find_first_not_of(" \t");
+                    std::string x, cond;
+                    const char* wrap = nullptr;
+                    for (const char* w : alpha ? std::initializer_list<const char*>{"tev_overflow_f32", "tev_unit_f32"}
+                                               : std::initializer_list<const char*>{"tev_overflow_vec3f", "tev_unit_vec3f"})
+                        if (!wrap && ut_call(c, w, &x)) wrap = w;
+                    if (wrap && tw_condition(ut_trim(x), !alpha, initial, rastBits, rast, &cond)) {
+                        std::string fast = t;
+                        fast.replace(cAt, c.size(), std::string(wrap) + (alpha ? "(1.0)" : "(vec3f(1.0))"));
+                        const size_t lead = line.find_first_not_of(" \t");
+                        line = line.substr(0, lead == std::string::npos ? 0 : lead) + "if (" + cond + ") { " + fast +
+                               " } else { " + t + " }";
+                        n++;
+                    }
+                }
+            }
+            for (int r = 0; r < 3; r++)
+                if (tw_assigns(t, "tevreg" + std::to_string(r))) initial[r] = false;
+        }
+        out += line;
+        if (eol < body.size()) out += '\n';
+        at = eol + 1;
+    }
+    if (n == 0) return 0;
+    wgsl->replace(fsOpen + 1, fsClose - fsOpen - 1, out);
+    return n;
+}
+// ---- tev_white_rewrite (end)
+
 }  // namespace swdk

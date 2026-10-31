@@ -282,7 +282,12 @@ bool tev_fast_enabled();
 // the TEV overflow left out for operands known in [0, 1], same pixels): 2 registers, konst colours and
 // textures, 1 registers and konst colours only (exact whatever the texture formats), 0 off.
 uint32_t tev_unit_mode();
-// The XXH3 seed of a GX module's key for the translation variant in use (TEV_FAST, TEV_UNIT): each variant
+// WIICOMPILED_DK_EOF_FIX (default 1): GX modules are translated with tev_white_rewrite (shader_translate.h:
+// a regular TEV op whose C operand is uniform gets a branch for C = 1.0, where its C work folds away; same
+// pixels): 1 TEV registers and konst colours (exact by construction), 2 material rasterized colours too
+// (exact given the rasterizer's interpolation of a constant; the end-of-frame quad's first stage), 0 off.
+uint32_t tev_white_mode();
+// The XXH3 seed of a GX module's key for the translation variant in use (TEV_FAST, TEV_UNIT, EOF_FIX): each variant
 // has keys of its own, so the SD card's cache never mixes them (0: none, the plain XXH3 of the WGSL).
 uint64_t module_key_seed();
 // WIICOMPILED_DK_DUMP_MODULES=<hex key>[,...] or "all": the module's WGSL and GLSL written next to the
