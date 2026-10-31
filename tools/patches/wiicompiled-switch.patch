@@ -9423,30 +9423,166 @@ index 2514913..4b52f5b 100644
  extern bool g_requiresCheckedAccess;
  inline bool RequiresCheckedAccess() noexcept { return g_requiresCheckedAccess; }
 diff --git a/runtime/include/hle/dvd_contract.h b/runtime/include/hle/dvd_contract.h
-index 9cb9576..3f5eb4d 100644
+index 9cb9576..f4c6dad 100644
 --- a/runtime/include/hle/dvd_contract.h
 +++ b/runtime/include/hle/dvd_contract.h
-@@ -16,6 +16,10 @@
+@@ -6,6 +6,7 @@
+ #include <cctype>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <filesystem>
+ #include <fstream>
+ #include <limits>
+@@ -16,6 +17,10 @@
  #include <string>
  #include <utility>
  #include <vector>
-+#if defined(__SWITCH__)
++#if defined(__SWITCH__) || defined(DVD_READ_CONTRACT_FILE_CACHE)
 +#include <cstdio>
 +#include <mutex>
 +#endif
  
  namespace DvdFstContract {
  
-@@ -287,6 +291,65 @@ inline constexpr const char* Describe(HostReadFailure failure) noexcept {
+@@ -284,14 +289,223 @@ inline constexpr const char* Describe(HostReadFailure failure) noexcept {
+     return "unknown host read error";
+ }
+ 
++// A disc file that exists only as a list of pieces: byte ranges of other host files, bytes held in
++// memory and zeros. The Switch serves its modded PROJECT.BIN this way (mods.cpp): the PC writes a
++// merged 406 MB copy, which on the SD card meant reading and writing 406 MB before the first frame.
++// The DVD index stores `key` as the entry's host path (it is never opened); ReadExact recognises it
++// and assembles the range. Register every virtual file before DVDInit (mods::Apply runs before
++// aurora_initialize and any guest code) and never change the registry after that: reads take no lock.
++namespace Virtual {
++
++inline constexpr int32_t kBytes = -1;  // Piece::source: File::bytes from Piece::from
++inline constexpr int32_t kZeros = -2;  // Piece::source: zeros
++
++struct Piece {
++    uint64_t start = 0;  // offset in the virtual file
++    uint64_t length = 0;
++    int32_t source = kZeros;  // index into File::sources, kBytes or kZeros
++    uint64_t from = 0;        // offset in the source file or in File::bytes
++};
++
++struct File {
++    std::filesystem::path key;
++    std::string dvdPath;  // e.g. "/project.bin"
++    std::vector<uint8_t> bytes;
++    std::vector<std::filesystem::path> sources;
++    std::vector<Piece> pieces;  // contiguous from offset 0
++    uint64_t size = 0;
++
++    // Pieces go on at the end; one that continues the last piece (zeros after zeros, the next bytes of
++    // the same source) extends it.
++    void Append(int32_t source, uint64_t from, uint64_t length) {
++        if (length == 0) {
++            return;
++        }
++        if (!pieces.empty()) {
++            Piece& last = pieces.back();
++            if (last.source == source && (source == kZeros || last.from + last.length == from)) {
++                last.length += length;
++                size += length;
++                return;
++            }
++        }
++        pieces.push_back({size, length, source, from});
++        size += length;
++    }
++    void AppendBytes(uint64_t from, uint64_t length) { Append(kBytes, from, length); }
++    void AppendZeros(uint64_t length) { Append(kZeros, 0, length); }
++    void AppendSource(const std::filesystem::path& path, uint64_t from, uint64_t length) {
++        if (length == 0) {
++            return;
++        }
++        size_t index = 0;
++        while (index < sources.size() && !(sources[index] == path)) {
++            ++index;
++        }
++        if (index == sources.size()) {
++            sources.push_back(path);
++        }
++        Append(static_cast<int32_t>(index), from, length);
++    }
++};
++
++inline std::vector<File>& Files() {
++    static std::vector<File> files;
++    return files;
++}
++
++// A file with the same key replaces the earlier one.
++inline void Register(File file) {
++    for (File& existing : Files()) {
++        if (existing.key == file.key) {
++            existing = std::move(file);
++            return;
++        }
++    }
++    Files().push_back(std::move(file));
++}
++
++inline const File* Find(const std::filesystem::path& key) {
++    for (const File& file : Files()) {
++        if (file.key == key) {
++            return &file;
++        }
++    }
++    return nullptr;
++}
++
++// The same contract as ReadExact on a real file with these bytes. `readSource(path, offset, length,
++// out, failure)` reads one complete range of a source file into `out`.
++template <typename ReadSource>
++inline bool Read(const File& file, uint64_t offset, uint32_t length, std::vector<uint8_t>& destination,
++                 HostReadFailure& failure, ReadSource&& readSource) {
++    failure = HostReadFailure::None;
++    if (offset >= file.size) {
++        failure = HostReadFailure::BadOffset;
++        return false;
++    }
++    if (static_cast<uint64_t>(length) > file.size - offset) {
++        failure = HostReadFailure::ShortRead;
++        return false;
++    }
++    std::vector<uint8_t> staged(length);
++    // The last piece starting at or before `offset` (the first starts at 0).
++    auto piece = std::upper_bound(file.pieces.begin(), file.pieces.end(), offset,
++                                  [](uint64_t value, const Piece& p) { return value < p.start; });
++    --piece;
++    for (uint64_t done = 0; done < length; ++piece) {
++        const uint64_t at = offset + done - piece->start;
++        const uint64_t n = std::min<uint64_t>(piece->length - at, length - done);
++        uint8_t* const out = staged.data() + done;
++        if (piece->source == kBytes) {
++            std::memcpy(out, file.bytes.data() + piece->from + at, static_cast<size_t>(n));
++        } else if (piece->source >= 0 &&
++                   !readSource(file.sources[static_cast<size_t>(piece->source)], piece->from + at,
++                               static_cast<uint32_t>(n), out, failure)) {
++            return false;
++        }
++        done += n;
++    }
++    destination = std::move(staged);
++    return true;
++}
++
++} // namespace Virtual
++
  // Read into private storage first and publish it only after the complete host
  // range has been obtained. Callers can therefore leave a guest DMA destination
  // untouched for every failure, including a host file truncated after indexing.
-+#if defined(__SWITCH__)
-+inline bool ReadExact(const std::filesystem::path& hostPath,
-+                      uint64_t offset,
-+                      uint32_t length,
-+                      std::vector<uint8_t>& destination,
-+                      HostReadFailure& failure) {
++#if defined(__SWITCH__) || defined(DVD_READ_CONTRACT_FILE_CACHE)
++// One complete range of a host file into `out`, through a few files kept open. (Host tests define
++// DVD_READ_CONTRACT_FILE_CACHE to run this reader.)
++inline bool ReadHostRange(const std::string& path,
++                          uint64_t offset,
++                          uint32_t length,
++                          uint8_t* out,
++                          HostReadFailure& failure) {
 +    struct OpenFile {
 +        std::string path;
 +        FILE* file = nullptr;
@@ -9458,7 +9594,6 @@ index 9cb9576..3f5eb4d 100644
 +    static uint64_t uses = 0;
 +    failure = HostReadFailure::None;
 +    const std::lock_guard<std::mutex> lock(mutex);
-+    const std::string path = hostPath.string();
 +    OpenFile* slot = nullptr;
 +    for (OpenFile& f : open) {
 +        if (f.file && f.path == path) slot = &f;
@@ -9486,14 +9621,30 @@ index 9cb9576..3f5eb4d 100644
 +        failure = HostReadFailure::ShortRead;
 +        return false;
 +    }
-+    std::vector<uint8_t> staged(length);
 +    if (fseeko(slot->file, static_cast<off_t>(offset), SEEK_SET) != 0) {
 +        failure = HostReadFailure::BadOffset;
 +        return false;
 +    }
-+    if (length != 0 && std::fread(staged.data(), 1, length, slot->file) != length) {
++    if (length != 0 && std::fread(out, 1, length, slot->file) != length) {
 +        std::clearerr(slot->file);
 +        failure = HostReadFailure::ShortRead;
++        return false;
++    }
++    return true;
++}
++
++inline bool ReadExact(const std::filesystem::path& hostPath,
++                      uint64_t offset,
++                      uint32_t length,
++                      std::vector<uint8_t>& destination,
++                      HostReadFailure& failure) {
++    if (const Virtual::File* file = Virtual::Find(hostPath)) {
++        return Virtual::Read(*file, offset, length, destination, failure,
++                             [](const std::filesystem::path& source, uint64_t from, uint32_t n, uint8_t* out,
++                                HostReadFailure& why) { return ReadHostRange(source.string(), from, n, out, why); });
++    }
++    std::vector<uint8_t> staged(length);
++    if (!ReadHostRange(hostPath.string(), offset, length, staged.data(), failure)) {
 +        return false;
 +    }
 +    destination = std::move(staged);
@@ -9503,7 +9654,22 @@ index 9cb9576..3f5eb4d 100644
  inline bool ReadExact(const std::filesystem::path& hostPath,
                        uint64_t offset,
                        uint32_t length,
-@@ -334,5 +397,6 @@ inline bool ReadExact(const std::filesystem::path& hostPath,
+                       std::vector<uint8_t>& destination,
+                       HostReadFailure& failure) {
++    if (const Virtual::File* file = Virtual::Find(hostPath)) {
++        return Virtual::Read(*file, offset, length, destination, failure,
++                             [](const std::filesystem::path& source, uint64_t from, uint32_t n, uint8_t* out,
++                                HostReadFailure& why) {
++                                 std::vector<uint8_t> range;
++                                 if (!ReadExact(source, from, n, range, why)) return false;
++                                 std::copy(range.begin(), range.end(), out);
++                                 return true;
++                             });
++    }
+     failure = HostReadFailure::None;
+ 
+     std::ifstream file(hostPath, std::ios::binary);
+@@ -334,5 +548,6 @@ inline bool ReadExact(const std::filesystem::path& hostPath,
      destination = std::move(staged);
      return true;
  }
@@ -10589,204 +10755,3 @@ index 4ef3b2b..239d784 100644
  std::optional<TranslatedFunctionInfo> TranslatedFunctionRegistry::FindByHostAddress(uintptr_t hostAddr) {
      const bool frozen = RegistryFrozen().load(std::memory_order_acquire);
      if (!frozen) {
-diff --git a/runtime/src/abi_dispatch_fast.cpp b/runtime/src/abi_dispatch_fast.cpp
-new file mode 100644
-index 0000000..24a4584
---- /dev/null
-+++ b/runtime/src/abi_dispatch_fast.cpp
-@@ -0,0 +1,195 @@
-+// P25: the Horizon build's indirect-call entry (every bctrl of the translated code lands in
-+// InvokeIndirectCpu) with a one-load hit path.
-+//
-+// abi_bridge.h defines InvokeIndirectCpu inline (noinline), so a single weak copy is linked. This
-+// translation unit, which is not part of a unity group and never names the inline one, defines the
-+// same symbol strongly (the asm label below is its mangled name): the linker takes the strong
-+// definition over the weak copies and every call site, in any translation unit, reaches this code.
-+// abi_bridge.h is not touched, so changing this file rebuilds only this file.
-+//
-+// Old path per call (62 instructions on a memo hit): null/zero checks, ApplyRuntimeCallOptions, the
-+// lookupPublished_ acquire load, a thread-local 16-byte memo (TLS address, multiplicative hash, valid
-+// flag, address compare), the record's entry / mask / preserve fields, TryGetCpuContext, the
-+// g_switchDispatchCheck flag, the ScopedTranslatedExecutionAddress and the call.
-+// New hit path (~32): one global 8-byte word per slot (target | signed function offset << 32), one
-+// compare (a second slot of the 2-way set on a first-way miss), TryGetCpuContext, the scope and the
-+// call. Nothing else can differ for a word that is
-+// there: it is only written for an address whose authoritative lookup (the old memo and generated
-+// table) gave a record the old fast branch calls directly (entry set, FPR mask 0, no GPR
-+// preservation, record->address == target) and whose target ApplyRuntimeCallOptions leaves alone.
-+// The record fields are immutable once the registry is published, so the verdict never changes.
-+// Everything else (a native, a guarded mask, another context, a registry miss, before Finalize,
-+// target 0, a null context, the createPath target, a memo collision) runs the old body unchanged.
-+//
-+// WIICOMPILED_DISPATCH_FAST=0 never fills the table (every call takes the old body).
-+// WIICOMPILED_DISPATCH_CHECK=1 also never fills it, so the check keeps comparing every call.
-+#include "abi_bridge.h"
-+
-+#if defined(__SWITCH__)
-+#include <atomic>
-+#include <cstdint>
-+#include <cstdio>
-+#include <cstdlib>
-+#include <cstring>
-+
-+// P25-LOGIC-BEGIN (pure logic: extracted verbatim by local/tmp/cpu/P25-test; needs <atomic>,
-+// <cstdint>, RawDispatchRecord and CpuContext only)
-+namespace mkw_fast_dispatch {
-+
-+// 2-way sets of two adjacent words (one 16-byte pair, one cache line): 1024 sets, 2048 words, 16 KiB.
-+// (The old thread-local memo was direct-mapped with 512 entries of 16 bytes.)
-+inline constexpr uint32_t kSets = 1024;
-+inline constexpr uint32_t kEntries = kSets * 2u;
-+// ApplyRuntimeCallOptions rewrites r4 of this target's call (ScnRenderer::createPath): its calls
-+// always take the old body. If ApplyRuntimeCallOptions ever handles another target, list it here.
-+inline constexpr uint32_t kCreatePathTarget = 0x8023BD38u;
-+
-+inline uint32_t Index(uint32_t target) noexcept {  // first word of the target's set
-+    return (((target >> 2) ^ (target >> 13)) & (kSets - 1u)) * 2u;
-+}
-+
-+// What the old fast branch needs to run `record` for `target`, as one word: the low half is the
-+// guest target (0 = empty slot; target 0 never reaches the table), the high half the signed
-+// distance from `anchor` (the table's own address) to the host entry. False: not representable /
-+// not eligible, the caller leaves the slot alone.
-+inline bool Pack(uint32_t target, const RawDispatchRecord* record, uintptr_t anchor,
-+                 uint64_t* word) noexcept {
-+    if (target == 0u || target == kCreatePathTarget || record == nullptr || record->entry == nullptr ||
-+        record->nonvolatileFprWriteMask != 0u || record->preserveNonvolatileGprs ||
-+        record->address != target) {
-+        return false;
-+    }
-+    const int64_t distance = static_cast<int64_t>(reinterpret_cast<uintptr_t>(record->entry)) -
-+                             static_cast<int64_t>(anchor);
-+    if (distance < INT32_MIN || distance > INT32_MAX) {
-+        return false;
-+    }
-+    *word = (static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(distance))) << 32) | target;
-+    return true;
-+}
-+
-+inline void (*Unpack(uint64_t word, uintptr_t anchor) noexcept)(CpuContext*) {
-+    return reinterpret_cast<void (*)(CpuContext*)>(
-+        static_cast<uintptr_t>(static_cast<int64_t>(anchor) + (static_cast<int64_t>(word) >> 32)));
-+}
-+
-+// The word that holds `target` in its set, or 0. A word that is present is never 0 (its low half is a
-+// nonzero target), so "word != 0" is the whole hit test, and target 0 (the empty slots' value) never
-+// hits.
-+inline uint64_t Find(const std::atomic<uint64_t>* table, uint32_t target) noexcept {
-+    const std::atomic<uint64_t>* set = table + Index(target);
-+    uint64_t word = set[0].load(std::memory_order_relaxed);
-+    if (static_cast<uint32_t>(word) == target) {
-+        return word;
-+    }
-+    word = set[1].load(std::memory_order_relaxed);
-+    return static_cast<uint32_t>(word) == target ? word : 0u;
-+}
-+
-+// Store `word` (made by Pack for `target`, which Find just missed): an empty way first, else the way
-+// `victim` selects. Nothing is ever removed, and a slot only ever changes between valid words.
-+inline void Insert(std::atomic<uint64_t>* table, uint32_t target, uint64_t word, uint32_t victim) noexcept {
-+    std::atomic<uint64_t>* set = table + Index(target);
-+    if (static_cast<uint32_t>(set[0].load(std::memory_order_relaxed)) == 0u) {
-+        set[0].store(word, std::memory_order_relaxed);
-+    } else if (static_cast<uint32_t>(set[1].load(std::memory_order_relaxed)) == 0u) {
-+        set[1].store(word, std::memory_order_relaxed);
-+    } else {
-+        set[victim & 1u].store(word, std::memory_order_relaxed);
-+    }
-+}
-+
-+}  // namespace mkw_fast_dispatch
-+// P25-LOGIC-END
-+
-+namespace {
-+// Global, shared by every thread that calls InvokeIndirectCpu (the guest thread, audio and callback
-+// threads): a slot is one 64-bit word, written and read atomically, and any word that is present
-+// is valid for every thread (the table is immutable data after Finalize).
-+alignas(64) std::atomic<uint64_t> g_fastDispatch[mkw_fast_dispatch::kEntries];
-+
-+// RecompMod::ScopedTranslatedExecutionAddress for an address known to be nonzero (the hit path's
-+// target is: a present word never has a zero low half), without its zero test.
-+class NonzeroExecutionAddressScope {
-+public:
-+    explicit NonzeroExecutionAddressScope(uint32_t address) noexcept
-+        : previous_(RecompMod::g_currentTranslatedExecutionAddress) {
-+        RecompMod::g_currentTranslatedExecutionAddress = address;
-+    }
-+    ~NonzeroExecutionAddressScope() noexcept {
-+        RecompMod::g_currentTranslatedExecutionAddress = previous_;
-+    }
-+    NonzeroExecutionAddressScope(const NonzeroExecutionAddressScope&) = delete;
-+    NonzeroExecutionAddressScope& operator=(const NonzeroExecutionAddressScope&) = delete;
-+
-+private:
-+    uint32_t previous_;
-+};
-+
-+bool FastDispatchEnabled() noexcept {
-+    static const bool enabled = [] {
-+        const char* env = std::getenv("WIICOMPILED_DISPATCH_FAST");
-+        const bool on = env == nullptr || env[0] != '0';
-+        std::fprintf(stderr, "[dispatch] indirect fast table %s (WIICOMPILED_DISPATCH_FAST)\n",
-+                     on ? "on" : "off");
-+        return on;
-+    }();
-+    return enabled;
-+}
-+
-+// Cold: runs once per slot (re)fill.
-+__attribute__((noinline)) void FastDispatchFill(uint32_t target, const RawDispatchRecord* record) noexcept {
-+    if (g_switchDispatchCheck || !FastDispatchEnabled()) {
-+        return;
-+    }
-+    uint64_t word;
-+    if (mkw_fast_dispatch::Pack(target, record, reinterpret_cast<uintptr_t>(&g_fastDispatch[0]), &word)) {
-+        static std::atomic<uint32_t> victim{0};
-+        mkw_fast_dispatch::Insert(g_fastDispatch, target, word,
-+                                  victim.fetch_add(1, std::memory_order_relaxed));
-+    }
-+}
-+
-+// The old InvokeIndirectCpu body (abi_bridge.h), plus the fill. The hit path above it has already
-+// failed (or was never eligible), so this decides exactly what the old code decided.
-+__attribute__((noinline)) void InvokeIndirectCpuSlow(uint32_t target, CpuContext* ctx) {
-+    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
-+    if (target == 0) {
-+        ReportMissingCpuTarget(target, cpu);
-+    }
-+    ApplyRuntimeCallOptions(target, cpu);
-+    const RawDispatchRecord* record = TranslatedFunctionRegistry::FindRawByAddressPtr(target);
-+    if (record != nullptr && record->entry != nullptr && record->nonvolatileFprWriteMask == 0 &&
-+        !record->preserveNonvolatileGprs) {
-+        FastDispatchFill(target, record);
-+        if (TryGetCpuContext() == cpu) {
-+            if (g_switchDispatchCheck) [[unlikely]] {
-+                SwitchDispatchCheck(target, record, cpu);
-+            }
-+            RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
-+            record->entry(cpu);
-+            return;
-+        }
-+    }
-+    InvokeIndirectCpuGeneral(target, cpu);
-+}
-+}  // namespace
-+
-+// The strong definition of InvokeIndirectCpu(unsigned int, CpuContext*) (abi_bridge.h).
-+void MkwInvokeIndirectCpuFast(uint32_t target, CpuContext* ctx)
-+    __asm__("_Z17InvokeIndirectCpujP10CpuContext");
-+void MkwInvokeIndirectCpuFast(uint32_t target, CpuContext* ctx) {
-+    if (__builtin_expect(ctx != nullptr, 1)) {
-+        // 0 = not in the table (target 0 included: it goes to the old body).
-+        const uint64_t word = mkw_fast_dispatch::Find(g_fastDispatch, target);
-+        if (__builtin_expect(word != 0 && TryGetCpuContext() == ctx, 1)) {
-+            const auto entry =
-+                mkw_fast_dispatch::Unpack(word, reinterpret_cast<uintptr_t>(&g_fastDispatch[0]));
-+            NonzeroExecutionAddressScope translatedExecution(target);
-+            entry(ctx);
-+            return;
-+        }
-+    }
-+    InvokeIndirectCpuSlow(target, ctx);
-+}
-+#endif  // __SWITCH__

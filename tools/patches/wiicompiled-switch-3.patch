@@ -1,3 +1,212 @@
+diff --git a/runtime/src/hle/mlb/gfx_options.cpp b/runtime/src/hle/mlb/gfx_options.cpp
+new file mode 100644
+index 0000000..0b014f6
+--- /dev/null
++++ b/runtime/src/hle/mlb/gfx_options.cpp
+@@ -0,0 +1,203 @@
++// MLB Power Pros 2008 (RL8E54): optional lighter graphics (launcher VIDEO tab, Config.toml
++// [video] shadows, crowd, fielding_fov, reflections). All off by default; each native below is then one predictable
++// branch followed by the translation of the original function (kept callable by REGISTER_NATIVE_FUNCTION_AS),
++// so the game runs exactly as before. docs/ingenieria-inversa.md section 20 has the reverse engineering.
++//
++// - Player shadows, 0x806DA22C(character, mode): detaches the four shadow nodes (+0x14F0 blob, +0x1600 body,
++//   +0x17D0/+0x19A0 items), stores mode at +0x3A8 and attaches the ones the mode asks for: 1 = blob (one
++//   4-triangle mesh), 2/3 = planar shadows (the body's skinned to the skeleton, ~690 triangles, plus the
++//   items'), 0 = none. Only render nodes change; +0x3A8 is read only by the character's SetVisible
++//   (0x806DA4E8) and per-frame update (0x806DAF80), which update those nodes. "simple" turns 2/3 into 1,
++//   "off" passes 0.
++// - Bat shadows, 0x806E4DBC(bat, shown): the bat's SetVisible (vtable 0x80D5F8B0 slot +0x10, only called
++//   through it). The bat (constructor 0x806E4BC0, 0x654 bytes; the batter's at character +0x1C20 or
++//   +0x1C30, the on-deck one at +0x70 of the match's player set 0x80894694) has its models at +0x40/+0x150
++//   (pM_bat_R/L, cracked, or the two halves of a broken bat) and its own shadow projectors at +0x2A0/+0x470
++//   (pM_bat_shadow, pM_breakbat_*_shadow). It shows the projectors only while its byte +0x640 is set; the
++//   game clears that byte itself through 0x806E5070 where the bat must not cast one (0x806E29F0,
++//   0x807A1608). With "off" or "simple" (the game has no round shadow for a bat) the call runs with +0x640
++//   cleared and the byte is put back right after, so the bat takes the game's own no-shadow path and
++//   every reader sees the game's value. The ball's shadow is a separate plain model (model_game.pack
++//   +0x3400) and is left alone.
++// - Crowd, 0x80C60A94(scene): the stadium's per-frame visibility pass. A placement's node is shown when its
++//   tree-A flag, its byte in the visibility table (scene+0x6B8) and its sphere-in-frustum test agree; a
++//   zero byte also skips the piece's animation/LOD step (0x80C600C8, which writes that piece's node only).
++//   The crowd entries (placement type byte +0x52 in 0x13..0x17) are cleared for the call and put back right
++//   after it, so every other reader and writer of the table (0x80C5DA4C attendance level, day/night...)
++//   sees it unchanged. "less" hides the stands set the attendance level currently shows (0x80C5DA4C,
++//   level at scene+0x7B8: 0 shows 0x13/0x17 and hides 0x14/0x16, 1 the reverse, 2 none, 3 all), so it
++//   always halves the visible stands crowd; 0x15 stays. "off" hides 0x13..0x17.
++// - Play-shot field of view, 0x80054BEC(camera, f1 = degrees): the camera FOV setter (+0x1D8, focal
++//   length +0x1C4, dirty bit +0x80 |= 2). Scaled only when called from the play shot 0x808F1C5C (return
++//   address 0x808F1CCC), the shot that follows the ball after contact: there the shot camera [obj+0x4C]
++//   gets its FOV right before 0x80C779D4 copies it into the main camera (0x80055300), so the scaled angle
++//   reaches stadium culling and the players' source-camera view alike. The value 0x808F1C5C keeps at
++//   obj+0x8C and every other caller are untouched.
++// - Reflections, 0x8000DC70(handler): the pass count of the environment-map draw handler (constructor
++//   0x8000C8E0, vtable 0x80146018 slot +0x14, its only reference; "return 2"). The model draw loops
++//   (0x80015C10, 0x8000F400, 0x8001CBD4...) use the count only as the bound of begin pass (0x80060DD0: pass
++//   index at 0x8031AFC0) / draw / end pass (0x80060DDC: index back to -1). Pass 0 is the normal draw
++//   (0x80060B68); pass 1 (0x8000CD0C) fills the handler's own UV buffers (0x8000D770, sphere map, it alone
++//   flips their double-buffer index) and draws the mesh again with additive blending, saving and restoring the
++//   GX state it changes. It is created for helmet-like parts (0x806DB730: part +0x550 when character +0x50 is
++//   0/3/4/0x10, +0xBF0/+0xD10 by +0x68/+0x6C) and the bat (0x806E529C). "off" returns 1, the count of the
++//   base class (0x8000E184, vtable 0x80168A08), so those models are drawn like every other one: no shine, and
++//   nothing reads the skipped UV buffers or the pass index outside that draw.
++#include <cstdint>
++#include <cstdlib>
++#include <string>
++
++#include "abi_bridge.h"
++#include "memory.h"
++#include "runtime_config.h"
++
++extern "C" void func_806DA22C(CpuContext* ctx);  // the translations (kept: _AS registrations)
++extern "C" void func_806E4DBC(CpuContext* ctx);
++extern "C" void func_80C60A94(CpuContext* ctx);
++extern "C" void func_80054BEC(CpuContext* ctx);
++extern "C" void func_8000DC70(CpuContext* ctx);
++
++namespace mlb_gfx_options {
++
++enum class Shadows : uint8_t { Full, Simple, Off };
++enum class Crowd : uint8_t { Full, Less, Off };
++
++struct Settings {
++    Shadows shadows = Shadows::Full;
++    Crowd crowd = Crowd::Full;
++    float fovScale = 1.0f;  // 1 = untouched
++    bool fov = false;
++    bool reflections = true;
++};
++
++// Read once, at the first call of any of these natives (the guest starts after the pre-boot launcher,
++// which is the only thing that changes these settings).
++const Settings& Get() {
++    static const Settings settings = [] {
++        Settings s;
++        // WIICOMPILED_GFX_SHADOWS / _CROWD / _FOV / _REFLECTIONS override Config.toml (console runs started with nxlink
++        // pass them as arguments; the Switch has no launcher to change the file).
++        const char* envShadows = std::getenv("WIICOMPILED_GFX_SHADOWS");
++        const std::string shadows = envShadows ? envShadows : RuntimeConfigFile::PlayerShadows("full");
++        s.shadows = shadows == "off" ? Shadows::Off : shadows == "simple" ? Shadows::Simple : Shadows::Full;
++        const char* envCrowd = std::getenv("WIICOMPILED_GFX_CROWD");
++        const std::string crowd = envCrowd ? envCrowd : RuntimeConfigFile::CrowdLevel("full");
++        s.crowd = crowd == "off" ? Crowd::Off : crowd == "less" ? Crowd::Less : Crowd::Full;
++        const char* envFov = std::getenv("WIICOMPILED_GFX_FOV");
++        const uint32_t percent = envFov ? static_cast<uint32_t>(std::strtoul(envFov, nullptr, 10)) : RuntimeConfigFile::FieldingFov(100);
++        s.fov = percent >= 60 && percent < 100;
++        s.fovScale = s.fov ? static_cast<float>(percent) / 100.0f : 1.0f;
++        const char* envReflections = std::getenv("WIICOMPILED_GFX_REFLECTIONS");
++        const std::string reflections = envReflections ? envReflections : RuntimeConfigFile::Reflections("on");
++        s.reflections = reflections != "off";
++        return s;
++    }();
++    return settings;
++}
++
++constexpr uint32_t kSceneEnabled = 0x798, kPlacements = 0x6B4, kTable = 0x6B8, kCount = 0x600, kLevel = 0x7B8;
++constexpr uint32_t kPlacementSize = 0x54, kPlacementType = 0x52;
++constexpr uint32_t kBatShadowOn = 0x640;  // bat byte: its shadow projectors are shown (0x806E5070 sets it)
++constexpr uint32_t kPlayShotFovReturn = 0x808F1CCC;  // after `bl 0x80054BEC` in the play shot 0x808F1C5C
++
++bool HiddenType(Crowd crowd, uint32_t level, uint8_t type) {
++    if (type < 0x13 || type > 0x17) return false;
++    if (crowd == Crowd::Off) return true;
++    // Less: the stands set this attendance level shows (level 1 shows 0x14/0x16, the others 0x13/0x17).
++    return level == 1 ? (type == 0x14 || type == 0x16) : (type == 0x13 || type == 0x17);
++}
++
++void StadiumUpdateWithoutCrowd(CpuContext* ctx, Crowd crowd) {
++    const uint32_t scene = ctx->gpr[3];
++    const uint32_t table = scene != 0 && Memory::Read8(scene + kSceneEnabled) != 0 ? Memory::Read32(scene + kTable) : 0;
++    const uint32_t placements = table != 0 ? Memory::Read32(scene + kPlacements) : 0;
++    const int32_t count = placements != 0 ? static_cast<int32_t>(Memory::Read32(scene + kCount)) : 0;
++    if (count <= 0) {
++        func_80C60A94(ctx);
++        return;
++    }
++    // Stadiums have 14-22 crowd placements; beyond the buffer they simply stay as the game set them.
++    constexpr int kMax = 256;
++    uint16_t index[kMax];
++    uint8_t value[kMax];
++    int saved = 0;
++    const uint32_t level = Memory::Read32(scene + kLevel);
++    for (int32_t i = 0; i < count && saved < kMax; ++i) {
++        const uint8_t type = Memory::Read8(placements + static_cast<uint32_t>(i) * kPlacementSize + kPlacementType);
++        if (!HiddenType(crowd, level, type)) continue;
++        const uint8_t shown = Memory::Read8(table + static_cast<uint32_t>(i));
++        if (shown == 0) continue;
++        index[saved] = static_cast<uint16_t>(i);
++        value[saved] = shown;
++        ++saved;
++        Memory::Write8(table + static_cast<uint32_t>(i), 0);
++    }
++    func_80C60A94(ctx);
++    // Put the table back. Nothing the pass reaches writes it; an entry it did set is left as it is.
++    if (Memory::Read32(scene + kTable) != table) return;
++    for (int k = 0; k < saved; ++k) {
++        const uint32_t at = table + index[k];
++        if (Memory::Read8(at) == 0) Memory::Write8(at, value[k]);
++    }
++}
++
++}  // namespace mlb_gfx_options
++
++extern "C" void MLB_CharShadowMode_806DA22C(CpuContext* ctx) {
++    using namespace mlb_gfx_options;
++    const Shadows shadows = Get().shadows;
++    if (shadows != Shadows::Full) [[unlikely]] {
++        const uint32_t mode = ctx->gpr[4];
++        if (shadows == Shadows::Off) ctx->gpr[4] = 0;
++        else if (mode == 2 || mode == 3) ctx->gpr[4] = 1;
++    }
++    func_806DA22C(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x806DA22C, MLB_CharShadowMode_806DA22C, "CharShadowMode");
++
++extern "C" void MLB_BatSetVisible_806E4DBC(CpuContext* ctx) {
++    using namespace mlb_gfx_options;
++    if (Get().shadows != Shadows::Full) [[unlikely]] {
++        // Only the bat's own node calls are reached (SetVisible of its models and projectors); none writes
++        // +0x640, so it is still 0 afterwards unless the game changed it, and then it is left as it is.
++        const uint32_t bat = ctx->gpr[3];
++        const uint8_t shadowOn = Memory::Read8(bat + kBatShadowOn);
++        Memory::Write8(bat + kBatShadowOn, 0);
++        func_806E4DBC(ctx);
++        if (Memory::Read8(bat + kBatShadowOn) == 0) Memory::Write8(bat + kBatShadowOn, shadowOn);
++        return;
++    }
++    func_806E4DBC(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x806E4DBC, MLB_BatSetVisible_806E4DBC, "BatSetVisible");
++
++extern "C" void MLB_StadiumVisibility_80C60A94(CpuContext* ctx) {
++    using namespace mlb_gfx_options;
++    const Crowd crowd = Get().crowd;
++    if (crowd != Crowd::Full) [[unlikely]] {
++        StadiumUpdateWithoutCrowd(ctx, crowd);
++        return;
++    }
++    func_80C60A94(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80C60A94, MLB_StadiumVisibility_80C60A94, "StadiumVisibility");
++
++extern "C" void MLB_CameraSetFov_80054BEC(CpuContext* ctx) {
++    using namespace mlb_gfx_options;
++    const Settings& s = Get();
++    if (s.fov && ctx->lr == kPlayShotFovReturn) [[unlikely]] {
++        // A single, as the play shot's fmuls left it, scaled in single precision.
++        ctx->fpr[1].d = static_cast<double>(static_cast<float>(ctx->fpr[1].d) * s.fovScale);
++    }
++    func_80054BEC(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80054BEC, MLB_CameraSetFov_80054BEC, "CameraSetFov");
++
++extern "C" void MLB_EnvMapPassCount_8000DC70(CpuContext* ctx) {
++    if (!mlb_gfx_options::Get().reflections) [[unlikely]] {
++        ctx->gpr[3] = 1;  // the base handler's count: only the normal draw (pass 0)
++        return;
++    }
++    func_8000DC70(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8000DC70, MLB_EnvMapPassCount_8000DC70, "EnvMapPassCount");
 diff --git a/runtime/src/hle/mlb/light_natives.cpp b/runtime/src/hle/mlb/light_natives.cpp
 new file mode 100644
 index 0000000..ab533ff
@@ -5119,7 +5328,7 @@ index b155a20..244abc5 100644
          OSResumeThread_HLE_801aa58c(cpu);
  
 diff --git a/runtime/src/hle/storage/dvd.cpp b/runtime/src/hle/storage/dvd.cpp
-index 8f4c9b4..c8b80bb 100644
+index 8f4c9b4..bd9a967 100644
 --- a/runtime/src/hle/storage/dvd.cpp
 +++ b/runtime/src/hle/storage/dvd.cpp
 @@ -15,6 +15,9 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size);
@@ -5213,6 +5422,19 @@ index 8f4c9b4..c8b80bb 100644
  
          std::string prefix = virtualPrefix.empty() ? "/" : virtualPrefix;
          if (prefix.back() != '/' && prefix.back() != '\\') {
+@@ -837,6 +888,12 @@ extern "C" void DVDInit_8015EA1C()
+     // reverse discovery order: the explicitly configured root outranks the mod
+     // manifest.
+     const size_t vanillaEntryCount = g_fileEntries.size();
++    // Virtual files (dvd_contract.h: the Switch's modded PROJECT.BIN, mods.cpp) replace disc files
++    // first, where the PC's merged copy sits: its folder is the last overlay root registered, so the
++    // first one applied.
++    for (const DvdReadContract::Virtual::File& file : DvdReadContract::Virtual::Files()) {
++        RegisterFileEntry(file.dvdPath, file.key, static_cast<uint32_t>(file.size));
++    }
+     for (auto overlay = overlays.rbegin(); overlay != overlays.rend(); ++overlay) {
+         ScanOverlayRoot(*overlay);
+     }
 diff --git a/runtime/src/hle/storage/nand_async.cpp b/runtime/src/hle/storage/nand_async.cpp
 index aeb1962..a9fce54 100644
 --- a/runtime/src/hle/storage/nand_async.cpp
@@ -6585,6 +6807,192 @@ index 88a484e..ba4576b 100644
      if (MemoryInline::GetPointerFast(addr, length)) {
          return true;
      }
+diff --git a/runtime/src/mods.cpp b/runtime/src/mods.cpp
+index 0c3ee8b..8aeb532 100644
+--- a/runtime/src/mods.cpp
++++ b/runtime/src/mods.cpp
+@@ -1,5 +1,6 @@
+ #include "mods.h"
+ 
++#include "hle/dvd_contract.h"
+ #include "recomp_mod_loader.h"
+ #include "runtime_config.h"
+ #include "runtime_log.h"
+@@ -185,6 +186,125 @@ bool BuildProjectBin(const std::filesystem::path& original, const std::map<std::
+     return true;
+ }
+ 
++// BuildProjectBin without the copy: `file` gets the new header (in memory) and, in order, the ranges
++// of the original and of the mod files that BuildProjectBin would write, with the same zero padding,
++// so reading it gives the bytes of the merged copy. The Switch serves it from the DVD layer
++// (dvd_contract.h DvdReadContract::Virtual) instead of writing 406 MB to the SD card. Keep the two in
++// step: tests compare them byte for byte (local/tmp/cpu/MODSW).
++bool PlanProjectBin(const std::filesystem::path& original, const std::map<std::string, std::filesystem::path>& replacements,
++                    const std::vector<NewFile>& added, DvdReadContract::Virtual::File& file, std::string& error) {
++    constexpr uint32_t kSector = 0x800;
++    std::ifstream src(original, std::ios::binary);
++    std::vector<char> head(0x40);
++    if (!src.read(head.data(), static_cast<std::streamsize>(head.size()))) {
++        error = "cannot read " + Utf8(original);
++        return false;
++    }
++    const uint32_t recordsOff = Be32(head, 0x14), orderOff = Be32(head, 0x28), namesOff = Be32(head, 0x2C),
++                   dataOff = Be32(head, 0x34);
++    if (Be32(head, 4) != kSector || !(recordsOff < orderOff && orderOff < namesOff && namesOff < dataOff)) {
++        error = "unexpected PROJECT.BIN header";
++        return false;
++    }
++    std::vector<char> header(dataOff);
++    src.seekg(0);
++    if (!src.read(header.data(), static_cast<std::streamsize>(header.size()))) {
++        error = "cannot read the header of " + Utf8(original);
++        return false;
++    }
++    std::error_code ec;
++    const uint64_t originalSize = std::filesystem::file_size(original, ec);
++    if (ec) {
++        error = "cannot read " + Utf8(original);
++        return false;
++    }
++    // The size of a mod file as BuildProjectBin reads it (an unreadable one gives no bytes).
++    auto sizeOf = [&](const std::filesystem::path& path, uint64_t& bytes) {
++        std::error_code sizeError;
++        bytes = std::filesystem::file_size(path, sizeError);
++        if (sizeError) bytes = 0;
++        if (bytes >= 0xFFFFF800u) {
++            error = Utf8(path) + " is too large";
++            return false;
++        }
++        return true;
++    };
++    file.AppendBytes(0, dataOff);  // the header, filled in at the end
++    uint32_t sector = 0;
++    size_t used = 0;
++    uint32_t slot = 1;
++    for (; orderOff + slot * 8 + 8 <= namesOff; ++slot) {
++        const uint32_t index = Be32(header, orderOff + slot * 8);
++        const uint32_t start = Be32(header, orderOff + slot * 8 + 4);
++        if (index == 0 && start == 0) break;
++        const size_t record = recordsOff + static_cast<size_t>(index) * 0x1C;
++        const size_t nameAt = namesOff + Be32(header, record + 4);
++        std::string name(header.data() + nameAt);
++        name = Lower(name.substr(name.rfind('/') == 0 ? 1 : 0));
++        uint64_t bytes = 0;
++        if (const auto it = replacements.find(name); it != replacements.end()) {
++            if (!sizeOf(it->second, bytes)) return false;
++            file.AppendSource(it->second, 0, bytes);
++            ++used;
++        } else {
++            bytes = Be32(header, record + 0x18);
++            const uint64_t from = uint64_t{dataOff} + uint64_t{start} * kSector;
++            if (from + bytes > originalSize) {
++                error = "PROJECT.BIN entry " + name + " lies past the end of the file";
++                return false;
++            }
++            file.AppendSource(original, from, bytes);
++        }
++        const uint32_t sectors = static_cast<uint32_t>((bytes + kSector - 1) / kSector);
++        file.AppendZeros(uint64_t{sectors} * kSector - bytes);
++        PutBe32(header, record + 8, sectors);
++        PutBe32(header, record + 0x18, static_cast<uint32_t>(bytes));
++        PutBe32(header, orderOff + slot * 8 + 4, sector);
++        sector += sectors;
++    }
++    const uint32_t buckets = Be32(header, 0x20);
++    const uint32_t lastBucket = orderOff + Be32(header, Be32(header, 0x18) + 4 * buckets);
++    if (!added.empty() && lastBucket + 8 + 8 * Be32(header, lastBucket) != orderOff + slot * 8) {
++        error = "unexpected PROJECT.BIN order buckets";
++        return false;
++    }
++    if (!added.empty()) PutBe32(header, lastBucket, Be32(header, lastBucket) + static_cast<uint32_t>(added.size()));
++    for (const NewFile& newFile : added) {
++        if (orderOff + (slot + 1) * 8 + 8 > namesOff) {
++            error = "PROJECT.BIN order table is full; too many new files";
++            return false;
++        }
++        const size_t record = recordsOff + static_cast<size_t>(newFile.id) * 0x1C;
++        if (record + 0x1C > orderOff) {
++            error = "new file id out of range";
++            return false;
++        }
++        uint64_t bytes = 0;
++        if (!sizeOf(newFile.path, bytes)) return false;
++        file.AppendSource(newFile.path, 0, bytes);
++        const uint32_t sectors = static_cast<uint32_t>((bytes + kSector - 1) / kSector);
++        file.AppendZeros(uint64_t{sectors} * kSector - bytes);
++        for (uint32_t at = 0; at < 0x1C; at += 4) PutBe32(header, record + at, 0);
++        PutBe32(header, record + 8, sectors);
++        PutBe32(header, record + 0xC, kSector);
++        PutBe32(header, record + 0x18, static_cast<uint32_t>(bytes));
++        PutBe32(header, orderOff + slot * 8, newFile.id);
++        PutBe32(header, orderOff + slot * 8 + 4, sector);
++        ++slot;
++        sector += sectors;
++    }
++    if (used != replacements.size()) {
++        RT_LOG(RT_TAG_RUNTIME) << "mods: " << replacements.size() - used
++                               << " project/ file(s) match no PROJECT.BIN entry and were ignored" << std::endl;
++    }
++    if (file.size > 0xFFFFFFFFu) {  // the DVD index keeps 32-bit sizes
++        error = "the modded PROJECT.BIN would exceed 4 GiB";
++        return false;
++    }
++    file.bytes.assign(header.begin(), header.end());
++    return true;
++}
++
+ } // namespace
+ 
+ std::filesystem::path Directory() {
+@@ -562,9 +682,18 @@ std::filesystem::path ApplyRoster(const Mod& mod, const char* cachePath) {
+     return pack;
+ }
+ 
++// The Switch serves the modded PROJECT.BIN as a virtual file (PlanProjectBin) instead of writing the
++// merged copy: 406 MB read and written on the SD card, with no frame on screen, froze the console at
++// start-up. Host tests define MODS_VIRTUAL_PROJECT_BIN to run this path.
++#if defined(__SWITCH__) || defined(MODS_VIRTUAL_PROJECT_BIN)
++constexpr bool kVirtualProjectBin = true;
++#else
++constexpr bool kVirtualProjectBin = false;
++#endif
++
+ // project/ packs of the enabled mods, merged into a per-user copy of PROJECT.BIN that is served as a
+ // disc overlay. The copy is rebuilt only when the original or any pack changes (size and time).
+-// ponytail: a full 406 MB copy; a virtual file in the DVD layer would avoid it if disk space matters.
++// ponytail: a full 406 MB copy on the PC; the Switch uses the virtual file (kVirtualProjectBin).
+ void ApplyProjectPacks(const std::map<std::string, std::filesystem::path>& packs, const std::vector<NewFile>& added,
+                        const char* cachePath) {
+     namespace fs = std::filesystem;
+@@ -574,6 +703,28 @@ void ApplyProjectPacks(const std::map<std::string, std::filesystem::path>& packs
+     const fs::path merged = disc / "project.bin";
+     const fs::path stamp = disc / "project.bin.sources";
+     std::error_code ec;
++    if (kVirtualProjectBin) {
++        const auto started = std::chrono::steady_clock::now();
++        DvdReadContract::Virtual::File file;
++        file.key = disc / "project.bin (virtual)";  // never opened: the DVD layer serves it
++        file.dvdPath = "/project.bin";
++        std::string error;
++        if (!PlanProjectBin(original, packs, added, file, error)) {
++            RT_LOG(RT_TAG_RUNTIME) << "mods: cannot build the modded PROJECT.BIN: " << error << std::endl;
++            return;
++        }
++        // A merged copy left by an older build only takes space on the SD card.
++        for (const fs::path& stale : {merged, disc / "project.bin.partial", stamp}) fs::remove(stale, ec);
++        const size_t pieces = file.pieces.size();
++        const uint64_t size = file.size;
++        DvdReadContract::Virtual::Register(std::move(file));
++        RT_LOG(RT_TAG_RUNTIME) << "mods: virtual PROJECT.BIN (" << size << " bytes, " << pieces << " pieces) with "
++                               << packs.size() << " replaced and " << added.size() << " new pack(s) in "
++                               << std::chrono::duration_cast<std::chrono::milliseconds>(
++                                      std::chrono::steady_clock::now() - started).count()
++                               << " ms" << std::endl;
++        return;
++    }
+     auto describe = [&](const fs::path& path) {
+         const auto time = fs::last_write_time(path, ec).time_since_epoch().count();
+         return Utf8(path) + " " + std::to_string(static_cast<unsigned long long>(fs::file_size(path, ec))) + " " +
 diff --git a/runtime/src/platform/switch/switch_crash.cpp b/runtime/src/platform/switch/switch_crash.cpp
 new file mode 100644
 index 0000000..a133027
@@ -8090,6 +8498,35 @@ index 7a2f7dd..967c4a9 100644
      match_benchmark::OnHostFrame();
      stadium_viewer::OnHostFrame();
      season_probe::OnHostFrame();
+diff --git a/runtime/src/stadium_banner.cpp b/runtime/src/stadium_banner.cpp
+index 6fe510f..217530c 100644
+--- a/runtime/src/stadium_banner.cpp
++++ b/runtime/src/stadium_banner.cpp
+@@ -17,6 +17,10 @@
+ #define STBTT_STATIC
+ #include "imstb_truetype.h"
+ 
++#if defined(__SWITCH__)
++extern "C" const void* SwitchUiSharedFont(size_t* size);
++#endif
++
+ namespace mods {
+ namespace {
+ 
+@@ -46,6 +50,13 @@ std::vector<uint32_t> Codepoints(const std::string& text) {
+ }
+ 
+ std::vector<uint8_t> ReadFont() {
++#if defined(__SWITCH__)
++    // Horizon has no font files: the system's shared font (pl, switch_ui.cpp), which the launcher uses.
++    size_t size = 0;
++    if (const auto* data = static_cast<const uint8_t*>(SwitchUiSharedFont(&size)); data != nullptr && size != 0) {
++        return std::vector<uint8_t>(data, data + size);
++    }
++#endif
+ #if defined(_WIN32)
+     const char* candidates[] = {"C:/Windows/Fonts/ariblk.ttf", "C:/Windows/Fonts/arialbd.ttf",
+                                 "C:/Windows/Fonts/segoeuib.ttf"};
 diff --git a/runtime/tests/runtime_config_tests.cpp b/runtime/tests/runtime_config_tests.cpp
 index 749652e..46b4d5d 100644
 --- a/runtime/tests/runtime_config_tests.cpp

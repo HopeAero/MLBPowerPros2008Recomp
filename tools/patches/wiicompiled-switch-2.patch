@@ -1,3 +1,204 @@
+diff --git a/runtime/src/abi_dispatch_fast.cpp b/runtime/src/abi_dispatch_fast.cpp
+new file mode 100644
+index 0000000..24a4584
+--- /dev/null
++++ b/runtime/src/abi_dispatch_fast.cpp
+@@ -0,0 +1,195 @@
++// P25: the Horizon build's indirect-call entry (every bctrl of the translated code lands in
++// InvokeIndirectCpu) with a one-load hit path.
++//
++// abi_bridge.h defines InvokeIndirectCpu inline (noinline), so a single weak copy is linked. This
++// translation unit, which is not part of a unity group and never names the inline one, defines the
++// same symbol strongly (the asm label below is its mangled name): the linker takes the strong
++// definition over the weak copies and every call site, in any translation unit, reaches this code.
++// abi_bridge.h is not touched, so changing this file rebuilds only this file.
++//
++// Old path per call (62 instructions on a memo hit): null/zero checks, ApplyRuntimeCallOptions, the
++// lookupPublished_ acquire load, a thread-local 16-byte memo (TLS address, multiplicative hash, valid
++// flag, address compare), the record's entry / mask / preserve fields, TryGetCpuContext, the
++// g_switchDispatchCheck flag, the ScopedTranslatedExecutionAddress and the call.
++// New hit path (~32): one global 8-byte word per slot (target | signed function offset << 32), one
++// compare (a second slot of the 2-way set on a first-way miss), TryGetCpuContext, the scope and the
++// call. Nothing else can differ for a word that is
++// there: it is only written for an address whose authoritative lookup (the old memo and generated
++// table) gave a record the old fast branch calls directly (entry set, FPR mask 0, no GPR
++// preservation, record->address == target) and whose target ApplyRuntimeCallOptions leaves alone.
++// The record fields are immutable once the registry is published, so the verdict never changes.
++// Everything else (a native, a guarded mask, another context, a registry miss, before Finalize,
++// target 0, a null context, the createPath target, a memo collision) runs the old body unchanged.
++//
++// WIICOMPILED_DISPATCH_FAST=0 never fills the table (every call takes the old body).
++// WIICOMPILED_DISPATCH_CHECK=1 also never fills it, so the check keeps comparing every call.
++#include "abi_bridge.h"
++
++#if defined(__SWITCH__)
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++// P25-LOGIC-BEGIN (pure logic: extracted verbatim by local/tmp/cpu/P25-test; needs <atomic>,
++// <cstdint>, RawDispatchRecord and CpuContext only)
++namespace mkw_fast_dispatch {
++
++// 2-way sets of two adjacent words (one 16-byte pair, one cache line): 1024 sets, 2048 words, 16 KiB.
++// (The old thread-local memo was direct-mapped with 512 entries of 16 bytes.)
++inline constexpr uint32_t kSets = 1024;
++inline constexpr uint32_t kEntries = kSets * 2u;
++// ApplyRuntimeCallOptions rewrites r4 of this target's call (ScnRenderer::createPath): its calls
++// always take the old body. If ApplyRuntimeCallOptions ever handles another target, list it here.
++inline constexpr uint32_t kCreatePathTarget = 0x8023BD38u;
++
++inline uint32_t Index(uint32_t target) noexcept {  // first word of the target's set
++    return (((target >> 2) ^ (target >> 13)) & (kSets - 1u)) * 2u;
++}
++
++// What the old fast branch needs to run `record` for `target`, as one word: the low half is the
++// guest target (0 = empty slot; target 0 never reaches the table), the high half the signed
++// distance from `anchor` (the table's own address) to the host entry. False: not representable /
++// not eligible, the caller leaves the slot alone.
++inline bool Pack(uint32_t target, const RawDispatchRecord* record, uintptr_t anchor,
++                 uint64_t* word) noexcept {
++    if (target == 0u || target == kCreatePathTarget || record == nullptr || record->entry == nullptr ||
++        record->nonvolatileFprWriteMask != 0u || record->preserveNonvolatileGprs ||
++        record->address != target) {
++        return false;
++    }
++    const int64_t distance = static_cast<int64_t>(reinterpret_cast<uintptr_t>(record->entry)) -
++                             static_cast<int64_t>(anchor);
++    if (distance < INT32_MIN || distance > INT32_MAX) {
++        return false;
++    }
++    *word = (static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(distance))) << 32) | target;
++    return true;
++}
++
++inline void (*Unpack(uint64_t word, uintptr_t anchor) noexcept)(CpuContext*) {
++    return reinterpret_cast<void (*)(CpuContext*)>(
++        static_cast<uintptr_t>(static_cast<int64_t>(anchor) + (static_cast<int64_t>(word) >> 32)));
++}
++
++// The word that holds `target` in its set, or 0. A word that is present is never 0 (its low half is a
++// nonzero target), so "word != 0" is the whole hit test, and target 0 (the empty slots' value) never
++// hits.
++inline uint64_t Find(const std::atomic<uint64_t>* table, uint32_t target) noexcept {
++    const std::atomic<uint64_t>* set = table + Index(target);
++    uint64_t word = set[0].load(std::memory_order_relaxed);
++    if (static_cast<uint32_t>(word) == target) {
++        return word;
++    }
++    word = set[1].load(std::memory_order_relaxed);
++    return static_cast<uint32_t>(word) == target ? word : 0u;
++}
++
++// Store `word` (made by Pack for `target`, which Find just missed): an empty way first, else the way
++// `victim` selects. Nothing is ever removed, and a slot only ever changes between valid words.
++inline void Insert(std::atomic<uint64_t>* table, uint32_t target, uint64_t word, uint32_t victim) noexcept {
++    std::atomic<uint64_t>* set = table + Index(target);
++    if (static_cast<uint32_t>(set[0].load(std::memory_order_relaxed)) == 0u) {
++        set[0].store(word, std::memory_order_relaxed);
++    } else if (static_cast<uint32_t>(set[1].load(std::memory_order_relaxed)) == 0u) {
++        set[1].store(word, std::memory_order_relaxed);
++    } else {
++        set[victim & 1u].store(word, std::memory_order_relaxed);
++    }
++}
++
++}  // namespace mkw_fast_dispatch
++// P25-LOGIC-END
++
++namespace {
++// Global, shared by every thread that calls InvokeIndirectCpu (the guest thread, audio and callback
++// threads): a slot is one 64-bit word, written and read atomically, and any word that is present
++// is valid for every thread (the table is immutable data after Finalize).
++alignas(64) std::atomic<uint64_t> g_fastDispatch[mkw_fast_dispatch::kEntries];
++
++// RecompMod::ScopedTranslatedExecutionAddress for an address known to be nonzero (the hit path's
++// target is: a present word never has a zero low half), without its zero test.
++class NonzeroExecutionAddressScope {
++public:
++    explicit NonzeroExecutionAddressScope(uint32_t address) noexcept
++        : previous_(RecompMod::g_currentTranslatedExecutionAddress) {
++        RecompMod::g_currentTranslatedExecutionAddress = address;
++    }
++    ~NonzeroExecutionAddressScope() noexcept {
++        RecompMod::g_currentTranslatedExecutionAddress = previous_;
++    }
++    NonzeroExecutionAddressScope(const NonzeroExecutionAddressScope&) = delete;
++    NonzeroExecutionAddressScope& operator=(const NonzeroExecutionAddressScope&) = delete;
++
++private:
++    uint32_t previous_;
++};
++
++bool FastDispatchEnabled() noexcept {
++    static const bool enabled = [] {
++        const char* env = std::getenv("WIICOMPILED_DISPATCH_FAST");
++        const bool on = env == nullptr || env[0] != '0';
++        std::fprintf(stderr, "[dispatch] indirect fast table %s (WIICOMPILED_DISPATCH_FAST)\n",
++                     on ? "on" : "off");
++        return on;
++    }();
++    return enabled;
++}
++
++// Cold: runs once per slot (re)fill.
++__attribute__((noinline)) void FastDispatchFill(uint32_t target, const RawDispatchRecord* record) noexcept {
++    if (g_switchDispatchCheck || !FastDispatchEnabled()) {
++        return;
++    }
++    uint64_t word;
++    if (mkw_fast_dispatch::Pack(target, record, reinterpret_cast<uintptr_t>(&g_fastDispatch[0]), &word)) {
++        static std::atomic<uint32_t> victim{0};
++        mkw_fast_dispatch::Insert(g_fastDispatch, target, word,
++                                  victim.fetch_add(1, std::memory_order_relaxed));
++    }
++}
++
++// The old InvokeIndirectCpu body (abi_bridge.h), plus the fill. The hit path above it has already
++// failed (or was never eligible), so this decides exactly what the old code decided.
++__attribute__((noinline)) void InvokeIndirectCpuSlow(uint32_t target, CpuContext* ctx) {
++    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
++    if (target == 0) {
++        ReportMissingCpuTarget(target, cpu);
++    }
++    ApplyRuntimeCallOptions(target, cpu);
++    const RawDispatchRecord* record = TranslatedFunctionRegistry::FindRawByAddressPtr(target);
++    if (record != nullptr && record->entry != nullptr && record->nonvolatileFprWriteMask == 0 &&
++        !record->preserveNonvolatileGprs) {
++        FastDispatchFill(target, record);
++        if (TryGetCpuContext() == cpu) {
++            if (g_switchDispatchCheck) [[unlikely]] {
++                SwitchDispatchCheck(target, record, cpu);
++            }
++            RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
++            record->entry(cpu);
++            return;
++        }
++    }
++    InvokeIndirectCpuGeneral(target, cpu);
++}
++}  // namespace
++
++// The strong definition of InvokeIndirectCpu(unsigned int, CpuContext*) (abi_bridge.h).
++void MkwInvokeIndirectCpuFast(uint32_t target, CpuContext* ctx)
++    __asm__("_Z17InvokeIndirectCpujP10CpuContext");
++void MkwInvokeIndirectCpuFast(uint32_t target, CpuContext* ctx) {
++    if (__builtin_expect(ctx != nullptr, 1)) {
++        // 0 = not in the table (target 0 included: it goes to the old body).
++        const uint64_t word = mkw_fast_dispatch::Find(g_fastDispatch, target);
++        if (__builtin_expect(word != 0 && TryGetCpuContext() == ctx, 1)) {
++            const auto entry =
++                mkw_fast_dispatch::Unpack(word, reinterpret_cast<uintptr_t>(&g_fastDispatch[0]));
++            NonzeroExecutionAddressScope translatedExecution(target);
++            entry(ctx);
++            return;
++        }
++    }
++    InvokeIndirectCpuSlow(target, ctx);
++}
++#endif  // __SWITCH__
 diff --git a/runtime/src/audio_backend.cpp b/runtime/src/audio_backend.cpp
 index e65ecfb..540e8a2 100644
 --- a/runtime/src/audio_backend.cpp
@@ -10438,212 +10639,3 @@ index 0000000..4e7543c
 +}
 +REGISTER_NATIVE_FUNCTION_AS(0x8000D770, MLB_EnvMapCoords_8000D770, "EnvMapCoords");
 +#endif
-diff --git a/runtime/src/hle/mlb/gfx_options.cpp b/runtime/src/hle/mlb/gfx_options.cpp
-new file mode 100644
-index 0000000..0b014f6
---- /dev/null
-+++ b/runtime/src/hle/mlb/gfx_options.cpp
-@@ -0,0 +1,203 @@
-+// MLB Power Pros 2008 (RL8E54): optional lighter graphics (launcher VIDEO tab, Config.toml
-+// [video] shadows, crowd, fielding_fov, reflections). All off by default; each native below is then one predictable
-+// branch followed by the translation of the original function (kept callable by REGISTER_NATIVE_FUNCTION_AS),
-+// so the game runs exactly as before. docs/ingenieria-inversa.md section 20 has the reverse engineering.
-+//
-+// - Player shadows, 0x806DA22C(character, mode): detaches the four shadow nodes (+0x14F0 blob, +0x1600 body,
-+//   +0x17D0/+0x19A0 items), stores mode at +0x3A8 and attaches the ones the mode asks for: 1 = blob (one
-+//   4-triangle mesh), 2/3 = planar shadows (the body's skinned to the skeleton, ~690 triangles, plus the
-+//   items'), 0 = none. Only render nodes change; +0x3A8 is read only by the character's SetVisible
-+//   (0x806DA4E8) and per-frame update (0x806DAF80), which update those nodes. "simple" turns 2/3 into 1,
-+//   "off" passes 0.
-+// - Bat shadows, 0x806E4DBC(bat, shown): the bat's SetVisible (vtable 0x80D5F8B0 slot +0x10, only called
-+//   through it). The bat (constructor 0x806E4BC0, 0x654 bytes; the batter's at character +0x1C20 or
-+//   +0x1C30, the on-deck one at +0x70 of the match's player set 0x80894694) has its models at +0x40/+0x150
-+//   (pM_bat_R/L, cracked, or the two halves of a broken bat) and its own shadow projectors at +0x2A0/+0x470
-+//   (pM_bat_shadow, pM_breakbat_*_shadow). It shows the projectors only while its byte +0x640 is set; the
-+//   game clears that byte itself through 0x806E5070 where the bat must not cast one (0x806E29F0,
-+//   0x807A1608). With "off" or "simple" (the game has no round shadow for a bat) the call runs with +0x640
-+//   cleared and the byte is put back right after, so the bat takes the game's own no-shadow path and
-+//   every reader sees the game's value. The ball's shadow is a separate plain model (model_game.pack
-+//   +0x3400) and is left alone.
-+// - Crowd, 0x80C60A94(scene): the stadium's per-frame visibility pass. A placement's node is shown when its
-+//   tree-A flag, its byte in the visibility table (scene+0x6B8) and its sphere-in-frustum test agree; a
-+//   zero byte also skips the piece's animation/LOD step (0x80C600C8, which writes that piece's node only).
-+//   The crowd entries (placement type byte +0x52 in 0x13..0x17) are cleared for the call and put back right
-+//   after it, so every other reader and writer of the table (0x80C5DA4C attendance level, day/night...)
-+//   sees it unchanged. "less" hides the stands set the attendance level currently shows (0x80C5DA4C,
-+//   level at scene+0x7B8: 0 shows 0x13/0x17 and hides 0x14/0x16, 1 the reverse, 2 none, 3 all), so it
-+//   always halves the visible stands crowd; 0x15 stays. "off" hides 0x13..0x17.
-+// - Play-shot field of view, 0x80054BEC(camera, f1 = degrees): the camera FOV setter (+0x1D8, focal
-+//   length +0x1C4, dirty bit +0x80 |= 2). Scaled only when called from the play shot 0x808F1C5C (return
-+//   address 0x808F1CCC), the shot that follows the ball after contact: there the shot camera [obj+0x4C]
-+//   gets its FOV right before 0x80C779D4 copies it into the main camera (0x80055300), so the scaled angle
-+//   reaches stadium culling and the players' source-camera view alike. The value 0x808F1C5C keeps at
-+//   obj+0x8C and every other caller are untouched.
-+// - Reflections, 0x8000DC70(handler): the pass count of the environment-map draw handler (constructor
-+//   0x8000C8E0, vtable 0x80146018 slot +0x14, its only reference; "return 2"). The model draw loops
-+//   (0x80015C10, 0x8000F400, 0x8001CBD4...) use the count only as the bound of begin pass (0x80060DD0: pass
-+//   index at 0x8031AFC0) / draw / end pass (0x80060DDC: index back to -1). Pass 0 is the normal draw
-+//   (0x80060B68); pass 1 (0x8000CD0C) fills the handler's own UV buffers (0x8000D770, sphere map, it alone
-+//   flips their double-buffer index) and draws the mesh again with additive blending, saving and restoring the
-+//   GX state it changes. It is created for helmet-like parts (0x806DB730: part +0x550 when character +0x50 is
-+//   0/3/4/0x10, +0xBF0/+0xD10 by +0x68/+0x6C) and the bat (0x806E529C). "off" returns 1, the count of the
-+//   base class (0x8000E184, vtable 0x80168A08), so those models are drawn like every other one: no shine, and
-+//   nothing reads the skipped UV buffers or the pass index outside that draw.
-+#include <cstdint>
-+#include <cstdlib>
-+#include <string>
-+
-+#include "abi_bridge.h"
-+#include "memory.h"
-+#include "runtime_config.h"
-+
-+extern "C" void func_806DA22C(CpuContext* ctx);  // the translations (kept: _AS registrations)
-+extern "C" void func_806E4DBC(CpuContext* ctx);
-+extern "C" void func_80C60A94(CpuContext* ctx);
-+extern "C" void func_80054BEC(CpuContext* ctx);
-+extern "C" void func_8000DC70(CpuContext* ctx);
-+
-+namespace mlb_gfx_options {
-+
-+enum class Shadows : uint8_t { Full, Simple, Off };
-+enum class Crowd : uint8_t { Full, Less, Off };
-+
-+struct Settings {
-+    Shadows shadows = Shadows::Full;
-+    Crowd crowd = Crowd::Full;
-+    float fovScale = 1.0f;  // 1 = untouched
-+    bool fov = false;
-+    bool reflections = true;
-+};
-+
-+// Read once, at the first call of any of these natives (the guest starts after the pre-boot launcher,
-+// which is the only thing that changes these settings).
-+const Settings& Get() {
-+    static const Settings settings = [] {
-+        Settings s;
-+        // WIICOMPILED_GFX_SHADOWS / _CROWD / _FOV / _REFLECTIONS override Config.toml (console runs started with nxlink
-+        // pass them as arguments; the Switch has no launcher to change the file).
-+        const char* envShadows = std::getenv("WIICOMPILED_GFX_SHADOWS");
-+        const std::string shadows = envShadows ? envShadows : RuntimeConfigFile::PlayerShadows("full");
-+        s.shadows = shadows == "off" ? Shadows::Off : shadows == "simple" ? Shadows::Simple : Shadows::Full;
-+        const char* envCrowd = std::getenv("WIICOMPILED_GFX_CROWD");
-+        const std::string crowd = envCrowd ? envCrowd : RuntimeConfigFile::CrowdLevel("full");
-+        s.crowd = crowd == "off" ? Crowd::Off : crowd == "less" ? Crowd::Less : Crowd::Full;
-+        const char* envFov = std::getenv("WIICOMPILED_GFX_FOV");
-+        const uint32_t percent = envFov ? static_cast<uint32_t>(std::strtoul(envFov, nullptr, 10)) : RuntimeConfigFile::FieldingFov(100);
-+        s.fov = percent >= 60 && percent < 100;
-+        s.fovScale = s.fov ? static_cast<float>(percent) / 100.0f : 1.0f;
-+        const char* envReflections = std::getenv("WIICOMPILED_GFX_REFLECTIONS");
-+        const std::string reflections = envReflections ? envReflections : RuntimeConfigFile::Reflections("on");
-+        s.reflections = reflections != "off";
-+        return s;
-+    }();
-+    return settings;
-+}
-+
-+constexpr uint32_t kSceneEnabled = 0x798, kPlacements = 0x6B4, kTable = 0x6B8, kCount = 0x600, kLevel = 0x7B8;
-+constexpr uint32_t kPlacementSize = 0x54, kPlacementType = 0x52;
-+constexpr uint32_t kBatShadowOn = 0x640;  // bat byte: its shadow projectors are shown (0x806E5070 sets it)
-+constexpr uint32_t kPlayShotFovReturn = 0x808F1CCC;  // after `bl 0x80054BEC` in the play shot 0x808F1C5C
-+
-+bool HiddenType(Crowd crowd, uint32_t level, uint8_t type) {
-+    if (type < 0x13 || type > 0x17) return false;
-+    if (crowd == Crowd::Off) return true;
-+    // Less: the stands set this attendance level shows (level 1 shows 0x14/0x16, the others 0x13/0x17).
-+    return level == 1 ? (type == 0x14 || type == 0x16) : (type == 0x13 || type == 0x17);
-+}
-+
-+void StadiumUpdateWithoutCrowd(CpuContext* ctx, Crowd crowd) {
-+    const uint32_t scene = ctx->gpr[3];
-+    const uint32_t table = scene != 0 && Memory::Read8(scene + kSceneEnabled) != 0 ? Memory::Read32(scene + kTable) : 0;
-+    const uint32_t placements = table != 0 ? Memory::Read32(scene + kPlacements) : 0;
-+    const int32_t count = placements != 0 ? static_cast<int32_t>(Memory::Read32(scene + kCount)) : 0;
-+    if (count <= 0) {
-+        func_80C60A94(ctx);
-+        return;
-+    }
-+    // Stadiums have 14-22 crowd placements; beyond the buffer they simply stay as the game set them.
-+    constexpr int kMax = 256;
-+    uint16_t index[kMax];
-+    uint8_t value[kMax];
-+    int saved = 0;
-+    const uint32_t level = Memory::Read32(scene + kLevel);
-+    for (int32_t i = 0; i < count && saved < kMax; ++i) {
-+        const uint8_t type = Memory::Read8(placements + static_cast<uint32_t>(i) * kPlacementSize + kPlacementType);
-+        if (!HiddenType(crowd, level, type)) continue;
-+        const uint8_t shown = Memory::Read8(table + static_cast<uint32_t>(i));
-+        if (shown == 0) continue;
-+        index[saved] = static_cast<uint16_t>(i);
-+        value[saved] = shown;
-+        ++saved;
-+        Memory::Write8(table + static_cast<uint32_t>(i), 0);
-+    }
-+    func_80C60A94(ctx);
-+    // Put the table back. Nothing the pass reaches writes it; an entry it did set is left as it is.
-+    if (Memory::Read32(scene + kTable) != table) return;
-+    for (int k = 0; k < saved; ++k) {
-+        const uint32_t at = table + index[k];
-+        if (Memory::Read8(at) == 0) Memory::Write8(at, value[k]);
-+    }
-+}
-+
-+}  // namespace mlb_gfx_options
-+
-+extern "C" void MLB_CharShadowMode_806DA22C(CpuContext* ctx) {
-+    using namespace mlb_gfx_options;
-+    const Shadows shadows = Get().shadows;
-+    if (shadows != Shadows::Full) [[unlikely]] {
-+        const uint32_t mode = ctx->gpr[4];
-+        if (shadows == Shadows::Off) ctx->gpr[4] = 0;
-+        else if (mode == 2 || mode == 3) ctx->gpr[4] = 1;
-+    }
-+    func_806DA22C(ctx);
-+}
-+REGISTER_NATIVE_FUNCTION_AS(0x806DA22C, MLB_CharShadowMode_806DA22C, "CharShadowMode");
-+
-+extern "C" void MLB_BatSetVisible_806E4DBC(CpuContext* ctx) {
-+    using namespace mlb_gfx_options;
-+    if (Get().shadows != Shadows::Full) [[unlikely]] {
-+        // Only the bat's own node calls are reached (SetVisible of its models and projectors); none writes
-+        // +0x640, so it is still 0 afterwards unless the game changed it, and then it is left as it is.
-+        const uint32_t bat = ctx->gpr[3];
-+        const uint8_t shadowOn = Memory::Read8(bat + kBatShadowOn);
-+        Memory::Write8(bat + kBatShadowOn, 0);
-+        func_806E4DBC(ctx);
-+        if (Memory::Read8(bat + kBatShadowOn) == 0) Memory::Write8(bat + kBatShadowOn, shadowOn);
-+        return;
-+    }
-+    func_806E4DBC(ctx);
-+}
-+REGISTER_NATIVE_FUNCTION_AS(0x806E4DBC, MLB_BatSetVisible_806E4DBC, "BatSetVisible");
-+
-+extern "C" void MLB_StadiumVisibility_80C60A94(CpuContext* ctx) {
-+    using namespace mlb_gfx_options;
-+    const Crowd crowd = Get().crowd;
-+    if (crowd != Crowd::Full) [[unlikely]] {
-+        StadiumUpdateWithoutCrowd(ctx, crowd);
-+        return;
-+    }
-+    func_80C60A94(ctx);
-+}
-+REGISTER_NATIVE_FUNCTION_AS(0x80C60A94, MLB_StadiumVisibility_80C60A94, "StadiumVisibility");
-+
-+extern "C" void MLB_CameraSetFov_80054BEC(CpuContext* ctx) {
-+    using namespace mlb_gfx_options;
-+    const Settings& s = Get();
-+    if (s.fov && ctx->lr == kPlayShotFovReturn) [[unlikely]] {
-+        // A single, as the play shot's fmuls left it, scaled in single precision.
-+        ctx->fpr[1].d = static_cast<double>(static_cast<float>(ctx->fpr[1].d) * s.fovScale);
-+    }
-+    func_80054BEC(ctx);
-+}
-+REGISTER_NATIVE_FUNCTION_AS(0x80054BEC, MLB_CameraSetFov_80054BEC, "CameraSetFov");
-+
-+extern "C" void MLB_EnvMapPassCount_8000DC70(CpuContext* ctx) {
-+    if (!mlb_gfx_options::Get().reflections) [[unlikely]] {
-+        ctx->gpr[3] = 1;  // the base handler's count: only the normal draw (pass 0)
-+        return;
-+    }
-+    func_8000DC70(ctx);
-+}
-+REGISTER_NATIVE_FUNCTION_AS(0x8000DC70, MLB_EnvMapPassCount_8000DC70, "EnvMapPassCount");
