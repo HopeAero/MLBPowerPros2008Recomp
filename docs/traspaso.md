@@ -1,12 +1,15 @@
-# Traspaso — port de Switch (rama `switch-arm64`), 2026-10-29
+# Traspaso — port de Switch (rama `switch-arm64`), 2026-10-31
 
-Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de trabajo; el historial está en `git log -p docs/traspaso.md`.
+Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de trabajo; el historial está en `git log -p docs/traspaso.md`. Las secciones de abajo son notas por fase de sesiones anteriores.
 
 ## Dónde estamos
 
-- **Rendimiento:** 59.9 fps a reloj stock en modo portátil (CPU 1020 / GPU 307 MHz) con el renderer deko3d, que ya es el predeterminado. Benchmark de 90 s: p50 16.67 ms, p95 ~17.1 ms.
-- **Audio:** resuelto. El narrador va a tiempo (ticker de 5 ms a 200 despertares/s, 0 pasadas perdidas) y no hay huecos de salida aunque caigan los fps. El usuario lo confirmó de oído: "el audio va perfecto, ni lo tocaría".
-- **Lo pendiente:** bajones de **un frame** (30–36 ms) al fildear y en la toma inicial que muestra a todos los jugadores. El usuario observa que *cuantos más fildeadores y corredores hay en pantalla, más caen los fps* (CPU ~80% al lanzar o batear, ~90–92% al fildear). Prueba 23: 39 picos de más de 30 ms en 16 570 frames de partido.
+- **Rendimiento (2026-10-30, stock, portátil):** frames tarde por CPU 6,5 % (T2, fase 87) → **3,6 %** con el front end de Aurora repartido en 3 núcleos (fases 90 + 92, **predeterminado en Switch desde la fase 94**; `WIICOMPILED_GXF_AURORA=0` lo apaga). Uso por núcleo en partido: 0 ≈ 92 %, 1 (decodificador FIFO) ≈ 74 %, 2 (front end GXF, grabación deko3d, audio) ≈ 20 %. Con sombras apagadas y cámara de jugada al 80 %: 1,3–1,5 %; el usuario: "60 FPS". Lo que queda tarde en esas sesiones es GPU (toma inicial en portátil).
+- **Opciones gráficas** (fase 91 + 93, pestaña VIDEO del launcher, `Config.toml` `[video]`, apagadas por defecto; en consola `WIICOMPILED_GFX_SHADOWS=off|simple`, `_CROWD=off|less`, `_FOV=60..100`): sombras de jugadores y bate (la de la pelota se queda), público, campo de visión de la toma de jugada. El público casi no cuesta (medido); sombras + cámara sí. RE en `docs/ingenieria-inversa.md` §20.
+- **Descartado hoy:** PGO (fase 88, herramienta en `tools/switch/pgo/`, `MLB_SWITCH_PGO=gen|use:<dir>`): sin ganancia en partido.
+- **Verificación de GXF:** banco en PC `local/tmp/cpu/GXF2/` (`run.py`): off/thread/deferred/split idénticos byte a byte (entrada del decodificador, estado, lecturas, escrituras guest), 20/20 mutantes. Contadores en la línea `gxf_per_frame`.
+- **Siguiente:** análisis del núcleo 1 en `local/tmp/cpu/GXW/` (D1–D9: estado sucio, memo de pipeline por valor, poda de caché de texturas que cuesta ~2 ms en picos) por si el núcleo 1 se satura; agente GFXOPT4 midiendo otros costes visuales (composición de texturas por jugador `0x806CE608`, reflejos, piezas animadas del estadio, HUD).
+- **El usuario no quiere más pruebas de diagnóstico en consola:** diagnosticar con los logs existentes y pedir solo una prueba final por tanda.
 
 ## GX-F1 (2026-10-28): factibilidad, sin cambios de runtime
 
