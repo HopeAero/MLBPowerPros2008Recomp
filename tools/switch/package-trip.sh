@@ -58,7 +58,7 @@ trip2)
 dvd_root = "../Data"
 
 [launcher]
-show_on_startup = false
+show_on_startup = true
 
 [video]
 graphics_api = "vulkan"

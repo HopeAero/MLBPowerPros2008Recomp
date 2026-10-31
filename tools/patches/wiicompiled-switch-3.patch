@@ -5434,7 +5434,7 @@ index 502f72c..885f8bb 100644
  namespace {
  struct Context {
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index 4eef06f..8838920 100644
+index 4eef06f..3bd622b 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
 @@ -47,6 +47,14 @@
@@ -5511,7 +5511,19 @@ index 4eef06f..8838920 100644
      art.main = LoadTexture(dir / "main.png", &art.mainBlur, EraseArtFooter);
      art.mainEn = LoadTexture(dir / "main.png", nullptr, EraseArtWords);
      art.settings = LoadTexture(dir / "settings.png", &art.settingsBlur);
-@@ -429,6 +456,12 @@ constexpr const char* kRosterEditorPage =
+@@ -304,6 +331,11 @@ constexpr int kOpenRosterEditor = -3;
+ constexpr int kOpenTextureStudio = -4;
+ constexpr int kOpenSavesFolder = -5;
+ constexpr int kOpenSeasonStudio = -6;
++#if defined(__SWITCH__)
++constexpr int kLanguageRow = 0;  // INTERFAZ: IDIOMA only (the launcher always shows on the Switch)
++#else
++constexpr int kLanguageRow = 1;  // INTERFAZ: MOSTRAR AL INICIAR, IDIOMA
++#endif
+ constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, MEJORAS; HERRAMIENTAS follows it
+ constexpr int kEnhancementsTab = 4;
+ 
+@@ -429,6 +461,12 @@ constexpr const char* kRosterEditorPage =
  
  #if defined(_WIN32)
  std::wstring Quoted(const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; }
@@ -5524,7 +5536,7 @@ index 4eef06f..8838920 100644
  #else
  // Starts a program without waiting for it; the game keeps running. Steam's overlay preload is
  // dropped so desktop tools (xdg-open, the file manager) do not inherit it.
-@@ -507,6 +540,8 @@ void OpenRosterEditor() {
+@@ -507,6 +545,8 @@ void OpenRosterEditor() {
      const fs::path page = data / "abrir.html";
      std::ofstream(page, std::ios::binary | std::ios::trunc) << kRosterEditorPage;
      ShellExecuteW(nullptr, L"open", page.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -5533,7 +5545,7 @@ index 4eef06f..8838920 100644
  #else
      namespace fs = std::filesystem;
      const auto exeDir = RuntimeConfigFile::ExecutableDirectory();
-@@ -692,6 +727,13 @@ bool Relaunch() {
+@@ -692,6 +732,13 @@ bool Relaunch() {
      CloseHandle(process.hThread);
      CloseHandle(process.hProcess);
      return true;
@@ -5547,15 +5559,15 @@ index 4eef06f..8838920 100644
  #else
      setenv("WIICOMPILED_SKIP_LAUNCHER", "1", 1);
      std::vector<char*> args(g_argv, g_argv + g_argc);
-@@ -708,7 +750,15 @@ Result Run(int argc, char** argv) {
+@@ -708,7 +755,15 @@ Result Run(int argc, char** argv) {
      g_argc = argc;
      g_argv = argv;
      g_lang = LangFromSetting(RuntimeConfigFile::UiLanguage("auto"));
 -    if (AutomatedRun() || !RuntimeConfigFile::LauncherOnStartup(true)) {
 +#if defined(__SWITCH__)
-+    // No F10 menu without a keyboard: holding L or R (or ZL / ZR) while the game starts shows the
-+    // launcher even when MOSTRAR AL INICIAR is off.
-+    const bool forced = !AutomatedRun() && SwitchUiShoulderHeld();
++    // The Switch always opens the launcher (it is where the game is set up; there is no F10 menu):
++    // only automated runs and the relaunch after PLAY (WIICOMPILED_SKIP_LAUNCHER) skip it.
++    const bool forced = !AutomatedRun();
 +#else
 +    const bool forced = false;
 +#endif
@@ -5564,7 +5576,7 @@ index 4eef06f..8838920 100644
          LoadFonts();  // the in-game password buttons draw in the launcher's style
          return Result::Play;
      }
-@@ -728,6 +778,9 @@ Result Run(int argc, char** argv) {
+@@ -728,6 +783,9 @@ Result Run(int argc, char** argv) {
      for (const ApiOption& option : kApis) {
          if (option.backend == aurora_get_backend()) runningApi = option.label;
      }
@@ -5574,7 +5586,7 @@ index 4eef06f..8838920 100644
  
      Option api{Tr("API GRÁFICA", "GRAPHICS API"),
                 Tr("Con qué API se dibuja el juego. Automática elige la mejor para tu equipo.",
-@@ -743,6 +796,14 @@ Result Run(int argc, char** argv) {
+@@ -743,6 +801,14 @@ Result Run(int argc, char** argv) {
          if (RuntimeConfigFile::DisplayMode("windowed") == kDisplayModes[i]) display.value = static_cast<int>(i);
      }
      // The EFB is 528 lines (wider in 16:9), so each step is 528 lines times the multiplier.
@@ -5589,7 +5601,7 @@ index 4eef06f..8838920 100644
      Option resolution{Tr("RESOLUCIÓN INTERNA", "INTERNAL RESOLUTION"),
                        Tr("Resolución a la que se dibuja el juego. 1x es la de Wii; más alta es más nítida y más "
                           "exigente para la GPU. 4x dibuja a casi 4K aunque la ventana sea más pequeña.\n\n"
-@@ -751,6 +812,7 @@ Result Run(int argc, char** argv) {
+@@ -751,6 +817,7 @@ Result Run(int argc, char** argv) {
                           "GPU. 4x draws at almost 4K even if the window is smaller.\n\n"
                           "Match window draws at your window's or screen's resolution: the most efficient option."),
                        {"1x (Wii)", "1.5x (~800p)", "2x (~1080p)", "3x (~1600p)", "4x (~4K)", Tr("Según la ventana", "Match window")}};
@@ -5597,7 +5609,7 @@ index 4eef06f..8838920 100644
      const float currentResolution = RuntimeConfigFile::ResolutionMultiplier(1.0f);
      for (size_t i = 0; i < kResolutions.size(); ++i) {
          if (kResolutions[i] == currentResolution) resolution.value = static_cast<int>(i);
-@@ -837,10 +899,19 @@ Result Run(int argc, char** argv) {
+@@ -837,10 +904,19 @@ Result Run(int argc, char** argv) {
      Option wiimote{"WII REMOTE", Tr("Usar Wii Remotes reales por Bluetooth. Déjalo en No si solo usas mando o teclado.",
                                      "Use real Wii Remotes over Bluetooth. Leave it at No if you only use a controller or keyboard."),
                     YesNo(), RuntimeConfigFile::WiiRemotesEnabled(true) ? 1 : 0};
@@ -5617,7 +5629,7 @@ index 4eef06f..8838920 100644
  
      // MEJORAS: what the Wii game does not have (how it plays, what it offers). Each one starts as on the
      // Wii; the ones still being tried by players are tagged experimental.
-@@ -854,30 +925,44 @@ Result Run(int argc, char** argv) {
+@@ -854,30 +930,44 @@ Result Run(int argc, char** argv) {
                     {Tr("10 (original)", "10 (original)"), "20", Tr("Sin límite", "No limit")},
                     RuntimeConfigFile::MaxSeasons(10) == 20 ? 1 : RuntimeConfigFile::MaxSeasons(10) == 0 ? 2 : 0};
      seasons.experimental = true;
@@ -5666,7 +5678,7 @@ index 4eef06f..8838920 100644
                      {Tr("Automático", "Automatic"), "Español", "English"},
                      savedLanguage == "es" ? 1 : savedLanguage == "en" ? 2 : 0, false};
  
-@@ -885,6 +970,20 @@ Result Run(int argc, char** argv) {
+@@ -885,6 +975,20 @@ Result Run(int argc, char** argv) {
      const std::vector<mods::Mod> installedMods = mods::Discover();
      std::vector<std::string> modHelp;
      modHelp.reserve(installedMods.size());
@@ -5687,7 +5699,7 @@ index 4eef06f..8838920 100644
      Tab modsTab{"MODS", {}, installedMods.empty()
                                  ? (RosterEditorInstalled()
                                         ? Tr("Todavía no hay mods instalados. Ponlos en la carpeta mods (HERRAMIENTAS > "
-@@ -896,6 +995,7 @@ Result Run(int argc, char** argv) {
+@@ -896,6 +1000,7 @@ Result Run(int argc, char** argv) {
                                              "No mods installed yet. Put them in the mods folder (TOOLS > "
                                              "OPEN MODS FOLDER)."))
                                  : nullptr};
@@ -5695,7 +5707,7 @@ index 4eef06f..8838920 100644
      // The first row says whose saves the game will use; it follows the roster mods switched on here.
      std::vector<mods::Mod> currentMods = installedMods;
      std::string savesNotice;
-@@ -903,6 +1003,25 @@ Result Run(int argc, char** argv) {
+@@ -903,6 +1008,25 @@ Result Run(int argc, char** argv) {
          const std::string set = mods::SaveSetName(currentMods);
          return set.empty() ? std::string(Tr("Normales", "Normal")) : set;
      };
@@ -5721,7 +5733,7 @@ index 4eef06f..8838920 100644
      modsTab.options.push_back({Tr("PARTIDAS EN USO", "SAVES IN USE"),
                                 Tr("Las partidas que usará el juego. Los mods que cambian el roster tienen partidas propias: "
                                    "cada combinación guarda las suyas, y sin ellos se usan las normales. Al cambiar de mods "
-@@ -922,6 +1041,7 @@ Result Run(int argc, char** argv) {
+@@ -922,6 +1046,7 @@ Result Run(int argc, char** argv) {
      toolsTab.options.push_back({Tr("EDITOR DE TEMPORADA", "SEASON EDITOR"), kSeasonStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenSeasonStudio});
      toolsTab.options.push_back({kRosterPlayersLabel, kRosterPlayersHelp, {Tr("Nativos", "Native"), Tr("Como en el editor", "As in the editor")},
                                  RuntimeConfigFile::NativeRoster(true) ? 0 : 1});
@@ -5729,7 +5741,7 @@ index 4eef06f..8838920 100644
      for (size_t i = 0; i < installedMods.size(); ++i) {
          const mods::Mod& m = installedMods[i];
          std::string help = m.description.empty() ? std::string(Tr("Sin descripción.", "No description.")) : m.description;
-@@ -958,8 +1078,116 @@ Result Run(int argc, char** argv) {
+@@ -958,8 +1083,116 @@ Result Run(int argc, char** argv) {
                       "for a second position (two-way player)."),
                    YesNo(), RuntimeConfigFile::TwoWayPlayer(false) ? 1 : 0};
      twoWay.experimental = true;
@@ -5832,22 +5844,22 @@ index 4eef06f..8838920 100644
 +    shadows.restart = crowd.restart = playFov.restart = reflections.restart = false;
 +    // No graphics API, window mode, FSR, MSAA or frame interpolation on the Switch (deko3d draws neither
 +    // FSR, MSAA nor interpolated frames; the screen is the console's), and no Wii Remotes over Bluetooth.
-     std::vector<Tab> tabs{
--        {"VIDEO", {api, quality, display, resolution, fsr, filtering, mipmaps, msaa, aspect, fill, interpolation, fps}},
++    std::vector<Tab> tabs{
 +        {"VIDEO", {preset, resolution, filtering, mipmaps, aspect, fill, fps, shadows, crowd, playFov, reflections, experimentalGx}},
 +        {"AUDIO", {volume, mute}},
 +        {Tr("CONTROLES", "CONTROLS"), {wiimote}},
-+        {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
++        {Tr("INTERFAZ", "INTERFACE"), {language}},  // no MOSTRAR AL INICIAR: always shown on the Switch
 +        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh, modernLeagues, twoWay}},
 +    };
 +    tabs.push_back(std::move(modsTab));  // HERRAMIENTAS only has PC programs (its setting is in MODS)
 +#else
-+    std::vector<Tab> tabs{
+     std::vector<Tab> tabs{
+-        {"VIDEO", {api, quality, display, resolution, fsr, filtering, mipmaps, msaa, aspect, fill, interpolation, fps}},
 +        {"VIDEO", {api, quality, display, resolution, fsr, filtering, mipmaps, msaa, aspect, fill, interpolation, fps, shadows, crowd, playFov, reflections}},
          {"AUDIO", {volume, mute}},
          {Tr("CONTROLES", "CONTROLS"), {wiimote}},
          {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
-@@ -967,6 +1195,7 @@ Result Run(int argc, char** argv) {
+@@ -967,6 +1200,7 @@ Result Run(int argc, char** argv) {
      };
      tabs.push_back(std::move(modsTab));
      tabs.push_back(std::move(toolsTab));
@@ -5855,7 +5867,7 @@ index 4eef06f..8838920 100644
      auto option = [&](int tab, int index) -> Option& { return tabs[static_cast<size_t>(tab)].options[static_cast<size_t>(index)]; };
      // MEJORAS' footer: what a new season will use with the enabled mods and these options.
      season_text::SeasonText seasonText;
-@@ -983,15 +1212,30 @@ Result Run(int argc, char** argv) {
+@@ -983,15 +1217,30 @@ Result Run(int argc, char** argv) {
          tabs[kEnhancementsTab].footer = seasonText.footer.c_str();
      };
  
@@ -5890,7 +5902,7 @@ index 4eef06f..8838920 100644
      auto matchPreset = [&] {
          Option& q = videoOption(quality.label);
          q.value = 0;
-@@ -1001,6 +1245,7 @@ Result Run(int argc, char** argv) {
+@@ -1001,6 +1250,7 @@ Result Run(int argc, char** argv) {
                  q.value = static_cast<int>(i) + 1;
          }
      };
@@ -5898,7 +5910,7 @@ index 4eef06f..8838920 100644
      matchPreset();
      refreshSeason();
  
-@@ -1013,7 +1258,9 @@ Result Run(int argc, char** argv) {
+@@ -1013,7 +1263,9 @@ Result Run(int argc, char** argv) {
              return;
          }
          if (o.mod == kOpenSavesFolder) {
@@ -5908,7 +5920,7 @@ index 4eef06f..8838920 100644
              return;
          }
          if (o.mod == kOpenRosterEditor) {
-@@ -1058,6 +1305,21 @@ Result Run(int argc, char** argv) {
+@@ -1058,6 +1310,21 @@ Result Run(int argc, char** argv) {
          if (label == filtering.label) RuntimeConfigFile::SetTextureFiltering(kFilteringLevels[static_cast<size_t>(o.value)]);
          if (label == mipmaps.label) RuntimeConfigFile::SetAutoMipmaps(o.value != 0);
          if (label == msaa.label) RuntimeConfigFile::SetMsaa(kMsaaSamples[static_cast<size_t>(o.value)]);
@@ -5930,7 +5942,7 @@ index 4eef06f..8838920 100644
          if (label == quality.label && o.value > 0) {
              const Preset& p = kPresets[static_cast<size_t>(o.value - 1)];
              videoOption(resolution.label).value = p.resolution;
-@@ -1068,6 +1330,7 @@ Result Run(int argc, char** argv) {
+@@ -1068,6 +1335,7 @@ Result Run(int argc, char** argv) {
              RuntimeConfigFile::SetTextureFiltering(kFilteringLevels[static_cast<size_t>(p.filtering)]);
          }
          if (label == resolution.label || label == fsr.label || label == filtering.label) matchPreset();
@@ -5938,7 +5950,7 @@ index 4eef06f..8838920 100644
          if (label == fps.label) RuntimeConfigFile::SetShowFps(o.value != 0);
          if (label == volume.label) RuntimeConfigFile::SetAudioVolume(static_cast<float>(o.value) / 10.0f);
          if (label == mute.label) RuntimeConfigFile::SetAudioMuted(o.value != 0);
-@@ -1077,6 +1340,10 @@ Result Run(int argc, char** argv) {
+@@ -1077,6 +1345,10 @@ Result Run(int argc, char** argv) {
          if (label == universalDh.label) RuntimeConfigFile::SetUniversalDh(o.value != 0);
          if (label == modernLeagues.label) RuntimeConfigFile::SetModernLeagues(o.value != 0);
          if (label == twoWay.label) RuntimeConfigFile::SetTwoWayPlayer(o.value != 0);
@@ -5949,7 +5961,7 @@ index 4eef06f..8838920 100644
          if (label == language.label) {
              const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
              RuntimeConfigFile::SetUiLanguage(code);
-@@ -1103,11 +1370,19 @@ Result Run(int argc, char** argv) {
+@@ -1103,11 +1375,19 @@ Result Run(int argc, char** argv) {
      settings_overlay::PrepareLauncherControllers();
      const auto savedNavFlags = ImGui::GetIO().ConfigFlags;
      ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -5969,7 +5981,7 @@ index 4eef06f..8838920 100644
      if (const char* select = std::getenv("WIICOMPILED_LAUNCHER_SELECT"); select != nullptr && *select != '\0') {
          for (size_t i = 0; i < apis.size(); ++i) {
              if (std::strcmp(apis[i].configName, select) == 0 && option(0, 0).value != static_cast<int>(i)) {
-@@ -1117,6 +1392,7 @@ Result Run(int argc, char** argv) {
+@@ -1117,6 +1397,7 @@ Result Run(int argc, char** argv) {
          }
          choice = Choice::Play;
      }
@@ -5977,7 +5989,18 @@ index 4eef06f..8838920 100644
      // WIICOMPILED_LAUNCHER_PAGE=settings opens the settings panel (screenshots).
      const char* page = std::getenv("WIICOMPILED_LAUNCHER_PAGE");
      // (=mods / =tools open the MODS screen on its MODS or HERRAMIENTAS tab.)
-@@ -1147,6 +1423,7 @@ Result Run(int argc, char** argv) {
+@@ -1136,8 +1417,8 @@ Result Run(int argc, char** argv) {
+     // rebuilt on the same page; the rebuilt one finds the language already set and does nothing).
+     if (testAction != nullptr && std::strncmp(testAction, "language-", 9) == 0) {
+         for (size_t i = 0; i < kLanguageCodes.size(); ++i) {
+-            if (std::strcmp(kLanguageCodes[i], testAction + 9) == 0 && option(3, 1).value != static_cast<int>(i)) {
+-                option(3, 1).value = static_cast<int>(i);
++            if (std::strcmp(kLanguageCodes[i], testAction + 9) == 0 && option(3, kLanguageRow).value != static_cast<int>(i)) {
++                option(3, kLanguageRow).value = static_cast<int>(i);
+                 apply(3, 1);
+             }
+         }
+@@ -1147,6 +1428,7 @@ Result Run(int argc, char** argv) {
      int menu = 0;
      int tab = page && std::strcmp(page, "controls") == 0 ? 2 : page && std::strcmp(page, "enhancements") == 0 ? 4 : toolsPage ? kModsTab + 1 : modsOnly ? kModsTab : 0;
      if (tab == 2 || tab == 4) settingsOpen = true;  // =controls, =enhancements (MEJORAS)
@@ -5985,7 +6008,7 @@ index 4eef06f..8838920 100644
      int row = 0;
      // Long lists use the rows that fit at the current size; page controls stay
      // below the scrollable list. Q/E and L1/R1 switch settings categories.
-@@ -1165,6 +1442,21 @@ Result Run(int argc, char** argv) {
+@@ -1165,6 +1447,21 @@ Result Run(int argc, char** argv) {
          return value && std::strcmp(value, "nav") == 0 && RuntimeConfigFile::PortableRootDirectory().has_value();
      }();
  #include "../tests/launcher_nav_probe.inc"
@@ -6007,7 +6030,7 @@ index 4eef06f..8838920 100644
      using Clock = std::chrono::steady_clock;
      const auto start = Clock::now();
      auto nextFrame = start;
-@@ -1177,6 +1469,9 @@ Result Run(int argc, char** argv) {
+@@ -1177,6 +1474,9 @@ Result Run(int argc, char** argv) {
              continue;
          }
          aurora_wait_for_frame_worker();
@@ -6017,7 +6040,7 @@ index 4eef06f..8838920 100644
          ImGui::GetIO().ConfigFlags = savedNavFlags | ImGuiConfigFlags_NavEnableKeyboard;
          if (launcher_controls::Capturing())
              ImGui::GetIO().ConfigFlags &= ~(ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard);
-@@ -1279,8 +1574,7 @@ Result Run(int argc, char** argv) {
+@@ -1279,8 +1579,7 @@ Result Run(int argc, char** argv) {
                  }
                  // Info box (its baked example text was erased from main.png).
                  const char* lines[] = {Tr("¡A jugar! Arranca MLB Power Pros 2008.", "Play ball! Starts MLB Power Pros 2008."),
@@ -6027,7 +6050,7 @@ index 4eef06f..8838920 100644
                                         Tr("Activa o desactiva mods de texturas y archivos.", "Switches texture and file mods on or off."),
                                         Tr("Cierra el juego.", "Closes the game.")};
                  ShadowedText(dl, g_text, 31 * s, at(100, 777), IM_COL32_WHITE, lines[menu]);
-@@ -1296,7 +1590,7 @@ Result Run(int argc, char** argv) {
+@@ -1296,7 +1595,7 @@ Result Run(int argc, char** argv) {
                  ShadowedText(dl, g_text, 22 * s, ImVec2(at(1578, 0).x - vw, at(0, 822).y), Rgba(200, 225, 255),
                               version.c_str());
                  if (restart) {
@@ -6036,7 +6059,7 @@ index 4eef06f..8838920 100644
                      const float nw = TextSize(g_text, 22 * s, note).x;
                      ShadowedText(dl, g_text, 22 * s, ImVec2(at(1578, 0).x - nw, at(0, 782).y), Rgba(255, 224, 110), note);
                  }
-@@ -1338,7 +1632,7 @@ Result Run(int argc, char** argv) {
+@@ -1338,7 +1637,7 @@ Result Run(int argc, char** argv) {
                  {Tr("JUGAR", "PLAY"), Rgba(255, 206, 96), Rgba(240, 112, 18), Rgba(150, 50, 0),
                   Tr("¡A jugar! Arranca MLB Power Pros 2008.", "Play ball! Starts MLB Power Pros 2008."), nullptr},
                  {Tr("AJUSTES", "SETTINGS"), Rgba(160, 244, 120), Rgba(34, 164, 58), Rgba(10, 90, 30),
@@ -6045,7 +6068,7 @@ index 4eef06f..8838920 100644
                   Tr("Los cambios se guardan al momento.", "Changes are saved right away.")},
                  {Tr("SALIR", "EXIT"), Rgba(244, 160, 244), Rgba(168, 64, 200), Rgba(90, 20, 120), Tr("Cierra el juego.", "Closes the game."), nullptr},
              }};
-@@ -1404,7 +1698,7 @@ Result Run(int argc, char** argv) {
+@@ -1404,7 +1703,7 @@ Result Run(int argc, char** argv) {
              ShadowedText(dl, g_text, 20 * u, ImVec2(ib.x - 28 * u - vs.x, ib.y - 40 * u), Rgba(190, 225, 255),
                           version.c_str());
              if (restart) {
@@ -6054,7 +6077,7 @@ index 4eef06f..8838920 100644
                  const ImVec2 ns = TextSize(g_text, 20 * u, note);
                  ShadowedText(dl, g_text, 20 * u, ImVec2(ib.x - 28 * u - ns.x, ia.y + 22 * u), Rgba(255, 224, 120), note);
              }
-@@ -1439,10 +1733,16 @@ Result Run(int argc, char** argv) {
+@@ -1439,10 +1738,16 @@ Result Run(int argc, char** argv) {
  
      aurora_set_skip_unready_pipelines(savedSkipPipelines);
      ImGui::GetIO().ConfigFlags = savedNavFlags;
@@ -6071,7 +6094,7 @@ index 4eef06f..8838920 100644
          return restart && again == Result::Play ? Result::Relaunch : again;
      }
      if (choice == Choice::Quit) {
-@@ -1451,8 +1751,17 @@ Result Run(int argc, char** argv) {
+@@ -1451,8 +1756,17 @@ Result Run(int argc, char** argv) {
      if (!restart) {
          return Result::Play;
      }
