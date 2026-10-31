@@ -8853,7 +8853,7 @@ index 0063653..3587f77 100644
          target_compile_options(mkw_psq_helpers_tests PRIVATE -march=x86-64-v3)
      endif()
 diff --git a/runtime/cmake/PublicProducts.cmake b/runtime/cmake/PublicProducts.cmake
-index 251c83a..49419c2 100644
+index 251c83a..6c42272 100644
 --- a/runtime/cmake/PublicProducts.cmake
 +++ b/runtime/cmake/PublicProducts.cmake
 @@ -18,6 +18,9 @@ if(EXISTS "${GUEST_SYMBOL_TABLE_FILE}")
@@ -8916,7 +8916,7 @@ index 251c83a..49419c2 100644
      elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
          # mkw_runtime_common is an OBJECT library: WiiCompiled/RetroRewind only pull in its .o
          # files via $<TARGET_OBJECTS:>, which does not propagate mkw_runtime_common's own
-@@ -310,8 +330,86 @@ endfunction()
+@@ -310,8 +330,90 @@ endfunction()
  
  add_executable(WiiCompiled "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})
  mkw_configure_product(WiiCompiled)
@@ -8998,6 +8998,10 @@ index 251c83a..49419c2 100644
 +        target_link_options(WiiCompiled PRIVATE "LINKER:--wrap=${_fn}")
 +    endforeach()
 +    set_source_files_properties("${MKW_RUNTIME_SOURCE_DIR}/src/platform/switch/switch_io.cpp"
++        PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++    # platform/switch/switch_disc_image.cpp: the player's disc image as the DATA folder (libnx's
++    # crypto headers, newlib's device table): not in a unity group either.
++    set_source_files_properties("${MKW_RUNTIME_SOURCE_DIR}/src/platform/switch/switch_disc_image.cpp"
 +        PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 +endif()
  if(TARGET mkw_base_sensitive)
@@ -9676,6 +9680,470 @@ index 9cb9576..f4c6dad 100644
 +#endif
  
  } // namespace DvdReadContract
+diff --git a/runtime/include/hle/wii_disc_image.h b/runtime/include/hle/wii_disc_image.h
+new file mode 100644
+index 0000000..1f0bbc5
+--- /dev/null
++++ b/runtime/include/hle/wii_disc_image.h
+@@ -0,0 +1,458 @@
++#pragma once
++
++// The player's Wii disc image read in place: the files of its DATA partition decrypted on demand,
++// laid out as an extracted DATA folder (sys/boot.bin, bi2.bin, apploader.img, main.dol, fst.bin and
++// files/...), the layout dvd.cpp, mods.cpp, nand_fs.cpp and the launcher read. The Switch mounts it
++// as a read-only device (platform/switch/switch_disc_image.cpp) when no extracted DATA folder exists.
++//
++// Wii disc layout (as Dolphin and nod read it): partition groups at 0x40000, each partition's ticket
++// at its start (title key at 0x1BF, AES-128-CBC under the common key with IV = title id), the data
++// area offset/size at 0x2B8/0x2BC (>> 2), the data in 0x8000-byte clusters: 0x400 bytes of hashes,
++// then 0x7C00 bytes of data encrypted with the title key, IV = bytes 0x3D0..0x3DF of the cluster's
++// encrypted hash block. Inside the data: boot.bin at 0 (DOL offset at 0x420, FST offset and size at
++// 0x424/0x428, all >> 2), bi2.bin at 0x440, the apploader at 0x2440, FST file offsets >> 2.
++// No platform code here: AES and the image file come from the caller (Cipher, Source).
++
++#include <algorithm>
++#include <cctype>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++#if !defined(_WIN32)
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
++namespace WiiDisc {
++
++// The retail Wii common key (Dolphin's IOS/IOSC.cpp, nod's key table): it decrypts the title key in
++// a disc's ticket. Not game data: one constant shared by every retail Wii disc.
++inline constexpr uint8_t kRetailCommonKey[16] = {0xeb, 0xe4, 0x2a, 0x22, 0x5e, 0x85, 0x93, 0xe4,
++                                                 0x48, 0xd9, 0xc5, 0x45, 0x73, 0x81, 0xaa, 0xf7};
++
++inline constexpr uint64_t kClusterSize = 0x8000;
++inline constexpr uint64_t kClusterHashSize = 0x400;
++inline constexpr uint64_t kClusterDataSize = 0x7C00;
++
++// AES-128-CBC decryption (the Switch: libnx's hardware AES; host tests: their own).
++class Cipher {
++public:
++    virtual ~Cipher() = default;
++    virtual void SetKey(const uint8_t key[16]) = 0;
++    // `size` is a multiple of 16; `src` and `dst` do not overlap.
++    virtual void DecryptCbc(const uint8_t iv[16], const uint8_t* src, uint8_t* dst, size_t size) = 0;
++};
++
++// The raw image bytes.
++class Source {
++public:
++    virtual ~Source() = default;
++    virtual uint64_t Size() const = 0;
++    // The complete range or false.
++    virtual bool ReadAt(uint64_t offset, void* dst, size_t size) = 0;
++};
++
++// An image file. POSIX descriptors elsewhere than Windows (no stdio buffer: reads are large and the
++// process's stdio teardown at exit cannot meet a reader still running on another thread).
++class FileSource final : public Source {
++public:
++    ~FileSource() override {
++#if defined(_WIN32)
++        if (file_ != nullptr) std::fclose(file_);
++#else
++        if (fd_ >= 0) ::close(fd_);
++#endif
++    }
++    bool Open(const std::string& path) {
++#if defined(_WIN32)
++        file_ = std::fopen(path.c_str(), "rb");
++        if (file_ == nullptr) return false;
++        (void)std::setvbuf(file_, nullptr, _IONBF, 0);
++        if (_fseeki64(file_, 0, SEEK_END) != 0) return false;
++        const long long end = _ftelli64(file_);
++        if (end < 0) return false;
++        size_ = static_cast<uint64_t>(end);
++#else
++        fd_ = ::open(path.c_str(), O_RDONLY);
++        if (fd_ < 0) return false;
++        const off_t end = ::lseek(fd_, 0, SEEK_END);
++        if (end < 0) return false;
++        size_ = static_cast<uint64_t>(end);
++#endif
++        return true;
++    }
++    uint64_t Size() const override { return size_; }
++    bool ReadAt(uint64_t offset, void* dst, size_t size) override {
++        if (offset > size_ || size > size_ - offset) return false;
++        auto* out = static_cast<uint8_t*>(dst);
++#if defined(_WIN32)
++        if (_fseeki64(file_, static_cast<long long>(offset), SEEK_SET) != 0) return false;
++        return size == 0 || std::fread(out, 1, size, file_) == size;
++#else
++        if (::lseek(fd_, static_cast<off_t>(offset), SEEK_SET) < 0) return false;
++        while (size != 0) {
++            const ssize_t n = ::read(fd_, out, size);
++            if (n <= 0) return false;
++            out += n;
++            size -= static_cast<size_t>(n);
++        }
++        return true;
++#endif
++    }
++
++private:
++#if defined(_WIN32)
++    std::FILE* file_ = nullptr;
++#else
++    int fd_ = -1;
++#endif
++    uint64_t size_ = 0;
++};
++
++inline uint32_t Be32(const uint8_t* p) {
++    return (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) | uint32_t{p[3]};
++}
++
++// "files/Sound/x.bin", "/files/sound//x.bin", "FILES/sound/./x.bin" -> "files/sound/x.bin" (ASCII
++// lower case: the SD card's FAT/exFAT names compare that way too).
++inline std::string LookupKey(std::string_view path) {
++    std::vector<std::string> parts;
++    size_t at = 0;
++    while (at <= path.size()) {
++        size_t end = path.find_first_of("/\\", at);
++        if (end == std::string_view::npos) end = path.size();
++        std::string part(path.substr(at, end - at));
++        if (part == "..") {
++            if (!parts.empty()) parts.pop_back();
++        } else if (!part.empty() && part != ".") {
++            for (char& c : part) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++            parts.push_back(std::move(part));
++        }
++        at = end + 1;
++    }
++    std::string key;
++    for (const std::string& part : parts) {
++        if (!key.empty()) key += '/';
++        key += part;
++    }
++    return key;
++}
++
++struct Node {
++    std::string name;
++    int32_t parent = -1;
++    bool directory = false;
++    std::vector<int32_t> children;  // directories: in FST order
++    uint64_t offset = 0;            // files: in the partition's decrypted data
++    uint64_t size = 0;
++};
++
++class Image {
++public:
++    static constexpr int32_t kRoot = 0;
++
++    // Parses the disc and its DATA partition; `commonKey` is kRetailCommonKey except in tests.
++    bool Open(std::unique_ptr<Source> source, std::unique_ptr<Cipher> cipher, const uint8_t commonKey[16],
++              std::string& error) {
++        // Not while other threads read. A reopened Image keeps none of the earlier image's clusters.
++        source_ = std::move(source);
++        cipher_ = std::move(cipher);
++        nodes_.clear();
++        lookup_.clear();
++        for (Slot& slot : slots_) slot.cluster = ~uint64_t{0};
++        uint8_t header[0x100];
++        if (!source_->ReadAt(0, header, sizeof(header))) return Fail(error, "the file is too small for a disc image");
++        gameId_.assign(reinterpret_cast<const char*>(header), 6);
++        for (char& c : gameId_) {
++            if (!std::isalnum(static_cast<unsigned char>(c))) c = '?';
++        }
++        if (Be32(header + 0x18) != 0x5D1C9EA3u) return Fail(error, "not a Wii disc image (no Wii magic word)");
++
++        // The first DATA partition (type 0) in the four partition groups.
++        uint8_t groups[0x20];
++        if (!source_->ReadAt(0x40000, groups, sizeof(groups))) return Fail(error, "cannot read the partition table");
++        uint64_t partition = 0;
++        for (int g = 0; g < 4 && partition == 0; ++g) {
++            const uint32_t count = Be32(groups + g * 8);
++            const uint64_t table = uint64_t{Be32(groups + g * 8 + 4)} << 2;
++            for (uint32_t i = 0; i < count && i < 64 && partition == 0; ++i) {
++                uint8_t entry[8];
++                if (!source_->ReadAt(table + i * 8u, entry, sizeof(entry))) return Fail(error, "cannot read the partition table");
++                if (Be32(entry + 4) == 0) partition = uint64_t{Be32(entry)} << 2;
++            }
++        }
++        if (partition == 0) return Fail(error, "the disc has no DATA partition");
++
++        uint8_t head[0x2C0];
++        if (!source_->ReadAt(partition, head, sizeof(head))) return Fail(error, "cannot read the partition header");
++        if (head[0x1F1] != 0) return Fail(error, "the partition is not encrypted with the retail common key");
++        uint8_t iv[16] = {};
++        std::memcpy(iv, head + 0x1DC, 8);  // title id
++        uint8_t titleKey[16];
++        cipher_->SetKey(commonKey);
++        cipher_->DecryptCbc(iv, head + 0x1BF, titleKey, 16);
++        cipher_->SetKey(titleKey);
++        dataOffset_ = partition + (uint64_t{Be32(head + 0x2B8)} << 2);
++        const uint64_t dataBytes = uint64_t{Be32(head + 0x2BC)} << 2;
++        if (dataBytes == 0 || dataOffset_ > source_->Size() || dataBytes > source_->Size() - dataOffset_) {
++            return Fail(error, "the partition's data lies past the end of the image (a trimmed or scrubbed copy?)");
++        }
++        clusterCount_ = dataBytes / kClusterSize;
++        dataSize_ = clusterCount_ * kClusterDataSize;
++
++        uint8_t boot[0x440];
++        uint8_t apploader[0x20];
++        if (!ReadData(0, boot, sizeof(boot)) || !ReadData(0x2440, apploader, sizeof(apploader))) {
++            return Fail(error, "cannot read the partition's boot block");
++        }
++        const uint64_t dolOffset = uint64_t{Be32(boot + 0x420)} << 2;
++        const uint64_t fstOffset = uint64_t{Be32(boot + 0x424)} << 2;
++        const uint64_t fstSize = uint64_t{Be32(boot + 0x428)} << 2;
++        uint8_t dol[0x100];
++        if (fstSize < 12 || fstSize > (64u << 20) || !ReadData(dolOffset, dol, sizeof(dol))) {
++            return Fail(error, "the partition's boot block is not valid");
++        }
++        uint64_t dolSize = sizeof(dol);  // the end of the DOL's last section
++        for (int i = 0; i < 18; ++i) {
++            dolSize = std::max<uint64_t>(dolSize, uint64_t{Be32(dol + i * 4)} + Be32(dol + 0x90 + i * 4));
++        }
++        std::vector<uint8_t> fst(static_cast<size_t>(fstSize));
++        if (!ReadData(fstOffset, fst.data(), fst.size())) return Fail(error, "cannot read the file table");
++
++        nodes_.push_back({"", -1, true, {}, 0, 0});
++        lookup_[""] = kRoot;
++        const int32_t files = AddNode(kRoot, "files", true, 0, 0);
++        const int32_t sys = AddNode(kRoot, "sys", true, 0, 0);
++        AddNode(sys, "boot.bin", false, 0, 0x440);
++        AddNode(sys, "bi2.bin", false, 0x440, 0x2000);
++        AddNode(sys, "apploader.img", false, 0x2440, 0x20ull + Be32(apploader + 0x14) + Be32(apploader + 0x18));
++        AddNode(sys, "main.dol", false, dolOffset, dolSize);
++        AddNode(sys, "fst.bin", false, fstOffset, fstSize);
++
++        const uint32_t count = Be32(fst.data() + 8);
++        if (count == 0 || uint64_t{count} * 12 > fst.size()) return Fail(error, "the file table is not valid");
++        const size_t names = size_t{count} * 12;
++        struct Frame {
++            uint32_t end;
++            int32_t node;
++        };
++        std::vector<Frame> stack{{count, files}};
++        for (uint32_t i = 1; i < count; ++i) {
++            while (stack.size() > 1 && i >= stack.back().end) stack.pop_back();
++            const uint8_t* e = fst.data() + size_t{i} * 12;
++            const size_t nameAt = names + (Be32(e) & 0x00FFFFFFu);
++            const auto* nameEnd = static_cast<const uint8_t*>(nameAt < fst.size() ? std::memchr(fst.data() + nameAt, 0, fst.size() - nameAt) : nullptr);
++            if (nameEnd == nullptr) return Fail(error, "the file table is not valid");
++            const std::string name(reinterpret_cast<const char*>(fst.data() + nameAt), reinterpret_cast<const char*>(nameEnd));
++            if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\:") != std::string::npos) {
++                return Fail(error, "the file table names a file the SD card cannot hold: " + name);
++            }
++            if (e[0] != 0) {
++                const uint32_t end = Be32(e + 8);
++                if (end <= i || end > stack.back().end) return Fail(error, "the file table is not valid");
++                stack.push_back({end, AddNode(stack.back().node, name, true, 0, 0)});
++            } else {
++                const uint64_t offset = uint64_t{Be32(e + 4)} << 2;
++                const uint64_t size = Be32(e + 8);
++                if (offset > dataSize_ || size > dataSize_ - offset) {
++                    return Fail(error, "the file table names a file past the end of the partition: " + name);
++                }
++                AddNode(stack.back().node, name, false, offset, size);
++            }
++        }
++        for (int32_t n = 1; n < static_cast<int32_t>(nodes_.size()); ++n) {
++            if (!nodes_[n].directory && (nodes_[n].offset > dataSize_ || nodes_[n].size > dataSize_ - nodes_[n].offset)) {
++                return Fail(error, "the partition's boot block names data past its end");
++            }
++        }
++        return true;
++    }
++
++    // Bytes 0-5 of the disc header (non-alphanumerics as '?').
++    const std::string& GameId() const { return gameId_; }
++    uint64_t ImageSize() const { return source_ ? source_->Size() : 0; }
++
++    // The node at `path` (relative to the DATA folder, any case), or -1.
++    int32_t Find(std::string_view path) const {
++        const auto it = lookup_.find(LookupKey(path));
++        return it == lookup_.end() ? -1 : it->second;
++    }
++    const Node& At(int32_t index) const { return nodes_[static_cast<size_t>(index)]; }
++    size_t NodeCount() const { return nodes_.size(); }
++    // "files/sound/voice0.bin"
++    std::string PathOf(int32_t index) const {
++        std::string path;
++        for (int32_t n = index; n > kRoot; n = nodes_[static_cast<size_t>(n)].parent) {
++            path.insert(0, path.empty() ? nodes_[static_cast<size_t>(n)].name : nodes_[static_cast<size_t>(n)].name + "/");
++        }
++        return path;
++    }
++
++    // The complete range of a file, or false.
++    bool ReadFile(int32_t index, uint64_t offset, void* dst, size_t size) {
++        const Node& node = nodes_[static_cast<size_t>(index)];
++        if (node.directory || offset > node.size || size > node.size - offset) return false;
++        return ReadData(node.offset + offset, dst, size);
++    }
++
++    // The complete range of the partition's decrypted data, or false. Partial clusters go through a
++    // small cache of decrypted clusters; whole ones are read in batches and decrypted straight into
++    // `dst`. Thread-safe.
++    bool ReadData(uint64_t offset, void* dst, size_t size) {
++        if (offset > dataSize_ || size > dataSize_ - offset) return false;
++        auto* out = static_cast<uint8_t*>(dst);
++        const std::lock_guard<std::mutex> lock(mutex_);
++        while (size != 0) {
++            const uint64_t cluster = offset / kClusterDataSize;
++            const size_t at = static_cast<size_t>(offset % kClusterDataSize);
++            if (at == 0 && size >= kClusterDataSize) {
++                const size_t count = std::min<size_t>(size / kClusterDataSize, kBatchClusters);
++                batch_.resize(static_cast<size_t>(kBatchClusters * kClusterSize));
++                if (!source_->ReadAt(dataOffset_ + cluster * kClusterSize, batch_.data(), count * kClusterSize)) return false;
++                for (size_t i = 0; i < count; ++i) {
++                    const uint8_t* raw = batch_.data() + i * kClusterSize;
++                    cipher_->DecryptCbc(raw + 0x3D0, raw + kClusterHashSize, out + i * kClusterDataSize, kClusterDataSize);
++                }
++                const size_t n = count * static_cast<size_t>(kClusterDataSize);
++                out += n;
++                offset += n;
++                size -= n;
++                continue;
++            }
++            const uint8_t* plain = Cluster(cluster);
++            if (plain == nullptr) return false;
++            const size_t n = std::min<size_t>(static_cast<size_t>(kClusterDataSize) - at, size);
++            std::memcpy(out, plain + at, n);
++            out += n;
++            offset += n;
++            size -= n;
++        }
++        return true;
++    }
++
++private:
++    static constexpr size_t kBatchClusters = 64;  // 2 MiB of raw clusters per read
++    static constexpr size_t kCacheSlots = 16;     // ~500 KiB of decrypted clusters
++
++    struct Slot {
++        uint64_t cluster = ~uint64_t{0};
++        uint64_t used = 0;
++        std::vector<uint8_t> plain;
++    };
++
++    static bool Fail(std::string& error, std::string why) {
++        error = std::move(why);
++        return false;
++    }
++
++    int32_t AddNode(int32_t parent, std::string name, bool directory, uint64_t offset, uint64_t size) {
++        const int32_t index = static_cast<int32_t>(nodes_.size());
++        nodes_.push_back({std::move(name), parent, directory, {}, offset, size});
++        nodes_[static_cast<size_t>(parent)].children.push_back(index);
++        lookup_[LookupKey(PathOf(index))] = index;
++        return index;
++    }
++
++    // The decrypted data of one cluster (mutex_ held), or null.
++    const uint8_t* Cluster(uint64_t cluster) {
++        Slot* victim = &slots_[0];
++        for (Slot& slot : slots_) {
++            if (slot.cluster == cluster) {
++                slot.used = ++uses_;
++                return slot.plain.data();
++            }
++            if (slot.used < victim->used) victim = &slot;
++        }
++        raw_.resize(static_cast<size_t>(kClusterSize));  // not on the stack: guest fibers read the disc too
++        if (cluster >= clusterCount_ || !source_->ReadAt(dataOffset_ + cluster * kClusterSize, raw_.data(), raw_.size())) {
++            return nullptr;
++        }
++        victim->plain.resize(static_cast<size_t>(kClusterDataSize));
++        cipher_->DecryptCbc(raw_.data() + 0x3D0, raw_.data() + kClusterHashSize, victim->plain.data(), kClusterDataSize);
++        victim->cluster = cluster;
++        victim->used = ++uses_;
++        return victim->plain.data();
++    }
++
++    std::unique_ptr<Source> source_;
++    std::unique_ptr<Cipher> cipher_;
++    std::string gameId_;
++    uint64_t dataOffset_ = 0;
++    uint64_t clusterCount_ = 0;
++    uint64_t dataSize_ = 0;
++    std::vector<Node> nodes_;
++    std::unordered_map<std::string, int32_t> lookup_;
++    std::mutex mutex_;
++    Slot slots_[kCacheSlots];
++    uint64_t uses_ = 0;
++    std::vector<uint8_t> batch_;
++    std::vector<uint8_t> raw_;
++};
++
++// sys/fst.bin with the disc offsets of its files zeroed: where a file lies on the disc is not part
++// of what the game reads (dvd.cpp publishes its own offsets), and copies re-laid out without the
++// disc's padding (NKit) move them. The names, tree and sizes stay; each file's bytes are hashed on
++// their own.
++inline void CanonicalFst(std::vector<uint8_t>& fst) {
++    if (fst.size() < 12) return;
++    const uint64_t count = std::min<uint64_t>(Be32(fst.data() + 8), fst.size() / 12);
++    for (uint64_t i = 1; i < count; ++i) {
++        if (fst[i * 12] == 0) std::memset(fst.data() + i * 12 + 4, 0, 4);
++    }
++}
++
++// The SHA-256 of every file the DATA folder holds, independent of the image's container, padding
++// and junk: for each file in sorted path order, its path ("files/sound/voice0.bin"), a zero byte,
++// its size (8 bytes, big-endian) and its bytes (sys/fst.bin as CanonicalFst). `Hasher` has
++// Update(const void*, size_t) and Final(uint8_t[32]); `progress(done, total)` is called between
++// reads and returns false to stop.
++template <typename Hasher, typename Progress>
++bool ContentDigest(Image& image, Hasher& hasher, uint8_t digest[32], Progress&& progress) {
++    std::vector<std::pair<std::string, int32_t>> files;
++    uint64_t total = 0;
++    for (int32_t n = 1; n < static_cast<int32_t>(image.NodeCount()); ++n) {
++        if (!image.At(n).directory) {
++            files.emplace_back(image.PathOf(n), n);
++            total += image.At(n).size;
++        }
++    }
++    std::sort(files.begin(), files.end());
++    std::vector<uint8_t> buffer(4u << 20);
++    uint64_t done = 0;
++    for (const auto& [path, n] : files) {
++        const uint64_t size = image.At(n).size;
++        uint8_t prefix[8];
++        for (int i = 0; i < 8; ++i) prefix[i] = static_cast<uint8_t>(size >> (56 - 8 * i));
++        hasher.Update(path.data(), path.size() + 1);  // with the terminating zero
++        hasher.Update(prefix, sizeof(prefix));
++        if (path == "sys/fst.bin") {
++            std::vector<uint8_t> fst(static_cast<size_t>(size));
++            if (!image.ReadFile(n, 0, fst.data(), fst.size())) return false;
++            CanonicalFst(fst);
++            hasher.Update(fst.data(), fst.size());
++            done += size;
++            if (!progress(done, total)) return false;
++            continue;
++        }
++        for (uint64_t at = 0; at < size;) {
++            const size_t chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), size - at));
++            if (!image.ReadFile(n, at, buffer.data(), chunk)) return false;
++            hasher.Update(buffer.data(), chunk);
++            at += chunk;
++            done += chunk;
++            if (!progress(done, total)) return false;
++        }
++    }
++    hasher.Final(digest);
++    return true;
++}
++
++}  // namespace WiiDisc
 diff --git a/runtime/include/hle_stubs.h b/runtime/include/hle_stubs.h
 index f83b85d..3784b6e 100644
 --- a/runtime/include/hle_stubs.h
@@ -10455,303 +10923,3 @@ index f527424..b55cc83 100644
  
  class ScopedTranslatedExecutionAddress {
  public:
-diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
-index 3198082..29ad115 100644
---- a/runtime/include/runtime_config.h
-+++ b/runtime/include/runtime_config.h
-@@ -46,6 +46,14 @@ struct RuntimeUserConfig {
-     std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
-     std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
-     std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
-+    // Lighter graphics (hle/mlb/gfx_options.cpp), launcher VIDEO tab; all as on the Wii by default.
-+    std::optional<std::string> playerShadows;  // [video] shadows: "full", "simple" (round blob) or "off"
-+    std::optional<std::string> crowdLevel;     // [video] crowd: "full", "less" (half the stands) or "off"
-+    std::optional<uint32_t> fieldingFov;       // [video] fielding_fov: play-shot camera angle in percent, 60-100
-+    std::optional<std::string> reflections;    // [video] reflections: "on" (helmet and bat shine) or "off"
-+    // [video] experimental_gx: the Switch's GXF4 steps (texture objects and the raw-FIFO stream on the GX
-+    // threads), WIICOMPILED_GXF_TEX / WIICOMPILED_GXF_STREAM when those are not set (main.cpp, launcher VIDEO).
-+    std::optional<bool> experimentalGx;
-     std::optional<int32_t> windowPosX;
-     std::optional<int32_t> windowPosY;
-     std::optional<uint32_t> windowWidth;
-@@ -193,6 +201,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
- // only vulkan for linux
- #elif defined(__linux__)
-     static constexpr std::array<std::string_view, 4> values{"auto", "vulkan", "opengles", "null"};
-+#elif defined(__SWITCH__)
-+    static constexpr std::array<std::string_view, 3> values{"auto", "vulkan", "null"};
- #elif defined(_WIN32)
-     static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
- #endif
-@@ -228,6 +238,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
-     }
- #elif defined(__APPLE__)
-     return RuntimePlatform::ExecutableDirectory();
-+#elif defined(__SWITCH__)
-+    return std::filesystem::path("sdmc:/switch/mlbpowerpros2008");  // where the homebrew menu finds it
- #else
-     // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
-     // does not NUL-terminate and silently truncates if the buffer is too small, so this grows
-@@ -275,6 +287,9 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
- }
- 
- inline std::filesystem::path ApplicationDataDirectory() {
-+#if defined(__SWITCH__)
-+    return *ExecutableDirectory() / kPortableUserDataDirectoryName;  // always portable on the SD card
-+#endif
-     if (const auto& portableRoot = PortableRootDirectory()) {
-         return *portableRoot / kPortableUserDataDirectoryName;
-     }
-@@ -479,6 +494,21 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
-     config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
-     config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
-     config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
-+    if (auto value = FindConfigValue<std::string>(document, "video", "shadows");
-+        value && (*value == "full" || *value == "simple" || *value == "off")) {
-+        config.playerShadows = *value;
-+    }
-+    if (auto value = FindConfigValue<std::string>(document, "video", "crowd");
-+        value && (*value == "full" || *value == "less" || *value == "off")) {
-+        config.crowdLevel = *value;
-+    }
-+    if (auto value = FindConfigUint(document, "video", "fielding_fov"); value && *value >= 60 && *value <= 100) {
-+        config.fieldingFov = *value;
-+    }
-+    if (auto value = FindConfigValue<std::string>(document, "video", "reflections"); value && (*value == "on" || *value == "off")) {
-+        config.reflections = *value;
-+    }
-+    config.experimentalGx = FindConfigValue<bool>(document, "video", "experimental_gx");
-     config.windowPosX = FindConfigInt(document, "video", "window_x");
-     config.windowPosY = FindConfigInt(document, "video", "window_y");
-     if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
-@@ -695,6 +725,9 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
-         }
-     }
- 
-+#if defined(__SWITCH__)
-+    input.close();  // Horizon: a file open for reading cannot be opened for writing
-+#endif
-     std::error_code ec;
-     if (path.has_parent_path()) {
-         std::filesystem::create_directories(path.parent_path(), ec);
-@@ -978,6 +1011,51 @@ inline bool SetTwoWayPlayer(bool value) {
-     return WriteSetting("season", "two_way_player", value ? "true" : "false");
- }
- 
-+inline std::string PlayerShadows(std::string fallback = "full") {
-+    return Get().playerShadows.value_or(std::move(fallback));
-+}
-+
-+inline bool SetPlayerShadows(std::string value) {
-+    Mutable().playerShadows = value;
-+    return WriteSetting("video", "shadows", FormatString(value));
-+}
-+
-+inline std::string CrowdLevel(std::string fallback = "full") {
-+    return Get().crowdLevel.value_or(std::move(fallback));
-+}
-+
-+inline bool SetCrowdLevel(std::string value) {
-+    Mutable().crowdLevel = value;
-+    return WriteSetting("video", "crowd", FormatString(value));
-+}
-+
-+inline uint32_t FieldingFov(uint32_t fallback = 100) {
-+    return Get().fieldingFov.value_or(fallback);
-+}
-+
-+inline bool SetFieldingFov(uint32_t value) {
-+    Mutable().fieldingFov = value;
-+    return WriteSetting("video", "fielding_fov", std::to_string(value));
-+}
-+
-+inline std::string Reflections(std::string fallback = "on") {
-+    return Get().reflections.value_or(std::move(fallback));
-+}
-+
-+inline bool SetReflections(std::string value) {
-+    Mutable().reflections = value;
-+    return WriteSetting("video", "reflections", FormatString(value));
-+}
-+
-+inline bool ExperimentalGx(bool fallback = false) {
-+    return Get().experimentalGx.value_or(fallback);
-+}
-+
-+inline bool SetExperimentalGx(bool value) {
-+    Mutable().experimentalGx = value;
-+    return WriteSetting("video", "experimental_gx", value ? "true" : "false");
-+}
-+
- inline bool UniversalDh(bool fallback = false) {
-     return Get().universalDh.value_or(fallback);
- }
-diff --git a/runtime/include/season_text.h b/runtime/include/season_text.h
-index 6485bf0..cd2d43a 100644
---- a/runtime/include/season_text.h
-+++ b/runtime/include/season_text.h
-@@ -99,7 +99,11 @@ inline SeasonText DescribeSeason(const season_pack::Plan& plan, int maxSeasons)
-                       ? std::string()
-                       : std::string(Tr(". Lo que viene de un mod manda sobre estas opciones", ". What comes from a mod overrides these options"))) +
-                  (plan.conflicts.empty() ? "" : Tr(". Hay avisos", ". There are warnings")) +
-+#if defined(__SWITCH__)  // the Season Editor is a PC program
-+                 ".";
-+#else
-                  Tr(". Detalles y ajustes en HERRAMIENTAS > EDITOR DE TEMPORADA.", ". Details and settings in TOOLS > SEASON EDITOR.");
-+#endif
-     return out;
- }
- 
-diff --git a/runtime/include/system_bridge.h b/runtime/include/system_bridge.h
-index f66df4c..3ee7632 100644
---- a/runtime/include/system_bridge.h
-+++ b/runtime/include/system_bridge.h
-@@ -16,8 +16,9 @@
- // the norm. A POSIX signal handler jumping back to here must use the sig-prefixed pair instead:
- // only sigsetjmp/siglongjmp save and restore the process signal mask, which is what keeps SIGSEGV
- // from staying blocked (and a second fault during the same ctor loop from escalating instead of
--// trapping) after the first recovered fault.
--#if defined(_WIN32)
-+// trapping) after the first recovered fault. Horizon has no signals and newlib no sigjmp_buf, so
-+// the Switch takes the plain pair too.
-+#if defined(_WIN32) || defined(__SWITCH__)
- using MkwJmpBuf = jmp_buf;
- #define MKW_SETJMP(buf) setjmp(buf)
- #else
-diff --git a/runtime/include/wii_es_crypto.h b/runtime/include/wii_es_crypto.h
-index 0c515b5..82ce075 100644
---- a/runtime/include/wii_es_crypto.h
-+++ b/runtime/include/wii_es_crypto.h
-@@ -24,6 +24,10 @@
- #include <cryptopp/ec2n.h>
- #include <cryptopp/oids.h>
- #include <cryptopp/osrng.h>
-+#if defined(__SWITCH__)
-+#include <cryptopp/randpool.h>
-+extern "C" void randomGet(void* buf, size_t len);  // libnx's CSRNG: Crypto++ has no OS RNG on Horizon
-+#endif
- #include <cryptopp/sha.h>
- 
- #include <algorithm>
-@@ -150,7 +154,18 @@ inline EcSignature SignMessage(const uint8_t* key, const uint8_t* data, size_t s
-         throw std::runtime_error("Crypto++ returned an unexpected sect233r1 signature size");
-     }
- 
-+#if defined(__SWITCH__)
-+    thread_local CryptoPP::RandomPool random;
-+    thread_local bool seeded = false;
-+    if (!seeded) {
-+        uint8_t seed[32];
-+        randomGet(seed, sizeof seed);
-+        random.IncorporateEntropy(seed, sizeof seed);
-+        seeded = true;
-+    }
-+#else
-     thread_local CryptoPP::AutoSeededRandomPool random;
-+#endif
-     EcSignature signature{};
-     const size_t written = signer.SignMessage(random, data, size, signature.data());
-     if (written != signature.size()) {
-diff --git a/runtime/src/abi_bridge.cpp b/runtime/src/abi_bridge.cpp
-index 4ef3b2b..239d784 100644
---- a/runtime/src/abi_bridge.cpp
-+++ b/runtime/src/abi_bridge.cpp
-@@ -4,6 +4,11 @@
- #include <array>
- #include <atomic>
- #include <cstddef>
-+#if defined(__SWITCH__)
-+#include <cinttypes>
-+#include <cstdio>
-+#include <cstdlib>
-+#endif
- #include <iomanip>
- #include <iostream>
- #include <mutex>
-@@ -32,6 +37,52 @@ static_assert(offsetof(CpuContext, srr1) == 456);
- static_assert(offsetof(CpuContext, msr) == 460);
- static_assert(sizeof(CpuContext) == 464);
- 
-+#if defined(__SWITCH__)
-+// The dispatch path's thread_locals (ppc_isa_context.h, abi_bridge.h): the headers reach them
-+// through MKW_SWITCH_TLS_ADDRESS_FN, without __aarch64_read_tp.
-+thread_local CpuContext* g_currentCpuContext = nullptr;
-+thread_local IndirectResolvedDispatchMemoEntry g_indirectResolvedDispatchMemo[kIndirectDispatchCacheEntries]{};
-+thread_local IndirectRawDispatchMemoEntry g_indirectRawDispatchMemo[kIndirectDispatchCacheEntries]{};
-+
-+namespace {
-+// The inline sequence and the compiler's own TLS access (a __aarch64_read_tp call) must give the
-+// same address on this thread; a different libnx thread-pointer layout would stop here.
-+void CheckSwitchTlsAccess() {
-+    if (MkwCurrentCpuContextSlot() == &g_currentCpuContext &&
-+        MkwIndirectResolvedDispatchMemo() == &g_indirectResolvedDispatchMemo[0] &&
-+        MkwIndirectRawDispatchMemo() == &g_indirectRawDispatchMemo[0]) {
-+        return;
-+    }
-+    std::fprintf(stderr, "[runtime] inline TLS access disagrees with the compiler's (%p/%p)\n",
-+                 static_cast<void*>(MkwCurrentCpuContextSlot()), static_cast<void*>(&g_currentCpuContext));
-+    ShowRuntimeFatalPopup("translated dispatch initialization failed",
-+                          "The inline thread-local access of the dispatch path does not match the compiler's.");
-+    std::abort();
-+}
-+
-+uint64_t g_switchDispatchCheckCalls = 0;
-+uint64_t g_switchDispatchCheckMismatches = 0;
-+}  // namespace
-+
-+void SwitchDispatchCheck(uint32_t target, const RawDispatchRecord* record, const CpuContext* cpu) noexcept {
-+    const RawDispatchRecord* reference = TranslatedFunctionRegistry::FindRawByAddressPtrUncached(target);
-+    const CpuContext* current = g_currentCpuContext;  // the compiler's TLS access
-+    ++g_switchDispatchCheckCalls;
-+    if (reference != record || current != cpu) {
-+        if (++g_switchDispatchCheckMismatches <= 32) {
-+            std::fprintf(stderr,
-+                         "[dispatch-check] MISMATCH target=0x%08X memo=%p uncached=%p ctx=%p current=%p\n",
-+                         target, static_cast<const void*>(record), static_cast<const void*>(reference),
-+                         static_cast<const void*>(cpu), static_cast<const void*>(current));
-+        }
-+    }
-+    if ((g_switchDispatchCheckCalls & ((1u << 22) - 1u)) == 0) {
-+        std::fprintf(stderr, "[dispatch-check] calls=%" PRIu64 " mismatches=%" PRIu64 "\n",
-+                     g_switchDispatchCheckCalls, g_switchDispatchCheckMismatches);
-+    }
-+}
-+#endif
-+
- namespace {
- std::vector<TranslatedFunctionInfo>& Registry() {
-     static std::vector<TranslatedFunctionInfo> entries;
-@@ -338,6 +389,13 @@ void TranslatedFunctionRegistry::Register(TranslatedFunctionInfo info) {
- }
- 
- void TranslatedFunctionRegistry::Finalize() {
-+#if defined(__SWITCH__)
-+    CheckSwitchTlsAccess();
-+    if (const char* check = std::getenv("WIICOMPILED_DISPATCH_CHECK"); check != nullptr && check[0] == '1') {
-+        g_switchDispatchCheck = true;
-+        std::fprintf(stderr, "[dispatch-check] comparing every fast-path indirect call with the uncached lookup\n");
-+    }
-+#endif
-     if (const size_t overrides = PriorityOverrideCount(); overrides != 0) {
-         RT_LOG(RT_TAG_RUNTIME) << overrides
-                   << " registration(s) took over an address by priority" << std::endl;
-@@ -403,6 +461,19 @@ const RawDispatchRecord* TranslatedFunctionRegistry::FindRawByAddressPtrSlow(uin
-     return it != entries.end() && it->address == address ? &*it : nullptr;
- }
- 
-+#if defined(__SWITCH__)
-+const RawDispatchRecord* TranslatedFunctionRegistry::FindRawByAddressPtrUncached(uint32_t address) {
-+    if (!lookupPublished_.load(std::memory_order_acquire)) {
-+        return nullptr;
-+    }
-+    const RawDispatchRecord* record = nullptr;
-+    if (const auto* table = g_publishedStaticIndirectDispatchTable.load(std::memory_order_acquire)) {
-+        record = FindStaticIndirectDispatchEntry(table, address);
-+    }
-+    return record != nullptr ? record : FindRawByAddressPtrSlow(address);
-+}
-+#endif
-+
- std::optional<TranslatedFunctionInfo> TranslatedFunctionRegistry::FindByHostAddress(uintptr_t hostAddr) {
-     const bool frozen = RegistryFrozen().load(std::memory_order_acquire);
-     if (!frozen) {
