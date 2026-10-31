@@ -5387,7 +5387,7 @@ index 9818084..ef23e67 100644
 +
 +#include "fifo_async.inc"
 diff --git a/aurora-main/lib/gx/fifo.hpp b/aurora-main/lib/gx/fifo.hpp
-index b01ea45..cbeac66 100644
+index b01ea45..7a1c895 100644
 --- a/aurora-main/lib/gx/fifo.hpp
 +++ b/aurora-main/lib/gx/fifo.hpp
 @@ -3,6 +3,8 @@
@@ -5471,7 +5471,7 @@ index b01ea45..cbeac66 100644
    if (!detail::sInDisplayList)
      LIKELY {
        if (detail::sBufferSize < detail::sBufferCapacity)
-@@ -76,14 +130,268 @@ inline void write_f32(const float val) {
+@@ -76,14 +130,309 @@ inline void write_f32(const float val) {
  // Display list recording
  void begin_display_list(uint8_t* buf, uint32_t size);
  uint32_t end_display_list();
@@ -5625,6 +5625,11 @@ index b01ea45..cbeac66 100644
 +// its segments; a sync point waits for both (front end, then decoder). Off: sGxfThread's worker
 +// is the deferred-mode producer and decoder in one core-1 thread.
 +extern bool sGxfSplit;
++// GXF4 (with sGxf; default off, each read once by resolve_mode): WIICOMPILED_GXF_TEX=1 runs the
++// runtime's texture-object maps (gx_texture.cpp, gx_objects.cpp) as records too, and
++// WIICOMPILED_GXF_STREAM=1 its raw-FIFO vertex parser (gx_fifo.cpp); C API aurora_gxf_* below.
++extern bool sGxfTex;
++extern bool sGxfStream;
 +} // namespace detail
 +// True on the GXF worker, and on the main thread inside a GxfDirect scope (or while it runs the
 +// records itself in deferred mode): Aurora runs the call there instead of recording it.
@@ -5741,12 +5746,48 @@ index b01ea45..cbeac66 100644
 +extern "C" int aurora_gx_g7_check(void);
 +extern "C" int aurora_gx_g7_lock(void);
 +#endif
++
++// GXF4 (fifo_async.inc): the runtime's side of WIICOMPILED_GXF_TEX / WIICOMPILED_GXF_STREAM.
++// aurora_gxf_tex/aurora_gxf_stream: the switches (resolving the FIFO mode first if needed);
++// aurora_gxf_intercept: gxf_intercept(); aurora_gxf_exec: gxf_exec(); aurora_gxf_post: gxf_post;
++// aurora_gxf_direct_begin/end: a GxfDirect scope (begin returns whether end must be called);
++// aurora_gxf_set_pending: the runtime holds main-thread words of an open record (the raw-FIFO
++// stream) that must be posted before any other record or sync point: `flush` posts them (once).
++// aurora_gxf4_counters: the gxf4_per_frame line (main-thread counters, and worker counters read
++// at rest by the stats report's sync point).
++enum Gxf4Counter : uint32_t {
++  kGxf4TexRecords = 0,  // main: texture-object records posted
++  kGxf4TexSyncs,        // main: texture-object calls run at a sync point (getters, fallbacks)
++  kGxf4TexUnknown,      // main: loads whose store decision the main-thread model could not tell
++  kGxf4TexMispredicts,  // worker: load decision != the main thread's (must stay 0)
++  kGxf4TexForeignReads, // worker: guest GXTexObj read outside the record's snapshot (must stay 0)
++  kGxf4TexStores,       // main: end-of-load GXData stores
++  kGxf4TexRejects,      // main: loads decided rejected (no store)
++  kGxf4StreamPrims,     // main: raw-FIFO primitives finished on the worker
++  kGxf4StreamWords,     // main: FIFO words handed over
++  kGxf4StreamChunks,    // main: stream records posted
++  kGxf4StreamStops,     // main: streams stopped at a sync point (parser state copied back)
++  kGxf4StreamLayouts,   // main: vertex layouts sent with a stream start
++  kGxf4StreamBursts,    // main: burst writes handed over
++  kGxf4StreamErrors,    // worker: a stream word outside an open primitive (must stay 0)
++  kGxf4CounterCount = 16
++};
++extern "C" uint64_t aurora_gxf4_counters[kGxf4CounterCount];
++extern "C" int aurora_gxf_tex(void);
++extern "C" int aurora_gxf_stream(void);
++extern "C" int aurora_gxf_intercept(void);
++extern "C" int aurora_gxf_exec(void);
++extern "C" void aurora_gxf_post(void (*exec)(const uint8_t* payload), const void* a, uint32_t aSize, const void* b,
++                                uint32_t bSize, int kick);
++extern "C" int aurora_gxf_direct_begin(const char* site);
++extern "C" void aurora_gxf_direct_end(void);
++extern "C" void aurora_gxf_set_pending(void (*flush)(void));
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 new file mode 100644
-index 0000000..61c2ed7
+index 0000000..d3dc61a
 --- /dev/null
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -0,0 +1,1770 @@
+@@ -0,0 +1,1839 @@
 +// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
 +// at the end of fifo.cpp.
 +//
@@ -5810,6 +5851,8 @@ index 0000000..61c2ed7
 +bool sGxf = false;
 +bool sGxfThread = false;
 +bool sGxfSplit = false;
++bool sGxfTex = false;
++bool sGxfStream = false;
 +// Below the frame worker, presenter and audio threads that share core 2 (0x2C, the AX mixer
 +// 0x2B): they preempt the front end, never the reverse. WIICOMPILED_GXF_SPLIT_PRIO overrides.
 +int sGxfSplitPriority = 0x2D;
@@ -5876,6 +5919,14 @@ index 0000000..61c2ed7
 +      Log.info("GXF: Aurora front end on the FIFO worker ({})", sGxfSplit ? "split" : sGxfThread ? "thread" : "deferred");
 +      if (sGxfSplit) {
 +        Log.info("GXF: split, front end on core 2 at priority 0x{:x}, decoding on core 1", sGxfSplitPriority);
++      }
++      // GXF4 (fifo.hpp; default off until the console confirms them).
++      const char* tex = std::getenv("WIICOMPILED_GXF_TEX");
++      sGxfTex = tex != nullptr && tex[0] == '1';
++      const char* stream = std::getenv("WIICOMPILED_GXF_STREAM");
++      sGxfStream = stream != nullptr && stream[0] == '1';
++      if (sGxfTex || sGxfStream) {
++        Log.info("GXF4: texture objects {}, raw-FIFO stream {}", sGxfTex ? "on" : "off", sGxfStream ? "on" : "off");
 +      }
 +    }
 +  }
@@ -5955,6 +6006,7 @@ index 0000000..61c2ed7
 +           gxfErrors = 0, gxfForeign = 0, gxfCheck = 0;
 +  uint64_t gxfExecWaits = 0, gxfExecWaitNs = 0, gxfExecSegments = 0, gxfDecWaits = 0, gxfDecWaitNs = 0,
 +           gxfExecCpuNs = 0;
++  uint64_t gxf4[kGxf4CounterCount]{};
 +#if defined(__SWITCH__)
 +  uint64_t a3[kA3CounterCount]{};
 +  uint64_t g6[kG6CounterCount]{};
@@ -5997,6 +6049,7 @@ index 0000000..61c2ed7
 +  s.gxfExecSegments = sGxfStats.execSegments.load(std::memory_order_relaxed);
 +  s.gxfDecWaits = sGxfStats.decWaits;
 +  s.gxfDecWaitNs = sGxfStats.decWaitNs;
++  std::memcpy(s.gxf4, aurora_gxf4_counters, sizeof(s.gxf4));
 +#if defined(__SWITCH__)
 +  // One kernel call per stats mark/report (never per frame): the thread's CPU time on any core.
 +  s.gxfExecCpuNs = sGxfExecThread != 0 ? SwitchThreadCpuNs(sGxfExecThread) : 0;
@@ -6993,6 +7046,17 @@ index 0000000..61c2ed7
 +uint64_t sGxfDoneSeen = 0;  // main: a GxfShared::done value read earlier
 +uint64_t sGxfInlineDone = 0; // deferred: bytes the main thread has run
 +std::atomic<uint64_t> sGxfDirectEpoch{0};
++// GXF4 (aurora_gxf_set_pending): main-thread words of an open runtime record, posted before any
++// other record and before every sync point waits.
++void (*sGxfPending)() = nullptr;
++
++inline void gxf_flush_pending() {
++  if (sGxfPending != nullptr) UNLIKELY {
++    const auto flush = sGxfPending;
++    sGxfPending = nullptr;
++    flush();
++  }
++}
 +
 +constexpr uint32_t align16(uint32_t v) noexcept { return (v + 15u) & ~15u; }
 +
@@ -7303,6 +7367,7 @@ index 0000000..61c2ed7
 +bool gxf_exec() noexcept { return tGxfExec; }
 +
 +void gxf_post(GxfExec exec, const void* a, uint32_t aSize, const void* b, uint32_t bSize, bool kick) {
++  gxf_flush_pending();
 +  gxf_ensure_started();
 +  const uint32_t size = align16(static_cast<uint32_t>(sizeof(GxfHeader)) + aSize + bSize);
 +  const uint32_t at = gxf_reserve(size);
@@ -7324,7 +7389,11 @@ index 0000000..61c2ed7
 +}
 +
 +void gxf_sync() {
-+  if (!sGxfStarted || tGxfExec) {
++  if (tGxfExec) {
++    return;
++  }
++  gxf_flush_pending();
++  if (!sGxfStarted) {
 +    return;
 +  }
 +  if (!detail::sGxfThread) {
@@ -7332,13 +7401,15 @@ index 0000000..61c2ed7
 +    return;
 +  }
 +  // A record appended by the guest pump while waiting is waited for too. Split: both stages, the
-+  // front end first (its done publishes the segments it pushed), then the decoder.
++  // front end first (its done publishes the segments it pushed), then the decoder. GXF4: words the
++  // pump left pending are posted and waited for as well.
 +  do {
++    gxf_flush_pending();
 +    while (sGxfShared->done.load(std::memory_order_acquire) != sGxfHead) {
 +      gxf_wait_done(sGxfHead);
 +    }
 +    sGxfDoneSeen = sGxfHead;
-+  } while (detail::sGxfSplit && !gxf_wait_decoded());
++  } while (sGxfPending != nullptr || (detail::sGxfSplit && !gxf_wait_decoded()));
 +}
 +
 +bool gxf_direct_begin(const char* site) {
@@ -7406,6 +7477,35 @@ index 0000000..61c2ed7
 +// Completed end-of-frame drains: memory a display list pointed at may be reused after it changes.
 +extern "C" uint64_t aurora_gx_fifo_frame_epoch(void) { return aurora::gx::fifo::sFrameEpoch; }
 +
++// ---- GXF4: the runtime's texture-object and raw-FIFO records (fifo.hpp) ----------------------------
++uint64_t aurora_gxf4_counters[kGxf4CounterCount] = {}; // extern "C" in fifo.hpp
++extern "C" int aurora_gxf_tex(void) {
++  using namespace aurora::gx::fifo;
++  if (!detail::sModeResolved) {
++    detail::resolve_mode();
++  }
++  return detail::sGxfTex ? 1 : 0;
++}
++extern "C" int aurora_gxf_stream(void) {
++  using namespace aurora::gx::fifo;
++  if (!detail::sModeResolved) {
++    detail::resolve_mode();
++  }
++  return detail::sGxfStream ? 1 : 0;
++}
++extern "C" int aurora_gxf_intercept(void) { return aurora::gx::fifo::gxf_intercept() ? 1 : 0; }
++extern "C" int aurora_gxf_exec(void) { return aurora::gx::fifo::gxf_exec() ? 1 : 0; }
++extern "C" void aurora_gxf_post(void (*exec)(const uint8_t* payload), const void* a, uint32_t aSize, const void* b,
++                                uint32_t bSize, int kick) {
++  aurora::gx::fifo::gxf_post(exec, a, aSize, b, bSize, kick != 0);
++}
++extern "C" int aurora_gxf_direct_begin(const char* site) {
++  using namespace aurora::gx::fifo;
++  return detail::sGxf && gxf_direct_begin(site) ? 1 : 0;
++}
++extern "C" void aurora_gxf_direct_end(void) { aurora::gx::fifo::gxf_direct_end(); }
++extern "C" void aurora_gxf_set_pending(void (*flush)(void)) { aurora::gx::fifo::sGxfPending = flush; }
++
 +extern "C" void aurora_gx_fifo_stats_mark(void) {
 +  aurora::gx::fifo::GxfDirect gxf("aurora_gx_fifo_stats_mark"); // GXF: worker counters at rest
 +  aurora::gx::fifo::sMark = aurora::gx::fifo::take_snapshot();
@@ -7430,6 +7530,7 @@ index 0000000..61c2ed7
 +    return delta(now.quiesces[i], base.quiesces[i]);
 +  };
 +  const double frames = std::max(1.0, drains(DrainReason::EndFrame));
++  const auto gxf4 = [&](Gxf4Counter c) { return delta(now.gxf4[c], base.gxf4[c]); };
 +  const char* modeName = mode() == Mode::Thread ? "thread" : (mode() == Mode::Deferred ? "deferred" : "sync");
 +  const int n = std::snprintf(
 +      out, static_cast<size_t>(size),
@@ -7446,6 +7547,9 @@ index 0000000..61c2ed7
 +      "ring_waits=%.2f worker_exec_ms=%.3f errors=%.0f foreign_writes=%.0f check_violations=%.0f "
 +      "split=%d exec_cpu_ms=%.3f exec_dec_wait_ms=%.3f exec_dec_waits=%.2f exec_segments=%.1f "
 +      "main_dec_wait_ms=%.3f main_dec_waits=%.2f\n"
++      "gxf4_per_frame tex=%d stream=%d tex_records=%.1f tex_syncs=%.2f tex_unknown=%.2f tex_mispredicts=%.0f "
++      "tex_foreign_reads=%.0f tex_stores=%.1f tex_rejects=%.2f stream_prims=%.1f stream_words=%.1f "
++      "stream_chunks=%.1f stream_stops=%.2f stream_layouts=%.2f stream_bursts=%.1f stream_errors=%.0f\n"
 +#if defined(__SWITCH__)
 +      "gx_a3_per_frame enabled=%d vtx_probes=%.1f vtx_probes_elided=%.1f tlut_digests=%.1f "
 +      "tlut_digests_skipped=%.1f dl_front_hits=%.1f layout_hashes=%.1f layout_rows_hashed=%.1f\n"
@@ -7480,7 +7584,13 @@ index 0000000..61c2ed7
 +      delta(now.gxfForeign, base.gxfForeign), delta(now.gxfCheck, base.gxfCheck), detail::sGxfSplit ? 1 : 0,
 +      delta(now.gxfExecCpuNs, base.gxfExecCpuNs) / frames / 1e6, delta(now.gxfExecWaitNs, base.gxfExecWaitNs) / frames / 1e6,
 +      delta(now.gxfExecWaits, base.gxfExecWaits) / frames, delta(now.gxfExecSegments, base.gxfExecSegments) / frames,
-+      delta(now.gxfDecWaitNs, base.gxfDecWaitNs) / frames / 1e6, delta(now.gxfDecWaits, base.gxfDecWaits) / frames
++      delta(now.gxfDecWaitNs, base.gxfDecWaitNs) / frames / 1e6, delta(now.gxfDecWaits, base.gxfDecWaits) / frames,
++      detail::sGxfTex ? 1 : 0, detail::sGxfStream ? 1 : 0, gxf4(kGxf4TexRecords) / frames,
++      gxf4(kGxf4TexSyncs) / frames, gxf4(kGxf4TexUnknown) / frames, gxf4(kGxf4TexMispredicts),
++      gxf4(kGxf4TexForeignReads), gxf4(kGxf4TexStores) / frames, gxf4(kGxf4TexRejects) / frames,
++      gxf4(kGxf4StreamPrims) / frames, gxf4(kGxf4StreamWords) / frames, gxf4(kGxf4StreamChunks) / frames,
++      gxf4(kGxf4StreamStops) / frames, gxf4(kGxf4StreamLayouts) / frames, gxf4(kGxf4StreamBursts) / frames,
++      gxf4(kGxf4StreamErrors)
 +#if defined(__SWITCH__)
 +      ,
 +      a3_enabled() ? 1 : 0, delta(now.a3[kA3VtxProbes], base.a3[kA3VtxProbes]) / frames,
@@ -10106,10 +10216,10 @@ index f527424..b55cc83 100644
  class ScopedTranslatedExecutionAddress {
  public:
 diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
-index 3198082..10de0be 100644
+index 3198082..2fbf872 100644
 --- a/runtime/include/runtime_config.h
 +++ b/runtime/include/runtime_config.h
-@@ -46,6 +46,10 @@ struct RuntimeUserConfig {
+@@ -46,6 +46,11 @@ struct RuntimeUserConfig {
      std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
      std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
      std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
@@ -10117,10 +10227,11 @@ index 3198082..10de0be 100644
 +    std::optional<std::string> playerShadows;  // [video] shadows: "full", "simple" (round blob) or "off"
 +    std::optional<std::string> crowdLevel;     // [video] crowd: "full", "less" (half the stands) or "off"
 +    std::optional<uint32_t> fieldingFov;       // [video] fielding_fov: play-shot camera angle in percent, 60-100
++    std::optional<std::string> reflections;    // [video] reflections: "on" (helmet and bat shine) or "off"
      std::optional<int32_t> windowPosX;
      std::optional<int32_t> windowPosY;
      std::optional<uint32_t> windowWidth;
-@@ -193,6 +197,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
+@@ -193,6 +198,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
  // only vulkan for linux
  #elif defined(__linux__)
      static constexpr std::array<std::string_view, 4> values{"auto", "vulkan", "opengles", "null"};
@@ -10129,7 +10240,7 @@ index 3198082..10de0be 100644
  #elif defined(_WIN32)
      static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
  #endif
-@@ -228,6 +234,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
+@@ -228,6 +235,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
      }
  #elif defined(__APPLE__)
      return RuntimePlatform::ExecutableDirectory();
@@ -10138,7 +10249,7 @@ index 3198082..10de0be 100644
  #else
      // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
      // does not NUL-terminate and silently truncates if the buffer is too small, so this grows
-@@ -275,6 +283,9 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
+@@ -275,6 +284,9 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
  }
  
  inline std::filesystem::path ApplicationDataDirectory() {
@@ -10148,7 +10259,7 @@ index 3198082..10de0be 100644
      if (const auto& portableRoot = PortableRootDirectory()) {
          return *portableRoot / kPortableUserDataDirectoryName;
      }
-@@ -479,6 +490,17 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
+@@ -479,6 +491,20 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
      config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
      config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
      config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
@@ -10163,10 +10274,13 @@ index 3198082..10de0be 100644
 +    if (auto value = FindConfigUint(document, "video", "fielding_fov"); value && *value >= 60 && *value <= 100) {
 +        config.fieldingFov = *value;
 +    }
++    if (auto value = FindConfigValue<std::string>(document, "video", "reflections"); value && (*value == "on" || *value == "off")) {
++        config.reflections = *value;
++    }
      config.windowPosX = FindConfigInt(document, "video", "window_x");
      config.windowPosY = FindConfigInt(document, "video", "window_y");
      if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
-@@ -695,6 +717,9 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
+@@ -695,6 +721,9 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
          }
      }
  
@@ -10176,7 +10290,7 @@ index 3198082..10de0be 100644
      std::error_code ec;
      if (path.has_parent_path()) {
          std::filesystem::create_directories(path.parent_path(), ec);
-@@ -978,6 +1003,33 @@ inline bool SetTwoWayPlayer(bool value) {
+@@ -978,6 +1007,42 @@ inline bool SetTwoWayPlayer(bool value) {
      return WriteSetting("season", "two_way_player", value ? "true" : "false");
  }
  
@@ -10205,6 +10319,15 @@ index 3198082..10de0be 100644
 +inline bool SetFieldingFov(uint32_t value) {
 +    Mutable().fieldingFov = value;
 +    return WriteSetting("video", "fielding_fov", std::to_string(value));
++}
++
++inline std::string Reflections(std::string fallback = "on") {
++    return Get().reflections.value_or(std::move(fallback));
++}
++
++inline bool SetReflections(std::string value) {
++    Mutable().reflections = value;
++    return WriteSetting("video", "reflections", FormatString(value));
 +}
 +
  inline bool UniversalDh(bool fallback = false) {
