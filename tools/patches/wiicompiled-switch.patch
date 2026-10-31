@@ -5743,10 +5743,10 @@ index b01ea45..cbeac66 100644
 +#endif
 diff --git a/aurora-main/lib/gx/fifo_async.inc b/aurora-main/lib/gx/fifo_async.inc
 new file mode 100644
-index 0000000..e8e56dd
+index 0000000..61c2ed7
 --- /dev/null
 +++ b/aurora-main/lib/gx/fifo_async.inc
-@@ -0,0 +1,1763 @@
+@@ -0,0 +1,1770 @@
 +// GX FIFO processing modes, WIICOMPILED_GX_FIFO=sync|deferred|thread (switch phase 22). Included
 +// at the end of fifo.cpp.
 +//
@@ -5844,7 +5844,14 @@ index 0000000..e8e56dd
 +  }
 +  // GXF (fifo.hpp): the front end moves to the worker, which runs this file as a deferred-mode
 +  // producer and decoder; the asynchronous modes only (sync has no decoder of its own).
-+  if (const char* gxf = std::getenv("WIICOMPILED_GXF_AURORA"); gxf != nullptr && gxf[0] == '1') {
++  // On the Switch GXF and its split are the default (measured 2026-10-30); "0" turns them off.
++#if defined(__SWITCH__)
++  constexpr bool kGxfDefault = true;
++#else
++  constexpr bool kGxfDefault = false;
++#endif
++  const char* gxfEnv = std::getenv("WIICOMPILED_GXF_AURORA");
++  if (gxfEnv != nullptr ? gxfEnv[0] == '1' : kGxfDefault) {
 +    const char* hleWorker = std::getenv("WIICOMPILED_GX_HLE_WORKER");
 +    if (mode == Mode::Sync) {
 +      Log.warn("GXF: WIICOMPILED_GXF_AURORA=1 needs WIICOMPILED_GX_FIFO=thread or deferred; off");
@@ -5856,7 +5863,7 @@ index 0000000..e8e56dd
 +      // WIICOMPILED_GXF_SPLIT=1: the front end gets a thread of its own (core 2) and is the
 +      // producer of this file's thread mode; the FIFO worker (core 1) only decodes.
 +      const char* split = std::getenv("WIICOMPILED_GXF_SPLIT");
-+      sGxfSplit = sGxfThread && split != nullptr && split[0] == '1';
++      sGxfSplit = sGxfThread && (split != nullptr ? split[0] == '1' : kGxfDefault);
 +      if (const char* prio = std::getenv("WIICOMPILED_GXF_SPLIT_PRIO"); sGxfSplit && prio != nullptr) {
 +        const long value = std::strtol(prio, nullptr, 0);
 +        if (value >= 0x20 && value <= 0x3F) {
