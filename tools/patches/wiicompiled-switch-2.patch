@@ -8379,10 +8379,10 @@ index 0000000..4e7543c
 +#endif
 diff --git a/runtime/src/hle/mlb/gfx_options.cpp b/runtime/src/hle/mlb/gfx_options.cpp
 new file mode 100644
-index 0000000..b3b4979
+index 0000000..4780a17
 --- /dev/null
 +++ b/runtime/src/hle/mlb/gfx_options.cpp
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,179 @@
 +// MLB Power Pros 2008 (RL8E54): optional lighter graphics (launcher VIDEO tab, Config.toml
 +// [video] shadows, crowd, fielding_fov). All off by default; each native below is then one predictable
 +// branch followed by the translation of the original function (kept callable by REGISTER_NATIVE_FUNCTION_AS),
@@ -8394,6 +8394,16 @@ index 0000000..b3b4979
 +//   items'), 0 = none. Only render nodes change; +0x3A8 is read only by the character's SetVisible
 +//   (0x806DA4E8) and per-frame update (0x806DAF80), which update those nodes. "simple" turns 2/3 into 1,
 +//   "off" passes 0.
++// - Bat shadows, 0x806E4DBC(bat, shown): the bat's SetVisible (vtable 0x80D5F8B0 slot +0x10, only called
++//   through it). The bat (constructor 0x806E4BC0, 0x654 bytes; the batter's at character +0x1C20 or
++//   +0x1C30, the on-deck one at +0x70 of the match's player set 0x80894694) has its models at +0x40/+0x150
++//   (pM_bat_R/L, cracked, or the two halves of a broken bat) and its own shadow projectors at +0x2A0/+0x470
++//   (pM_bat_shadow, pM_breakbat_*_shadow). It shows the projectors only while its byte +0x640 is set; the
++//   game clears that byte itself through 0x806E5070 where the bat must not cast one (0x806E29F0,
++//   0x807A1608). With "off" or "simple" (the game has no round shadow for a bat) the call runs with +0x640
++//   cleared and the byte is put back right after, so the bat takes the game's own no-shadow path and
++//   every reader sees the game's value. The ball's shadow is a separate plain model (model_game.pack
++//   +0x3400) and is left alone.
 +// - Crowd, 0x80C60A94(scene): the stadium's per-frame visibility pass. A placement's node is shown when its
 +//   tree-A flag, its byte in the visibility table (scene+0x6B8) and its sphere-in-frustum test agree; a
 +//   zero byte also skips the piece's animation/LOD step (0x80C600C8, which writes that piece's node only).
@@ -8417,6 +8427,7 @@ index 0000000..b3b4979
 +#include "runtime_config.h"
 +
 +extern "C" void func_806DA22C(CpuContext* ctx);  // the translations (kept: _AS registrations)
++extern "C" void func_806E4DBC(CpuContext* ctx);
 +extern "C" void func_80C60A94(CpuContext* ctx);
 +extern "C" void func_80054BEC(CpuContext* ctx);
 +
@@ -8456,6 +8467,7 @@ index 0000000..b3b4979
 +
 +constexpr uint32_t kSceneEnabled = 0x798, kPlacements = 0x6B4, kTable = 0x6B8, kCount = 0x600, kLevel = 0x7B8;
 +constexpr uint32_t kPlacementSize = 0x54, kPlacementType = 0x52;
++constexpr uint32_t kBatShadowOn = 0x640;  // bat byte: its shadow projectors are shown (0x806E5070 sets it)
 +constexpr uint32_t kPlayShotFovReturn = 0x808F1CCC;  // after `bl 0x80054BEC` in the play shot 0x808F1C5C
 +
 +bool HiddenType(Crowd crowd, uint32_t level, uint8_t type) {
@@ -8512,6 +8524,22 @@ index 0000000..b3b4979
 +    func_806DA22C(ctx);
 +}
 +REGISTER_NATIVE_FUNCTION_AS(0x806DA22C, MLB_CharShadowMode_806DA22C, "CharShadowMode");
++
++extern "C" void MLB_BatSetVisible_806E4DBC(CpuContext* ctx) {
++    using namespace mlb_gfx_options;
++    if (Get().shadows != Shadows::Full) [[unlikely]] {
++        // Only the bat's own node calls are reached (SetVisible of its models and projectors); none writes
++        // +0x640, so it is still 0 afterwards unless the game changed it, and then it is left as it is.
++        const uint32_t bat = ctx->gpr[3];
++        const uint8_t shadowOn = Memory::Read8(bat + kBatShadowOn);
++        Memory::Write8(bat + kBatShadowOn, 0);
++        func_806E4DBC(ctx);
++        if (Memory::Read8(bat + kBatShadowOn) == 0) Memory::Write8(bat + kBatShadowOn, shadowOn);
++        return;
++    }
++    func_806E4DBC(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x806E4DBC, MLB_BatSetVisible_806E4DBC, "BatSetVisible");
 +
 +extern "C" void MLB_StadiumVisibility_80C60A94(CpuContext* ctx) {
 +    using namespace mlb_gfx_options;
