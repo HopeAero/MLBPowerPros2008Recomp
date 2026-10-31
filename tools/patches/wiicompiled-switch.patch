@@ -9731,6 +9731,18 @@ index a5066f8..8f8bf4f 100644
  
  template <typename QuantizedType>
  inline void PpcStorePairPsqQuantizedStackInline(uint32_t addr, double value, uint32_t scale)
+diff --git a/runtime/include/launcher_controls.h b/runtime/include/launcher_controls.h
+index bcbc3f7..c5e54a0 100644
+--- a/runtime/include/launcher_controls.h
++++ b/runtime/include/launcher_controls.h
+@@ -7,6 +7,7 @@ bool PlayStationPrompts();
+ const char* AcceptPrompt();
+ const char* BackPrompt();
+ const char* TabPrompt();
++const char* InfoPrompt();  // " · <button>: info" for the settings footer (compact windows)
+ const char* DeviceLabel();
+ // Draw inside a sized, scrollable parent. Returns true while capturing input
+ // or exercising the stick, so launcher navigation cannot steal that input.
 diff --git a/runtime/include/mbedtls_switch_config.h b/runtime/include/mbedtls_switch_config.h
 new file mode 100644
 index 0000000..0f8d25e
@@ -10174,10 +10186,29 @@ index 0856e7b..154e652 100644
 +#endif
 \ No newline at end of file
 diff --git a/runtime/include/power_pros_ui.h b/runtime/include/power_pros_ui.h
-index 83a67e4..159822b 100644
+index 83a67e4..cf20d62 100644
 --- a/runtime/include/power_pros_ui.h
 +++ b/runtime/include/power_pros_ui.h
-@@ -89,6 +89,11 @@ inline ImFont* LoadFirstFont(std::initializer_list<const char*> paths, float siz
+@@ -21,6 +21,9 @@
+ 
+ #if defined(_WIN32)
+ extern "C" __declspec(dllimport) unsigned short __stdcall GetUserDefaultUILanguage(void);
++#elif defined(__SWITCH__)
++extern "C" bool SwitchUiSystemLanguageSpanish();               // platform/switch/switch_ui.cpp
++extern "C" const void* SwitchUiSharedFont(std::size_t* size);  // the console's shared font, or null
+ #endif
+ 
+ namespace power_pros_ui {
+@@ -33,6 +36,8 @@ enum class Lang { Es, En };
+ inline Lang SystemLang() {
+ #if defined(_WIN32)
+     return (GetUserDefaultUILanguage() & 0x3FF) == 0x0A ? Lang::Es : Lang::En;   // PRIMARYLANGID == LANG_SPANISH
++#elif defined(__SWITCH__)
++    return SwitchUiSystemLanguageSpanish() ? Lang::Es : Lang::En;  // the console's language
+ #else
+     const char* l = std::getenv("LANG");
+     return l && l[0] == 'e' && l[1] == 's' ? Lang::Es : Lang::En;
+@@ -89,6 +94,11 @@ inline ImFont* LoadFirstFont(std::initializer_list<const char*> paths, float siz
  // Font paths differ per distribution (Fedora and SteamOS have no DejaVu where Debian and Arch keep
  // it): when none of the listed files exists, ask fontconfig for the closest match to the pattern.
  inline ImFont* LoadFontconfigFont(const char* pattern, float size) {
@@ -10189,14 +10220,52 @@ index 83a67e4..159822b 100644
      const std::string command = std::string("fc-match -f '%{file}' '") + pattern + "' 2>/dev/null";
      FILE* pipe = popen(command.c_str(), "r");
      if (pipe == nullptr) return nullptr;
-@@ -98,6 +103,7 @@ inline ImFont* LoadFontconfigFont(const char* pattern, float size) {
+@@ -98,6 +108,20 @@ inline ImFont* LoadFontconfigFont(const char* pattern, float size) {
      if (length == 0) return nullptr;
      path[length] = '\0';
      return LoadFirstFont({path}, size);
 +#endif
++}
++#endif
++
++#if defined(__SWITCH__)
++// The console's shared font (system data, not the game's), used in place; smaller bakes than the PC's:
++// the screen is 720p and the atlas stays in memory for the whole game.
++inline ImFont* LoadSharedFont(float size) {
++    std::size_t bytes = 0;
++    const void* data = SwitchUiSharedFont(&bytes);
++    if (data == nullptr) return nullptr;
++    ImFontConfig config;
++    config.FontDataOwnedByAtlas = false;
++    return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(const_cast<void*>(data), static_cast<int>(bytes), size, &config);
  }
  #endif
  
+@@ -105,7 +129,11 @@ inline void LoadFonts() {
+     if (g_text != nullptr) return;  // once: the launcher and the in-game overlay share the atlas
+     ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+     if (atlas->Fonts.empty()) atlas->AddFontDefault();  // the in-game overlay keeps ImGui's font
+-#if defined(_WIN32)
++#if defined(__SWITCH__)
++    g_text = LoadSharedFont(40.0f);
++    g_bold = LoadSharedFont(32.0f);
++    g_title = LoadSharedFont(84.0f);
++#elif defined(_WIN32)
+     g_text = LoadFirstFont({"C:/Windows/Fonts/bahnschrift.ttf", "C:/Windows/Fonts/segoeui.ttf",
+                             "C:/Windows/Fonts/arial.ttf"}, 48.0f);
+     g_bold = LoadFirstFont({"C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf"}, 40.0f);
+@@ -125,7 +153,10 @@ inline void LoadFonts() {
+     if (g_text == nullptr) g_text = fallback;
+     if (g_bold == nullptr) g_bold = g_text;
+     if (g_title == nullptr) g_title = g_bold;
+-#if defined(_WIN32)
++#if defined(__SWITCH__)
++    g_menu = LoadSharedFont(20.f);
++    g_menuBold = LoadSharedFont(26.f);
++#elif defined(_WIN32)
+     g_menu = LoadFirstFont({"C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"}, 20.f);
+     g_menuBold = LoadFirstFont({"C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf"}, 26.f);
+ #else
 diff --git a/runtime/include/recomp_mod_loader.h b/runtime/include/recomp_mod_loader.h
 index f527424..b55cc83 100644
 --- a/runtime/include/recomp_mod_loader.h
@@ -10216,10 +10285,10 @@ index f527424..b55cc83 100644
  class ScopedTranslatedExecutionAddress {
  public:
 diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
-index 3198082..2fbf872 100644
+index 3198082..29ad115 100644
 --- a/runtime/include/runtime_config.h
 +++ b/runtime/include/runtime_config.h
-@@ -46,6 +46,11 @@ struct RuntimeUserConfig {
+@@ -46,6 +46,14 @@ struct RuntimeUserConfig {
      std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
      std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
      std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
@@ -10228,10 +10297,13 @@ index 3198082..2fbf872 100644
 +    std::optional<std::string> crowdLevel;     // [video] crowd: "full", "less" (half the stands) or "off"
 +    std::optional<uint32_t> fieldingFov;       // [video] fielding_fov: play-shot camera angle in percent, 60-100
 +    std::optional<std::string> reflections;    // [video] reflections: "on" (helmet and bat shine) or "off"
++    // [video] experimental_gx: the Switch's GXF4 steps (texture objects and the raw-FIFO stream on the GX
++    // threads), WIICOMPILED_GXF_TEX / WIICOMPILED_GXF_STREAM when those are not set (main.cpp, launcher VIDEO).
++    std::optional<bool> experimentalGx;
      std::optional<int32_t> windowPosX;
      std::optional<int32_t> windowPosY;
      std::optional<uint32_t> windowWidth;
-@@ -193,6 +198,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
+@@ -193,6 +201,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
  // only vulkan for linux
  #elif defined(__linux__)
      static constexpr std::array<std::string_view, 4> values{"auto", "vulkan", "opengles", "null"};
@@ -10240,7 +10312,7 @@ index 3198082..2fbf872 100644
  #elif defined(_WIN32)
      static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
  #endif
-@@ -228,6 +235,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
+@@ -228,6 +238,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
      }
  #elif defined(__APPLE__)
      return RuntimePlatform::ExecutableDirectory();
@@ -10249,7 +10321,7 @@ index 3198082..2fbf872 100644
  #else
      // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
      // does not NUL-terminate and silently truncates if the buffer is too small, so this grows
-@@ -275,6 +284,9 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
+@@ -275,6 +287,9 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
  }
  
  inline std::filesystem::path ApplicationDataDirectory() {
@@ -10259,7 +10331,7 @@ index 3198082..2fbf872 100644
      if (const auto& portableRoot = PortableRootDirectory()) {
          return *portableRoot / kPortableUserDataDirectoryName;
      }
-@@ -479,6 +491,20 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
+@@ -479,6 +494,21 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
      config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
      config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
      config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
@@ -10277,10 +10349,11 @@ index 3198082..2fbf872 100644
 +    if (auto value = FindConfigValue<std::string>(document, "video", "reflections"); value && (*value == "on" || *value == "off")) {
 +        config.reflections = *value;
 +    }
++    config.experimentalGx = FindConfigValue<bool>(document, "video", "experimental_gx");
      config.windowPosX = FindConfigInt(document, "video", "window_x");
      config.windowPosY = FindConfigInt(document, "video", "window_y");
      if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
-@@ -695,6 +721,9 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
+@@ -695,6 +725,9 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
          }
      }
  
@@ -10290,7 +10363,7 @@ index 3198082..2fbf872 100644
      std::error_code ec;
      if (path.has_parent_path()) {
          std::filesystem::create_directories(path.parent_path(), ec);
-@@ -978,6 +1007,42 @@ inline bool SetTwoWayPlayer(bool value) {
+@@ -978,6 +1011,51 @@ inline bool SetTwoWayPlayer(bool value) {
      return WriteSetting("season", "two_way_player", value ? "true" : "false");
  }
  
@@ -10330,9 +10403,34 @@ index 3198082..2fbf872 100644
 +    return WriteSetting("video", "reflections", FormatString(value));
 +}
 +
++inline bool ExperimentalGx(bool fallback = false) {
++    return Get().experimentalGx.value_or(fallback);
++}
++
++inline bool SetExperimentalGx(bool value) {
++    Mutable().experimentalGx = value;
++    return WriteSetting("video", "experimental_gx", value ? "true" : "false");
++}
++
  inline bool UniversalDh(bool fallback = false) {
      return Get().universalDh.value_or(fallback);
  }
+diff --git a/runtime/include/season_text.h b/runtime/include/season_text.h
+index 6485bf0..cd2d43a 100644
+--- a/runtime/include/season_text.h
++++ b/runtime/include/season_text.h
+@@ -99,7 +99,11 @@ inline SeasonText DescribeSeason(const season_pack::Plan& plan, int maxSeasons)
+                       ? std::string()
+                       : std::string(Tr(". Lo que viene de un mod manda sobre estas opciones", ". What comes from a mod overrides these options"))) +
+                  (plan.conflicts.empty() ? "" : Tr(". Hay avisos", ". There are warnings")) +
++#if defined(__SWITCH__)  // the Season Editor is a PC program
++                 ".";
++#else
+                  Tr(". Detalles y ajustes en HERRAMIENTAS > EDITOR DE TEMPORADA.", ". Details and settings in TOOLS > SEASON EDITOR.");
++#endif
+     return out;
+ }
+ 
 diff --git a/runtime/include/system_bridge.h b/runtime/include/system_bridge.h
 index f66df4c..3ee7632 100644
 --- a/runtime/include/system_bridge.h
