@@ -39,7 +39,7 @@ new file mode 100644
 index 0000000..83faaac
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,1251 @@
+@@ -0,0 +1,1383 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -307,6 +307,10 @@ index 0000000..83faaac
 +constexpr int kAtlasWidth = 512, kTitleW = 384, kTitleH = 28, kButtonW = 138, kButtonH = 30;
 +int g_stage = 0;        // 1 while the panel asks for the second position, 2 once answered
 +uint32_t g_second = 0;  // 2..9 (C..RF) for the latest new pitcher, 0 none
++bool g_creationBatter = false;
++std::array<uint8_t, 3> g_pitchPerks{}, g_batPerks{};
++bool g_perksReady[2] = {false, false};
++bool g_perkBatter[2] = {false, false};
 +
 +void Sound(CpuContext* ctx, uint32_t id) {
 +    Call(ctx, 0x80010F8Cu, InvokeDirectCpu<0x80010F8Cu>);
@@ -505,6 +509,9 @@ index 0000000..83faaac
 +        return;  // the game goes on to the next step
 +    }
 +    g_second = 0;
++    g_pitchPerks = {}, g_batPerks = {};
++    g_perksReady[0] = g_perksReady[1] = false;
++    g_perkBatter[0] = g_perkBatter[1] = false;
 +    if (cursor != 0) return;
 +    g_stage = 1;
 +    Paint(ctx);
@@ -1106,13 +1113,20 @@ index 0000000..83faaac
 +    if (Memory::Read8(0x81048D84u) != 0) {
 +        Call(ctx, 0x80A2F738u, InvokeDirectCpu<0x80A2F738u>);
 +        Call(ctx, 0x8057BD3Cu, InvokeDirectCpu<0x8057BD3Cu>);
-+        ctx->gpr[3] = (ctx->gpr[3] & 0xFF) == 1 ? 1 : 0;
++        ctx->gpr[3] = !g_creationBatter && (ctx->gpr[3] & 0xFF) == 1 ? 1 : 0;
++        // Creation initializes abilities by main position, before any daily role exists.
++        return;
 +    } else {
 +        Call(ctx, 0x80A16F38u, InvokeDirectCpu<0x80A16F38u>);
 +        ctx->gpr[3] &= 0xFFFF;
 +        Call(ctx, 0x80B06888u, InvokeDirectCpu<0x80B06888u>);
 +    }
 +    const uint32_t pitcher = ctx->gpr[3];
++    // The new-career finalizer also runs with 0x81048D84 clear, after assigning the second aptitude.
++    if (lr >= 0x80A20FB8u && lr < 0x80A240A8u) {
++        ctx->gpr[3] = g_creationBatter ? 0 : pitcher;
++        return;
++    }
 +    if (pitcher == 0 || !LifeMode() || SecondPosition(ctx, LifeRecord(ctx)) == 0) {
 +        ctx->gpr[3] = pitcher;
 +        return;
@@ -1145,6 +1159,10 @@ index 0000000..83faaac
 +    const uint32_t record = ctx->gpr[3], lr = ctx->lr;
 +    const uint32_t value = (Memory::Read32(record + 0x5C) >> 6) & 0xF;
 +    ctx->gpr[3] = value;
++    if (value == kPitcher && g_creationBatter) {
++        ctx->gpr[3] = g_second;
++        return;
++    }
 +    if (value != kPitcher || !LifeMode()) return;
 +    const bool site = std::find(std::begin(kLifeRoleSites), std::end(kLifeRoleSites), lr) != std::end(kLifeRoleSites);
 +    if (!site || LifeRecord(ctx) != record) {
@@ -1162,6 +1180,120 @@ index 0000000..83faaac
 +    ctx->gpr[3] = second != 0 && batter ? second : value;
 +}
 +PPC_NATIVE_OVERRIDE_VOID(8057BD3C, MLB_MainPosition_8057BD3C, (CpuContext* ctx), (ctx));
++
++// Original panel bodies: calling their symbols bypasses only this wrapper, keeping their children.
++extern "C" void func_80977244(CpuContext*);
++extern "C" void func_809772CC(CpuContext*);
++extern "C" void func_80A53244(CpuContext*);
++extern "C" void func_80A532A8(CpuContext*);
++extern "C" void func_80A21160(CpuContext*);
++
++namespace two_way {
++namespace {
++bool CreatingTwoWay() {
++    return RuntimeConfigFile::TwoWayPlayer(false) && g_second >= 2 && g_second <= 9 &&
++           ((Memory::Read32(kNewPlayer + 0x5C) >> 6) & 15) == kPitcher;
++}
++
++void PerkBytes(bool weakness, std::array<uint8_t, 3>& perks, bool write) {
++    const uint32_t header = Memory::Read32(0x8104B5C0u);
++    if (!Memory::Contains(header, 157)) return;
++    for (unsigned i = weakness ? 2 : 0; i < (weakness ? 3u : 2u); ++i) {
++        if (write) Memory::Write8(header + 154 + i, perks[i]);
++        else perks[i] = Memory::Read8(header + 154 + i);
++    }
++}
++
++void PerkPanel(CpuContext* ctx, bool weakness, bool enter) {
++    // shortcut: the stock summary has three perk rows; expand it when both sets need a simultaneous preview.
++    const uint32_t panel = ctx->gpr[3];
++    const auto init = weakness ? func_80A53244 : func_80977244;
++    const auto update = weakness ? func_80A532A8 : func_809772CC;
++    if (!CreatingTwoWay()) {
++        (enter ? init : update)(ctx);
++        return;
++    }
++    if (enter) g_perkBatter[weakness] = false;
++    if (enter) std::fprintf(stderr, "[two-way] MLB Life creation: pitching %s\n", weakness ? "drawback" : "strengths");
++    if (weakness) PerkBytes(false, g_perkBatter[weakness] ? g_batPerks : g_pitchPerks, true);
++    g_creationBatter = g_perkBatter[weakness];
++    (enter ? init : update)(ctx);
++    const CpuContext result = *ctx;
++    if (!enter && Memory::Read32(panel + 296) == 3) {
++        const bool confirmed = Memory::Read8(panel + 292) != 0;
++        const bool batting = g_perkBatter[weakness];
++        if (confirmed) {
++            PerkBytes(weakness, batting ? g_batPerks : g_pitchPerks, false);
++            if (batting) g_perksReady[weakness] = true;
++        }
++        if ((confirmed && !batting) || (!confirmed && batting)) {
++            g_perkBatter[weakness] = !batting;
++            PerkBytes(weakness, batting ? g_pitchPerks : g_batPerks, true);
++            g_creationBatter = !batting;
++            if (weakness) PerkBytes(false, batting ? g_pitchPerks : g_batPerks, true);
++            std::fprintf(stderr, "[two-way] MLB Life creation: %s %s\n", !batting ? "batting" : "pitching",
++                         weakness ? "drawback" : "strengths");
++            Memory::Write32(panel + 2092, 0);  // advantage selection starts at its first slot
++            Memory::Write32(panel + 304, 0);
++            Memory::Write16(panel + (weakness ? 2082 : 2086), 0xFFFF);
++            Memory::Write16(panel + (weakness ? 2084 : 2088), 0xFFFF);
++            ctx->gpr[3] = panel;
++            init(ctx);  // clears completion/cancel and rebuilds the original list for this role
++        } else {
++            PerkBytes(weakness, g_pitchPerks, true);
++            g_perkBatter[weakness] = false;
++        }
++    }
++    g_creationBatter = false;
++    if (weakness) PerkBytes(false, g_pitchPerks, true);
++    *ctx = result;
++}
++}  // namespace
++}  // namespace two_way
++
++extern "C" void MLB_AdvantagesEnter_80977244(CpuContext* ctx) { two_way::PerkPanel(ctx, false, true); }
++REGISTER_NATIVE_FUNCTION_AS(0x80977244, MLB_AdvantagesEnter_80977244, "MLB_AdvantagesEnter_80977244");
++extern "C" void MLB_AdvantagesUpdate_809772CC(CpuContext* ctx) { two_way::PerkPanel(ctx, false, false); }
++REGISTER_NATIVE_FUNCTION_AS(0x809772CC, MLB_AdvantagesUpdate_809772CC, "MLB_AdvantagesUpdate_809772CC");
++extern "C" void MLB_WeaknessEnter_80A53244(CpuContext* ctx) { two_way::PerkPanel(ctx, true, true); }
++REGISTER_NATIVE_FUNCTION_AS(0x80A53244, MLB_WeaknessEnter_80A53244, "MLB_WeaknessEnter_80A53244");
++extern "C" void MLB_WeaknessUpdate_80A532A8(CpuContext* ctx) { two_way::PerkPanel(ctx, true, false); }
++REGISTER_NATIVE_FUNCTION_AS(0x80A532A8, MLB_WeaknessUpdate_80A532A8, "MLB_WeaknessUpdate_80A532A8");
++
++// The finalizer calls this after pitching abilities and before building growth from the record.
++extern "C" void MLB_CreationGrowth_80A21160(CpuContext* ctx) {
++    using namespace two_way;
++    if (CreatingTwoWay() && g_perksReady[0] && g_perksReady[1]) {
++        const CpuContext input = *ctx;
++        const uint32_t owner = ctx->gpr[3], record = LifeRecord(ctx);
++        const uint32_t pitching = Memory::Read32(record + 0x78);
++        std::array<uint32_t, 3> positions{};
++        for (unsigned i = 0; i < positions.size(); ++i) positions[i] = Memory::Read32(record + 0x5C + i * 4);
++        const uint32_t header = Memory::Read32(0x8104B5C0u);
++        const uint32_t limits = header + 4532;
++        std::array<uint8_t, 14> pitchLimits{};
++        for (unsigned i = 0; i < pitchLimits.size(); ++i) pitchLimits[i] = Memory::Read8(limits + 7 + i);
++        PerkBytes(false, g_batPerks, true);
++        PerkBytes(true, g_batPerks, true);
++        g_creationBatter = true;
++        ctx->gpr[3] = owner;
++        Call(ctx, 0x80A219F4u, InvokeDirectCpu<0x80A219F4u>);
++        ctx->gpr[3] = owner, ctx->gpr[4] = record;
++        Call(ctx, 0x80A233E8u, InvokeDirectCpu<0x80A233E8u>);
++        g_creationBatter = false;
++        Memory::Write32(record + 0x78, pitching);
++        for (unsigned i = 0; i < positions.size(); ++i) Memory::Write32(record + 0x5C + i * 4, positions[i]);
++        // Indices 0..6 are batting, 7..9 pitching; keep each role's own min/max and pitching allowance.
++        for (unsigned i = 0; i < pitchLimits.size(); ++i)
++            if (i < 3 || i >= 10) Memory::Write8(limits + 7 + i, pitchLimits[i]);
++        PerkBytes(false, g_pitchPerks, true);
++        PerkBytes(true, g_pitchPerks, true);
++        *ctx = input;
++        std::fprintf(stderr, "[two-way] MLB Life creation: applied pitching and batting perks\n");
++    }
++    func_80A21160(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80A21160, MLB_CreationGrowth_80A21160, "MLB_CreationGrowth_80A21160");
 +
 +// The drill list's help bar ("A Advance, + Move CRS", from the game's layout) gets "X Change" after it
 +// while the list is open, drawn from the game's own pictures: the X button of the button atlas
@@ -1291,6 +1423,7 @@ index 0000000..83faaac
 +                 ImVec2(56 / 128.0f, 132 / 512.0f));
 +}
 +}  // namespace two_way
+
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
 index d9976c9..0238edd 100644
 --- a/runtime/src/launcher.cpp
