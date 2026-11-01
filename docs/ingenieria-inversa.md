@@ -39,7 +39,7 @@ Qué buscas y dónde está:
 2. [Arranque y sistema operativo](#2-arranque-y-sistema-operativo)
 3. [Hilos y ritmo](#3-hilos-y-ritmo)
 4. [Motor de sonido y comentarista](#4-motor-de-sonido-y-comentarista)
-    [Hilos](#hilos) · [Canales y voces AX](#canales-y-voces-ax) · [Streams del comentarista](#streams-del-comentarista)
+    [Hilos](#hilos) · [Canales y voces AX](#canales-y-voces-ax) · [Streams del comentarista](#streams-del-comentarista) · [Bancos de voz y nombres](#bancos-de-voz-y-nombres-de-jugador-callnames)
 5. [Disco y `project.bin`](#5-disco-y-projectbin)
     [Formato `PACKWII`](#formato-packwii)
 6. [Estadios: modelos `PJ7M` y tabla `tbl`](#6-estadios-modelos-pj7m-y-tabla-tbl)
@@ -340,6 +340,98 @@ Medido en octubre de 2026 con el perfilador de la Switch (partido de prueba) y c
 **Lo mismo con la ventana oculta en Windows 11** (19 de octubre de 2026): Windows 11 deja de respetar `timeBeginPeriod(1)` mientras la ventana del programa está minimizada o tapada del todo, y los temporizadores vuelven a 15,6 ms. Medido con un programa de prueba de `Sleep(5)`: 135 despertares/s con la ventana visible y 64/s minimizada. A ese ritmo el temporizador de 5 ms va a un tercio y el comentario se rompe mientras dure (un jugador: unos 15 segundos en la séptima entrada). El runtime pide la exención con `SetProcessInformation(ProcessPowerThrottling)` (`PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` y `EXECUTION_SPEED`): 171-177/s también minimizada. Parche `wiicompiled-timers-when-hidden`.
 
 Fuentes: desensamblado (`0x80027A54`, `0x80027BF8`, `0x80038E50`-`0x8003A41C`); `wiicompiled-periodic-sleep.patch`, `wiicompiled-audio-depop.patch`, `config/wiicompiled/rl8e54-data.csv`, `docs/wiicompiled-feasibility.md`.
+
+### Bancos de voz y nombres de jugador (callnames)
+
+Investigado el 31 de octubre de 2026 para poder añadir nombres nuevos (desensamblado y lecturas de disco de un partido con `WIICOMPILED_DEBUG_DVD=1`).
+
+**Tabla de bancos:** en `0x80153950` hay 18 descriptores de `0x14` bytes, uno por `voiceN.bin`. `0x80025708` la registra con `0x80032E50(tabla, 18)`, y `0x80032C74` abre los archivos.
+
+| Campo del descriptor | Contenido |
+|---|---|
+| `+0x00` | puntero al nombre (`"voice0.bin"`…) |
+| `+0x04` | desplazamiento inicial dentro del archivo (siempre 0) |
+| `+0x08` | tamaño del archivo |
+| `+0x0C` | `entrynum` del DVD, o -1 si no existe |
+
+- Accesores: `0x80032DDC` (nombre), `0x80032E00` (`+0x04`), `0x80032E28` (`+0x10`), `0x80032EDC` (`+0x0C`).
+
+**Formato de `voiceN.bin`** (todo en sectores de `0x800` bytes):
+
+| Parte | Contenido |
+|---|---|
+| Sector 0 | cabecera: `0x005A8AAB`, sector del índice, número de frases, bytes del índice (= frases × 4), número de frases otra vez, `0x80` |
+| Sectores 1… | frases: cada una es 1 sector de cabecera (formato en [Streams del comentarista](#streams-del-comentarista)) y sus datos ADPCM, rellenos hasta el siguiente sector |
+| Sector del índice | `u16 sector[frases]` y después `u16 duración_ms[frases]` (la misma duración que `+0x10` de la cabecera de frase) |
+
+- El juego lee el sector 0 y el índice de los 18 bancos al arrancar (visto en las lecturas de disco); durante el partido solo lee cabecera + datos de cada frase.
+- Las frases vacías apuntan a una frase de relleno de 3 muestras (9 ms). Las primeras 3 de cada banco son de relleno.
+- Cabecera de frase, más detalle: `+0x04` lleva en el byte alto `0xB4`, `0xC8`, `0x96` o `0xD2` según el banco y en los 16 bits bajos la frecuencia (22.050 Hz, o 10.000/44.100 en el relleno). Ese byte alto parece el volumen, sin confirmar. `+0x8C` es la dirección inicial (2), `+0x90` los 16 coeficientes DSP-ADPCM, `+0xB0` ganancia, `+0xB2` escala inicial, y siguen los históricos.
+
+**Id de frase → banco y sector:**
+
+- `0x8003B398(id)` devuelve el banco y `0x8003B530(id)` el índice local (`id − base`). Los rangos están escritos en el código:
+
+| Banco | Base del id | Frases |
+|---|---|---|
+| 0 | `0x4000` | 995 |
+| 1 | `0x4800` | 1619 |
+| 2 | `0x5000` | 2400 |
+| 3 | `0x6000` | 1902 |
+| 4 | `0x6800` | 2765 |
+| 5 | `0x7800` | 2741 |
+| 6 | `0x8800` | 6186 |
+| 7 | `0xA800` | 4661 |
+| 8 | `0xC800` | 874 |
+| 9 | `0xD000` | 1585 |
+| 10 | `0xD800` | 2431 |
+| 11 | `0xE800` | 1659 |
+| 12 | `0xF000` | 2593 |
+| 13 | `0x10000` | 2737 |
+| 14 | `0x11000` | 5175 |
+| 15 | `0x13000` | 3650 |
+| 16 | `0x15000` | 820 |
+| 17 | `0x16000` | 3650 |
+
+- `0x8003ACF0(id)` devuelve el sector de la frase: `índice[local] + (k << 16)`. La tabla de sectores de cada banco está en `0x8029C1A0 + banco × 12` (puntero, número de frases), y `k` sale de 32 umbrales por banco en `0x8029C2D8 + banco × 0x80` (24 bits bajos) para bancos de más de 65.536 sectores. Ningún banco del disco llega.
+- `0x8003A648` lee la cabecera de la frase en `sector × 0x800` y los datos a partir de ahí. Si la tabla del banco no está cargada, `0x8003AEB8` lee el sector del índice que toca.
+
+**Nombres de jugador:**
+
+- El jugador lleva su voz en `VoiceId` (14 bits en `0x92.2` del registro, ver `docs/roster-2008.md`). En el roster de 2008 va de 2051 a 4789: 1004 voces distintas.
+- **Índice local = `VoiceId − 0x800`** en los bancos de nombres. Comprobado en un partido Yankees: la primera frase del banco 17 fue el índice 260 (`VoiceId` 2308, Derek Jeter). Ningún `VoiceId` del roster cae en un hueco del índice (locales `0x5F6`-`0x5F7`, `0x63E`-`0x63F`, `0x9BC`-`0x9BD`) ni fuera de `3..0xE3C`.
+- **Bancos con nombres:** 14, 15 y 17 tienen grabado un nombre por `VoiceId` (locales `3..0xE3C`, 3636 nombres; 15 y 17 tienen exactamente 3650 frases). El banco 6 tiene la misma disposición, pero entero es relleno de 9 ms (ninguna frase real).
+  - Duraciones de Jeter: banco 14, 396 ms; banco 15, 431 ms; banco 17, 1310 ms.
+  - Escuchado (31 de octubre de 2026, Jeter):
+
+| Banco | Quién | Qué dice |
+|---|---|---|
+| 14 | comentarista principal | el apellido en tono normal ("Jeter") |
+| 15 | comentarista principal | el apellido emocionado, subiendo el tono ("¡Jeter!") |
+| 17 | comentarista de fondo | el nombre completo ("Derek Jeter") |
+- Huecos libres: los locales `0xE3D`-`0xE41` de los bancos 15 y 17 están dentro del rango del código pero no tienen frase real. Para más de 5 nombres nuevos hay que ampliar los rangos de `0x8003B398`/`0x8003B530`: entre `0x13E42` y `0x14FFF` ningún banco responde.
+- El código que convierte `VoiceId` en id de frase no está localizado: no aparece como constante (`0x12800 + VoiceId`, etc.) en el DOL ni en el REL.
+
+**Lista de nombres del editor (`env_voice_data.pack`, archivo 3081 de `project.bin`):**
+
+- La lee un grupo de funciones del REL en `0x807EDF4C`-`0x807EE354`, con `0x8000BBFC(3081, 0x40000000 | desplazamiento)` (puntero dentro del pack).
+- La **clave** de cada nombre es `0x8000 + VoiceId` (= id del banco 6 con el mismo índice local). Las funciones también aceptan la clave + `0x8800` (= id del banco 14).
+- Los nombres son de 15 caracteres u16 (30 bytes, `0xFFFF` al final) con la tabla de caracteres del roster.
+
+| Lista | Claves | Nombres | Entradas | Contenido |
+|---|---|---|---|---|
+| A | `+0x20` | `+0x1E0C` | 1915 (`0x77B`) | apellidos genéricos en mayúsculas, por orden alfabético (`AARDSMA`…`ZUNIGA`); claves `0x8E40`-`0x963C` |
+| B | `+0xFEB4` | `+0x10ED0` | 970 (`0x3CA`) | jugadores de MLB (`Jeter`, `K.Jimenez`…), agrupados por la inicial; `0xFEFE` separa las letras; claves `0x8803`-`0x8DF6` |
+| C | `+0x10DDC` | `+0x1807C` | 61 (`0x3D`) | leyendas (`VoiceId` 4466-4789) |
+
+- `+0xFE80`: 26 `s16`, la posición en la lista B donde empieza cada letra (-1 = ninguna, la X).
+- `0x8065A0D4(clave)` decide si se busca en la lista B (`0x8803`-`0x8DF5`) y `0x8065A110`, si se busca primero en la C (`0x8E40`-`0x91BB`); si no aparece, se busca en la A.
+- `0x807EDF4C(clave)` devuelve el nombre; `0x807EE0C8(clave)`, la lista (1 = B o C, 2 = A, 0 = ninguna); `0x807EE2D0(i)`/`0x807EE310(i)`, clave y nombre de la entrada i de la A; `0x807EE240`/`0x807EE288`, lo mismo en la B; `0x807EE280` devuelve 970; `0x807EE200(letra)`, el inicio de la letra.
+- El número de entradas de cada lista está escrito en el código (`0x77B`, `0x3CA`, `0x3D`). Para añadir nombres a la lista hay que cambiar esas funciones.
+- El mismo jugador puede estar en dos listas: David Aardsma tiene `VoiceId` 2052 (lista B) y además hay un `AARDSMA` genérico en la A (clave `0x91BE`).
+- **Ojo:** el banco 14 tiene otras 1523 frases a partir del índice local `0xE41`. Un `VoiceId` nuevo por encima de `0x1640` no puede ir al final del banco 14 sin pisarlas.
+
+Fuentes: desensamblado (`0x80025708`, `0x80032C74`-`0x80032F28`, `0x8065A0D4`, `0x807EDF4C`-`0x807EE354`, `0x8003A648`, `0x8003ACF0`, `0x8003AEB8`, `0x8003B220`, `0x8003B398`, `0x8003B530`); lecturas de `voiceN.bin` de un partido de prueba; roster de `game_data.pack`.
 
 ## 5. Disco y `project.bin`
 
