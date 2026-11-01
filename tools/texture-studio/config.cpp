@@ -4,7 +4,11 @@
 #include "config.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace tstudio {
 namespace {
@@ -21,11 +25,42 @@ std::vector<std::string> Lines(const std::filesystem::path& file) {
     }
     return lines;
 }
+std::string WithoutComment(std::string_view text) {
+    char quote = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (quote) {
+            if (text[i] == '\\' && quote == '"') ++i;
+            else if (text[i] == quote) quote = 0;
+        } else if (text[i] == '"' || text[i] == '\'') quote = text[i];
+        else if (text[i] == '#') return Trim(text.substr(0, i));
+    }
+    return Trim(text);
+}
+// The whole value, including multiline enabled arrays; malformed arrays are never overwritten.
+std::optional<size_t> ValueEnd(const std::vector<std::string>& lines, size_t first) {
+    const auto initial = Trim(std::string_view(lines[first]).substr(lines[first].find('=') + 1));
+    if (initial.empty() || initial.front() != '[') return first + 1;
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = first; i < lines.size(); ++i) {
+        const auto text = WithoutComment(i == first ? initial : lines[i]);
+        for (size_t k = 0; k < text.size(); ++k) {
+            const char c = text[k];
+            if (quote) {
+                if (c == '\\' && quote == '"') ++k;
+                else if (c == quote) quote = 0;
+            } else if (c == '"' || c == '\'') quote = c;
+            else if (c == '[') ++depth;
+            else if (c == ']' && --depth == 0) return i + 1;
+        }
+    }
+    return std::nullopt;
+}
 // [first, end) of the section's lines (after its header); first == end == lines.size() if absent.
 std::pair<size_t, size_t> Section(const std::vector<std::string>& lines, std::string_view section) {
     size_t start = lines.size();
     for (size_t i = 0; i < lines.size(); ++i) {
-        const std::string t = Trim(lines[i]);
+        const std::string t = WithoutComment(lines[i]);
         if (t.size() < 2 || t.front() != '[' || t.back() != ']') continue;
         if (start != lines.size()) return {start, i};
         if (Trim(std::string_view(t).substr(1, t.size() - 2)) == section) start = i + 1;
@@ -57,20 +92,7 @@ std::string Value(std::string_view v) {
         return out;
     }
     if (t.front() == '\'') return t.substr(1, t.find('\'', 1) == std::string::npos ? std::string::npos : t.find('\'', 1) - 1);
-    size_t end = t.size();
-    char quote = 0;
-    for (size_t i = 0; i < t.size(); ++i) {  // first # outside quotes
-        if (quote) {
-            if (t[i] == '\\' && quote == '"') ++i;
-            else if (t[i] == quote) quote = 0;
-        } else if (t[i] == '"' || t[i] == '\'') {
-            quote = t[i];
-        } else if (t[i] == '#') {
-            end = i;
-            break;
-        }
-    }
-    return Trim(std::string_view(t).substr(0, end));
+    return WithoutComment(t);
 }
 } // namespace
 
@@ -78,7 +100,11 @@ std::optional<std::string> ReadSetting(const std::filesystem::path& config, std:
     const auto lines = Lines(config);
     const size_t i = KeyLine(lines, Section(lines, section), key);
     if (i == lines.size()) return std::nullopt;
-    return Value(std::string_view(lines[i]).substr(lines[i].find('=') + 1));
+    const auto end = ValueEnd(lines, i);
+    if (!end) return std::nullopt;
+    std::string value = WithoutComment(std::string_view(lines[i]).substr(lines[i].find('=') + 1));
+    for (size_t j = i + 1; j < *end; ++j) value += " " + WithoutComment(lines[j]);
+    return Value(value);
 }
 
 std::vector<std::string> ReadEnabledMods(const std::filesystem::path& config) {
@@ -99,6 +125,9 @@ std::vector<std::string> ReadEnabledMods(const std::filesystem::path& config) {
 }
 
 bool SetModEnabled(const std::filesystem::path& config, const std::string& id, bool enabled) {
+    const auto lines = Lines(config);
+    const size_t key = KeyLine(lines, Section(lines, "mods"), "enabled");
+    if (key != lines.size() && !ValueEnd(lines, key)) return false;
     auto list = ReadEnabledMods(config);
     std::erase(list, id);
     if (enabled) list.push_back(id);
@@ -126,24 +155,35 @@ bool WriteSetting(const std::filesystem::path& config, std::string_view section,
     const std::string line = std::string(key) + " = " + value;
     const size_t i = KeyLine(lines, range, key);
     if (i == lines.size()) lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(range.second), line);
-    else lines[i] = line;
+    else {
+        const auto end = ValueEnd(lines, i);
+        if (!end) return false;
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i + 1), lines.begin() + static_cast<std::ptrdiff_t>(*end));
+        lines[i] = line;
+    }
     // Written to a temporary file and renamed, so a failure never leaves the game's config half-written.
     auto temp = config;
     temp += ".tmp";
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        for (const auto& line : lines) out << line << "\r\n";
-        if (!out) return false;
-    }
+#ifdef _WIN32
+    FILE* out = _wfopen(temp.c_str(), L"wbx");
+#else
+    FILE* out = std::fopen(temp.c_str(), "wbx");
+#endif
+    if (!out) return false;
+    std::string text;
+    for (const auto& line : lines) text += line + "\r\n";
+    const bool written = std::fwrite(text.data(), 1, text.size(), out) == text.size() && std::fflush(out) == 0;
+    const bool closed = std::fclose(out) == 0;
     std::error_code ec;
+    if (!written || !closed) { std::filesystem::remove(temp, ec); return false; }
+#ifdef _WIN32
+    const bool replaced = MoveFileExW(temp.c_str(), config.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
     std::filesystem::rename(temp, config, ec);
-    if (ec) {
-        ec.clear();
-        std::filesystem::remove(config, ec);
-        std::filesystem::rename(temp, config, ec);
-    }
-    if (ec) std::filesystem::remove(temp, ec);
-    return !ec;
+    const bool replaced = !ec;
+#endif
+    if (!replaced) std::filesystem::remove(temp, ec);
+    return replaced;
 }
 
 } // namespace tstudio

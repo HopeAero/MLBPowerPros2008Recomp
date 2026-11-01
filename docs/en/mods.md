@@ -20,6 +20,7 @@ mods\
     project\       project.bin packages (.pack/.dat/.arc) with their names
     roster\        a PowerUp / PowerUp+ roster (.dat)
     schedule\      Season mode schedules (<year>.csv)
+    callnames\     new names for the commentators (callnames.toml + WAV or MP3)
 ```
 
 `mod.toml` is optional; without it, the folder name is used:
@@ -50,11 +51,47 @@ description = "Uniforms redrawn at 4x."
   - The game's limits: March 1 to October 31 and 16 games a day; what does not fit is dropped and the log (`console.log`) says so. The game's regular season runs from March 19 to October 1. The game's All-Star Game stays on its day.
   - A year's real schedule is downloaded from the launcher (TOOLS > SEASON EDITOR, `docs/en/season-studio.md`, 2002 to 2026) or with `python tools/season_schedule.py mlb 2026 mymod/schedule/2026.csv`. If it does not fit the game's season (3/19 to 10/1, 16 games a day), the game places it a few days earlier or later without losing games. To play the 2026 schedule in the first year, save it as `schedule/2008.csv`, or better make a season pack (below).
   - The schedule does not change divisions: for Houston to count in the AL West a season pack needs `[divisions]` (below). The DH in both leagues is separate (`dh = "both"` or the launcher option). Details in `docs/en/reverse-engineering.md`, "Game schedule".
+- **`callnames/`**: new player names the commentators say, which also appear in the editor's voice list (Arrange › VOICE SETUP) and in PowerUp+'s voice picker. Details in [Callnames](#callnames).
 - **`riivolution/`**: Riivolution XMLs (`<wiidisc>`) valid for `RL8E54`. The mod folder acts as the SD root.
   - File patches work.
   - **Memory** patches only work for data: the game code is already translated to native, so changing PowerPC instructions in memory has no effect. The same goes for Gecko/Action Replay codes that modify code.
 
 If two active mods replace the same texture, the one in `UserData\texture_replacements` wins, then the first mod in alphabetical order.
+
+## Callnames
+
+The easiest way is the [Callname Editor](callname-studio.md): create and edit several names with your audio, without writing TOML.
+
+Each name has three recordings: the surname in a normal and an excited tone (main commentator) and the full name (colour commentator). You provide the audio: your own recording, TTS, etc. Only share audio you have the right to share.
+
+```
+mods\
+  MyCallnames\
+    mod.toml
+    callnames\
+      callnames.toml
+      acuna.wav
+      acuna_hype.wav
+      acuna_full.wav
+```
+
+```toml
+[[callname]]
+voice = 7300                 # voice number, 7223 to 10239; unique across your mods
+list = "Acuna Jr."           # text in the editor's list, up to 15 characters
+normal = "acuna.wav"         # surname, normal tone (required)
+excited = "acuna_hype.wav"   # excited surname (optional: normal is used when missing)
+full = "acuna_full.wav"      # full name (optional: normal is used when missing)
+```
+
+- **WAV or MP3:** 16-bit PCM WAV or MP3, mono or stereo, 8,000–192,000 Hz and up to 5 seconds per variant. The `normal`, `excited` and `full` fields may mix extensions (for example, `full = "acuna_full.mp3"`). The game converts them to its format at startup, matches the loudness of the game's names and keeps the result in `UserData\Cache\mods\callnames`: the first start with a new name takes a little longer.
+- **Text:** the game has no accents and no Ñ: "Acuña" shows as "Acuna". Anything it cannot show is dropped and the log (`console.log`) says so. In the name search (Search Type) it shows in upper case, without spaces.
+- **Giving it to a player:** in the game, Arrange › a team › VOICE SETUP › the player › Select Type › the initial. In PowerUp+ (MODS › EDIT ROSTER), the voice picker shows it as "Callname" and the `list` text; the exported roster gives the player the callname's voice number.
+- PowerUp+ saves callnames as direct 14-bit IDs (for example, 7300). A name whose audio fails or does not fit bank 14 is left out of the game editor. A complete bank replacement through `disc/` or Riivolution disables its callname extension.
+- **A roster that uses a callname needs the callname mod enabled.** Without it that player has no name (silence), as with an empty voice.
+- If two enabled mods use the same voice number, the first in alphabetical order wins and the log says so.
+- It works in every mode with commentary, MLB Life included.
+- How it works inside: `docs/en/reverse-engineering.md`, "Voice banks and player names".
 
 ## `project.bin`
 

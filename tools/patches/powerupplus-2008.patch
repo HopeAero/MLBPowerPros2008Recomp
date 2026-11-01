@@ -452,6 +452,155 @@ index ef7adb8..b7dea6e 100644
    async function exportRosterAsCsv() {
      const csvFile = await exportApiClientRef.current.executeCsv({
        rosterId: rosterId,
+diff --git a/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008CallnameTests.cs b/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008CallnameTests.cs
+new file mode 100644
+index 0000000..02a9f51
+--- /dev/null
++++ b/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008CallnameTests.cs
+@@ -0,0 +1,143 @@
++using NUnit.Framework;
++using PowerUp.GameSave.PowerPros2008;
++using PowerUp.Libraries;
++using Shouldly;
++using System;
++using System.IO;
++using System.Linq;
++
++namespace PowerUp.Tests.GameSave.PowerPros2008
++{
++  // Callnames from the 2008 launcher's mods (mods/<mod>/callnames/callnames.toml): each becomes a
++  // voice-library line "Callname_<list>,<voice>", so the voice picker offers it and the
++  // 2008 export writes the callname's VoiceId.
++  public class PowerPros2008CallnameTests
++  {
++    string modsDirectory = "";
++
++    [SetUp]
++    public void SetUp()
++    {
++      modsDirectory = Path.Combine(Path.GetTempPath(), "powerup-callnames-tests");
++      if (Directory.Exists(modsDirectory))
++        Directory.Delete(modsDirectory, true);
++      Write("Acuna", "# test\n[[callname]]\nvoice = 7300\nlist = \"Acuña Jr.\"\nnormal = \"a.wav\"\n\n[[callname]]\nvoice = 7301\nlist = \"Chourio\"\nnormal = \"c.wav\"\n");
++      Write("Bad", "[[callname]]\nvoice = 7000\nlist = \"Low\"\nnormal = \"x.wav\"\n[[callname]]\nlist = \"NoVoice\"\n");
++      Directory.CreateDirectory(Path.Combine(modsDirectory, "NoCallnames"));
++    }
++
++    void Write(string mod, string toml)
++    {
++      var folder = Path.Combine(modsDirectory, mod, "callnames");
++      Directory.CreateDirectory(folder);
++      File.WriteAllText(Path.Combine(folder, "callnames.toml"), toml);
++    }
++
++    [Test]
++    public void CallnameLibraryLines_ListsTheModsCallnames()
++    {
++      var lines = PowerPros2008Roster.CallnameLibraryLines(modsDirectory).OrderBy(l => l).ToArray();
++      lines.ShouldBe(new[] { "Callname_Acuña Jr.,7300", "Callname_Chourio,7301" });
++    }
++
++    [Test]
++    public void CallnameVoices_ExportAsTheirVoiceId()
++    {
++      PowerPros2008Roster.Voice2008(17300).ShouldBe(7300);
++      PowerPros2008Roster.Voice2007(7300).ShouldBe(7300);
++      foreach (var voice in Enumerable.Range(7223, 10239 - 7223 + 1))
++      {
++        PowerPros2008Roster.Voice2007(voice).ShouldBe(voice);
++        PowerPros2008Roster.Voice2008(voice).ShouldBe(voice);
++      }
++    }
++
++    [Test]
++    public void CallnameLibraryLines_DuplicatesKeepFirstVoiceAndName()
++    {
++      Write("ZBackup", "[[callname]]\nvoice=7300\nlist=\"Backup\"\n[[callname]]\nvoice=7302\nlist=\"Chourio\"\n");
++      PowerPros2008Roster.CallnameLibraryLines(modsDirectory).Length.ShouldBe(2);
++    }
++
++    [Test]
++    public void VoiceLibrary_DuplicatesKeepFirstVoiceAndKey()
++    {
++      IVoiceLibrary library = new VoiceLibrary(new[] { "Callname_First,7300", "Callname_Backup,7300", "Callname_First,7301", "Callname_Last,7302" });
++      library[7300].ShouldBe("Callname First");
++      library["Callname First"].ShouldBe(7300);
++      library.GetAll().Select(kvp => kvp.Key).ShouldBe(new[] { 7300, 7302 });
++      library.FindClosestTo("Callname", "Last").Key.ShouldBe(7302);
++    }
++
++    [Test]
++    public void CallnameLibraryLines_OnlyReadsImmediateModFolders()
++    {
++      Write("Nested/Backup", "[[callname]]\nvoice=7400\nlist=\"Nested\"\n");
++      PowerPros2008Roster.CallnameLibraryLines(modsDirectory).Length.ShouldBe(2);
++    }
++
++    [Test]
++    public void CallnameLibraryLines_UnreadableManifestDoesNotAbortOtherMods()
++    {
++      Write("Locked", "[[callname]]\nvoice=7400\nlist=\"Locked\"\n");
++      using var locked = File.Open(Path.Combine(modsDirectory, "Locked", "callnames", "callnames.toml"), FileMode.Open, FileAccess.ReadWrite, FileShare.None);
++      PowerPros2008Roster.CallnameLibraryLines(modsDirectory).Length.ShouldBe(2);
++    }
++
++    [Test]
++    public void CallnameLibraryLines_CommentsOtherTablesAndMp3()
++    {
++      Write("Toml", "voice=7400\nlist=\"Outside\"\n[[callname]] # comment\nvoice=7401\nlist=\"MP3\"\nnormal=\"sound.MP3\"\n[other]\nvoice=7402\nlist=\"Other\"\n");
++      PowerPros2008Roster.CallnameLibraryLines(modsDirectory).ShouldContain("Callname_MP3,7401");
++      PowerPros2008Roster.CallnameLibraryLines(modsDirectory).Length.ShouldBe(3);
++    }
++
++    [Test]
++    public void CallnameVoice_ToGameSavePreservesFourteenBits()
++    {
++      var pack = new byte[PowerPros2008Roster.PackBlock2008 + PowerPros2008Roster.BlockSize];
++      pack[PowerPros2008Roster.PackBlock2008 + 1] = 1;
++      const int voice = 7300, bit = 0x492;
++      for (var i = 0; i < 14; ++i)
++        pack[PowerPros2008Roster.PackBlock2008 + (bit + i) / 8] |= (byte)(((voice >> (13 - i)) & 1) << (7 - (bit + i) % 8));
++      var save = PowerPros2008Roster.ToGameSave(pack, new byte[PowerPros2008Roster.SaveSize]);
++      var actual = 0;
++      for (var i = 0; i < 14; ++i)
++        actual = (actual << 1) | ((save[PowerPros2008Roster.SaveBlock2007 + (bit + i) / 8] >> (7 - (bit + i) % 8)) & 1);
++      actual.ShouldBe(voice);
++    }
++
++    [Test]
++    public void VoiceLibraryLines_ImportedCallnameDoesNotAddPlayerAlias()
++    {
++      var data = Path.Combine(modsDirectory, "data");
++      Directory.CreateDirectory(data);
++      File.WriteAllText(Path.Combine(data, "Voice_Library.csv"), "Original_Player,1\n");
++      var pack = new byte[PowerPros2008Roster.PackBlock2008 + PowerPros2008Roster.BlockSize];
++      pack[PowerPros2008Roster.PackBlock2008 + 1] = 1;
++      for (var i = 0; i < 14; ++i)
++        pack[PowerPros2008Roster.PackBlock2008 + (0x492 + i) / 8] |= (byte)(((7300 >> (13 - i)) & 1) << (7 - (0x492 + i) % 8));
++      File.WriteAllBytes(Path.Combine(data, "PowerPros2008_game_data.pack"), pack);
++      var previous = PowerPros2008Roster.ModsDirectory;
++      try
++      {
++        PowerPros2008Roster.ModsDirectory = modsDirectory;
++        PowerPros2008Roster.VoiceLibraryLines(modsDirectory, new EmptyCharacters()).ShouldNotContain("_,17300");
++      }
++      finally { PowerPros2008Roster.ModsDirectory = previous; }
++    }
++
++    sealed class EmptyCharacters : ICharacterLibrary
++    {
++      public char this[ushort key] => ' ';
++      public ushort this[char key] => 0;
++    }
++
++    [Test]
++    public void CallnameLibraryLines_WithoutModsDirectory_IsEmpty()
++    {
++      PowerPros2008Roster.CallnameLibraryLines(null).ShouldBeEmpty();
++      PowerPros2008Roster.CallnameLibraryLines(Path.Combine(modsDirectory, "missing")).ShouldBeEmpty();
++    }
++  }
++}
 diff --git a/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008SkinTests.cs b/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008SkinTests.cs
 new file mode 100644
 index 0000000..49d5477
@@ -1380,10 +1529,10 @@ index 0000000..e330a50
 +}
 diff --git a/PowerUp/PowerUp/GameSave/PowerPros2008/PowerPros2008Roster.cs b/PowerUp/PowerUp/GameSave/PowerPros2008/PowerPros2008Roster.cs
 new file mode 100644
-index 0000000..010c9a4
+index 0000000..d58a619
 --- /dev/null
 +++ b/PowerUp/PowerUp/GameSave/PowerPros2008/PowerPros2008Roster.cs
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,414 @@
 +﻿using System;
 +using System.Collections.Generic;
 +using System.IO;
@@ -1433,6 +1582,8 @@ index 0000000..010c9a4
 +    /// <summary>Editor voice id -> 2008's, or 0 for a 2007 voice 2008 removed.</summary>
 +    public static int Voice2008(int voice)
 +    {
++      if (voice is >= 7223 and <= 10239)
++        return voice;
 +      if (voice >= Only2008Voice)
 +        return voice - Only2008Voice;
 +      foreach (var (first, last, offset) in PowerPros2008Fields.VoiceRuns)
@@ -1441,11 +1592,11 @@ index 0000000..010c9a4
 +      return 0;
 +    }
 +
-+    /// <summary>2008 voice id -> the editor's (the runs never overlap on the 2008 side).</summary>
++    /// <summary>2008 voice id -> the editor's; callnames stay raw to fit the save's 14-bit field.</summary>
 +    public static int Voice2007(int voice)
 +    {
-+      if (voice == 0)
-+        return 0;
++      if (voice == 0 || voice is >= 7223 and <= 10239)
++        return voice;
 +      foreach (var (first, last, offset) in PowerPros2008Fields.VoiceRuns)
 +        if (voice - offset >= first && voice - offset <= last)
 +          return voice - offset;
@@ -1461,7 +1612,78 @@ index 0000000..010c9a4
 +    /// one of the same name), and in 2008 mode the 2007 voices 2008 removed are left out, so every
 +    /// choice exists in the game.
 +    /// </summary>
-+    public static string[] VoiceLibraryLines(string dataDirectory, ICharacterLibrary characters)
++    /// <summary>
++    /// Callnames the launcher's mods add (mods/&lt;mod&gt;/callnames/callnames.toml, every mod in the folder):
++    /// "Callname_&lt;list&gt;,&lt;voice&gt;" for each [[callname]] with a voice in 7223-10239.
++    /// Only the voice and list keys are read.
++    /// </summary>
++    public static string[] CallnameLibraryLines(string? modsDirectory)
++    {
++      if (modsDirectory is null || !Directory.Exists(modsDirectory))
++        return [];
++      var lines = new List<string>();
++      var voices = new HashSet<int>();
++      var keys = new HashSet<string>();
++      string[] folders;
++      try { folders = Directory.GetDirectories(modsDirectory).OrderBy(path => path, StringComparer.Ordinal).ToArray(); }
++      catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return []; }
++      foreach (var folder in folders)
++      {
++        string[] source;
++        try { source = File.ReadAllLines(Path.Combine(folder, "callnames", "callnames.toml")); }
++        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { continue; }
++        int? voice = null;
++        string? list = null;
++        bool inCallname = false;
++        void Flush()
++        {
++          if (inCallname && voice is >= 7223 and <= 10239 && !string.IsNullOrWhiteSpace(list))
++          {
++            var key = $"Callname_{list.Replace(',', ' ')}";
++            var parsedKey = key.Replace('_', ' ');
++            if (!voices.Contains(voice.Value) && !keys.Contains(parsedKey))
++            {
++              voices.Add(voice.Value);
++              keys.Add(parsedKey);
++              lines.Add($"{key},{voice}");
++            }
++          }
++          voice = null;
++          list = null;
++        }
++        foreach (var raw in source)
++        {
++          var line = raw.Trim();
++          if (line.StartsWith('['))
++          {
++            Flush();
++            inCallname = line.Split('#', 2)[0].Trim() == "[[callname]]";
++            continue;
++          }
++          if (!inCallname)
++            continue;
++          var eq = line.IndexOf('=');
++          if (eq < 0 || line.StartsWith('#'))
++            continue;
++          var key = line[..eq].Trim();
++          var value = line[(eq + 1)..].Trim();
++          var hash = value.StartsWith('"') ? value.IndexOf('"', 1) + 1 : value.IndexOf('#');
++          if (hash > 0)
++            value = value[..hash].Trim();
++          if (key == "voice" && int.TryParse(value, out var number))
++            voice = number;
++          else if (key == "list" && value.Length >= 2 && value[0] == '"' && value[^1] == '"')
++            list = value[1..^1];
++        }
++        Flush();
++      }
++      return lines.ToArray();
++    }
++
++    public static string[] VoiceLibraryLines(string dataDirectory, ICharacterLibrary characters) =>
++      GameVoiceLibraryLines(dataDirectory, characters).Concat(CallnameLibraryLines(ModsDirectory)).ToArray();
++
++    static string[] GameVoiceLibraryLines(string dataDirectory, ICharacterLibrary characters)
 +    {
 +      var lines = File.ReadAllLines(Path.Combine(dataDirectory, "data", "Voice_Library.csv"));
 +      var packPath = Path.Combine(dataDirectory, "data", "PowerPros2008_game_data.pack");
@@ -1497,7 +1719,10 @@ index 0000000..010c9a4
 +        var record = pack.AsSpan(PackBlock2008 + i * PlayerSize, PlayerSize);
 +        if (record[0] == 0 && record[1] == 0)
 +          continue;
-+        var voice = Voice2007((int)GetBits(record, VoiceBit, VoiceBits));
++        var gameVoice = (int)GetBits(record, VoiceBit, VoiceBits);
++        if (gameVoice is >= 7223 and <= 10239)
++          continue;
++        var voice = Voice2007(gameVoice);
 +        if (voice < Only2008Voice || byName.ContainsValue(voice))
 +          continue;
 +        var name = $"{Text(record, 0x32)}_{Text(record, 0x16)}";
@@ -1723,10 +1948,10 @@ index 0000000..010c9a4
 +  }
 +}
 diff --git a/PowerUp/PowerUp/Libraries/CsvKeyValueLibrary.cs b/PowerUp/PowerUp/Libraries/CsvKeyValueLibrary.cs
-index aa8cdc8..d90acbe 100644
+index aa8cdc8..4b70662 100644
 --- a/PowerUp/PowerUp/Libraries/CsvKeyValueLibrary.cs
 +++ b/PowerUp/PowerUp/Libraries/CsvKeyValueLibrary.cs
-@@ -19,9 +19,12 @@ namespace PowerUp.Libraries
+@@ -19,14 +19,24 @@ namespace PowerUp.Libraries
  
      protected IEnumerable<KeyValuePair<TKey, TValue>> GetAll() => _valuesByKey.AsEnumerable();
  
@@ -1741,6 +1966,20 @@ index aa8cdc8..d90acbe 100644
          .Select(l => l.Split(','))
          .Select(l => new KeyValuePair<TKey, TValue>(ParseKey(l[0]), ParseValue(l[1])));
  
+-      _valuesByKey = keyValuePairs.ToDictionary(p => p.Key, p => p.Value);
+-      _keysByValue = keyValuePairs.ToDictionary(p => p.Value, p => p.Key);
++      _valuesByKey = new Dictionary<TKey, TValue>();
++      _keysByValue = new Dictionary<TValue, TKey>();
++      foreach (var pair in keyValuePairs)
++      {
++        if (_valuesByKey.ContainsKey(pair.Key) || _keysByValue.ContainsKey(pair.Value))
++          continue;
++        _valuesByKey.Add(pair.Key, pair.Value);
++        _keysByValue.Add(pair.Value, pair.Key);
++      }
+     }
+ 
+     public virtual TValue this[TKey key] => _valuesByKey.TryGetValue(key, out var value) 
 diff --git a/PowerUp/PowerUp/Libraries/LibraryConfig.cs b/PowerUp/PowerUp/Libraries/LibraryConfig.cs
 index b1ef0ed..dfc46c0 100644
 --- a/PowerUp/PowerUp/Libraries/LibraryConfig.cs
@@ -1762,10 +2001,10 @@ index b1ef0ed..dfc46c0 100644
        services.AddTransient<IPitchingMechanicsLibrary>(provider => new PitchingMechanicsLibrary(Path.Combine(dataDirectory, "./data/PitchingForm_Library.csv")));
        services.AddTransient<IFaceLibrary>(provider => new FaceLibrary(Path.Combine(dataDirectory, "./data/Face_Library.csv")));
 diff --git a/PowerUp/PowerUp/Libraries/VoiceLibrary.cs b/PowerUp/PowerUp/Libraries/VoiceLibrary.cs
-index 42fd76a..68b2ffa 100644
+index 42fd76a..7084645 100644
 --- a/PowerUp/PowerUp/Libraries/VoiceLibrary.cs
 +++ b/PowerUp/PowerUp/Libraries/VoiceLibrary.cs
-@@ -19,9 +19,12 @@ namespace PowerUp.Libraries
+@@ -19,11 +19,16 @@ namespace PowerUp.Libraries
      private readonly IDictionary<int, string> _lastNames;
      private readonly IDictionary<int, string> _lastNameSoundexes;
  
@@ -1778,9 +2017,14 @@ index 42fd76a..68b2ffa 100644
 -      var keyValuePairs = File.ReadAllLines(libraryFilePath)
 +      var keyValuePairs = lines
          .Select(l => l.Split(','))
-         .Select(l => new KeyValuePair<string, int>(l[0], int.Parse(l[1])));
+-        .Select(l => new KeyValuePair<string, int>(l[0], int.Parse(l[1])));
++        .Select(l => new KeyValuePair<string, int>(l[0], int.Parse(l[1])))
++        .Where(p => _valuesByKey.TryGetValue(ParseKey(p.Key), out var id) && id == p.Value)
++        .DistinctBy(p => p.Value);
  
-@@ -35,7 +38,8 @@ namespace PowerUp.Libraries
+       _firstNames = keyValuePairs.ToDictionary(kvp => kvp.Value, kvp => kvp.Key.Split("_")[0]);
+       _firstNamesSoundexes = keyValuePairs.ToDictionary(kvp => kvp.Value, kvp => kvp.Key.Split("_")[0].GetSoundex());
+@@ -35,7 +40,8 @@ namespace PowerUp.Libraries
      IEnumerable<KeyValuePair<int, string>> IVoiceLibrary.GetAll() => GetAll().Select(kvp => new KeyValuePair<int, string>(kvp.Value, kvp.Key));
  
      protected override int OnKeyNotFound(string key) => throw new KeyNotFoundException(key);

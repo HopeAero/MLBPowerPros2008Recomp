@@ -38,7 +38,7 @@ What you are looking for and where it is:
 2. [Boot and operating system](#2-boot-and-operating-system)
 3. [Threads and timing](#3-threads-and-timing)
 4. [Sound engine and commentator](#4-sound-engine-and-commentator)
-    [Threads](#threads) · [AX channels and voices](#ax-channels-and-voices) · [Commentator streams](#commentator-streams)
+    [Threads](#threads) · [AX channels and voices](#ax-channels-and-voices) · [Commentator streams](#commentator-streams) · [Voice banks and names](#voice-banks-and-player-names-callnames)
 5. [Disc and `project.bin`](#5-disc-and-projectbin)
     [`PACKWII` format](#packwii-format)
 6. [Stadiums: `PJ7M` models and `tbl` table](#6-stadiums-pj7m-models-and-tbl-table)
@@ -339,6 +339,124 @@ Measured in October 2026 with the Switch profiler (test match) and checked again
 **The same with a hidden window on Windows 11** (October 19, 2026): Windows 11 stops honouring `timeBeginPeriod(1)` while the program's window is minimized or fully covered, and timers go back to 15.6 ms. Measured with a `Sleep(5)` test program: 135 wakes/s with the window visible and 64/s minimized. At that pace the 5 ms timer runs at a third and the commentary breaks for as long as it lasts (a player: about 15 seconds in the seventh inning). The runtime asks for the opt-out with `SetProcessInformation(ProcessPowerThrottling)` (`PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` and `EXECUTION_SPEED`): 171-177/s minimized too. Patch `wiicompiled-timers-when-hidden`.
 
 Sources: disassembly (`0x80027A54`, `0x80027BF8`, `0x80038E50`-`0x8003A41C`); `wiicompiled-periodic-sleep.patch`, `wiicompiled-audio-depop.patch`, `config/wiicompiled/rl8e54-data.csv`, `docs/en/wiicompiled-feasibility.md`.
+
+### Voice banks and player names (callnames)
+
+Researched on October 31, 2026 to make adding new names possible (disassembly and the disc reads of a match with `WIICOMPILED_DEBUG_DVD=1`).
+
+**Bank table:** `0x80153950` holds 18 descriptors of `0x14` bytes, one per `voiceN.bin`. `0x80025708` registers it with `0x80032E50(table, 18)`, and `0x80032C74` opens the files.
+
+| Descriptor field | Contents |
+|---|---|
+| `+0x00` | pointer to the name (`"voice0.bin"`…) |
+| `+0x04` | start offset inside the file (always 0) |
+| `+0x08` | file size |
+| `+0x0C` | DVD `entrynum`, or -1 when missing |
+
+- Accessors: `0x80032DDC` (name), `0x80032E00` (`+0x04`), `0x80032E28` (`+0x10`), `0x80032EDC` (`+0x0C`).
+
+**`voiceN.bin` format** (all in `0x800`-byte sectors):
+
+| Part | Contents |
+|---|---|
+| Sector 0 | header: `0x005A8AAB`, index sector, phrase count, index bytes (= phrases × 4), phrase count again, `0x80` |
+| Sectors 1… | phrases: each is 1 header sector (format in [Commentator streams](#commentator-streams)) and its ADPCM data, padded to the next sector |
+| Index sector | `u16 sector[phrases]` followed by `u16 duration_ms[phrases]` (the same duration as `+0x10` of the phrase header) |
+
+- The virtual index is zero-padded to a full `0x800` sector before the original tail: the game rounds index reads to whole sectors. A new phrase header stores `+0x88 = 2 × ADPCM_bytes − 1` (end address, rather than nibble count).
+- The game reads sector 0 and the index of all 18 banks at boot (seen in the disc reads); during a match it only reads each phrase's header + data.
+- Empty phrases point to a 3-sample (9 ms) filler phrase. The first 3 of every bank are filler.
+- Phrase header, more detail: the high byte of `+0x04` is `0xB4`, `0xC8`, `0x96` or `0xD2` depending on the bank, and the low 16 bits are the rate (22,050 Hz, or 10,000/44,100 for filler). That high byte looks like the volume, unconfirmed. `+0x8C` is the start address (2), `+0x90` the 16 DSP-ADPCM coefficients, `+0xB0` gain, `+0xB2` initial scale, then the history samples.
+
+**Phrase id → bank and sector:**
+
+- `0x8003B398(id)` returns the bank and `0x8003B530(id)` the local index (`id − base`). The ranges are hard-coded:
+
+| Bank | Id base | Phrases |
+|---|---|---|
+| 0 | `0x4000` | 995 |
+| 1 | `0x4800` | 1619 |
+| 2 | `0x5000` | 2400 |
+| 3 | `0x6000` | 1902 |
+| 4 | `0x6800` | 2765 |
+| 5 | `0x7800` | 2741 |
+| 6 | `0x8800` | 6186 |
+| 7 | `0xA800` | 4661 |
+| 8 | `0xC800` | 874 |
+| 9 | `0xD000` | 1585 |
+| 10 | `0xD800` | 2431 |
+| 11 | `0xE800` | 1659 |
+| 12 | `0xF000` | 2593 |
+| 13 | `0x10000` | 2737 |
+| 14 | `0x11000` | 5175 |
+| 15 | `0x13000` | 3650 |
+| 16 | `0x15000` | 820 |
+| 17 | `0x16000` | 3650 |
+
+- `0x8003ACF0(id)` returns the phrase's sector: `index[local] + (k << 16)`. Each bank's sector table is at `0x8029C1A0 + bank × 12` (pointer, phrase count), and `k` comes from 32 thresholds per bank at `0x8029C2D8 + bank × 0x80` (low 24 bits), for banks over 65,536 sectors. No bank on the disc gets there.
+- `0x8003A648` reads the phrase header at `sector × 0x800` and the data after it. When the bank's table is not loaded, `0x8003AEB8` reads the index sector it needs.
+
+**Player names:**
+
+- A player's voice is `VoiceId` (14 bits at `0x92.2` of the record, see `docs/en/roster-2008.md`). In the 2008 roster it runs from 2051 to 4789: 1004 distinct voices.
+- **Local index = `VoiceId − 0x800`** in the name banks. Checked in a Yankees match: the first bank-17 phrase was index 260 (`VoiceId` 2308, Derek Jeter). No roster `VoiceId` lands on an index gap (locals `0x5F6`-`0x5F7`, `0x63E`-`0x63F`, `0x9BC`-`0x9BD`) or outside `3..0xE3C`.
+- **Banks with names:** 14, 15 and 17 have one recorded name per `VoiceId` (locals `3..0xE3C`, 3636 names; 15 and 17 have exactly 3650 phrases). Bank 6 has the same layout, but all of it is 9 ms filler (no real phrase).
+  - Jeter's durations: bank 14, 396 ms; bank 15, 431 ms; bank 17, 1310 ms.
+  - Listened to (October 31, 2026, Jeter):
+
+| Bank | Who | What it says |
+|---|---|---|
+| 14 | main commentator | the surname, normal tone ("Jeter") |
+| 15 | main commentator | the surname, excited, pitch rising ("Jeter!") |
+| 17 | colour commentator | the full name ("Derek Jeter") |
+- Free slots: locals `0xE3D`-`0xE41` of banks 15 and 17 are inside the code's range but hold no real phrase. More than 5 new names needs wider ranges in `0x8003B398`/`0x8003B530`: no bank answers between `0x13E42` and `0x14FFF`.
+- Converters accept callname keys only when the local is within the grown index of the destination bank; without an extension they retain the original result. PCM16 WAV and MP3 (dr_mp3 0.7.4, MIT-0/public domain) share mono mixing, resampling to 22,050 Hz and the early 5 s limit.
+- **Implemented** (patch `wiicompiled-callnames`, `docs/en/mods.md`): mods' `VoiceId`s 7223-10239, with natives for the ranges, the four converters and the editor list readers, compared with the original (run in a PowerPC interpreter) for every input.
+- **From `VoiceId` to phrase id** (found on October 31, 2026 with a guest stack trace in the `0x8003B398` native): the player's match object keeps his **key** = `0x8000 + VoiceId` at `+0xA4` (`0x8058256C`), and the commentary runs it through four converters with hard-coded ranges:
+
+| Function | Returns | For |
+|---|---|---|
+| `0x80659DE8` | key + `0x8800` (bank 14, normal surname); a bank-7 id + `0x8800` (bank 15); 0 for `0x963F-0x9A31`; anything else unchanged | main commentator |
+| `0x80659C98` | x + `0x2000`: key to bank-7 id (all filler), and bank-14 id to bank-15 id (excited surname); 0 out of range | main, excited |
+| `0x80659F70` | key + `0xD800` (bank 17, full name); 0 out of range | colour commentator (`0x807A9390`: `0x807A9AFC` → `0x80659F70`) |
+| `0x8065A14C(key, other)` | list B only: `0x80659DE8(key) + 0xE3E` (the **fourth recording**, bank 14 locals `0xE41-0x1433`; Jeter, 743 ms) or, with `other`, key + `0x1231` (bank 6, filler) | variant |
+
+  - Accepted key ranges: `0x8803-0x8DF5`, `0x8DF8-0x8E3D`, `0x8E40-0x91BB`, `0x91BE-0x963C`, `0x963F-0x9A31`, and the same + `0x8800`. A key outside them has no name: the commentary skips it.
+  - The excited form is asked as `0x80659C98(0x80659DE8(key))` (`0x806F91E8`). The commentary keeps 16-bit ids and adds `0x10000` when playing (`0x119C` → `0x1119C`).
+  - So a new `VoiceId` needs natives for these four functions, not just larger banks.
+
+**Editor name list (`env_voice_data.pack`, file 3081 of `project.bin`):**
+
+- Read by a group of REL functions at `0x807EDF4C`-`0x807EE354`, through `0x8000BBFC(3081, 0x40000000 | offset)` (pointer inside the pack).
+- Each name's **key** is `0x8000 + VoiceId` (= the bank-6 id with the same local index). The functions also accept key + `0x8800` (= the bank-14 id).
+- Names are 15 u16 characters (30 bytes, `0xFFFF` terminated) in the roster's character table.
+
+| List | Keys | Names | Entries | Contents |
+|---|---|---|---|---|
+| A | `+0x20` | `+0x1E0C` | 1915 (`0x77B`) | generic upper-case surnames in alphabetical order (`AARDSMA`…`ZUNIGA`); keys `0x8E40`-`0x963C` |
+| B | `+0xFEB4` | `+0x10ED0` | 970 (`0x3CA`) | MLB players (`Jeter`, `K.Jimenez`…), grouped by initial; `0xFEFE` separates the letters; keys `0x8803`-`0x8DF6` |
+| C | `+0x10DDC` | `+0x1807C` | 61 (`0x3D`) | legends (`VoiceId` 4466-4789) |
+
+- `+0xFE80`: 26 `s16`, the list-B position where each letter starts (-1 = none, the X).
+- `0x8065A0D4(key)` decides whether list B is searched (`0x8803`-`0x8DF5`) and `0x8065A110`, whether list C is searched first (`0x8E40`-`0x91BB`); when not found, list A is searched.
+- `0x807EDF4C(key)` returns the name; `0x807EE0C8(key)`, the list (1 = B or C, 2 = A, 0 = none); `0x807EE2D0(i)`/`0x807EE310(i)`, key and name of list-A entry i; `0x807EE240`/`0x807EE288`, the same for B; `0x807EE280` returns 970; `0x807EE200(letter)`, the letter's start.
+- Each list's entry count is hard-coded (`0x77B`, `0x3CA`, `0x3D`). Adding names to the list needs those functions changed.
+- The same player can be in two lists: David Aardsma has `VoiceId` 2052 (list B) and there is also a generic `AARDSMA` in A (key `0x91BE`).
+- **Careful:** bank 14 holds another 1523 phrases from local index `0xE41` on. A new `VoiceId` above `0x1640` cannot go at the end of bank 14 without overwriting them.
+
+**What the editor uses** (checked on October 31, 2026 in Arrange › a team › VOICE SETUP › a player):
+
+- **Select Type** ("Choose a voice from the players used during a game"): a grid of initials (X, with no names, is shown in another colour), then that letter's list with the **list B** names ("A", "Aardsma", "B.Abreu", "T.Abreu", "Accardo"…). Aardsma's key is `0x8804` = `0x8000` + his `VoiceId` 2052.
+- **Search Type**: the name is typed with the letters A-Z, `-` and `.`, and searched in **list A** (upper case).
+- Interface functions that read the lists (by what they call): list A `0x807E5494`, `0x807E5A24`, `0x807E5C18`, `0x807E65C0`, `0x807E7480`, `0x807E7614`, `0x807E772C`; list B `0x807E78B8`, `0x807E84DC`, `0x807E85F0` (count + letters), `0x807E867C`, `0x807E8EC0`, `0x807E974C`, `0x807E97F8`; name by key `0x80581A68`, `0x807E57A8`, `0x807E5890`, `0x807E60A4`, `0x807E8B38`, `0x807EB8B8`, `0x807EBCBC`, `0x807ED7D8`.
+- The sizes are only hard-coded in the reader: `0x77B` in `0x807EDF4C`, `0x807EE0C8` and `0x807EE358` (returns list A's count, called from `0x807E7480`, `0x807E7614` and `0x807E772C`); `0x3CA` in `0x807EDF4C`, `0x807EE0C8` and `0x807EE280`; `0x3D` in `0x807EDF4C` and `0x807EE0C8`. Other `0x3CA`s at `0x80754C3C`/`0x80754CB8` check `+0xF4 − 1` of another object (no proven link).
+
+**Bank indexes in memory** (read in the menu):
+
+- `0x8029C1A0 + bank × 12` = {pointer to the index, phrase count, index sector}. The indexes live in the MEM2 heap, back to back (bank 0 at `0x97D84500` … bank 17 at `0x97DB5500`), each the index bytes rounded to `0x1000`. The MEM2 heap has about 125 MB (patch `wiicompiled-mlb-mem2-heap`), so a larger index fits.
+- `0x8029C2D8 + bank × 0x80`: the first word is `0x80000000` and the next 31 are `0xFFFFFFFF`, with no thresholds: with sectors below `0x10000`, `k` = 0.
+
+Sources: disassembly (`0x80025708`, `0x80032C74`-`0x80032F28`, `0x80659C98`-`0x8065A1C0`, `0x807A9390`, `0x8065A0D4`, `0x807EDF4C`-`0x807EE354`, `0x8003A648`, `0x8003ACF0`, `0x8003AEB8`, `0x8003B220`, `0x8003B398`, `0x8003B530`); `voiceN.bin` reads of a test match; `game_data.pack` roster.
 
 ## 5. Disc and `project.bin`
 

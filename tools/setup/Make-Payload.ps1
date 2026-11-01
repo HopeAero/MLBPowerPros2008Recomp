@@ -109,6 +109,11 @@ $seasonBuild = Join-Path $root 'local\build\season-studio'
 & "$root\tools\season-studio\build.ps1" -Source $Source -Output $seasonBuild
 Copy-Item "$seasonBuild\SeasonStudio.exe" $workspace
 
+Write-Host 'Callname Studio...'
+$callnameBuild = Join-Path $root 'local\build\callname-studio'
+& "$root\tools\callname-studio\build.ps1" -Source $Source -Output $callnameBuild
+Copy-Item "$callnameBuild\CallnameStudio.exe" $workspace
+
 Write-Host 'Licenses...'
 New-Item -ItemType Directory -Force "$Output\licenses" | Out-Null
 Copy-Item "$root\LICENSE" "$Output\licenses\MLBPowerPros2008Recomp-LICENSE.txt"

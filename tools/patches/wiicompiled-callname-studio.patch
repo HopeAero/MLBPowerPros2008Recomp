@@ -1,0 +1,57 @@
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -298,6 +298,7 @@
+ constexpr int kOpenTextureStudio = -4;
+ constexpr int kOpenSavesFolder = -5;
+ constexpr int kOpenSeasonStudio = -6;
++constexpr int kOpenCallnameStudio = -7;
+ constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, MEJORAS; HERRAMIENTAS follows it
+ constexpr int kEnhancementsTab = 4;
+ 
+@@ -382,6 +383,10 @@
+     "Opens Power Pros Wii 2008 Texture Studio: browse the game's textures, export them to edit them "
+     "(Photoshop, HD upscaling) and save them as a texture mod without touching the game."};
+ 
++constexpr Phrase kCallnameStudioHelp{
++    "Crea callnames con tu audio WAV o MP3 y asígnalos en PowerUp+ (MODS > EDITAR ROSTER). Activa el mod para usarlos.",
++    "Create callnames with your WAV or MP3 audio and assign them in PowerUp+ (MODS > EDIT ROSTER). Enable the mod to use them."};
++
+ constexpr Phrase kSeasonStudioHelp{
+     "Abre el Editor de temporada, en su propia ventana:\n\n"
+     "- Qué tendrá una partida nueva del modo Temporada o de MLB Life (año, calendario, DH, ligas) y de qué mod "
+@@ -505,6 +510,7 @@
+ }
+ void OpenTextureStudio() { OpenStudio(L"TextureStudio.exe"); }
+ void OpenSeasonStudio() { OpenStudio(L"SeasonStudio.exe"); }
++void OpenCallnameStudio() { OpenStudio(L"CallnameStudio.exe"); }
+ 
+ // The folder whose saves the game uses with these mods: <user data>\ModSaves\<mods> for roster mods,
+ // else the NAND's own save folder.
+@@ -801,6 +807,7 @@
+     toolsTab.options.push_back({Tr("EDITAR ROSTER (PowerUp+)", "EDIT ROSTER (PowerUp+)"), kRosterEditorHelp, {Tr("Abrir", "Open")}, 0, false, kOpenRosterEditor});
+     toolsTab.options.push_back({Tr("EDITOR DE TEXTURAS", "TEXTURE EDITOR"), kTextureStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenTextureStudio});
+     toolsTab.options.push_back({Tr("EDITOR DE TEMPORADA", "SEASON EDITOR"), kSeasonStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenSeasonStudio});
++    toolsTab.options.push_back({Tr("EDITOR DE CALLNAMES", "CALLNAME EDITOR"), kCallnameStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenCallnameStudio});
+     toolsTab.options.push_back({kRosterPlayersLabel, kRosterPlayersHelp, {Tr("Nativos", "Native"), Tr("Como en el editor", "As in the editor")},
+                                 RuntimeConfigFile::NativeRoster(true) ? 0 : 1});
+     for (size_t i = 0; i < installedMods.size(); ++i) {
+@@ -905,6 +912,10 @@
+             OpenTextureStudio();
+             return;
+         }
++        if (o.mod == kOpenCallnameStudio) {
++            OpenCallnameStudio();
++            return;
++        }
+         if (o.mod == kOpenSeasonStudio) {
+             OpenSeasonStudio();
+             return;
+@@ -1013,6 +1024,7 @@
+     if (testAction != nullptr && std::strcmp(testAction, "roster-editor") == 0) OpenRosterEditor();
+     if (testAction != nullptr && std::strcmp(testAction, "texture-studio") == 0) OpenTextureStudio();
+     if (testAction != nullptr && std::strcmp(testAction, "season-studio") == 0) OpenSeasonStudio();
++    if (testAction != nullptr && std::strcmp(testAction, "callname-studio") == 0) OpenCallnameStudio();
+     // =language-es / =language-en: switch the language once, as if chosen in INTERFAZ (the launcher is
+     // rebuilt on the same page; the rebuilt one finds the language already set and does nothing).
+     if (testAction != nullptr && std::strncmp(testAction, "language-", 9) == 0) {

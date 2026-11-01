@@ -161,6 +161,8 @@ $studio = Join-Path $workspace 'TextureStudio.exe'  # texture mods (launcher > H
 if (Test-Path $studio) { Copy-Item $studio $game -Force }
 $seasonStudio = Join-Path $workspace 'SeasonStudio.exe'  # season settings and schedules (launcher > HERRAMIENTAS > EDITOR DE TEMPORADA)
 if (Test-Path $seasonStudio) { Copy-Item $seasonStudio $game -Force }
+$callnameStudio = Join-Path $workspace 'CallnameStudio.exe'  # launcher > HERRAMIENTAS > EDITOR DE CALLNAMES
+if (Test-Path $callnameStudio) { Copy-Item $callnameStudio $game -Force }
 foreach ($name in 'config', 'wii_bootstrap') {
     $dir = Join-Path $build $name
     if (Test-Path $dir) { Copy-Item $dir $game -Recurse -Force }

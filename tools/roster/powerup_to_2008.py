@@ -239,8 +239,13 @@ VOICE_RUNS = [
 ]
 
 
+CALLNAME_VOICES = range(7223, 10240)    # new callnames from mods (tools/callnames.py): same id in both games
+
+
 def voice_2008(voice):
     """2007 voice id -> 2008's, or 0 (no voice) for one 2008 does not have."""
+    if voice in CALLNAME_VOICES:
+        return voice
     return next((voice + d for first, last, d in VOICE_RUNS if first <= voice <= last), 0)
 
 
@@ -249,8 +254,8 @@ ONLY_2008_VOICE = 10000                  # PowerUp+ numbers a voice only 2008 ha
 
 def voice_2007(voice):
     """2008 voice id -> 2007's (the runs never overlap in 2008), or ONLY_2008_VOICE + voice."""
-    if voice == 0:
-        return 0
+    if voice == 0 or voice in CALLNAME_VOICES:
+        return voice
     return next((voice - d for first, last, d in VOICE_RUNS if first <= voice - d <= last), ONLY_2008_VOICE + voice)
 
 

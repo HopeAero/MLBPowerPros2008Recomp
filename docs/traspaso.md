@@ -2,6 +2,37 @@
 
 Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de trabajo; el historial está en `git log -p docs/traspaso.md`. Las secciones de abajo son notas por fase de sesiones anteriores.
 
+## Editor de callnames (rama `callnames`, 1 de noviembre de 2026)
+
+- `tools/callname-studio/` produce `CallnameStudio.exe`: SDL3/ImGui, aspecto y configuración compartidos con Season Studio, ES/EN, mods, alta/edición/borrado, importación WAV/MP3 y reproducción. Enlaza `ToGameText`, `Collect` y `ReadAudio` del runtime; conserva claves desconocidas y comentarios TOML.
+- Parche `wiicompiled-callname-studio` después de `wiicompiled-callnames`: AJUSTES → HERRAMIENTAS → EDITOR DE CALLNAMES. Integrado en Make-Payload y LocalBuild. Guías: `docs/callname-studio.md` y `docs/en/callname-studio.md`.
+- Corregido el helper común de Config.toml: arrays de mods multilínea con comentarios y temporales exclusivos sin borrar el destino cuando falla el reemplazo. Añadidas regresiones, incluida una symlink temporal fuera del mod.
+- Validado: 28 comprobaciones de autoprueba, CLI con audio sintético WAV/MP3, 12/12 tests host, picker/escucha/guardado por GUI, capturas ES/EN, apertura desde el launcher, cadena de 76 parches en clon limpio y empaquetado de la herramienta. Sonda de partido de 90 s: dos nombres cargados, lectura nueva de banco 17 virtual, salida 0. No aumenta la cobertura de recomp.
+- Evidencia privada y límites en `local/analysis/callname-studio/report.md`. Sin commit ni push; cambios para revisión. No se reconstruyó el instalador completo ni se hizo evaluación auditiva humana.
+
+## Callnames nuevos (rama `callnames`, 31 de octubre de 2026)
+
+### Revisión de callnames y MP3 (brief local/analysis/callnames-fix)
+
+- Corregidos padding sectorial del índice (5176 frases incluido), dirección final ADPCM, validación de audio antes de reservar, listas solo para audio montado, publicación de offsets solo tras fusionar PROJECT.BIN y conflictos con bancos disc/Riivolution.
+- WAV PCM16 y MP3 (dr_mp3 0.7.4, MIT-0/dominio público), mono/estéreo de 8–192 kHz, máximo 5 s; caché por contenido versión 2. PowerUp+ deduplica ids/nombres, lee manifests de un nivel, tolera comentarios/tablas y conserva ids 7223–10239 en 14 bits.
+- Validado: juego PC compilado; 12/12 CTest callnames, 34/34 PowerUp+ filtradas y pruebas Python. Tres sondas de 90 s: 7300 y 7223/MP3 leen la extensión del banco 17; sin mods todas las cabeceras pertenecen al índice original.
+- Ambos parches regenerados y aplicados en limpio (18 archivos runtime, 40 PowerUp+), comparación ignorando CR correcta; control de datos del juego correcto. Cambios sin commit/push en este worktree. Evidencia privada: `local/analysis/callnames-fix/report.md`.
+- Pendientes: GUI/escucha, MLB Life y Switch; diferencias de selección/orden de mods de PowerUp+ y conflictos por mayúsculas en sistemas sensibles a mayúsculas. Hallazgos 9/10/14 no descritos en el brief.
+
+Mods con nombres de jugador nuevos: diseño `docs/superpowers/specs/2026-10-31-callnames-design.md`, plan `docs/superpowers/plans/2026-10-31-callnames.md`, guía `docs/mods.md` («Callnames»), RE en `docs/ingenieria-inversa.md` («Bancos de voz y nombres de jugador»).
+
+- **PC, hecho y probado:** parche `wiicompiled-callnames` (último de la lista de `wiicompiled-translate.ps1`). Con el mod de prueba local `local/tmp/callnames/mod-acuna` (audio Piper `es_MX-ald-medium`, Unlicense; Jeter con `VoiceId` 7300):
+  - el banco 17 virtual sirve la frase nueva en el turno de Jeter (`MATCH_BENCH` + `WIICOMPILED_DEBUG_DVD`);
+  - «Acuna Jr.» sale en Arrange › VOICE SETUP › Select Type › A, después de Acosta, y queda asignado;
+  - sin mods, las lecturas de voz son las de siempre; con el roster en 7300 y sin el mod, silencio y sin cuelgue.
+- **Pruebas:** `mkw_callnames_tests` (comparan cada nativo con el original ejecutado en un intérprete PowerPC, para todas las entradas), `tools/test_callnames.py`, `tools/roster/test_voice_passthrough.py`, `PowerPros2008CallnameTests` en PowerUp+.
+- **Pendiente:**
+  - **Switch:** `local/tmp/switch_edit.py` añade su propio `DvdReadContract::Virtual` y cambia `ReadExact` en `dvd_contract.h`; con `wiicompiled-callnames` en la cadena ya existen. Hay que saltar esa parte del script (líneas ~27747-27960 y 11061-11140) o fusionarla, regenerar con `mkswitch.sh` y hacer que `BuildBank` lea los bancos de la ISO (fase 103: `ResolvedDvdRoot()/files/sound` no existe con ISO). Luego NRO y prueba en consola.
+  - **Escucha del usuario** de las tres variantes en un partido, y MLB Life (mismo código de comentario; sin sonda propia).
+  - Publicar PowerUp+ (`tools/powerupplus.ps1 -Publish`) en la próxima versión.
+  - Riesgo visto una vez: una ejecución con traza temporal se quedó colgada al arrancar; no se repitió en tres ejecuciones.
+
 ## Dónde estamos
 
 - **Publicado:** Switch v0.1.0 en el repo aparte [MLBPR2008-NX](https://github.com/HopeAero/MLBPR2008-NX) (solo README, LICENSE y releases; el zip trae el NRO con el icono genérico de libnx, los archivos del runtime y `UserData/Config.toml`, nunca datos del juego). Anuncio: [Discussion #8](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/8). Empaquetado en `local/release-nx/` (repo/, pkg/, notas). Construido desde 225e9f8 (fases 1–103).
