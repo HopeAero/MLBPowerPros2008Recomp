@@ -28,7 +28,7 @@ A **static recompilation** of *MLB Power Pros 2008* (Wii, USA, `RL8E54`) into a 
 | Graphics | Direct3D 12 or Vulkan (picked automatically), internal resolution 1x to 4x, true 16:9 widescreen, fill screen without black strips, AMD FSR 1, anisotropic filtering up to 16x, frame interpolation to 120 or 180 FPS (experimental), quality presets |
 | Audio | complete, commentator included |
 | Controllers | any controller through SDL3, or keyboard and mouse, as a GameCube controller; up to 4 players; Dolphin-style remapping; PlayStation or Xbox button names |
-| Mods | textures (HD too), `project.bin` files (uniforms, for example), 2008 rosters, stadiums edited in Blender and **new stadiums** in Exhibition. Untested: `riivolution/` |
+| Mods | textures (HD too), `project.bin` files (uniforms, for example), 2008 rosters, stadiums edited in Blender and **new stadiums** in Exhibition, **new player names for the commentators** (callnames, made with the Callname Editor and assigned with PowerUp+). Untested: `riivolution/` |
 | Installation | the Setup verifies your copy, extracts, translates and compiles it: about **4.5 minutes** (12 threads). Verified clean, in Spanish and English, on the development PC; **not yet tested on another PC** |
 | Translated code | 48,219 functions from `main.dol` and `ovl_main.rel`, none unsupported; 314 system functions bound to native code |
 | Languages | launcher, Setup, Texture Studio and Blender add-on in Spanish and English (system language, or your choice); documentation in both languages |
@@ -47,7 +47,7 @@ A **static recompilation** of *MLB Power Pros 2008* (Wii, USA, `RL8E54`) into a 
 
 Requirements: Windows 10/11 64-bit, a GPU with Direct3D 12 or Vulkan, your copy of *MLB Power Pros 2008* for Wii (USA, `RL8E54`) and about 2.5 GB free (900 MB for the Setup, 1.5 GB for the installed game).
 
-1. Download `MLB-Power-Pros-2008-Setup-v0.1.5.zip` from [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (latest: `v0.1.5` beta) and unzip it into a folder of yours (not Program Files).
+1. Download `MLB-Power-Pros-2008-Setup-v0.1.6.zip` from [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (latest: `v0.1.6` beta) and unzip it into a folder of yours (not Program Files).
 2. Open `MLBPowerPros2008-Setup.exe`, press **CHOOSE DISC** and pick your copy (ISO, NKit, RVZ, WBFS, WIA, GCZ or CISO).
 3. Press **INSTALL**. The Setup checks that it is a clean `RL8E54` dump, extracts it, translates the code and compiles it on your PC.
 4. Press **PLAY** or use the desktop shortcut. The launcher opens before each session: graphics API, display, resolution, audio, controls, mods and tools.

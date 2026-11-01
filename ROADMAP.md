@@ -6,7 +6,7 @@
 
 Talk about it: [roadmap discussion](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/7).
 
-Updated: October 31, 2026 · latest release [v0.1.5](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.5) (PC) and [Switch v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0).
+Updated: November 1, 2026 · latest release [v0.1.6](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.6) (PC) and [Switch v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0).
 
 Two rules hold for everything below: the game stays **faithful to the Wii original by default** (anything that changes gameplay is opt-in from the launcher), and **no game files are ever distributed**: on PC every player builds the game from their own disc; on Switch the NRO is published and players bring their own disc (see [decisions](docs/en/decisions.md)).
 
@@ -37,6 +37,7 @@ Two rules hold for everything below: the game stays **faithful to the Wii origin
 | Release | Highlights |
 |---|---|
 | [Switch v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0) | [Nintendo Switch](docs/en/roadmap/switch.md): native homebrew at 60 fps handheld without overclock, launcher with graphics presets, mods, direct ISO ([releases repo](https://github.com/HopeAero/MLBPR2008-NX)) |
+| [v0.1.6](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.6) | New player names (callnames) for the commentators with mods and the Callname Editor; Switch optimizations ported to PC (13% less main-thread CPU); lighter graphics options in VIDEO; Setup no longer flagged by Defender heuristics |
 | [v0.1.5](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.5) | Two-way players (Ohtani rule) in every mode; MLB Life role talk with the manager; Texture Studio AI upscaling and Dolphin packs |
 | [v0.1.4.1](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.4.1) | Controller hotfix |
 | [v0.1.4](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.4) | Real MLB schedules (2002–2026), start year, DH in both leagues, 15/15 leagues, Season Editor, player passwords as text |
