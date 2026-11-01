@@ -2,6 +2,14 @@
 
 Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de trabajo; el historial está en `git log -p docs/traspaso.md`. Las secciones de abajo son notas por fase de sesiones anteriores.
 
+## Editor de callnames (rama `callnames`, 1 de noviembre de 2026)
+
+- `tools/callname-studio/` produce `CallnameStudio.exe`: SDL3/ImGui, aspecto y configuración compartidos con Season Studio, ES/EN, mods, alta/edición/borrado, importación WAV/MP3 y reproducción. Enlaza `ToGameText`, `Collect` y `ReadAudio` del runtime; conserva claves desconocidas y comentarios TOML.
+- Parche `wiicompiled-callname-studio` después de `wiicompiled-callnames`: AJUSTES → HERRAMIENTAS → EDITOR DE CALLNAMES. Integrado en Make-Payload y LocalBuild. Guías: `docs/callname-studio.md` y `docs/en/callname-studio.md`.
+- Corregido el helper común de Config.toml: arrays de mods multilínea con comentarios y temporales exclusivos sin borrar el destino cuando falla el reemplazo. Añadidas regresiones, incluida una symlink temporal fuera del mod.
+- Validado: 28 comprobaciones de autoprueba, CLI con audio sintético WAV/MP3, 12/12 tests host, picker/escucha/guardado por GUI, capturas ES/EN, apertura desde el launcher, cadena de 76 parches en clon limpio y empaquetado de la herramienta. Sonda de partido de 90 s: dos nombres cargados, lectura nueva de banco 17 virtual, salida 0. No aumenta la cobertura de recomp.
+- Evidencia privada y límites en `local/analysis/callname-studio/report.md`. Sin commit ni push; cambios para revisión. No se reconstruyó el instalador completo ni se hizo evaluación auditiva humana.
+
 ## Callnames nuevos (rama `callnames`, 31 de octubre de 2026)
 
 ### Revisión de callnames y MP3 (brief local/analysis/callnames-fix)

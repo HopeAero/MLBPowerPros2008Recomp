@@ -60,6 +60,8 @@ Si dos mods activos reemplazan la misma textura, gana la de `UserData\texture_re
 
 ## Callnames
 
+Lo más fácil es el [Editor de callnames](callname-studio.md): crea y edita varios nombres con tu audio, sin escribir TOML.
+
 Cada nombre lleva tres audios: el apellido en tono normal y emocionado (comentarista principal) y el nombre completo (comentarista de fondo). El audio lo pones tú: grabado, TTS, etc. Comparte solo audio que tengas derecho a compartir.
 
 ```
