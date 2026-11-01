@@ -17,6 +17,18 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
 - **ABS** (pedido del dueño): investigación hecha, plan con fases en [docs/roadmap/abs.md](roadmap/abs.md), RE en `docs/ingenieria-inversa.md` §21. Antes de implementar, el dueño decide: ¿error del umpire para que el bateador gane desafíos, o solo zona de reglamento? ¿qué botón?
 - Probar la ISO directa en consola. Núcleo 1 con estado sucio si hace falta (`local/tmp/cpu/GXW/`, D1–D9).
 
+## PC: optimizaciones de Switch portadas (rama `pc-switch-optimizations`, 2026-11-01)
+
+Seis parches nuevos, solo de escritorio (Windows, Linux x86-64/Deck, Linux ARM64), al final de la lista de `tools/wiicompiled-translate.ps1`; `tools/switch/build-nro.sh` salta los `wiicompiled-pc-*` porque la Switch ya los lleva en sus parches. Informe completo: `local/analysis/pc-opt/report.md`.
+
+- `wiicompiled-pc-natives`: nativas `__ieee754_sqrt`/`__fill_mem` (fase 21), reverb `0x800BC3AC` (43), esfera de reflejos `0x8000D770` (38) y colores de luz `0x80061220` (95), sin asm ARM ni NEON en x86. `MIXUpdateSettings` (32) **no**: en x86 la nativa es más lenta que la traducción.
+- `wiicompiled-pc-dirty-writeback`: write-back de registros solo si están sucios (traductor, fase 87). Re-traduce: tras aplicarlo, `translate-recursive`.
+- `wiicompiled-pc-gx-batch` (XF incompleto 76/83, arrays 77), `wiicompiled-pc-dispatch-fast` (79), `wiicompiled-pc-auto-mips` (60), `wiicompiled-pc-gfx-options` (91/93/97: sombras, público, reflejos, cámara de jugada en la pestaña VIDEO; por defecto como el original).
+- **Medido** (hilo principal, ms de CPU por cuadro, benchmark de partido 60 s, Ryzen 5 5500): nativas −6 %, write-back sucio −3 %, GX+despacho −3 %, esfera de reflejos dentro del ruido. Cadena entera con y sin los seis parches (árboles `local/pc-opt/wsbase` y `wsfinal`, 4 pares): 6,16 ± 0,40 → 5,38 ± 0,07 ms (−13 %), CPU del proceso 530 → 473 ms/s; el juego sigue a 60 fps con el mismo p50/p95 (está limitado por el VI). Todas las opciones gráficas bajas a la vez: −0,5 a −0,7 ms de CPU más y ~0,15 ms de GPU.
+- **Pruebas de exactitud x86** (`local/pc-opt/tests`, `build.py <test>`): traducción del árbol PC contra la nativa compiladas con las banderas del producto; `fork()` sustituido por instantáneas de regiones y páginas escritas (write watch) puestas a cero. Mutantes en `mutants.py`.
+- **No portado:** reparto en núcleos/afinidad (decisión del usuario), FIFO asíncrono y offload GX, deko3d (compresión EFB, atajo TEV 1,0, alfa), THP (solo vídeo), nativa de `PSMTXConcat` (0,2 % de muestras), mezcla AX repartida, sondeos/diagnóstico.
+- **Trampas x86:** (1) Clang convierte `bits << 1 == 0` de un double en una comparación FP, que con DAZ da cierto para los subnormales: leer los bits del registro como entero. (2) En la traducción de escritorio los carriles paired-single son SSE con FTZ (sin el vaciado previo de NI) y los escalares no: separar `PMul`/`Mul`. (3) Las pruebas deben poner `g_currentCpuContext` y FPSCR[NI] como en el juego, o las llamadas anidadas cambian MXCSR.
+
 ## Cómo se trabajó (para repetirlo)
 
 - Cada cambio: un agente edita el árbol de compilación y entrega un snippet en `local/tmp/cpu/*.py` (formato `T2-codegen.py`); se integra con `python local/tmp/cpu/phase-integrate.py <snippet> <n> "<título>"`, luego `local/tmp/mkswitch.sh` y `local/tmp/P11-verify.sh`, y `tools/switch/build-nro.sh --graphics vulkan` (~15 min; ~40 con re-traducción). **Nunca ejecutar `local/tmp/switch_edit.py` sobre el árbol de compilación**: si pasa, `rm src/runtime/include/game_natives_rebound.h` y recompilar (rehace el árbol desde los parches).

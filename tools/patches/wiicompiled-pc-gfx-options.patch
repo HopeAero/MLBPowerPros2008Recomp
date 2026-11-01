@@ -1,0 +1,413 @@
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index 3198082..9c94dd9 100644
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -46,6 +46,11 @@ struct RuntimeUserConfig {
+     std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
+     std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
+     std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
++    // Lighter graphics (hle/mlb/gfx_options.cpp), launcher VIDEO tab; all as on the Wii by default.
++    std::optional<std::string> playerShadows;  // [video] shadows: "full", "simple" (round blob) or "off"
++    std::optional<std::string> crowdLevel;     // [video] crowd: "full", "less" (half the stands) or "off"
++    std::optional<uint32_t> fieldingFov;       // [video] fielding_fov: play-shot camera angle in percent, 60-100
++    std::optional<std::string> reflections;    // [video] reflections: "on" (helmet and bat shine) or "off"
+     std::optional<int32_t> windowPosX;
+     std::optional<int32_t> windowPosY;
+     std::optional<uint32_t> windowWidth;
+@@ -479,6 +484,20 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
+     config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
+     config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
+     config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
++    if (auto value = FindConfigValue<std::string>(document, "video", "shadows");
++        value && (*value == "full" || *value == "simple" || *value == "off")) {
++        config.playerShadows = *value;
++    }
++    if (auto value = FindConfigValue<std::string>(document, "video", "crowd");
++        value && (*value == "full" || *value == "less" || *value == "off")) {
++        config.crowdLevel = *value;
++    }
++    if (auto value = FindConfigUint(document, "video", "fielding_fov"); value && *value >= 60 && *value <= 100) {
++        config.fieldingFov = *value;
++    }
++    if (auto value = FindConfigValue<std::string>(document, "video", "reflections"); value && (*value == "on" || *value == "off")) {
++        config.reflections = *value;
++    }
+     config.windowPosX = FindConfigInt(document, "video", "window_x");
+     config.windowPosY = FindConfigInt(document, "video", "window_y");
+     if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
+@@ -978,6 +997,42 @@ inline bool SetTwoWayPlayer(bool value) {
+     return WriteSetting("season", "two_way_player", value ? "true" : "false");
+ }
+ 
++inline std::string PlayerShadows(std::string fallback = "full") {
++    return Get().playerShadows.value_or(std::move(fallback));
++}
++
++inline bool SetPlayerShadows(std::string value) {
++    Mutable().playerShadows = value;
++    return WriteSetting("video", "shadows", FormatString(value));
++}
++
++inline std::string CrowdLevel(std::string fallback = "full") {
++    return Get().crowdLevel.value_or(std::move(fallback));
++}
++
++inline bool SetCrowdLevel(std::string value) {
++    Mutable().crowdLevel = value;
++    return WriteSetting("video", "crowd", FormatString(value));
++}
++
++inline uint32_t FieldingFov(uint32_t fallback = 100) {
++    return Get().fieldingFov.value_or(fallback);
++}
++
++inline bool SetFieldingFov(uint32_t value) {
++    Mutable().fieldingFov = value;
++    return WriteSetting("video", "fielding_fov", std::to_string(value));
++}
++
++inline std::string Reflections(std::string fallback = "on") {
++    return Get().reflections.value_or(std::move(fallback));
++}
++
++inline bool SetReflections(std::string value) {
++    Mutable().reflections = value;
++    return WriteSetting("video", "reflections", FormatString(value));
++}
++
+ inline bool UniversalDh(bool fallback = false) {
+     return Get().universalDh.value_or(fallback);
+ }
+diff --git a/runtime/src/hle/mlb/gfx_options.cpp b/runtime/src/hle/mlb/gfx_options.cpp
+new file mode 100644
+index 0000000..0b014f6
+--- /dev/null
++++ b/runtime/src/hle/mlb/gfx_options.cpp
+@@ -0,0 +1,203 @@
++// MLB Power Pros 2008 (RL8E54): optional lighter graphics (launcher VIDEO tab, Config.toml
++// [video] shadows, crowd, fielding_fov, reflections). All off by default; each native below is then one predictable
++// branch followed by the translation of the original function (kept callable by REGISTER_NATIVE_FUNCTION_AS),
++// so the game runs exactly as before. docs/ingenieria-inversa.md section 20 has the reverse engineering.
++//
++// - Player shadows, 0x806DA22C(character, mode): detaches the four shadow nodes (+0x14F0 blob, +0x1600 body,
++//   +0x17D0/+0x19A0 items), stores mode at +0x3A8 and attaches the ones the mode asks for: 1 = blob (one
++//   4-triangle mesh), 2/3 = planar shadows (the body's skinned to the skeleton, ~690 triangles, plus the
++//   items'), 0 = none. Only render nodes change; +0x3A8 is read only by the character's SetVisible
++//   (0x806DA4E8) and per-frame update (0x806DAF80), which update those nodes. "simple" turns 2/3 into 1,
++//   "off" passes 0.
++// - Bat shadows, 0x806E4DBC(bat, shown): the bat's SetVisible (vtable 0x80D5F8B0 slot +0x10, only called
++//   through it). The bat (constructor 0x806E4BC0, 0x654 bytes; the batter's at character +0x1C20 or
++//   +0x1C30, the on-deck one at +0x70 of the match's player set 0x80894694) has its models at +0x40/+0x150
++//   (pM_bat_R/L, cracked, or the two halves of a broken bat) and its own shadow projectors at +0x2A0/+0x470
++//   (pM_bat_shadow, pM_breakbat_*_shadow). It shows the projectors only while its byte +0x640 is set; the
++//   game clears that byte itself through 0x806E5070 where the bat must not cast one (0x806E29F0,
++//   0x807A1608). With "off" or "simple" (the game has no round shadow for a bat) the call runs with +0x640
++//   cleared and the byte is put back right after, so the bat takes the game's own no-shadow path and
++//   every reader sees the game's value. The ball's shadow is a separate plain model (model_game.pack
++//   +0x3400) and is left alone.
++// - Crowd, 0x80C60A94(scene): the stadium's per-frame visibility pass. A placement's node is shown when its
++//   tree-A flag, its byte in the visibility table (scene+0x6B8) and its sphere-in-frustum test agree; a
++//   zero byte also skips the piece's animation/LOD step (0x80C600C8, which writes that piece's node only).
++//   The crowd entries (placement type byte +0x52 in 0x13..0x17) are cleared for the call and put back right
++//   after it, so every other reader and writer of the table (0x80C5DA4C attendance level, day/night...)
++//   sees it unchanged. "less" hides the stands set the attendance level currently shows (0x80C5DA4C,
++//   level at scene+0x7B8: 0 shows 0x13/0x17 and hides 0x14/0x16, 1 the reverse, 2 none, 3 all), so it
++//   always halves the visible stands crowd; 0x15 stays. "off" hides 0x13..0x17.
++// - Play-shot field of view, 0x80054BEC(camera, f1 = degrees): the camera FOV setter (+0x1D8, focal
++//   length +0x1C4, dirty bit +0x80 |= 2). Scaled only when called from the play shot 0x808F1C5C (return
++//   address 0x808F1CCC), the shot that follows the ball after contact: there the shot camera [obj+0x4C]
++//   gets its FOV right before 0x80C779D4 copies it into the main camera (0x80055300), so the scaled angle
++//   reaches stadium culling and the players' source-camera view alike. The value 0x808F1C5C keeps at
++//   obj+0x8C and every other caller are untouched.
++// - Reflections, 0x8000DC70(handler): the pass count of the environment-map draw handler (constructor
++//   0x8000C8E0, vtable 0x80146018 slot +0x14, its only reference; "return 2"). The model draw loops
++//   (0x80015C10, 0x8000F400, 0x8001CBD4...) use the count only as the bound of begin pass (0x80060DD0: pass
++//   index at 0x8031AFC0) / draw / end pass (0x80060DDC: index back to -1). Pass 0 is the normal draw
++//   (0x80060B68); pass 1 (0x8000CD0C) fills the handler's own UV buffers (0x8000D770, sphere map, it alone
++//   flips their double-buffer index) and draws the mesh again with additive blending, saving and restoring the
++//   GX state it changes. It is created for helmet-like parts (0x806DB730: part +0x550 when character +0x50 is
++//   0/3/4/0x10, +0xBF0/+0xD10 by +0x68/+0x6C) and the bat (0x806E529C). "off" returns 1, the count of the
++//   base class (0x8000E184, vtable 0x80168A08), so those models are drawn like every other one: no shine, and
++//   nothing reads the skipped UV buffers or the pass index outside that draw.
++#include <cstdint>
++#include <cstdlib>
++#include <string>
++
++#include "abi_bridge.h"
++#include "memory.h"
++#include "runtime_config.h"
++
++extern "C" void func_806DA22C(CpuContext* ctx);  // the translations (kept: _AS registrations)
++extern "C" void func_806E4DBC(CpuContext* ctx);
++extern "C" void func_80C60A94(CpuContext* ctx);
++extern "C" void func_80054BEC(CpuContext* ctx);
++extern "C" void func_8000DC70(CpuContext* ctx);
++
++namespace mlb_gfx_options {
++
++enum class Shadows : uint8_t { Full, Simple, Off };
++enum class Crowd : uint8_t { Full, Less, Off };
++
++struct Settings {
++    Shadows shadows = Shadows::Full;
++    Crowd crowd = Crowd::Full;
++    float fovScale = 1.0f;  // 1 = untouched
++    bool fov = false;
++    bool reflections = true;
++};
++
++// Read once, at the first call of any of these natives (the guest starts after the pre-boot launcher,
++// which is the only thing that changes these settings).
++const Settings& Get() {
++    static const Settings settings = [] {
++        Settings s;
++        // WIICOMPILED_GFX_SHADOWS / _CROWD / _FOV / _REFLECTIONS override Config.toml (console runs started with nxlink
++        // pass them as arguments; the Switch has no launcher to change the file).
++        const char* envShadows = std::getenv("WIICOMPILED_GFX_SHADOWS");
++        const std::string shadows = envShadows ? envShadows : RuntimeConfigFile::PlayerShadows("full");
++        s.shadows = shadows == "off" ? Shadows::Off : shadows == "simple" ? Shadows::Simple : Shadows::Full;
++        const char* envCrowd = std::getenv("WIICOMPILED_GFX_CROWD");
++        const std::string crowd = envCrowd ? envCrowd : RuntimeConfigFile::CrowdLevel("full");
++        s.crowd = crowd == "off" ? Crowd::Off : crowd == "less" ? Crowd::Less : Crowd::Full;
++        const char* envFov = std::getenv("WIICOMPILED_GFX_FOV");
++        const uint32_t percent = envFov ? static_cast<uint32_t>(std::strtoul(envFov, nullptr, 10)) : RuntimeConfigFile::FieldingFov(100);
++        s.fov = percent >= 60 && percent < 100;
++        s.fovScale = s.fov ? static_cast<float>(percent) / 100.0f : 1.0f;
++        const char* envReflections = std::getenv("WIICOMPILED_GFX_REFLECTIONS");
++        const std::string reflections = envReflections ? envReflections : RuntimeConfigFile::Reflections("on");
++        s.reflections = reflections != "off";
++        return s;
++    }();
++    return settings;
++}
++
++constexpr uint32_t kSceneEnabled = 0x798, kPlacements = 0x6B4, kTable = 0x6B8, kCount = 0x600, kLevel = 0x7B8;
++constexpr uint32_t kPlacementSize = 0x54, kPlacementType = 0x52;
++constexpr uint32_t kBatShadowOn = 0x640;  // bat byte: its shadow projectors are shown (0x806E5070 sets it)
++constexpr uint32_t kPlayShotFovReturn = 0x808F1CCC;  // after `bl 0x80054BEC` in the play shot 0x808F1C5C
++
++bool HiddenType(Crowd crowd, uint32_t level, uint8_t type) {
++    if (type < 0x13 || type > 0x17) return false;
++    if (crowd == Crowd::Off) return true;
++    // Less: the stands set this attendance level shows (level 1 shows 0x14/0x16, the others 0x13/0x17).
++    return level == 1 ? (type == 0x14 || type == 0x16) : (type == 0x13 || type == 0x17);
++}
++
++void StadiumUpdateWithoutCrowd(CpuContext* ctx, Crowd crowd) {
++    const uint32_t scene = ctx->gpr[3];
++    const uint32_t table = scene != 0 && Memory::Read8(scene + kSceneEnabled) != 0 ? Memory::Read32(scene + kTable) : 0;
++    const uint32_t placements = table != 0 ? Memory::Read32(scene + kPlacements) : 0;
++    const int32_t count = placements != 0 ? static_cast<int32_t>(Memory::Read32(scene + kCount)) : 0;
++    if (count <= 0) {
++        func_80C60A94(ctx);
++        return;
++    }
++    // Stadiums have 14-22 crowd placements; beyond the buffer they simply stay as the game set them.
++    constexpr int kMax = 256;
++    uint16_t index[kMax];
++    uint8_t value[kMax];
++    int saved = 0;
++    const uint32_t level = Memory::Read32(scene + kLevel);
++    for (int32_t i = 0; i < count && saved < kMax; ++i) {
++        const uint8_t type = Memory::Read8(placements + static_cast<uint32_t>(i) * kPlacementSize + kPlacementType);
++        if (!HiddenType(crowd, level, type)) continue;
++        const uint8_t shown = Memory::Read8(table + static_cast<uint32_t>(i));
++        if (shown == 0) continue;
++        index[saved] = static_cast<uint16_t>(i);
++        value[saved] = shown;
++        ++saved;
++        Memory::Write8(table + static_cast<uint32_t>(i), 0);
++    }
++    func_80C60A94(ctx);
++    // Put the table back. Nothing the pass reaches writes it; an entry it did set is left as it is.
++    if (Memory::Read32(scene + kTable) != table) return;
++    for (int k = 0; k < saved; ++k) {
++        const uint32_t at = table + index[k];
++        if (Memory::Read8(at) == 0) Memory::Write8(at, value[k]);
++    }
++}
++
++}  // namespace mlb_gfx_options
++
++extern "C" void MLB_CharShadowMode_806DA22C(CpuContext* ctx) {
++    using namespace mlb_gfx_options;
++    const Shadows shadows = Get().shadows;
++    if (shadows != Shadows::Full) [[unlikely]] {
++        const uint32_t mode = ctx->gpr[4];
++        if (shadows == Shadows::Off) ctx->gpr[4] = 0;
++        else if (mode == 2 || mode == 3) ctx->gpr[4] = 1;
++    }
++    func_806DA22C(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x806DA22C, MLB_CharShadowMode_806DA22C, "CharShadowMode");
++
++extern "C" void MLB_BatSetVisible_806E4DBC(CpuContext* ctx) {
++    using namespace mlb_gfx_options;
++    if (Get().shadows != Shadows::Full) [[unlikely]] {
++        // Only the bat's own node calls are reached (SetVisible of its models and projectors); none writes
++        // +0x640, so it is still 0 afterwards unless the game changed it, and then it is left as it is.
++        const uint32_t bat = ctx->gpr[3];
++        const uint8_t shadowOn = Memory::Read8(bat + kBatShadowOn);
++        Memory::Write8(bat + kBatShadowOn, 0);
++        func_806E4DBC(ctx);
++        if (Memory::Read8(bat + kBatShadowOn) == 0) Memory::Write8(bat + kBatShadowOn, shadowOn);
++        return;
++    }
++    func_806E4DBC(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x806E4DBC, MLB_BatSetVisible_806E4DBC, "BatSetVisible");
++
++extern "C" void MLB_StadiumVisibility_80C60A94(CpuContext* ctx) {
++    using namespace mlb_gfx_options;
++    const Crowd crowd = Get().crowd;
++    if (crowd != Crowd::Full) [[unlikely]] {
++        StadiumUpdateWithoutCrowd(ctx, crowd);
++        return;
++    }
++    func_80C60A94(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80C60A94, MLB_StadiumVisibility_80C60A94, "StadiumVisibility");
++
++extern "C" void MLB_CameraSetFov_80054BEC(CpuContext* ctx) {
++    using namespace mlb_gfx_options;
++    const Settings& s = Get();
++    if (s.fov && ctx->lr == kPlayShotFovReturn) [[unlikely]] {
++        // A single, as the play shot's fmuls left it, scaled in single precision.
++        ctx->fpr[1].d = static_cast<double>(static_cast<float>(ctx->fpr[1].d) * s.fovScale);
++    }
++    func_80054BEC(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80054BEC, MLB_CameraSetFov_80054BEC, "CameraSetFov");
++
++extern "C" void MLB_EnvMapPassCount_8000DC70(CpuContext* ctx) {
++    if (!mlb_gfx_options::Get().reflections) [[unlikely]] {
++        ctx->gpr[3] = 1;  // the base handler's count: only the normal draw (pass 0)
++        return;
++    }
++    func_8000DC70(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8000DC70, MLB_EnvMapPassCount_8000DC70, "EnvMapPassCount");
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 64624a2..5b8486d 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -839,8 +839,70 @@ Result Run(int argc, char** argv) {
+                      "for a second position (two-way player)."),
+                   YesNo(), RuntimeConfigFile::TwoWayPlayer(false) ? 1 : 0};
+     twoWay.experimental = true;
++    // Lighter graphics (hle/mlb/gfx_options.cpp): for weaker machines and the Switch, where batting with
++    // runners on and fouls or flies behind the catcher (the camera facing the stands) cost the most.
++    constexpr std::array<const char*, 3> kShadowModes{"full", "simple", "off"};
++    constexpr std::array<const char*, 3> kCrowdLevels{"full", "less", "off"};
++    constexpr std::array<uint32_t, 5> kFieldingFovs{100, 90, 80, 70, 60};
++    Option shadows{Tr("SOMBRAS DE JUGADORES", "PLAYER SHADOWS"),
++                   Tr("La sombra que cada jugador proyecta en el campo. Completas es la del juego; Simples deja "
++                      "solo una mancha redonda bajo cada jugador; Sin sombras las quita. Aligera las escenas con "
++                      "muchos jugadores a la vista (batear con corredores en base) en equipos modestos y en Switch. "
++                      "Solo cambia cómo se ve el partido, nunca cómo se juega.",
++                      "The shadow each player casts on the field. Full is the game's; Simple leaves only a round "
++                      "patch under each player; Off removes them. It lightens scenes with many players in view "
++                      "(batting with runners on base) on modest computers and on the Switch. It only changes how "
++                      "the game looks, never how it plays."),
++                   {Tr("Completas (original)", "Full (original)"), Tr("Simples", "Simple"), Tr("Sin sombras", "Off")}};
++    for (size_t i = 0; i < kShadowModes.size(); ++i) {
++        if (RuntimeConfigFile::PlayerShadows("full") == kShadowModes[i]) shadows.value = static_cast<int>(i);
++    }
++    shadows.experimental = true;
++    Option crowd{Tr("PÚBLICO", "CROWD"),
++                 Tr("El público de las gradas. Menos deja la mitad de la gente que el juego pone en las gradas; Sin "
++                    "público las deja vacías. Aligera las jugadas en las que la cámara mira a las gradas (faltas y "
++                    "elevados detrás del receptor). Solo cambia cómo se ve el partido, nunca cómo se juega.",
++                    "The crowd in the stands. Less keeps half of the people the game puts in the stands; Off leaves "
++                    "them empty. It lightens the plays where the camera faces the stands (fouls and flies behind "
++                    "the catcher). It only changes how the game looks, never how it plays."),
++                 {Tr("Completo (original)", "Full (original)"), Tr("Menos", "Less"), Tr("Sin público", "Off")}};
++    for (size_t i = 0; i < kCrowdLevels.size(); ++i) {
++        if (RuntimeConfigFile::CrowdLevel("full") == kCrowdLevels[i]) crowd.value = static_cast<int>(i);
++    }
++    crowd.experimental = true;
++    Option playFov{Tr("CÁMARA DE JUGADA", "PLAY CAMERA"),
++                   Tr("Ángulo de visión de la cámara que sigue la bola tras el batazo. 100 % es el del juego; con "
++                      "menos la cámara se cierra y deja fuera parte del estadio, lo que aligera esas jugadas. Con "
++                      "valores bajos, al fildear a mano la bola o el jugador pueden quedar cerca del borde o fuera "
++                      "de la imagen.",
++                      "Field of view of the camera that follows the ball after it is hit. 100% is the game's; with "
++                      "less the camera closes in and leaves part of the stadium out, which lightens those plays. "
++                      "At low values, when fielding by hand the ball or the fielder can end up near the edge or "
++                      "out of the picture."),
++                   {"100% (original)", "90%", "80%", "70%", "60%"}};
++    for (size_t i = 0; i < kFieldingFovs.size(); ++i) {
++        // The closest choice to the saved percent (Config.toml takes any value from 60 to 100).
++        const auto distance = [&](size_t k) { return std::abs(static_cast<int>(kFieldingFovs[k]) - static_cast<int>(RuntimeConfigFile::FieldingFov(100))); };
++        if (distance(i) < distance(static_cast<size_t>(playFov.value))) playFov.value = static_cast<int>(i);
++    }
++    playFov.experimental = true;
++    constexpr std::array<const char*, 2> kReflectionModes{"on", "off"};
++    Option reflections{Tr("REFLEJOS", "REFLECTIONS"),
++                       Tr("El brillo que el juego pinta sobre los cascos y el bate con un segundo dibujo de cada "
++                          "uno. Completos es el del juego; Sin reflejos los dibuja una sola vez, sin ese brillo, lo "
++                          "que aligera las escenas con muchos jugadores a la vista en equipos modestos y en Switch. "
++                          "Solo cambia cómo se ve el partido, nunca cómo se juega.",
++                          "The shine the game paints on helmets and the bat with a second draw of each. Full is the "
++                          "game's; Off draws them once, without that shine, which lightens scenes with many players "
++                          "in view on modest computers and on the Switch. It only changes how the game looks, never "
++                          "how it plays."),
++                       {Tr("Completos (original)", "Full (original)"), Tr("Sin reflejos", "Off")}};
++    for (size_t i = 0; i < kReflectionModes.size(); ++i) {
++        if (RuntimeConfigFile::Reflections("on") == kReflectionModes[i]) reflections.value = static_cast<int>(i);
++    }
++    reflections.experimental = true;
+     std::vector<Tab> tabs{
+-        {"VIDEO", {api, quality, display, resolution, fsr, filtering, mipmaps, msaa, aspect, fill, interpolation, fps}},
++        {"VIDEO", {api, quality, display, resolution, fsr, filtering, mipmaps, msaa, aspect, fill, interpolation, fps, shadows, crowd, playFov, reflections}},
+         {"AUDIO", {volume, mute}},
+         {Tr("CONTROLES", "CONTROLS"), {wiimote}},
+         {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
+@@ -958,6 +1020,10 @@ Result Run(int argc, char** argv) {
+         if (label == universalDh.label) RuntimeConfigFile::SetUniversalDh(o.value != 0);
+         if (label == modernLeagues.label) RuntimeConfigFile::SetModernLeagues(o.value != 0);
+         if (label == twoWay.label) RuntimeConfigFile::SetTwoWayPlayer(o.value != 0);
++        if (label == shadows.label) RuntimeConfigFile::SetPlayerShadows(kShadowModes[static_cast<size_t>(o.value)]);
++        if (label == crowd.label) RuntimeConfigFile::SetCrowdLevel(kCrowdLevels[static_cast<size_t>(o.value)]);
++        if (label == playFov.label) RuntimeConfigFile::SetFieldingFov(kFieldingFovs[static_cast<size_t>(o.value)]);
++        if (label == reflections.label) RuntimeConfigFile::SetReflections(kReflectionModes[static_cast<size_t>(o.value)]);
+         if (label == language.label) {
+             const char* code = kLanguageCodes[static_cast<size_t>(o.value)];
+             RuntimeConfigFile::SetUiLanguage(code);
+diff --git a/runtime/tests/runtime_config_tests.cpp b/runtime/tests/runtime_config_tests.cpp
+index 749652e..b4b96c7 100644
+--- a/runtime/tests/runtime_config_tests.cpp
++++ b/runtime/tests/runtime_config_tests.cpp
+@@ -42,6 +42,32 @@ int main() {
+         std::istringstream input("[season]\nmax_seasons = 15\n");
+         if (!Require(!RuntimeConfigFile::ParseConfig(input, "seasons.toml").maxSeasons, "15 seasons accepted")) return 1;
+     }
++    {
++        // Lighter graphics: [video] shadows / crowd take their named levels, fielding_fov 60-100; anything else
++        // is ignored (the game then runs as on the Wii).
++        std::istringstream input("[video]\nshadows = \"simple\"\ncrowd = \"off\"\nfielding_fov = 75\n");
++        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "gfx.toml");
++        if (!Require(config.playerShadows == std::optional<std::string>{"simple"}, "shadows level not loaded")) return 1;
++        if (!Require(config.crowdLevel == std::optional<std::string>{"off"}, "crowd level not loaded")) return 1;
++        if (!Require(config.fieldingFov == std::optional<uint32_t>{75}, "fielding_fov not loaded")) return 1;
++        std::istringstream bad("[video]\nshadows = \"none\"\ncrowd = true\nfielding_fov = 50\n");
++        const RuntimeUserConfig rejected = RuntimeConfigFile::ParseConfig(bad, "gfx.toml");
++        if (!Require(!rejected.playerShadows && !rejected.crowdLevel && !rejected.fieldingFov,
++                     "an invalid lighter-graphics setting was accepted")) return 1;
++        std::istringstream wide("[video]\nfielding_fov = 120\n");
++        if (!Require(!RuntimeConfigFile::ParseConfig(wide, "gfx.toml").fieldingFov, "fielding_fov 120 accepted")) return 1;
++        // [video] reflections: "on" (the game's) or "off"; anything else is ignored.
++        std::istringstream off("[video]\nreflections = \"off\"\n");
++        if (!Require(RuntimeConfigFile::ParseConfig(off, "gfx.toml").reflections == std::optional<std::string>{"off"},
++                     "reflections off not loaded")) return 1;
++        std::istringstream on("[video]\nreflections = \"on\"\n");
++        if (!Require(RuntimeConfigFile::ParseConfig(on, "gfx.toml").reflections == std::optional<std::string>{"on"},
++                     "reflections on not loaded")) return 1;
++        std::istringstream badReflections("[video]\nreflections = false\n");
++        if (!Require(!RuntimeConfigFile::ParseConfig(badReflections, "gfx.toml").reflections, "reflections = false accepted")) return 1;
++        std::istringstream partial("[video]\nreflections = \"some\"\n");
++        if (!Require(!RuntimeConfigFile::ParseConfig(partial, "gfx.toml").reflections, "reflections = some accepted")) return 1;
++    }
+     {
+         // The match benchmark and the stadium viewer must leave the player's Config.toml alone.
+         _putenv("WIICOMPILED_MATCH_BENCH=");

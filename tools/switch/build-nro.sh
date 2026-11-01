@@ -149,7 +149,8 @@ if [[ ! -f $src/runtime/include/game_natives_rebound.h ]]; then
 import re, sys
 text = open(sys.argv[1], encoding='utf-8-sig').read()
 block = re.search(r"foreach \(\$patch in (.*?)\)\s*\{", text, re.S).group(1)
-print('\n'.join(re.findall(r"'([\w-]+)'", block)))
+# Desktop ports duplicate implementations in the Switch patches applied below.
+print('\n'.join(p for p in re.findall(r"'([\w-]+)'", block) if not p.startswith('wiicompiled-pc-')))
 EOF
 )
     (( ${#patches[@]} > 0 )) || fail "could not read the patch list from tools/wiicompiled-translate.ps1"

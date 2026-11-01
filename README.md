@@ -91,7 +91,7 @@ Every change to the runtime is a **reproducible patch** on Wiicompiled's pinned 
 ## Features
 
 **Own launcher** (before each session, controller-friendly)
-- Video: graphics API, window or fullscreen, internal resolution, AMD FSR 1, anisotropic filtering, force 16:9, fill screen, frame interpolation, quality presets.
+- Video: graphics API, window or fullscreen, internal resolution, AMD FSR 1, anisotropic filtering, force 16:9, fill screen, frame interpolation, quality presets, lighter graphics for modest computers (player shadows, crowd, helmet and bat reflections, play-camera field of view; all as the original by default).
 - Audio, Dolphin-style controls (stick gates, dead zone, stick test) and interface options.
 - Mods: one switch per folder.
 - Tools: opens the roster editor, Texture Studio and the Season Editor.

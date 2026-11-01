@@ -1,0 +1,93 @@
+diff --git a/runtime/src/hle/gx/gx_dl.cpp b/runtime/src/hle/gx/gx_dl.cpp
+index 818478d..bc94a51 100644
+--- a/runtime/src/hle/gx/gx_dl.cpp
++++ b/runtime/src/hle/gx/gx_dl.cpp
+@@ -1206,6 +1206,21 @@ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
+     SyncAppliedVtxStateFromHleReal();
+ }
+ 
++static const uint8_t* ResolveDisplayListArray(uint32_t base, uint32_t span) {
++#if !defined(__APPLE__)
++    // macOS must retain GuestToHostPtr's canonical resource identity.
++    if (base && span) {
++        const uint32_t end = base + span - 1u;
++        if (end >= base && (end >> MemoryInline::kPageShift) == (base >> MemoryInline::kPageShift)) {
++            const uintptr_t bias = MemoryInline::g_fullWritablePageBias[base >> MemoryInline::kPageShift];
++            if (bias) return reinterpret_cast<const uint8_t*>((bias - 1u) + base);
++        }
++    }
++#endif
++    if (!Memory::Contains(base, span)) return nullptr;
++    return static_cast<const uint8_t*>(GuestToHostPtr(base, span));
++}
++
+ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX_ATTR>& maxIdx,
+                                             const std::array<bool, GX_VA_MAX_ATTR>& sawIdx,
+                                             GXVtxFmt vtxfmt,
+@@ -1231,11 +1246,7 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
+         }
+         const uint32_t span = (count > 0) ? (static_cast<uint32_t>((count - 1u) * arr.stride) + elemSize) : 0u;
+         const bool needsPack = arr.stride > 0xffu;
+-        if (!Memory::Contains(arr.base, span)) {
+-            ok = false;
+-            continue;
+-        }
+-        const uint8_t* hostPtr = static_cast<const uint8_t*>(GuestToHostPtr(arr.base, span));
++        const uint8_t* hostPtr = ResolveDisplayListArray(arr.base, span);
+         if (!hostPtr) {
+             ok = false;
+             continue;
+@@ -1272,11 +1283,7 @@ static bool ApplyAuroraIndexedXFArraysForDisplayList(const std::array<uint32_t,
+             continue;
+         }
+         const uint32_t span = maxXfIdx[attr] * arr.stride + bytes;
+-        if (!Memory::Contains(arr.base, span)) {
+-            ok = false;
+-            continue;
+-        }
+-        const uint8_t* hostPtr = static_cast<const uint8_t*>(GuestToHostPtr(arr.base, span));
++        const uint8_t* hostPtr = ResolveDisplayListArray(arr.base, span);
+         if (!hostPtr) {
+             ok = false;
+             continue;
+diff --git a/runtime/src/hle/gx/gx_fifo.cpp b/runtime/src/hle/gx/gx_fifo.cpp
+index a77e96e..058cccb 100644
+--- a/runtime/src/hle/gx/gx_fifo.cpp
++++ b/runtime/src/hle/gx/gx_fifo.cpp
+@@ -345,7 +345,22 @@ void SubmitAttribute(GXAttr attr, float* comps, const VtxAttrFmt& fmt, const u32
+ 
+ // `val` is a raw big-endian bit pattern: the FIFO stream is type-agnostic, and
+ // the float entry point converts before it gets here.
+-void HleFifoWrite(u32 val, uint32_t sizeBytes) {
++// Intermediate XF words cannot dispatch until the full packet has arrived.
++static inline bool TryIncompleteXfFifoWord(u32 value) {
++    auto& g = g_hleGxState;
++    if (g.inBegin || g.fifoByteCount < 5u || g.fifoReadOffset > g.fifoBytes.size() ||
++        g.fifoByteCount > g.fifoBytes.size() - g.fifoReadOffset ||
++        g.fifoBytes.size() - g.fifoReadOffset - g.fifoByteCount < 4u) return false;
++    uint8_t* data = g.fifoBytes.data() + g.fifoReadOffset;
++    if ((data[0] & GX_OPCODE_MASK_CMD) != GX_LOAD_XF_REG_CMD) return false;
++    const uint32_t packetBytes = 5u + (static_cast<uint32_t>(ReadBE16(data + 1)) + 1u) * 4u;
++    if (g.fifoByteCount + 4u >= packetBytes) return false;
++    BigEndian::Write32(data + g.fifoByteCount, value);
++    g.fifoByteCount += 4u;
++    return true;
++}
++
++static __attribute__((noinline)) void HleFifoWriteGeneral(u32 val, uint32_t sizeBytes) {
+     const bool recordOnly = IsDisplayListActive();
+     if (recordOnly) {
+         WriteDisplayListData(val, sizeBytes);
+@@ -654,6 +669,12 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
+     }
+ }
+ 
++void HleFifoWrite(u32 val, uint32_t sizeBytes) {
++    if ((sizeBytes == 0 || sizeBytes == 4) && !IsDisplayListActive() &&
++        TryIncompleteXfFifoWord(val)) return;
++    HleFifoWriteGeneral(val, sizeBytes);
++}
++
+ // Must behave exactly like GX_HLE_FIFO_Write32/16/8 run byte by byte. The ring is not
+ // bulk-appended ahead of a single parse because the parser can re-enter GX HLE (nested display
+ // lists, XF/draw calls), which would misorder that work relative to the stream.

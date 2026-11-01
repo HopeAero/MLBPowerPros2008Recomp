@@ -91,7 +91,7 @@ Todos los cambios al runtime son **parches reproducibles** sobre el commit fijad
 ## Funciones
 
 **Launcher propio** (antes de cada partida, también con mando)
-- Vídeo: API gráfica, ventana o pantalla completa, resolución interna, AMD FSR 1, filtro anisotrópico, forzar 16:9, llenar pantalla, interpolación, ajustes de calidad.
+- Vídeo: API gráfica, ventana o pantalla completa, resolución interna, AMD FSR 1, filtro anisotrópico, forzar 16:9, llenar pantalla, interpolación, ajustes de calidad, gráficos más ligeros para equipos modestos (sombras de jugadores, público, reflejos de cascos y bate, ángulo de la cámara de jugada; todo como el original por defecto).
 - Audio, controles al estilo de Dolphin (puertas de los sticks, zona muerta, prueba de sticks) y opciones de interfaz.
 - Mods: se activan o desactivan con un interruptor por carpeta.
 - Herramientas: abre el editor de rosters y el Texture Studio.
