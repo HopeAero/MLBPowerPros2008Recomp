@@ -410,7 +410,19 @@ Investigado el 31 de octubre de 2026 para poder añadir nombres nuevos (desensam
 | 15 | comentarista principal | el apellido emocionado, subiendo el tono ("¡Jeter!") |
 | 17 | comentarista de fondo | el nombre completo ("Derek Jeter") |
 - Huecos libres: los locales `0xE3D`-`0xE41` de los bancos 15 y 17 están dentro del rango del código pero no tienen frase real. Para más de 5 nombres nuevos hay que ampliar los rangos de `0x8003B398`/`0x8003B530`: entre `0x13E42` y `0x14FFF` ningún banco responde.
-- El código que convierte `VoiceId` en id de frase no está localizado: no aparece como constante (`0x12800 + VoiceId`, etc.) en el DOL ni en el REL.
+- **Implementado** (parche `wiicompiled-callnames`, `docs/mods.md`): `VoiceId` 7223-10239 de los mods, con nativos de los rangos, de los cuatro conversores y de los lectores de la lista del editor, comparados con el original (ejecutado en un intérprete PowerPC) para todas las entradas.
+- **De `VoiceId` a id de frase** (localizado el 31 de octubre de 2026 con una traza de la pila del guest en el nativo de `0x8003B398`): el objeto del jugador en el partido guarda su **clave** = `0x8000 + VoiceId` en `+0xA4` (`0x8058256C`), y el comentario la pasa por cuatro conversores con rangos escritos en el código:
+
+| Función | Qué devuelve | Para |
+|---|---|---|
+| `0x80659DE8` | clave + `0x8800` (banco 14, apellido normal); un id del banco 7 + `0x8800` (banco 15); 0 para `0x963F-0x9A31`; cualquier otro, sin cambiar | locutor principal |
+| `0x80659C98` | x + `0x2000`: de clave a id del banco 7 (todo relleno), y de id del banco 14 a id del banco 15 (apellido emocionado); 0 fuera de rango | principal, emocionado |
+| `0x80659F70` | clave + `0xD800` (banco 17, nombre completo); 0 fuera de rango | comentarista de fondo (`0x807A9390`: `0x807A9AFC` → `0x80659F70`) |
+| `0x8065A14C(clave, otro)` | solo lista B: `0x80659DE8(clave) + 0xE3E` (la **cuarta grabación**, banco 14 locales `0xE41-0x1433`; Jeter, 743 ms) u, con `otro`, clave + `0x1231` (banco 6, relleno) | variante |
+
+  - Rangos de clave aceptados: `0x8803-0x8DF5`, `0x8DF8-0x8E3D`, `0x8E40-0x91BB`, `0x91BE-0x963C`, `0x963F-0x9A31`, y los mismos + `0x8800`. Una clave fuera de ellos no tiene nombre: el comentario se lo salta.
+  - El emocionado se pide como `0x80659C98(0x80659DE8(clave))` (`0x806F91E8`). El comentario guarda ids de 16 bits y suma `0x10000` al reproducir (`0x119C` → `0x1119C`).
+  - Por eso un `VoiceId` nuevo necesita nativos de estas cuatro funciones, y no solo bancos más grandes.
 
 **Lista de nombres del editor (`env_voice_data.pack`, archivo 3081 de `project.bin`):**
 
@@ -443,7 +455,7 @@ Investigado el 31 de octubre de 2026 para poder añadir nombres nuevos (desensam
 - `0x8029C1A0 + banco × 12` = {puntero al índice, número de frases, sector del índice}. Los índices están en el montón de MEM2, seguidos (banco 0 en `0x97D84500` … banco 17 en `0x97DB5500`), cada uno de los bytes del índice redondeados a `0x1000`. El montón de MEM2 tiene unos 125 MB (parche `wiicompiled-mlb-mem2-heap`), así que un índice más grande cabe.
 - `0x8029C2D8 + banco × 0x80`: la primera palabra es `0x80000000` y las 31 siguientes, `0xFFFFFFFF`, sin umbrales: con sectores por debajo de `0x10000`, `k` = 0.
 
-Fuentes: desensamblado (`0x80025708`, `0x80032C74`-`0x80032F28`, `0x8065A0D4`, `0x807EDF4C`-`0x807EE354`, `0x8003A648`, `0x8003ACF0`, `0x8003AEB8`, `0x8003B220`, `0x8003B398`, `0x8003B530`); lecturas de `voiceN.bin` de un partido de prueba; roster de `game_data.pack`.
+Fuentes: desensamblado (`0x80025708`, `0x80032C74`-`0x80032F28`, `0x80659C98`-`0x8065A1C0`, `0x807A9390`, `0x8065A0D4`, `0x807EDF4C`-`0x807EE354`, `0x8003A648`, `0x8003ACF0`, `0x8003AEB8`, `0x8003B220`, `0x8003B398`, `0x8003B530`); lecturas de `voiceN.bin` de un partido de prueba; roster de `game_data.pack`.
 
 ## 5. Disco y `project.bin`
 

@@ -409,7 +409,19 @@ Researched on October 31, 2026 to make adding new names possible (disassembly an
 | 15 | main commentator | the surname, excited, pitch rising ("Jeter!") |
 | 17 | colour commentator | the full name ("Derek Jeter") |
 - Free slots: locals `0xE3D`-`0xE41` of banks 15 and 17 are inside the code's range but hold no real phrase. More than 5 new names needs wider ranges in `0x8003B398`/`0x8003B530`: no bank answers between `0x13E42` and `0x14FFF`.
-- The code that turns `VoiceId` into a phrase id is not located: it does not appear as a constant (`0x12800 + VoiceId`, etc.) in the DOL or the REL.
+- **Implemented** (patch `wiicompiled-callnames`, `docs/en/mods.md`): mods' `VoiceId`s 7223-10239, with natives for the ranges, the four converters and the editor list readers, compared with the original (run in a PowerPC interpreter) for every input.
+- **From `VoiceId` to phrase id** (found on October 31, 2026 with a guest stack trace in the `0x8003B398` native): the player's match object keeps his **key** = `0x8000 + VoiceId` at `+0xA4` (`0x8058256C`), and the commentary runs it through four converters with hard-coded ranges:
+
+| Function | Returns | For |
+|---|---|---|
+| `0x80659DE8` | key + `0x8800` (bank 14, normal surname); a bank-7 id + `0x8800` (bank 15); 0 for `0x963F-0x9A31`; anything else unchanged | main commentator |
+| `0x80659C98` | x + `0x2000`: key to bank-7 id (all filler), and bank-14 id to bank-15 id (excited surname); 0 out of range | main, excited |
+| `0x80659F70` | key + `0xD800` (bank 17, full name); 0 out of range | colour commentator (`0x807A9390`: `0x807A9AFC` → `0x80659F70`) |
+| `0x8065A14C(key, other)` | list B only: `0x80659DE8(key) + 0xE3E` (the **fourth recording**, bank 14 locals `0xE41-0x1433`; Jeter, 743 ms) or, with `other`, key + `0x1231` (bank 6, filler) | variant |
+
+  - Accepted key ranges: `0x8803-0x8DF5`, `0x8DF8-0x8E3D`, `0x8E40-0x91BB`, `0x91BE-0x963C`, `0x963F-0x9A31`, and the same + `0x8800`. A key outside them has no name: the commentary skips it.
+  - The excited form is asked as `0x80659C98(0x80659DE8(key))` (`0x806F91E8`). The commentary keeps 16-bit ids and adds `0x10000` when playing (`0x119C` → `0x1119C`).
+  - So a new `VoiceId` needs natives for these four functions, not just larger banks.
 
 **Editor name list (`env_voice_data.pack`, file 3081 of `project.bin`):**
 
@@ -442,7 +454,7 @@ Researched on October 31, 2026 to make adding new names possible (disassembly an
 - `0x8029C1A0 + bank × 12` = {pointer to the index, phrase count, index sector}. The indexes live in the MEM2 heap, back to back (bank 0 at `0x97D84500` … bank 17 at `0x97DB5500`), each the index bytes rounded to `0x1000`. The MEM2 heap has about 125 MB (patch `wiicompiled-mlb-mem2-heap`), so a larger index fits.
 - `0x8029C2D8 + bank × 0x80`: the first word is `0x80000000` and the next 31 are `0xFFFFFFFF`, with no thresholds: with sectors below `0x10000`, `k` = 0.
 
-Sources: disassembly (`0x80025708`, `0x80032C74`-`0x80032F28`, `0x8065A0D4`, `0x807EDF4C`-`0x807EE354`, `0x8003A648`, `0x8003ACF0`, `0x8003AEB8`, `0x8003B220`, `0x8003B398`, `0x8003B530`); `voiceN.bin` reads of a test match; `game_data.pack` roster.
+Sources: disassembly (`0x80025708`, `0x80032C74`-`0x80032F28`, `0x80659C98`-`0x8065A1C0`, `0x807A9390`, `0x8065A0D4`, `0x807EDF4C`-`0x807EE354`, `0x8003A648`, `0x8003ACF0`, `0x8003AEB8`, `0x8003B220`, `0x8003B398`, `0x8003B530`); `voiceN.bin` reads of a test match; `game_data.pack` roster.
 
 ## 5. Disc and `project.bin`
 
