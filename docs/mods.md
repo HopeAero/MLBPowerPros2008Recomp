@@ -20,7 +20,7 @@ mods\
     project\       paquetes de project.bin (.pack/.dat/.arc) con su nombre
     roster\        un roster de PowerUp / PowerUp+ (.dat)
     schedule\      calendarios del modo Temporada (<año>.csv)
-    callnames\     nombres nuevos para los comentaristas (callnames.toml + WAV)
+    callnames\     nombres nuevos para los comentaristas (callnames.toml + WAV o MP3)
 ```
 
 `mod.toml` es opcional; sin él se usa el nombre de la carpeta:
@@ -82,9 +82,10 @@ excited = "acuna_hype.wav"   # apellido emocionado (opcional: si falta, se usa n
 full = "acuna_full.wav"      # nombre completo (opcional: si falta, se usa normal)
 ```
 
-- **WAV:** PCM de 16 bits, mono o estéreo, a cualquier frecuencia, de hasta 5 segundos. El juego los pasa a su formato al arrancar, iguala el volumen al de los nombres del juego y lo guarda en `UserData\Cache\mods\callnames`: el primer arranque con un nombre nuevo tarda un poco más.
+- **WAV o MP3:** WAV PCM de 16 bits o MP3, mono o estéreo, de 8.000 a 192.000 Hz y hasta 5 segundos por variante. Se pueden mezclar extensiones en `normal`, `excited` y `full` (por ejemplo, `full = "acuna_full.mp3"`). El juego los pasa a su formato al arrancar, iguala el volumen al de los nombres del juego y lo guarda en `UserData\Cache\mods\callnames`: el primer arranque con un nombre nuevo tarda un poco más.
 - **Texto:** el juego no tiene tildes ni Ñ: «Acuña» se ve «Acuna». Lo que no puede mostrar se quita y el registro (`console.log`) lo dice. En la búsqueda por nombre (Search Type) sale en mayúsculas, sin espacios.
 - **Asignarlo a un jugador:** en el juego, Arrange › un equipo › VOICE SETUP › el jugador › Select Type › la inicial. En PowerUp+ (MODS › EDITAR ROSTER), en el selector de voz sale como «Callname» y el texto de `list`; al exportar el roster, el jugador lleva el número de voz del callname.
+- Las voces se conservan como ids directos de 14 bits (por ejemplo, 7300) al guardar desde PowerUp+. Si un audio falla o no cabe en el banco 14, el nombre no se añade al editor del juego. Un reemplazo completo de un banco por `disc/` o Riivolution desactiva su extensión de callnames.
 - **Un roster que use un callname necesita el mod de callnames activo.** Sin él, ese jugador queda sin nombre (silencio), como con una voz vacía.
 - Si dos mods activos usan el mismo número de voz, gana el primero en orden alfabético y el registro lo dice.
 - Vale en todos los modos que usan comentario, MLB Life incluido.

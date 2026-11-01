@@ -363,6 +363,7 @@ Researched on October 31, 2026 to make adding new names possible (disassembly an
 | Sectors 1… | phrases: each is 1 header sector (format in [Commentator streams](#commentator-streams)) and its ADPCM data, padded to the next sector |
 | Index sector | `u16 sector[phrases]` followed by `u16 duration_ms[phrases]` (the same duration as `+0x10` of the phrase header) |
 
+- The virtual index is zero-padded to a full `0x800` sector before the original tail: the game rounds index reads to whole sectors. A new phrase header stores `+0x88 = 2 × ADPCM_bytes − 1` (end address, rather than nibble count).
 - The game reads sector 0 and the index of all 18 banks at boot (seen in the disc reads); during a match it only reads each phrase's header + data.
 - Empty phrases point to a 3-sample (9 ms) filler phrase. The first 3 of every bank are filler.
 - Phrase header, more detail: the high byte of `+0x04` is `0xB4`, `0xC8`, `0x96` or `0xD2` depending on the bank, and the low 16 bits are the rate (22,050 Hz, or 10,000/44,100 for filler). That high byte looks like the volume, unconfirmed. `+0x8C` is the start address (2), `+0x90` the 16 DSP-ADPCM coefficients, `+0xB0` gain, `+0xB2` initial scale, then the history samples.
@@ -409,6 +410,7 @@ Researched on October 31, 2026 to make adding new names possible (disassembly an
 | 15 | main commentator | the surname, excited, pitch rising ("Jeter!") |
 | 17 | colour commentator | the full name ("Derek Jeter") |
 - Free slots: locals `0xE3D`-`0xE41` of banks 15 and 17 are inside the code's range but hold no real phrase. More than 5 new names needs wider ranges in `0x8003B398`/`0x8003B530`: no bank answers between `0x13E42` and `0x14FFF`.
+- Converters accept callname keys only when the local is within the grown index of the destination bank; without an extension they retain the original result. PCM16 WAV and MP3 (dr_mp3 0.7.4, MIT-0/public domain) share mono mixing, resampling to 22,050 Hz and the early 5 s limit.
 - **Implemented** (patch `wiicompiled-callnames`, `docs/en/mods.md`): mods' `VoiceId`s 7223-10239, with natives for the ranges, the four converters and the editor list readers, compared with the original (run in a PowerPC interpreter) for every input.
 - **From `VoiceId` to phrase id** (found on October 31, 2026 with a guest stack trace in the `0x8003B398` native): the player's match object keeps his **key** = `0x8000 + VoiceId` at `+0xA4` (`0x8058256C`), and the commentary runs it through four converters with hard-coded ranges:
 

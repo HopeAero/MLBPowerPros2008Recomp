@@ -4,6 +4,14 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
 
 ## Callnames nuevos (rama `callnames`, 31 de octubre de 2026)
 
+### Revisión de callnames y MP3 (brief local/analysis/callnames-fix)
+
+- Corregidos padding sectorial del índice (5176 frases incluido), dirección final ADPCM, validación de audio antes de reservar, listas solo para audio montado, publicación de offsets solo tras fusionar PROJECT.BIN y conflictos con bancos disc/Riivolution.
+- WAV PCM16 y MP3 (dr_mp3 0.7.4, MIT-0/dominio público), mono/estéreo de 8–192 kHz, máximo 5 s; caché por contenido versión 2. PowerUp+ deduplica ids/nombres, lee manifests de un nivel, tolera comentarios/tablas y conserva ids 7223–10239 en 14 bits.
+- Validado: juego PC compilado; 12/12 CTest callnames, 34/34 PowerUp+ filtradas y pruebas Python. Tres sondas de 90 s: 7300 y 7223/MP3 leen la extensión del banco 17; sin mods todas las cabeceras pertenecen al índice original.
+- Ambos parches regenerados y aplicados en limpio (18 archivos runtime, 40 PowerUp+), comparación ignorando CR correcta; control de datos del juego correcto. Cambios sin commit/push en este worktree. Evidencia privada: `local/analysis/callnames-fix/report.md`.
+- Pendientes: GUI/escucha, MLB Life y Switch; diferencias de selección/orden de mods de PowerUp+ y conflictos por mayúsculas en sistemas sensibles a mayúsculas. Hallazgos 9/10/14 no descritos en el brief.
+
 Mods con nombres de jugador nuevos: diseño `docs/superpowers/specs/2026-10-31-callnames-design.md`, plan `docs/superpowers/plans/2026-10-31-callnames.md`, guía `docs/mods.md` («Callnames»), RE en `docs/ingenieria-inversa.md` («Bancos de voz y nombres de jugador»).
 
 - **PC, hecho y probado:** parche `wiicompiled-callnames` (último de la lista de `wiicompiled-translate.ps1`). Con el mod de prueba local `local/tmp/callnames/mod-acuna` (audio Piper `es_MX-ald-medium`, Unlicense; Jeter con `VoiceId` 7300):

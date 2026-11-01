@@ -364,6 +364,7 @@ Investigado el 31 de octubre de 2026 para poder añadir nombres nuevos (desensam
 | Sectores 1… | frases: cada una es 1 sector de cabecera (formato en [Streams del comentarista](#streams-del-comentarista)) y sus datos ADPCM, rellenos hasta el siguiente sector |
 | Sector del índice | `u16 sector[frases]` y después `u16 duración_ms[frases]` (la misma duración que `+0x10` de la cabecera de frase) |
 
+- El índice virtual se rellena con ceros hasta el siguiente sector de `0x800` antes de copiar la cola original: el juego redondea sus lecturas del índice a sectores completos. La cabecera de frase nueva lleva `+0x88 = 2 × bytes_ADPCM − 1` (dirección final, no cantidad de nibbles).
 - El juego lee el sector 0 y el índice de los 18 bancos al arrancar (visto en las lecturas de disco); durante el partido solo lee cabecera + datos de cada frase.
 - Las frases vacías apuntan a una frase de relleno de 3 muestras (9 ms). Las primeras 3 de cada banco son de relleno.
 - Cabecera de frase, más detalle: `+0x04` lleva en el byte alto `0xB4`, `0xC8`, `0x96` o `0xD2` según el banco y en los 16 bits bajos la frecuencia (22.050 Hz, o 10.000/44.100 en el relleno). Ese byte alto parece el volumen, sin confirmar. `+0x8C` es la dirección inicial (2), `+0x90` los 16 coeficientes DSP-ADPCM, `+0xB0` ganancia, `+0xB2` escala inicial, y siguen los históricos.
@@ -410,6 +411,7 @@ Investigado el 31 de octubre de 2026 para poder añadir nombres nuevos (desensam
 | 15 | comentarista principal | el apellido emocionado, subiendo el tono ("¡Jeter!") |
 | 17 | comentarista de fondo | el nombre completo ("Derek Jeter") |
 - Huecos libres: los locales `0xE3D`-`0xE41` de los bancos 15 y 17 están dentro del rango del código pero no tienen frase real. Para más de 5 nombres nuevos hay que ampliar los rangos de `0x8003B398`/`0x8003B530`: entre `0x13E42` y `0x14FFF` ningún banco responde.
+- Los conversores aceptan claves de callnames solo si el local está dentro del índice ampliado del banco destino; sin extensión conservan el resultado original. WAV PCM16 y MP3 (dr_mp3 0.7.4, licencia MIT-0/dominio público) comparten mezcla a mono, remuestreo a 22.050 Hz y límite previo de 5 s.
 - **Implementado** (parche `wiicompiled-callnames`, `docs/mods.md`): `VoiceId` 7223-10239 de los mods, con nativos de los rangos, de los cuatro conversores y de los lectores de la lista del editor, comparados con el original (ejecutado en un intérprete PowerPC) para todas las entradas.
 - **De `VoiceId` a id de frase** (localizado el 31 de octubre de 2026 con una traza de la pila del guest en el nativo de `0x8003B398`): el objeto del jugador en el partido guarda su **clave** = `0x8000 + VoiceId` en `+0xA4` (`0x8058256C`), y el comentario la pasa por cuatro conversores con rangos escritos en el código:
 

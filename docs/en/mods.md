@@ -20,7 +20,7 @@ mods\
     project\       project.bin packages (.pack/.dat/.arc) with their names
     roster\        a PowerUp / PowerUp+ roster (.dat)
     schedule\      Season mode schedules (<year>.csv)
-    callnames\     new names for the commentators (callnames.toml + WAVs)
+    callnames\     new names for the commentators (callnames.toml + WAV or MP3)
 ```
 
 `mod.toml` is optional; without it, the folder name is used:
@@ -82,9 +82,10 @@ excited = "acuna_hype.wav"   # excited surname (optional: normal is used when mi
 full = "acuna_full.wav"      # full name (optional: normal is used when missing)
 ```
 
-- **WAV:** 16-bit PCM, mono or stereo, any rate, up to 5 seconds. The game converts them to its format at startup, matches the loudness of the game's names and keeps the result in `UserData\Cache\mods\callnames`: the first start with a new name takes a little longer.
+- **WAV or MP3:** 16-bit PCM WAV or MP3, mono or stereo, 8,000–192,000 Hz and up to 5 seconds per variant. The `normal`, `excited` and `full` fields may mix extensions (for example, `full = "acuna_full.mp3"`). The game converts them to its format at startup, matches the loudness of the game's names and keeps the result in `UserData\Cache\mods\callnames`: the first start with a new name takes a little longer.
 - **Text:** the game has no accents and no Ñ: "Acuña" shows as "Acuna". Anything it cannot show is dropped and the log (`console.log`) says so. In the name search (Search Type) it shows in upper case, without spaces.
 - **Giving it to a player:** in the game, Arrange › a team › VOICE SETUP › the player › Select Type › the initial. In PowerUp+ (MODS › EDIT ROSTER), the voice picker shows it as "Callname" and the `list` text; the exported roster gives the player the callname's voice number.
+- PowerUp+ saves callnames as direct 14-bit IDs (for example, 7300). A name whose audio fails or does not fit bank 14 is left out of the game editor. A complete bank replacement through `disc/` or Riivolution disables its callname extension.
 - **A roster that uses a callname needs the callname mod enabled.** Without it that player has no name (silence), as with an empty voice.
 - If two enabled mods use the same voice number, the first in alphabetical order wins and the log says so.
 - It works in every mode with commentary, MLB Life included.
