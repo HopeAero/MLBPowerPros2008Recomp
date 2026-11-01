@@ -816,3 +816,13 @@ Patch `wiicompiled-stadium-viewer` (runtime and aurora) and Blender add-on 0.7.0
 - **No HUD:** aurora leaves out orthographic draws that do not show an EFB copy (`AURORA_DRAW_FILTER_HUD`). Side effect: the batter model, composed with those passes, would come out black (it does not show in the viewer).
 - **Camera:** free camera (WASD, Q/E, Shift, mouse, wheel) on top of `0x80055D24`, and the match's real shots learned in the director `0x80C779D4`. The first view applies the batter shot first: without it, the camera's opening fly-over kept moving the image. In the free camera, the shot cameras look away to take players and cursor off screen; they are put back when a shot is chosen.
 - **End to end from Blender** (Coors Field, temp folder with spaces and parentheses): the game opens at the Blender view with no players or HUD; the second press closes the first process and shows the moved piece; `Config.toml` and the normal game's cache do not change; the normal match with the user's mods is unchanged (HUD, players, scoreboard).
+
+## Setup and launcher versus Windows Defender (26 October 2026)
+
+`tools/setup` and patch `wiicompiled-roster-editor` (runtime).
+
+- **Report:** while updating to v0.1.5 with REINSTALL, Windows Defender quarantined a player's Setup and the window closed mid-build. The detection name is still unknown.
+- **Pattern removed:** the Setup (PowerShell running `LocalBuild.ps1`) and the launcher (PowerUp+ server) created the process with `CREATE_SUSPENDED`, put it in the *job object* and then called `ResumeThread`, the pattern antivirus behaviour rules look for. Now the process starts inside the job with `PROC_THREAD_ATTRIBUTE_JOB_LIST`. The runtime builds with mingw's default `_WIN32_WINNT` (`0x601`), which hides that constant, so the patch uses its value, `0x0002000D`.
+- **Metadata:** the Setup had no version information. `setup.rc` adds VERSIONINFO (version from `project()` in `CMakeLists.txt`, 0.1.6) and an `asInvoker` manifest.
+- **Checked:** with a test `LocalBuild.ps1` that starts `ping`, force-closing the Setup ends PowerShell and `ping` (2 alive before, 0 after). With the default `_WIN32_WINNT`, a program with the launcher's code leaves the child inside the job (`IsProcessInJob`) and ends it when it exits. The 71 patches apply on a clean Wiicompiled and `launcher.cpp` compiles with the build's flags. Not checked against Defender (its service does not run on this PC) and the Setup is still unsigned.
+- **If a player hits it:** the installed game is only replaced at the end of `LocalBuild.ps1`, so the previous version stays playable. Restore the Setup from Protection history and ask for the detection name.

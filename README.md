@@ -52,6 +52,8 @@ Requirements: Windows 10/11 64-bit, a GPU with Direct3D 12 or Vulkan, your copy 
 3. Press **INSTALL**. The Setup checks that it is a clean `RL8E54` dump, extracts it, translates the code and compiles it on your PC.
 4. Press **PLAY** or use the desktop shortcut. The launcher opens before each session: graphics API, display, resolution, audio, controls, mods and tools.
 
+To update, unzip the new Setup and press **REINSTALL**; the installed game is only replaced at the end, so an interrupted update leaves the previous version playable. The Setup is not code-signed, so Windows Defender may block or quarantine it while it compiles. If that happens, restore it from *Windows Security > Protection history* and [report it](https://github.com/HopeAero/MLBPowerPros2008Recomp/issues) with the detection name.
+
 ![The Setup: choose your disc; no game files included](docs/media/setup-en.jpg)
 
 **Linux and Steam Deck** (experimental): no Setup window yet; one script does the same from a clone of this repository, then add the game to Steam as a non-Steam game:

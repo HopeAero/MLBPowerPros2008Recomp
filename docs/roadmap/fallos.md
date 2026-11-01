@@ -17,6 +17,7 @@ Cada versión se prueba sobre todo en una PC. Los jugadores encuentran lo que es
 - Cuelgue raro al arrancar (cerrar y volver a abrir). Sin explicar; visto en unos 2 de 9 arranques automáticos una vez, nunca desde un arreglo de octubre.
 - Copiar / pegar / importar / exportar contraseñas aún sin Wii Remote.
 - Los estadios nuevos solo salen en Exhibición.
+- Windows Defender puso en cuarentena el Setup durante una actualización (un informe, v0.1.5). La próxima versión quita el arranque de procesos suspendidos que marcan los antivirus y añade información de versión; el Setup sigue sin firma digital.
 
 ## Casillas
 - [x] Formulario de fallos y etiquetas

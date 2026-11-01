@@ -94,7 +94,7 @@ index 768fa64..3651477 100644
  
  constexpr const char* kModsHelp =
      "Abre la carpeta mods. Cada mod va en su propia carpeta, con un mod.toml opcional "
-@@ -231,6 +277,79 @@ constexpr const char* kModsReadme =
+@@ -231,6 +277,94 @@ constexpr const char* kModsReadme =
      "ModSaves junto a los datos del usuario. Sin esos mods vuelven tus partidas normales; los de\r\n"
      "texturas y uniformes usan las normales.\r\n";
  
@@ -152,15 +152,30 @@ index 768fa64..3651477 100644
 +                               L" " + Quoted(L"--DataDirectory=" + (data / "Data").wstring()) +
 +                               L" " + Quoted(L"--PowerPros2008ProjectBin=" + (RuntimeConfigFile::ResolvedDvdRoot() / "files" / "project.bin").wstring()) +
 +                               L" " + Quoted(L"--PowerPros2008ModsDirectory=" + mods::Directory().wstring());
-+        STARTUPINFOW startup{sizeof(startup)};
++        // The server starts inside the job instead of suspended and assigned afterwards: antivirus
++        // behaviour rules flag CREATE_SUSPENDED + ResumeThread. 0x0002000D is
++        // PROC_THREAD_ATTRIBUTE_JOB_LIST, which mingw hides below _WIN32_WINNT 0x0A00.
++        constexpr DWORD_PTR kJobListAttribute = 0x0002000D;
++        SIZE_T attributeSize = 0;
++        InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
++        std::vector<char> attributes(attributeSize);
++        STARTUPINFOEXW startup{};
++        startup.StartupInfo.cb = sizeof(startup);
++        startup.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
++        InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &attributeSize);
++        if (job != nullptr) {
++            UpdateProcThreadAttribute(startup.lpAttributeList, 0, kJobListAttribute, &job, sizeof(job), nullptr, nullptr);
++        }
 +        PROCESS_INFORMATION info{};
-+        if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
-+                            nullptr, data.wstring().c_str(), &startup, &info)) {
-+            RT_LOG(RT_TAG_RUNTIME) << "launcher: cannot start PowerUp+ (error " << GetLastError() << ")" << std::endl;
++        const bool started = CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
++                                            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr,
++                                            data.wstring().c_str(), &startup.StartupInfo, &info);
++        const DWORD error = started ? 0 : GetLastError();
++        DeleteProcThreadAttributeList(startup.lpAttributeList);
++        if (!started) {
++            RT_LOG(RT_TAG_RUNTIME) << "launcher: cannot start PowerUp+ (error " << error << ")" << std::endl;
 +            return;
 +        }
-+        if (job != nullptr) AssignProcessToJobObject(job, info.hProcess);
-+        ResumeThread(info.hThread);
 +        CloseHandle(info.hThread);
 +        if (process != nullptr) CloseHandle(process);
 +        process = info.hProcess;
@@ -174,7 +189,7 @@ index 768fa64..3651477 100644
  void OpenModsFolder() {
      const std::filesystem::path dir = mods::Directory();
      std::error_code ec;
-@@ -346,12 +465,17 @@ Result Run(int argc, char** argv) {
+@@ -346,12 +480,17 @@ Result Run(int argc, char** argv) {
                            "Muestra esta pantalla al abrir el juego. Se puede volver a activar en F10.", YesNo(), 1,
                            false};
  
@@ -195,7 +210,7 @@ index 768fa64..3651477 100644
      for (size_t i = 0; i < installedMods.size(); ++i) {
          const mods::Mod& m = installedMods[i];
          std::string help = m.description.empty() ? std::string("Sin descripción.") : m.description;
-@@ -384,6 +508,7 @@ Result Run(int argc, char** argv) {
+@@ -384,6 +523,7 @@ Result Run(int argc, char** argv) {
          {"INTERFAZ", {launcherOption}},
      };
      tabs.push_back(std::move(modsTab));
@@ -203,7 +218,7 @@ index 768fa64..3651477 100644
      auto option = [&](int tab, int index) -> Option& { return tabs[static_cast<size_t>(tab)].options[static_cast<size_t>(index)]; };
  
      bool restart = false;
-@@ -393,6 +518,10 @@ Result Run(int argc, char** argv) {
+@@ -393,6 +533,10 @@ Result Run(int argc, char** argv) {
              OpenModsFolder();
              return;
          }
@@ -214,7 +229,7 @@ index 768fa64..3651477 100644
          if (o.mod >= 0) {
              mods::SetEnabled(installedMods[static_cast<size_t>(o.mod)].id, o.value != 0);
              restart = true;
-@@ -436,37 +565,61 @@ Result Run(int argc, char** argv) {
+@@ -436,37 +580,61 @@ Result Run(int argc, char** argv) {
      }
      // WIICOMPILED_LAUNCHER_PAGE=settings opens the settings panel (screenshots).
      const char* page = std::getenv("WIICOMPILED_LAUNCHER_PAGE");
@@ -292,7 +307,7 @@ index 768fa64..3651477 100644
          return Back();
      };
      using Clock = std::chrono::steady_clock;
-@@ -496,12 +649,25 @@ Result Run(int argc, char** argv) {
+@@ -496,12 +664,25 @@ Result Run(int argc, char** argv) {
              const ImVec2 o((w - kArtW * s) * 0.5f, (h - kArtH * s) * 0.5f);
              auto at = [&](float x, float y) { return ImVec2(o.x + x * s, o.y + y * s); };
              auto hit = [&](const ArtRect& r) { return Hovered(at(r.x0, r.y0), at(r.x1, r.y1)); };
@@ -321,7 +336,7 @@ index 768fa64..3651477 100644
              dl->AddImage(backdrop, at(0, 0), at(kArtW, kArtH));
              if (!settingsOpen) {
                  // Buttons: the selected one is redrawn enlarged with a pulsing glow and sparks; the
-@@ -581,7 +747,8 @@ Result Run(int argc, char** argv) {
+@@ -581,7 +762,8 @@ Result Run(int argc, char** argv) {
                  int tabCount = 0;
                  tabRange(firstTab, tabCount);
                  for (int i = firstTab; i < firstTab + tabCount; ++i) {
@@ -331,7 +346,7 @@ index 768fa64..3651477 100644
                      if (click && hit(r)) tab = i, row = 0;
                      const float radius = (r.y1 - r.y0) * 0.5f * s;
                      if (tab == i) {
-@@ -598,10 +765,35 @@ Result Run(int argc, char** argv) {
+@@ -598,10 +780,35 @@ Result Run(int argc, char** argv) {
                  }
                  Tab& current = tabs[static_cast<size_t>(tab)];
                  const int count = static_cast<int>(current.options.size());
@@ -370,7 +385,7 @@ index 768fa64..3651477 100644
                      if (MouseMoved() && hit(r)) row = i;
                      if (hit(r) && click) row = i, change(tab, i, 1);
                      if (hit(r) && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) row = i, change(tab, i, -1);
-@@ -630,16 +822,24 @@ Result Run(int argc, char** argv) {
+@@ -630,16 +837,24 @@ Result Run(int argc, char** argv) {
                                                ImVec2(rx - a, mid + a * 1.2f), IM_COL32_WHITE);
                      }
                  }
@@ -402,7 +417,7 @@ index 768fa64..3651477 100644
                  }
                  const bool closeClicked = click && (hit(kArtClose) || !hit(kArtPanel));
                  if (settingsKeys() || closeClicked) settingsOpen = false;
-@@ -805,11 +1005,21 @@ Result Run(int argc, char** argv) {
+@@ -805,11 +1020,21 @@ Result Run(int argc, char** argv) {
                  // Options.
                  Tab& current = tabs[static_cast<size_t>(tab)];
                  const int count = static_cast<int>(current.options.size());
@@ -427,7 +442,7 @@ index 768fa64..3651477 100644
                      const ImVec2 b(split - 26 * u, a.y + rowH);
                      if (MouseMoved() && Hovered(a, b)) row = i;
                      if (Hovered(a, b) && click) row = i, change(tab, i, 1);
-@@ -841,14 +1051,20 @@ Result Run(int argc, char** argv) {
+@@ -841,14 +1066,20 @@ Result Run(int argc, char** argv) {
                  const float hx2 = split + 30 * u;
                  const float wrap = p1.x - 34 * u - hx2;
                  float hy2 = top + 26 * u;

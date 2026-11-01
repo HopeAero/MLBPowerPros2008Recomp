@@ -17,6 +17,7 @@ Every release is tested mostly on one PC. Players find what that PC can't: other
 - Rare hang at startup (close and open again). Unexplained; seen in about 2 of 9 automated boots once, never since a fix in October.
 - Password Copy / Paste / Import / Export not yet with the Wii Remote.
 - New stadiums appear only in Exhibition.
+- Windows Defender quarantined the Setup during an update (one report, v0.1.5). The next release drops the suspended-process start that antivirus rules flag and adds version information; the Setup is still not code-signed.
 
 ## Checklist
 - [x] Bug report form and labels
