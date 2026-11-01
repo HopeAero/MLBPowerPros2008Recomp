@@ -2,6 +2,21 @@
 
 Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de trabajo; el historial está en `git log -p docs/traspaso.md`. Las secciones de abajo son notas por fase de sesiones anteriores.
 
+## Callnames nuevos (rama `callnames`, 31 de octubre de 2026)
+
+Mods con nombres de jugador nuevos: diseño `docs/superpowers/specs/2026-10-31-callnames-design.md`, plan `docs/superpowers/plans/2026-10-31-callnames.md`, guía `docs/mods.md` («Callnames»), RE en `docs/ingenieria-inversa.md` («Bancos de voz y nombres de jugador»).
+
+- **PC, hecho y probado:** parche `wiicompiled-callnames` (último de la lista de `wiicompiled-translate.ps1`). Con el mod de prueba local `local/tmp/callnames/mod-acuna` (audio Piper `es_MX-ald-medium`, Unlicense; Jeter con `VoiceId` 7300):
+  - el banco 17 virtual sirve la frase nueva en el turno de Jeter (`MATCH_BENCH` + `WIICOMPILED_DEBUG_DVD`);
+  - «Acuna Jr.» sale en Arrange › VOICE SETUP › Select Type › A, después de Acosta, y queda asignado;
+  - sin mods, las lecturas de voz son las de siempre; con el roster en 7300 y sin el mod, silencio y sin cuelgue.
+- **Pruebas:** `mkw_callnames_tests` (comparan cada nativo con el original ejecutado en un intérprete PowerPC, para todas las entradas), `tools/test_callnames.py`, `tools/roster/test_voice_passthrough.py`, `PowerPros2008CallnameTests` en PowerUp+.
+- **Pendiente:**
+  - **Switch:** `local/tmp/switch_edit.py` añade su propio `DvdReadContract::Virtual` y cambia `ReadExact` en `dvd_contract.h`; con `wiicompiled-callnames` en la cadena ya existen. Hay que saltar esa parte del script (líneas ~27747-27960 y 11061-11140) o fusionarla, regenerar con `mkswitch.sh` y hacer que `BuildBank` lea los bancos de la ISO (fase 103: `ResolvedDvdRoot()/files/sound` no existe con ISO). Luego NRO y prueba en consola.
+  - **Escucha del usuario** de las tres variantes en un partido, y MLB Life (mismo código de comentario; sin sonda propia).
+  - Publicar PowerUp+ (`tools/powerupplus.ps1 -Publish`) en la próxima versión.
+  - Riesgo visto una vez: una ejecución con traza temporal se quedó colgada al arrancar; no se repitió en tres ejecuciones.
+
 ## Dónde estamos
 
 - **Publicado:** Switch v0.1.0 en el repo aparte [MLBPR2008-NX](https://github.com/HopeAero/MLBPR2008-NX) (solo README, LICENSE y releases; el zip trae el NRO con el icono genérico de libnx, los archivos del runtime y `UserData/Config.toml`, nunca datos del juego). Anuncio: [Discussion #8](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/8). Empaquetado en `local/release-nx/` (repo/, pkg/, notas). Construido desde 225e9f8 (fases 1–103).
