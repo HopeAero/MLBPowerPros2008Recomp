@@ -1,0 +1,2154 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 3735e33..9d20d38 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -400,6 +400,16 @@ add_executable(mkw_mod_saves_tests "${CMAKE_CURRENT_LIST_DIR}/tests/mod_saves_te
+ target_compile_features(mkw_mod_saves_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_mod_saves_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/../aurora-main/include")
+ add_test(NAME mkw_mod_saves_tests COMMAND mkw_mod_saves_tests)
++add_executable(mkw_callnames_tests "${CMAKE_CURRENT_LIST_DIR}/tests/callnames_tests.cpp"
++                                  "${CMAKE_CURRENT_LIST_DIR}/src/callnames/audio.cpp"
++                                  "${CMAKE_CURRENT_LIST_DIR}/src/callnames/collect.cpp"
++                                  "${CMAKE_CURRENT_LIST_DIR}/src/callnames/bank.cpp"
++                                  "${CMAKE_CURRENT_LIST_DIR}/src/callnames/phrase_ids.cpp"
++                                  "${CMAKE_CURRENT_LIST_DIR}/src/callnames/voice_list.cpp")
++target_compile_features(mkw_callnames_tests PRIVATE cxx_std_20)
++target_include_directories(mkw_callnames_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/../aurora-main/include")
++target_link_libraries(mkw_callnames_tests PRIVATE mkw::toml11)
++add_test(NAME mkw_callnames_tests COMMAND mkw_callnames_tests)
+ add_executable(mkw_auto_mips_tests "${CMAKE_CURRENT_LIST_DIR}/tests/auto_mips_tests.cpp")
+ target_compile_features(mkw_auto_mips_tests PRIVATE cxx_std_20)
+ add_test(NAME mkw_auto_mips_tests COMMAND mkw_auto_mips_tests)
+diff --git a/runtime/include/hle/dvd_contract.h b/runtime/include/hle/dvd_contract.h
+index 9cb9576..357eb14 100644
+--- a/runtime/include/hle/dvd_contract.h
++++ b/runtime/include/hle/dvd_contract.h
+@@ -6,6 +6,7 @@
+ #include <cctype>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <filesystem>
+ #include <fstream>
+ #include <limits>
+@@ -284,6 +285,129 @@ inline constexpr const char* Describe(HostReadFailure failure) noexcept {
+     return "unknown host read error";
+ }
+ 
++// A disc file that exists only as a list of pieces: byte ranges of other host files, bytes held in
++// memory and zeros. The Switch serves its modded PROJECT.BIN this way (mods.cpp): the PC writes a
++// merged 406 MB copy, which on the SD card meant reading and writing 406 MB before the first frame.
++// The DVD index stores `key` as the entry's host path (it is never opened); ReadExact recognises it
++// and assembles the range. Register every virtual file before DVDInit (mods::Apply runs before
++// aurora_initialize and any guest code) and never change the registry after that: reads take no lock.
++namespace Virtual {
++
++inline constexpr int32_t kBytes = -1;  // Piece::source: File::bytes from Piece::from
++inline constexpr int32_t kZeros = -2;  // Piece::source: zeros
++
++struct Piece {
++    uint64_t start = 0;  // offset in the virtual file
++    uint64_t length = 0;
++    int32_t source = kZeros;  // index into File::sources, kBytes or kZeros
++    uint64_t from = 0;        // offset in the source file or in File::bytes
++};
++
++struct File {
++    std::filesystem::path key;
++    std::string dvdPath;  // e.g. "/project.bin"
++    std::vector<uint8_t> bytes;
++    std::vector<std::filesystem::path> sources;
++    std::vector<Piece> pieces;  // contiguous from offset 0
++    uint64_t size = 0;
++
++    // Pieces go on at the end; one that continues the last piece (zeros after zeros, the next bytes of
++    // the same source) extends it.
++    void Append(int32_t source, uint64_t from, uint64_t length) {
++        if (length == 0) {
++            return;
++        }
++        if (!pieces.empty()) {
++            Piece& last = pieces.back();
++            if (last.source == source && (source == kZeros || last.from + last.length == from)) {
++                last.length += length;
++                size += length;
++                return;
++            }
++        }
++        pieces.push_back({size, length, source, from});
++        size += length;
++    }
++    void AppendBytes(uint64_t from, uint64_t length) { Append(kBytes, from, length); }
++    void AppendZeros(uint64_t length) { Append(kZeros, 0, length); }
++    void AppendSource(const std::filesystem::path& path, uint64_t from, uint64_t length) {
++        if (length == 0) {
++            return;
++        }
++        size_t index = 0;
++        while (index < sources.size() && !(sources[index] == path)) {
++            ++index;
++        }
++        if (index == sources.size()) {
++            sources.push_back(path);
++        }
++        Append(static_cast<int32_t>(index), from, length);
++    }
++};
++
++inline std::vector<File>& Files() {
++    static std::vector<File> files;
++    return files;
++}
++
++// A file with the same key replaces the earlier one.
++inline void Register(File file) {
++    for (File& existing : Files()) {
++        if (existing.key == file.key) {
++            existing = std::move(file);
++            return;
++        }
++    }
++    Files().push_back(std::move(file));
++}
++
++inline const File* Find(const std::filesystem::path& key) {
++    for (const File& file : Files()) {
++        if (file.key == key) {
++            return &file;
++        }
++    }
++    return nullptr;
++}
++
++// The same contract as ReadExact on a real file with these bytes. `readSource(path, offset, length,
++// out, failure)` reads one complete range of a source file into `out`.
++template <typename ReadSource>
++inline bool Read(const File& file, uint64_t offset, uint32_t length, std::vector<uint8_t>& destination,
++                 HostReadFailure& failure, ReadSource&& readSource) {
++    failure = HostReadFailure::None;
++    if (offset >= file.size) {
++        failure = HostReadFailure::BadOffset;
++        return false;
++    }
++    if (static_cast<uint64_t>(length) > file.size - offset) {
++        failure = HostReadFailure::ShortRead;
++        return false;
++    }
++    std::vector<uint8_t> staged(length);
++    // The last piece starting at or before `offset` (the first starts at 0).
++    auto piece = std::upper_bound(file.pieces.begin(), file.pieces.end(), offset,
++                                  [](uint64_t value, const Piece& p) { return value < p.start; });
++    --piece;
++    for (uint64_t done = 0; done < length; ++piece) {
++        const uint64_t at = offset + done - piece->start;
++        const uint64_t n = std::min<uint64_t>(piece->length - at, length - done);
++        uint8_t* const out = staged.data() + done;
++        if (piece->source == kBytes) {
++            std::memcpy(out, file.bytes.data() + piece->from + at, static_cast<size_t>(n));
++        } else if (piece->source >= 0 &&
++                   !readSource(file.sources[static_cast<size_t>(piece->source)], piece->from + at,
++                               static_cast<uint32_t>(n), out, failure)) {
++            return false;
++        }
++        done += n;
++    }
++    destination = std::move(staged);
++    return true;
++}
++
++} // namespace Virtual
++
+ // Read into private storage first and publish it only after the complete host
+ // range has been obtained. Callers can therefore leave a guest DMA destination
+ // untouched for every failure, including a host file truncated after indexing.
+@@ -292,6 +416,16 @@ inline bool ReadExact(const std::filesystem::path& hostPath,
+                       uint32_t length,
+                       std::vector<uint8_t>& destination,
+                       HostReadFailure& failure) {
++    if (const Virtual::File* file = Virtual::Find(hostPath)) {
++        return Virtual::Read(*file, offset, length, destination, failure,
++                             [](const std::filesystem::path& source, uint64_t from, uint32_t n, uint8_t* out,
++                                HostReadFailure& why) {
++                                 std::vector<uint8_t> range;
++                                 if (!ReadExact(source, from, n, range, why)) return false;
++                                 std::copy(range.begin(), range.end(), out);
++                                 return true;
++                             });
++    }
+     failure = HostReadFailure::None;
+ 
+     std::ifstream file(hostPath, std::ios::binary);
+diff --git a/runtime/include/mods.h b/runtime/include/mods.h
+index b43309c..55d8818 100644
+--- a/runtime/include/mods.h
++++ b/runtime/include/mods.h
+@@ -18,6 +18,7 @@
+ //   roster/        a PowerUp / PowerUp+ roster (MLB Power Pros 2007 Wii save, *.dat), converted to
+ //                  2008's game_data.pack on the player's PC; it applies to every mode, MLB Life too.
+ //   schedule/      Season mode game schedules, <year>.csv (season_schedule.h).
++//   callnames/     new player callnames: callnames.toml + WAVs (callnames.h).
+ // mod.toml may also set start_year (a season pack: a new Season mode game starts in that year) and
+ // dh = "both" (the DH in every Season mode game, as since 2022) or "original", leagues = "original"
+ // (2008's divisions, whatever the launcher's options say) and a [divisions] table
+@@ -61,6 +62,7 @@ struct Mod {
+     bool riivolution = false;
+     bool project = false;
+     bool roster = false;
++    bool callnames = false;  // callnames/callnames.toml: new player callnames (callnames.h)
+     bool enabled = false;
+ 
+     bool changesRoster = false;  // roster/ or project/game_data.pack: saves are kept apart
+diff --git a/runtime/src/hle/storage/dvd.cpp b/runtime/src/hle/storage/dvd.cpp
+index ac18c50..0b73368 100644
+--- a/runtime/src/hle/storage/dvd.cpp
++++ b/runtime/src/hle/storage/dvd.cpp
+@@ -837,6 +837,11 @@ extern "C" void DVDInit_8015EA1C()
+     // reverse discovery order: the explicitly configured root outranks the mod
+     // manifest.
+     const size_t vanillaEntryCount = g_fileEntries.size();
++    // Virtual files (dvd_contract.h: callname voice banks, mods.cpp; the Switch's modded PROJECT.BIN)
++    // replace disc files first, so an overlay root's real file still wins over them.
++    for (const DvdReadContract::Virtual::File& file : DvdReadContract::Virtual::Files()) {
++        RegisterFileEntry(file.dvdPath, file.key, static_cast<uint32_t>(file.size));
++    }
+     for (auto overlay = overlays.rbegin(); overlay != overlays.rend(); ++overlay) {
+         ScanOverlayRoot(*overlay);
+     }
+diff --git a/runtime/src/mods.cpp b/runtime/src/mods.cpp
+index 0c3ee8b..5a7ef99 100644
+--- a/runtime/src/mods.cpp
++++ b/runtime/src/mods.cpp
+@@ -1,5 +1,7 @@
+ #include "mods.h"
+ 
++#include "callnames.h"
++
+ #include "recomp_mod_loader.h"
+ #include "runtime_config.h"
+ #include "runtime_log.h"
+@@ -268,6 +270,7 @@ std::vector<Mod> Discover() {
+         mod.riivolution = IsDirectory(mod.root / "riivolution");
+         mod.project = IsDirectory(mod.root / "project");
+         mod.roster = IsDirectory(mod.root / "roster");
++        mod.callnames = std::filesystem::is_regular_file(mod.root / "callnames" / "callnames.toml", ec);
+         mod.changesRoster = mod.roster || std::filesystem::is_regular_file(mod.root / "project" / "game_data.pack", ec);
+         mod.enabled = std::find(enabled.begin(), enabled.end(), mod.id) != enabled.end();
+         found.push_back(std::move(mod));
+@@ -293,7 +296,7 @@ namespace {
+ // fields are moved with kRosterFields (tools/roster/powerup_to_2008.py, docs/roster-2008.md).
+ constexpr size_t kRosterPlayer = 0xB0, kRosterSlots = 1500, kRosterBlock = 0x43E80;
+ constexpr size_t kSaveRoster2007 = 0x68C74, kPackRoster2008 = 0x20;
+-constexpr uint32_t kRosterConverter = 13;  // 11: voices; 12: abilities by meaning; 13: 2008-only abilities
++constexpr uint32_t kRosterConverter = 14;  // 11: voices; 12: abilities by meaning; 13: 2008-only abilities; 14: callname voices
+ 
+ // kRosterUnnamedRuns expanded to single bit positions.
+ const std::vector<uint16_t>& RosterUnnamed() {
+@@ -341,6 +344,7 @@ uint32_t Skin2008(uint32_t value) {
+ 
+ // 2007 voice id -> 2008's (kVoiceRuns), or 0 (no voice) for one 2008 removed.
+ uint32_t Voice2008(uint32_t voice) {
++    if (voice >= callnames::kFirstVoice && voice <= callnames::kLastVoice) return voice;  // a mod's callname
+     for (const VoiceRun& run : kVoiceRuns) {
+         if (voice >= run.first && voice <= run.last) return voice + run.offset;
+     }
+@@ -614,6 +618,48 @@ void ApplyProjectPacks(const std::map<std::string, std::filesystem::path>& packs
+ 
+ } // namespace
+ 
++namespace {
++
++// callnames/ of the enabled mods: grown voice banks (callnames::Mount) and the editor's name lists in
++// env_voice_data.pack, built from the disc's or from another mod's copy of it.
++void ApplyCallnames(const std::vector<Mod>& all, const std::filesystem::path& cacheDir,
++                    std::map<std::string, std::filesystem::path>& packs) {
++    const std::vector<callnames::Callname> names = callnames::Mount(all, cacheDir);
++    if (names.empty()) return;
++    std::vector<char> original;
++    const auto replaced = packs.find("env_voice_data.pack");
++    if (replaced != packs.end()) {
++        std::ifstream in(replaced->second, std::ios::binary);
++        original.assign(std::istreambuf_iterator<char>(in), {});
++    } else if (!ReadProjectEntry(RuntimeConfigFile::ResolvedDvdRoot() / "files" / "project.bin", "env_voice_data.pack", original)) {
++        RT_LOG(RT_TAG_RUNTIME) << "[callnames] env_voice_data.pack not found: names left out of the editor's lists" << std::endl;
++        return;
++    }
++    std::vector<uint8_t> pack;
++    callnames::VoiceListLayout layout;
++    if (!callnames::BuildVoiceList(std::vector<uint8_t>(original.begin(), original.end()), names, pack, layout)) {
++        RT_LOG(RT_TAG_RUNTIME) << "[callnames] env_voice_data.pack has another layout: names left out of the editor's lists"
++                               << std::endl;
++        return;
++    }
++    const std::filesystem::path path = cacheDir / "env_voice_data.pack";
++    std::error_code ec;
++    std::filesystem::create_directories(cacheDir, ec);
++    std::vector<char> previous;
++    if (std::ifstream in(path, std::ios::binary); in) previous.assign(std::istreambuf_iterator<char>(in), {});
++    if (previous.size() != pack.size() || !std::equal(pack.begin(), pack.end(), previous.begin(),
++                                                      [](uint8_t a, char b) { return a == static_cast<uint8_t>(b); })) {
++        std::ofstream(path, std::ios::binary | std::ios::trunc)
++            .write(reinterpret_cast<const char*>(pack.data()), static_cast<std::streamsize>(pack.size()));
++    }
++    packs["env_voice_data.pack"] = path;
++    callnames::SetVoiceListLayout(layout);
++    RT_LOG(RT_TAG_RUNTIME) << "[callnames] editor lists: " << layout.countA << " surnames (Search), " << layout.countB
++                           << " rows (Select)" << std::endl;
++}
++
++}  // namespace
++
+ namespace {
+ std::filesystem::path g_saveDirectory;
+ 
+@@ -740,6 +786,8 @@ void Apply(AuroraConfig& config) {
+             }
+         }
+     }
++    ApplyCallnames(all, (cache != nullptr ? std::filesystem::path(reinterpret_cast<const char8_t*>(cache))
++                                          : Directory().parent_path()) / "mods" / "callnames", packs);
+     // A new stadium without its own name banner gets one drawn from its name (cached by name).
+     for (const Mod& mod : all) {
+         if (!mod.enabled) continue;
+diff --git a/runtime/include/callnames.h b/runtime/include/callnames.h
+new file mode 100644
+index 0000000..287b89f
+--- /dev/null
++++ b/runtime/include/callnames.h
+@@ -0,0 +1,148 @@
++// New player callnames from mods (mods/<mod>/callnames/callnames.toml + WAVs): encoded to the
++// game's DSP-ADPCM, appended to voice banks 14/15/17 and added to the editor's name lists.
++// docs/superpowers/specs/2026-10-31-callnames-design.md; RE in docs/ingenieria-inversa.md
++// ("Bancos de voz y nombres de jugador").
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <filesystem>
++#include <map>
++#include <string>
++#include <vector>
++
++#include "hle/dvd_contract.h"
++#include "mods.h"
++
++namespace callnames {
++
++constexpr uint32_t kRate = 22050;
++constexpr uint32_t kMaxSeconds = 5;
++
++// 16-bit PCM WAV (mono or stereo, any rate) to mono at kRate. False with `error` set for anything
++// else (8/24-bit, float, empty, longer than kMaxSeconds, broken header); never throws.
++bool ReadWav(const std::filesystem::path& path, std::vector<int16_t>& mono, std::string& error);
++// Scales so the loudest sample is `peak` (the game's names peak around 29000). Silence stays.
++void Normalize(std::vector<int16_t>& samples, int16_t peak = 29000);
++
++struct Adpcm {
++    std::array<int16_t, 16> coefs{};
++    std::vector<uint8_t> data;  // 8-byte frames (header byte + 14 nibbles), the last one partial
++    uint32_t samples = 0;
++};
++// Bytes of DSP-ADPCM for `samples` samples; the nibble count the phrase header stores is twice this.
++uint32_t AdpcmBytes(uint32_t samples);
++Adpcm Encode(const std::vector<int16_t>& samples);  // deterministic
++std::vector<int16_t> Decode(const Adpcm& adpcm);
++
++constexpr uint32_t kFirstVoice = 7223;  // VoiceIds whose phrase ids fall in gaps no bank uses
++constexpr uint32_t kLastVoice = 10239;
++constexpr size_t kMaxListChars = 15;
++
++struct Callname {
++    uint32_t voice = 0;
++    std::string list;            // as written in callnames.toml
++    std::u16string listGame;     // list B text in the game's character codes (accents removed)
++    std::u16string listUpper;    // list A text: upper case, only A-Z, '-' and '.'
++    std::filesystem::path normal, excited, full;  // excited/full fall back to normal
++    std::string mod;             // mod folder, for messages
++};
++
++// The game's 16-bit character codes for UTF-8 text: accents removed (Acuña -> Acuna), anything the
++// game cannot show dropped and listed in `dropped`.
++std::u16string ToGameText(const std::string& utf8, std::string& dropped);
++// The callnames of the enabled mods with a callnames/ folder, in mod order. A bad entry is skipped
++// with a line in `warnings`; a voice already taken by an earlier mod too.
++std::vector<Callname> Collect(const std::vector<mods::Mod>& enabled, std::vector<std::string>& warnings);
++
++// A WAV read, normalized and encoded; the result is kept in cacheDir under a hash of the WAV's bytes
++// (and the encoder version), so a changed file is encoded again even with the same name and size.
++bool EncodeCached(const std::filesystem::path& wav, const std::filesystem::path& cacheDir, Adpcm& out,
++                  std::string& error);
++
++constexpr uint32_t kSector = 0x800;
++
++// A voice bank served as a virtual file: header and index rewritten for the larger phrase count,
++// the original phrases, then the new ones (cacheDir/voice<bank>.ext holds them and the new index).
++struct BankBuild {
++    DvdReadContract::Virtual::File file;
++    uint32_t count = 0;               // phrases in the new index
++    std::vector<uint32_t> added;      // locals that got a phrase
++    std::vector<std::string> warnings;
++};
++// `phrases`: (local index, audio). Locals between the original count and a new one point to the
++// filler phrase (local 0); a phrase whose sector would reach 0x10000 is dropped with a warning.
++bool BuildBank(int bank, const std::filesystem::path& original,
++               const std::vector<std::pair<uint32_t, Adpcm>>& phrases, const std::filesystem::path& cacheDir,
++               BankBuild& out, std::string& error, uint32_t sectorLimit = 0x10000);
++
++// The game's phrase id -> bank (0x8003B398) and -> local index (0x8003B530, -1 for none), with the
++// hard-coded ranges of banks 14, 15 and 17 grown to the phrase counts their callname builds have
++// (0: the original count). Bit-identical to the original for every id when nothing grew.
++void SetBankCounts(uint32_t bank14, uint32_t bank15, uint32_t bank17);
++uint32_t PhraseBank(uint32_t id);
++int32_t PhraseLocal(uint32_t id);
++
++// The commentary's voice-key converters (key = 0x8000 + VoiceId; docs/ingenieria-inversa.md), each the
++// original's for every input except a callname's, which they also accept:
++//   RemapKey (0x80659DE8): key -> bank-14 id (normal surname); bank-7 id -> bank-15 id
++//   Excited  (0x80659C98): key -> bank-7 id; bank-14 id -> bank-15 id (excited surname)
++//   ColourName (0x80659F70): key -> bank-17 id (full name, colour commentator)
++//   Variant  (0x8065A14C): key -> list B's 4th recording (bank 14) or, with `other`, a bank-6 id;
++//            a callname has no 4th recording: its normal surname, and nothing with `other`.
++uint32_t RemapKey(uint32_t x);
++uint32_t Excited(uint32_t x);
++uint32_t ColourName(uint32_t x);
++uint32_t Variant(uint32_t x, bool other);
++
++// env_voice_data.pack (file 3081): where its name lists are. Offsets are from the pack's start, as the
++// game asks for them (0x8000BBFC(3081, 0x40000000 | offset)); names are 15 game characters (30 bytes).
++struct VoiceListLayout {
++    uint32_t keysA = 0x20, namesA = 0x1E0C, countA = 0x77B;      // generic surnames (Search Type)
++    uint32_t keysB = 0xFEB4, namesB = 0x10ED0, countB = 0x3CA;  // MLB players by initial (Select Type)
++    uint32_t letters = 0xFE80;                                  // 26 s16: list B position of each letter
++    uint32_t keysC = 0x10DDC, namesC = 0x1807C, countC = 0x3D;  // legends
++};
++constexpr uint16_t kLetterHeading = 0xFEFE;  // list B key of a letter's heading row (name 0x2000 | letter)
++// The pack with the names added: list A sorted (upper-case form), list B inside its initial's group
++// (a new group, and its letter entry, when the initial had none). The original lists stay where they
++// were; the grown A and B and the letter table go at the end. `layout` comes in as the original's
++// and goes out as the new pack's.
++bool BuildVoiceList(const std::vector<uint8_t>& original, const std::vector<Callname>& names,
++                    std::vector<uint8_t>& out, VoiceListLayout& layout);
++void SetVoiceListLayout(const VoiceListLayout& layout);
++const VoiceListLayout& CurrentVoiceListLayout();
++
++// The lookups of 0x807EDF4C (name offset by key, 0 = none) and 0x807EE0C8 (1 = list B or C,
++// 2 = list A, 0 = none), with the original's order: list B for keys 0x8803-0x8DF5, list C for
++// 0x8E40-0x91BB, then list A; a callname key (0x8000 + a callname voice) is looked up in B then A.
++// `read32(offset)` reads the pack.
++template <typename Read32>
++uint32_t FindVoiceName(const VoiceListLayout& l, uint32_t key, Read32&& read32, int* list = nullptr) {
++    auto search = [&](uint32_t keys, uint32_t names, uint32_t count) -> uint32_t {
++        for (uint32_t i = 0; i < count; ++i)
++            if (read32(keys + 4 * i) == key) return names + 30 * i;
++        return 0;
++    };
++    if (list) *list = 0;
++    if (key == 0) return 0;
++    const bool isNew = key - 0x8000 >= kFirstVoice && key - 0x8000 <= kLastVoice;
++    uint32_t at = 0;
++    if ((key > 0x8802 && key < 0x8DF6) || isNew) at = search(l.keysB, l.namesB, l.countB);
++    else if (key > 0x8E3F && key < 0x91BC) at = search(l.keysC, l.namesC, l.countC);
++    if (at) {
++        if (list) *list = 1;
++        return at;
++    }
++    at = search(l.keysA, l.namesA, l.countA);
++    if (at && list) *list = 2;
++    return at;
++}
++
++// Start-up (mods::Apply, before DVDInit): encodes the enabled mods' callnames (cached in cacheDir),
++// registers the grown voice banks as virtual files and grows the phrase-id ranges. Returns the
++// callnames that got into the banks (mods::Apply then adds them to the editor's list); none, and
++// nothing changed, without callname mods.
++std::vector<Callname> Mount(const std::vector<mods::Mod>& mods, const std::filesystem::path& cacheDir);
++
++}  // namespace callnames
+diff --git a/runtime/src/callnames/audio.cpp b/runtime/src/callnames/audio.cpp
+new file mode 100644
+index 0000000..38ca3d1
+--- /dev/null
++++ b/runtime/src/callnames/audio.cpp
+@@ -0,0 +1,232 @@
++// WAV reading and the DSP-ADPCM encoder for callnames (callnames.h).
++#include "callnames.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <fstream>
++#include <limits>
++
++namespace callnames {
++
++namespace {
++
++uint32_t Le32(const uint8_t* p) { return p[0] | p[1] << 8 | p[2] << 16 | uint32_t(p[3]) << 24; }
++uint16_t Le16(const uint8_t* p) { return uint16_t(p[0] | p[1] << 8); }
++
++int16_t Clamp16(int64_t v) { return int16_t(std::clamp<int64_t>(v, -32768, 32767)); }
++
++// One frame: 14 samples coded against the decoder's history (h1, h2) with a coefficient pair and a
++// scale exponent; returns the squared error and fills the nibbles and the new history.
++int64_t CodeFrame(const int16_t* x, int count, int c1, int c2, int exponent, int& h1, int& h2, int8_t* nibbles) {
++    const int scale = 1 << exponent;
++    int64_t error = 0;
++    for (int i = 0; i < count; ++i) {
++        const int64_t predicted = int64_t(c1) * h1 + int64_t(c2) * h2;
++        const double ideal = (double(x[i]) * 2048 - double(predicted)) / (double(scale) * 2048);
++        const int n = int(std::clamp<long>(std::lround(ideal), -8, 7));
++        const int v = Clamp16((int64_t(n) * scale * 2048 + predicted + 1024) >> 11);
++        nibbles[i] = int8_t(n);
++        error += int64_t(x[i] - v) * (x[i] - v);
++        h2 = h1;
++        h1 = v;
++    }
++    return error;
++}
++
++// Least-squares order-2 predictor of a frame (x[n] ~ a x[n-1] + b x[n-2]), as 11-bit fixed point.
++std::array<int, 2> FramePredictor(const std::vector<int16_t>& s, size_t start, size_t count) {
++    double r11 = 0, r12 = 0, r22 = 0, q1 = 0, q2 = 0;
++    for (size_t i = start; i < start + count; ++i) {
++        const double x = s[i], p1 = i >= 1 ? s[i - 1] : 0, p2 = i >= 2 ? s[i - 2] : 0;
++        r11 += p1 * p1;
++        r12 += p1 * p2;
++        r22 += p2 * p2;
++        q1 += x * p1;
++        q2 += x * p2;
++    }
++    const double det = r11 * r22 - r12 * r12;
++    double a = 0, b = 0;
++    if (std::fabs(det) > 1e-6 * (r11 * r22 + 1)) {
++        a = (q1 * r22 - q2 * r12) / det;
++        b = (q2 * r11 - q1 * r12) / det;
++    } else if (r11 > 0) {
++        a = q1 / r11;
++    }
++    auto fixed = [](double c) { return int(std::clamp<long>(std::lround(c * 2048), -32768, 32767)); };
++    return {fixed(std::clamp(a, -15.9, 15.9)), fixed(std::clamp(b, -15.9, 15.9))};
++}
++
++// Eight coefficient pairs: pair 0 is (0, 0) (silence and noise); the other seven are an
++// energy-weighted k-means of the frames' own predictors, seeded deterministically.
++std::array<int16_t, 16> ChooseCoefs(const std::vector<int16_t>& s) {
++    struct Point { double a, b, w; };
++    std::vector<Point> points;
++    for (size_t start = 0; start < s.size(); start += 14) {
++        const size_t count = std::min<size_t>(14, s.size() - start);
++        double energy = 0;
++        for (size_t i = start; i < start + count; ++i) energy += double(s[i]) * s[i];
++        if (energy < 1.0) continue;
++        const auto p = FramePredictor(s, start, count);
++        points.push_back({double(p[0]), double(p[1]), std::sqrt(energy)});
++    }
++    std::array<int16_t, 16> coefs{};
++    if (points.empty()) return coefs;
++    std::vector<Point> sorted = points;
++    std::stable_sort(sorted.begin(), sorted.end(), [](const Point& l, const Point& r) { return l.a < r.a; });
++    std::array<double, 7> ca{}, cb{};
++    for (int k = 0; k < 7; ++k) {
++        const Point& p = sorted[(sorted.size() - 1) * (2 * k + 1) / 14];
++        ca[k] = p.a;
++        cb[k] = p.b;
++    }
++    for (int iteration = 0; iteration < 24; ++iteration) {
++        std::array<double, 7> sa{}, sb{}, sw{};
++        for (const Point& p : points) {
++            int best = 0;
++            double bestDistance = std::numeric_limits<double>::max();
++            for (int k = 0; k < 7; ++k) {
++                const double d = (p.a - ca[k]) * (p.a - ca[k]) + (p.b - cb[k]) * (p.b - cb[k]);
++                if (d < bestDistance) { bestDistance = d; best = k; }
++            }
++            sa[best] += p.a * p.w;
++            sb[best] += p.b * p.w;
++            sw[best] += p.w;
++        }
++        for (int k = 0; k < 7; ++k) {
++            if (sw[k] > 0) { ca[k] = sa[k] / sw[k]; cb[k] = sb[k] / sw[k]; }
++        }
++    }
++    for (int k = 0; k < 7; ++k) {
++        coefs[2 + 2 * k] = int16_t(std::clamp<long>(std::lround(ca[k]), -32768, 32767));
++        coefs[3 + 2 * k] = int16_t(std::clamp<long>(std::lround(cb[k]), -32768, 32767));
++    }
++    return coefs;
++}
++
++}  // namespace
++
++bool ReadWav(const std::filesystem::path& path, std::vector<int16_t>& mono, std::string& error) {
++    mono.clear();
++    std::ifstream in(path, std::ios::binary);
++    if (!in) { error = "cannot open " + path.string(); return false; }
++    std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++    if (file.size() < 12 || std::memcmp(file.data(), "RIFF", 4) || std::memcmp(file.data() + 8, "WAVE", 4)) {
++        error = "not a RIFF/WAVE file";
++        return false;
++    }
++    uint16_t format = 0, channels = 0, bits = 0;
++    uint32_t rate = 0;
++    const uint8_t* data = nullptr;
++    uint32_t dataSize = 0;
++    for (size_t pos = 12; pos + 8 <= file.size();) {
++        const uint32_t size = Le32(&file[pos + 4]);
++        if (size > file.size() - pos - 8) { error = "truncated chunk"; return false; }
++        if (!std::memcmp(&file[pos], "fmt ", 4) && size >= 16) {
++            format = Le16(&file[pos + 8]);
++            channels = Le16(&file[pos + 10]);
++            rate = Le32(&file[pos + 12]);
++            bits = Le16(&file[pos + 22]);
++        } else if (!std::memcmp(&file[pos], "data", 4)) {
++            data = &file[pos + 8];
++            dataSize = size;
++        }
++        pos += 8 + size + (size & 1);
++    }
++    if ((format != 1 && format != 0xFFFE) || bits != 16) { error = "only 16-bit PCM WAV is supported"; return false; }
++    if (channels == 0 || rate == 0) { error = "bad fmt chunk"; return false; }
++    if (!data) { error = "no data chunk"; return false; }
++    const size_t frames = dataSize / (2u * channels);
++    if (frames == 0) { error = "empty WAV"; return false; }
++    std::vector<int16_t> downmix(frames);
++    for (size_t i = 0; i < frames; ++i) {
++        int64_t sum = 0;
++        for (uint16_t c = 0; c < channels; ++c) sum += int16_t(Le16(data + 2 * (i * channels + c)));
++        downmix[i] = Clamp16(sum / channels);
++    }
++    if (rate == kRate) {
++        mono = std::move(downmix);
++    } else {
++        const size_t out = size_t(uint64_t(frames) * kRate / rate);
++        mono.resize(out);
++        for (size_t i = 0; i < out; ++i) {
++            const double x = double(i) * rate / kRate;
++            const size_t k = size_t(x);
++            const double t = x - double(k);
++            const double a = downmix[std::min(k, frames - 1)], b = downmix[std::min(k + 1, frames - 1)];
++            mono[i] = Clamp16(std::lround(a + (b - a) * t));
++        }
++    }
++    if (mono.empty()) { error = "empty WAV"; return false; }
++    if (mono.size() > size_t(kMaxSeconds) * kRate) {
++        mono.clear();
++        error = "longer than 5 seconds";
++        return false;
++    }
++    return true;
++}
++
++void Normalize(std::vector<int16_t>& samples, int16_t peak) {
++    int top = 0;
++    for (int16_t s : samples) top = std::max(top, std::abs(int(s)));
++    if (top == 0) return;
++    const double gain = double(peak) / top;
++    for (int16_t& s : samples) s = Clamp16(std::lround(s * gain));
++}
++
++uint32_t AdpcmBytes(uint32_t samples) {
++    const uint32_t rest = samples % 14;
++    return samples / 14 * 8 + (rest ? 1 + (rest + 1) / 2 : 0);
++}
++
++Adpcm Encode(const std::vector<int16_t>& samples) {
++    Adpcm out;
++    out.samples = uint32_t(samples.size());
++    out.coefs = ChooseCoefs(samples);
++    out.data.reserve(AdpcmBytes(out.samples));
++    int h1 = 0, h2 = 0;
++    for (size_t start = 0; start < samples.size(); start += 14) {
++        const int count = int(std::min<size_t>(14, samples.size() - start));
++        int bestPair = 0, bestExponent = 0;
++        int64_t bestError = std::numeric_limits<int64_t>::max();
++        int8_t nibbles[14];
++        for (int pair = 0; pair < 8; ++pair) {
++            for (int exponent = 0; exponent <= 11; ++exponent) {
++                int t1 = h1, t2 = h2;
++                const int64_t error = CodeFrame(&samples[start], count, out.coefs[2 * pair], out.coefs[2 * pair + 1], exponent, t1, t2, nibbles);
++                if (error < bestError) { bestError = error; bestPair = pair; bestExponent = exponent; }
++            }
++        }
++        CodeFrame(&samples[start], count, out.coefs[2 * bestPair], out.coefs[2 * bestPair + 1], bestExponent, h1, h2, nibbles);
++        out.data.push_back(uint8_t(bestPair << 4 | bestExponent));
++        for (int i = 0; i < count; i += 2) {
++            const int hi = nibbles[i] & 15, lo = i + 1 < count ? nibbles[i + 1] & 15 : 0;
++            out.data.push_back(uint8_t(hi << 4 | lo));
++        }
++    }
++    return out;
++}
++
++std::vector<int16_t> Decode(const Adpcm& adpcm) {
++    std::vector<int16_t> out;
++    out.reserve(adpcm.samples);
++    int h1 = 0, h2 = 0;
++    for (size_t frame = 0; frame < adpcm.data.size() && out.size() < adpcm.samples; frame += 8) {
++        const uint8_t ps = adpcm.data[frame];
++        const int scale = 1 << (ps & 15);
++        const int c1 = adpcm.coefs[(ps >> 4) * 2], c2 = adpcm.coefs[(ps >> 4) * 2 + 1];
++        for (size_t b = frame + 1; b < frame + 8 && b < adpcm.data.size(); ++b) {
++            for (int n : {adpcm.data[b] >> 4, adpcm.data[b] & 15}) {
++                if (out.size() == adpcm.samples) return out;
++                if (n >= 8) n -= 16;
++                const int v = Clamp16((int64_t(n) * scale * 2048 + int64_t(c1) * h1 + int64_t(c2) * h2 + 1024) >> 11);
++                h2 = h1;
++                h1 = v;
++                out.push_back(int16_t(v));
++            }
++        }
++    }
++    return out;
++}
++
++}  // namespace callnames
+diff --git a/runtime/src/callnames/bank.cpp b/runtime/src/callnames/bank.cpp
+new file mode 100644
+index 0000000..7b5695d
+--- /dev/null
++++ b/runtime/src/callnames/bank.cpp
+@@ -0,0 +1,181 @@
++// Voice banks with new callnames appended, served as virtual files, and the encode cache (callnames.h).
++#include "callnames.h"
++
++#include <cstdio>
++#include <fstream>
++#include <iterator>
++
++namespace callnames {
++
++namespace {
++
++constexpr char kEncoderVersion[] = "callnames-adpcm-1";  // bump when Encode/Normalize change their output
++
++uint32_t Be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
++uint16_t Be16(const uint8_t* p) { return uint16_t(p[0] << 8 | p[1]); }
++void SetBe32(uint8_t* p, uint32_t v) { p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v); }
++void SetBe16(uint8_t* p, uint16_t v) { p[0] = uint8_t(v >> 8); p[1] = uint8_t(v); }
++
++bool ReadAt(const std::filesystem::path& path, uint64_t offset, size_t size, std::vector<uint8_t>& out) {
++    std::ifstream in(path, std::ios::binary);
++    if (!in) return false;
++    in.seekg(std::streamoff(offset));
++    out.resize(size);
++    in.read(reinterpret_cast<char*>(out.data()), std::streamsize(size));
++    return in.gcount() == std::streamsize(size);
++}
++
++bool ReadAll(const std::filesystem::path& path, std::vector<uint8_t>& out) {
++    std::ifstream in(path, std::ios::binary);
++    if (!in) return false;
++    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++    return true;
++}
++
++bool WriteAll(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
++    const std::filesystem::path partial = path.string() + ".partial";
++    {
++        std::ofstream out(partial, std::ios::binary | std::ios::trunc);
++        out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
++        if (!out) return false;
++    }
++    std::error_code ec;
++    std::filesystem::rename(partial, path, ec);
++    return !ec;
++}
++
++uint64_t Fnv1a(const std::vector<uint8_t>& bytes, uint64_t hash = 0xCBF29CE484222325ull) {
++    for (uint8_t b : bytes) hash = (hash ^ b) * 0x100000001B3ull;
++    return hash;
++}
++
++}  // namespace
++
++bool EncodeCached(const std::filesystem::path& wav, const std::filesystem::path& cacheDir, Adpcm& out,
++                  std::string& error) {
++    std::vector<uint8_t> bytes;
++    if (!ReadAll(wav, bytes)) {
++        error = "cannot open " + wav.string();
++        return false;
++    }
++    const std::vector<uint8_t> version(std::begin(kEncoderVersion), std::end(kEncoderVersion));
++    char name[32];
++    std::snprintf(name, sizeof(name), "%016llx.adpcm", static_cast<unsigned long long>(Fnv1a(bytes, Fnv1a(version))));
++    const std::filesystem::path cached = cacheDir / name;
++    std::vector<uint8_t> blob;
++    // Cache file: u32 samples, 16 s16 coefficients, then the ADPCM bytes (big-endian).
++    if (ReadAll(cached, blob) && blob.size() >= 36) {
++        out.samples = Be32(blob.data());
++        for (int i = 0; i < 16; ++i) out.coefs[i] = int16_t(Be16(&blob[4 + 2 * i]));
++        out.data.assign(blob.begin() + 36, blob.end());
++        if (out.data.size() == AdpcmBytes(out.samples)) return true;
++    }
++    std::vector<int16_t> mono;
++    if (!ReadWav(wav, mono, error)) return false;
++    Normalize(mono);
++    out = Encode(mono);
++    blob.assign(36, 0);
++    SetBe32(blob.data(), out.samples);
++    for (int i = 0; i < 16; ++i) SetBe16(&blob[4 + 2 * i], uint16_t(out.coefs[i]));
++    blob.insert(blob.end(), out.data.begin(), out.data.end());
++    std::error_code ec;
++    std::filesystem::create_directories(cacheDir, ec);
++    WriteAll(cached, blob);  // a cache that cannot be written only costs encoding again next time
++    return true;
++}
++
++bool BuildBank(int bank, const std::filesystem::path& original,
++               const std::vector<std::pair<uint32_t, Adpcm>>& phrases, const std::filesystem::path& cacheDir,
++               BankBuild& out, std::string& error, uint32_t sectorLimit) {
++    out = BankBuild{};
++    std::vector<uint8_t> header;
++    if (!ReadAt(original, 0, kSector, header) || Be32(header.data()) != 0x005A8AAB) {
++        error = original.string() + ": not a voice bank";
++        return false;
++    }
++    std::error_code ec;
++    const uint64_t fileSize = std::filesystem::file_size(original, ec);
++    const uint32_t indexSector = Be32(&header[4]), oldCount = Be32(&header[8]);
++    const uint64_t indexAt = uint64_t(indexSector) * kSector;
++    std::vector<uint8_t> index;
++    if (ec || oldCount < 4 || !ReadAt(original, indexAt, size_t(oldCount) * 4, index)) {
++        error = original.string() + ": unreadable index";
++        return false;
++    }
++    std::vector<uint16_t> sectors(oldCount), ms(oldCount);
++    for (uint32_t i = 0; i < oldCount; ++i) {
++        sectors[i] = Be16(&index[2 * i]);
++        ms[i] = Be16(&index[2 * oldCount + 2 * i]);
++    }
++    std::vector<uint8_t> templ;  // a real phrase header of this bank (local 3; 0-2 are filler)
++    if (!ReadAt(original, uint64_t(sectors[3]) * kSector, kSector, templ)) {
++        error = original.string() + ": unreadable phrase header";
++        return false;
++    }
++
++    std::vector<uint8_t> ext;  // new phrases, then the new index and the original tail
++    uint32_t next = indexSector;
++    for (const auto& [local, adpcm] : phrases) {
++        const uint32_t dataSectors = uint32_t((adpcm.data.size() + kSector - 1) / kSector);
++        if (next >= sectorLimit) {
++            out.warnings.push_back("voice" + std::to_string(bank) + ".bin: no room for phrase " + std::to_string(local) +
++                                   " (sector " + std::to_string(next) + ")");
++            continue;
++        }
++        std::vector<uint8_t> phrase = templ;
++        SetBe32(&phrase[0x00], uint32_t(adpcm.data.size()));
++        SetBe32(&phrase[0x04], (Be32(&templ[4]) & 0xFFFF0000u) | kRate);
++        const uint32_t millis = uint32_t((uint64_t(adpcm.samples) * 1000 + kRate / 2) / kRate);
++        SetBe32(&phrase[0x10], millis);
++        SetBe32(&phrase[0x88], 2 * uint32_t(adpcm.data.size()));
++        SetBe32(&phrase[0x8C], 2);
++        for (int i = 0; i < 16; ++i) SetBe16(&phrase[0x90 + 2 * i], uint16_t(adpcm.coefs[i]));
++        SetBe16(&phrase[0xB0], 0);
++        SetBe16(&phrase[0xB2], adpcm.data.empty() ? 0 : adpcm.data[0]);
++        SetBe16(&phrase[0xB4], 0);
++        SetBe16(&phrase[0xB6], 0);
++        phrase.insert(phrase.end(), adpcm.data.begin(), adpcm.data.end());
++        phrase.resize(size_t(1 + dataSectors) * kSector, 0);
++        ext.insert(ext.end(), phrase.begin(), phrase.end());
++        if (local >= sectors.size()) {
++            sectors.resize(local + 1, sectors[0]);
++            ms.resize(local + 1, ms[0]);
++        }
++        sectors[local] = uint16_t(next);
++        ms[local] = uint16_t(std::min<uint32_t>(millis, 0xFFFF));
++        out.added.push_back(local);
++        next += 1 + dataSectors;
++    }
++    out.count = uint32_t(sectors.size());
++    const uint32_t newIndexSector = next;
++    for (uint16_t s : sectors) ext.push_back(uint8_t(s >> 8)), ext.push_back(uint8_t(s));
++    for (uint16_t m : ms) ext.push_back(uint8_t(m >> 8)), ext.push_back(uint8_t(m));
++    std::vector<uint8_t> tail;
++    const uint64_t tailAt = indexAt + uint64_t(oldCount) * 4;
++    if (fileSize > tailAt && !ReadAt(original, tailAt, size_t(fileSize - tailAt), tail)) {
++        error = original.string() + ": unreadable tail";
++        return false;
++    }
++    ext.insert(ext.end(), tail.begin(), tail.end());
++
++    const std::filesystem::path extPath = cacheDir / ("voice" + std::to_string(bank) + ".ext");
++    std::filesystem::create_directories(cacheDir, ec);
++    if (!WriteAll(extPath, ext)) {
++        error = "cannot write " + extPath.string();
++        return false;
++    }
++    SetBe32(&header[4], newIndexSector);
++    SetBe32(&header[8], out.count);
++    SetBe32(&header[12], out.count * 4);
++    SetBe32(&header[16], out.count);
++    auto& file = out.file;
++    file.key = cacheDir / ("voice" + std::to_string(bank) + ".virtual");
++    file.dvdPath = "/sound/voice" + std::to_string(bank) + ".bin";
++    file.bytes = header;
++    file.AppendBytes(0, kSector);
++    file.AppendSource(original, kSector, uint64_t(indexSector - 1) * kSector);
++    file.AppendSource(extPath, 0, ext.size());
++    return true;
++}
++
++}  // namespace callnames
+diff --git a/runtime/src/callnames/collect.cpp b/runtime/src/callnames/collect.cpp
+new file mode 100644
+index 0000000..f75779d
+--- /dev/null
++++ b/runtime/src/callnames/collect.cpp
+@@ -0,0 +1,145 @@
++// callnames/callnames.toml of the enabled mods (callnames.h).
++#include "callnames.h"
++
++#include <fstream>
++#include <set>
++
++#include <toml.hpp>
++
++namespace callnames {
++
++namespace {
++
++std::filesystem::path FromUtf8(const std::string& text) {
++    return std::filesystem::path(std::u8string(text.begin(), text.end()));
++}
++
++std::string Utf8(const std::filesystem::path& path) {
++    const std::u8string text = path.u8string();
++    return std::string(text.begin(), text.end());
++}
++
++// Latin-1 letters with accents (U+00C0..U+00FF) to their plain letter; 0 for the rest.
++char Plain(char32_t c) {
++    static constexpr const char* kLatin1 =
++        "AAAAAAACEEEEIIII"   // C0-CF
++        "DNOOOOO\0OUUUUY\0s" // D0-DF
++        "aaaaaaaceeeeiiii"   // E0-EF
++        "dnooooo\0ouuuuy\0y";// F0-FF
++    if (c >= 0xC0 && c <= 0xFF) return kLatin1[c - 0xC0];
++    return 0;
++}
++
++// The game's code for an ASCII character, or -1.
++int GameCode(char c) {
++    if (c >= 'A' && c <= 'Z') return 220 + (c - 'A');
++    if (c >= 'a' && c <= 'z') return 252 + (c - 'a');
++    if (c >= '0' && c <= '9') return 203 + (c - '0');
++    switch (c) {
++    case ' ': return 0;
++    case '.': return 4;
++    case ';': return 7;
++    case '?': return 8;
++    case '!': return 9;
++    case '/': return 30;
++    case '\'': return 38;
++    case '(': return 41;
++    case ')': return 42;
++    case '+': return 59;
++    case '-': return 60;
++    case '=': return 64;
++    default: return -1;
++    }
++}
++
++}  // namespace
++
++std::u16string ToGameText(const std::string& utf8, std::string& dropped) {
++    dropped.clear();
++    std::u16string out;
++    for (size_t i = 0; i < utf8.size();) {
++        const unsigned char lead = static_cast<unsigned char>(utf8[i]);
++        const size_t length = lead < 0x80 ? 1 : (lead >> 5) == 6 ? 2 : (lead >> 4) == 14 ? 3 : (lead >> 3) == 30 ? 4 : 1;
++        char32_t c = length == 1 ? lead : lead & (0x7F >> length);
++        for (size_t k = 1; k < length && i + k < utf8.size(); ++k) c = c << 6 | (static_cast<unsigned char>(utf8[i + k]) & 0x3F);
++        const char ascii = c < 0x80 ? static_cast<char>(c) : Plain(c);
++        const int code = ascii ? GameCode(ascii) : -1;
++        if (code >= 0) out.push_back(static_cast<char16_t>(code));
++        else dropped += utf8.substr(i, length);
++        i += length;
++    }
++    return out;
++}
++
++std::vector<Callname> Collect(const std::vector<mods::Mod>& enabled, std::vector<std::string>& warnings) {
++    std::vector<Callname> out;
++    std::set<uint32_t> taken;
++    for (const mods::Mod& mod : enabled) {
++        if (!mod.enabled || !mod.callnames) continue;
++        const std::filesystem::path folder = mod.root / "callnames";
++        const std::filesystem::path manifest = folder / "callnames.toml";
++        toml::value document;
++        try {
++            std::ifstream input(manifest, std::ios::binary);
++            document = toml::parse(input, Utf8(manifest));
++        } catch (const std::exception& error) {
++            warnings.push_back(mod.id + ": unreadable callnames.toml: " + error.what());
++            continue;
++        }
++        if (!document.contains("callname") || !document.at("callname").is_array()) {
++            warnings.push_back(mod.id + ": callnames.toml has no [[callname]]");
++            continue;
++        }
++        for (const toml::value& entry : document.at("callname").as_array()) {
++            if (!entry.is_table()) continue;
++            Callname name;
++            name.mod = mod.id;
++            const int64_t voice = toml::find_or<int64_t>(entry, "voice", 0);
++            name.list = toml::find_or<std::string>(entry, "list", "");
++            const std::string label = mod.id + ": " + (name.list.empty() ? "voice " + std::to_string(voice) : "\"" + name.list + "\"");
++            if (voice < kFirstVoice || voice > kLastVoice) {
++                warnings.push_back(label + ": voice " + std::to_string(voice) + " outside " + std::to_string(kFirstVoice) + "-" +
++                                   std::to_string(kLastVoice));
++                continue;
++            }
++            name.voice = static_cast<uint32_t>(voice);
++            std::string dropped;
++            name.listGame = ToGameText(name.list, dropped);
++            if (name.listGame.empty() || name.listGame.size() > kMaxListChars) {
++                warnings.push_back(label + ": list must have 1-15 characters the game can show");
++                continue;
++            }
++            if (!dropped.empty()) warnings.push_back(label + ": characters the game cannot show were dropped: " + dropped);
++            for (char16_t code : name.listGame) {
++                if (code >= 252 && code <= 277) code = static_cast<char16_t>(code - 32);  // a-z -> A-Z
++                if ((code >= 220 && code <= 245) || code == 4 || code == 60) name.listUpper.push_back(code);
++            }
++            auto file = [&](const char* key) { return toml::find_or<std::string>(entry, key, ""); };
++            if (file("normal").empty()) {
++                warnings.push_back(label + ": no normal WAV");
++                continue;
++            }
++            name.normal = folder / FromUtf8(file("normal"));
++            name.excited = file("excited").empty() ? name.normal : folder / FromUtf8(file("excited"));
++            name.full = file("full").empty() ? name.normal : folder / FromUtf8(file("full"));
++            std::error_code ec;
++            bool missing = false;
++            for (const auto* path : {&name.normal, &name.excited, &name.full}) {
++                if (!std::filesystem::is_regular_file(*path, ec)) {
++                    warnings.push_back(label + ": missing " + Utf8(path->filename()));
++                    missing = true;
++                    break;
++                }
++            }
++            if (missing) continue;
++            if (!taken.insert(name.voice).second) {
++                warnings.push_back(label + ": voice " + std::to_string(name.voice) + " already used by an earlier mod");
++                continue;
++            }
++            out.push_back(std::move(name));
++        }
++    }
++    return out;
++}
++
++}  // namespace callnames
+diff --git a/runtime/src/callnames/mount.cpp b/runtime/src/callnames/mount.cpp
+new file mode 100644
+index 0000000..8af435e
+--- /dev/null
++++ b/runtime/src/callnames/mount.cpp
+@@ -0,0 +1,54 @@
++// Start-up: the enabled mods' callnames encoded (cached), voice banks 14/15/17 registered as
++// virtual files and the phrase-id ranges grown (callnames.h). Runs from mods::Apply, before DVDInit.
++#include "callnames.h"
++
++#include <chrono>
++
++#include "runtime_config.h"
++#include "runtime_log.h"
++
++namespace callnames {
++
++std::vector<Callname> Mount(const std::vector<mods::Mod>& mods, const std::filesystem::path& cacheDir) {
++    std::vector<std::string> warnings;
++    const std::vector<Callname> names = Collect(mods, warnings);
++    for (const std::string& warning : warnings) RT_LOG(RT_TAG_RUNTIME) << "[callnames] " << warning << std::endl;
++    if (names.empty()) return {};
++    const auto started = std::chrono::steady_clock::now();
++    const std::filesystem::path sound = RuntimeConfigFile::ResolvedDvdRoot() / "files" / "sound";
++    uint32_t counts[3] = {0, 0, 0};
++    int index = 0;
++    for (const int bank : {14, 15, 17}) {
++        std::vector<std::pair<uint32_t, Adpcm>> phrases;
++        for (const Callname& name : names) {
++            const std::filesystem::path& wav = bank == 14 ? name.normal : bank == 15 ? name.excited : name.full;
++            Adpcm adpcm;
++            std::string error;
++            if (!EncodeCached(wav, cacheDir / "encoded", adpcm, error)) {
++                RT_LOG(RT_TAG_RUNTIME) << "[callnames] " << name.mod << ": \"" << name.list << "\": " << error << std::endl;
++                continue;
++            }
++            phrases.emplace_back(name.voice - 0x800, std::move(adpcm));
++        }
++        BankBuild build;
++        std::string error;
++        if (!BuildBank(bank, sound / ("voice" + std::to_string(bank) + ".bin"), phrases, cacheDir, build, error)) {
++            RT_LOG(RT_TAG_RUNTIME) << "[callnames] voice" << bank << ".bin: " << error << std::endl;
++            ++index;
++            continue;
++        }
++        for (const std::string& warning : build.warnings) RT_LOG(RT_TAG_RUNTIME) << "[callnames] " << warning << std::endl;
++        counts[index++] = build.count;
++        RT_LOG(RT_TAG_RUNTIME) << "[callnames] voice" << bank << ".bin: " << build.added.size() << " new phrase(s), "
++                               << build.count << " in the index" << std::endl;
++        DvdReadContract::Virtual::Register(std::move(build.file));
++    }
++    SetBankCounts(counts[0], counts[1], counts[2]);
++    if (counts[0] == 0 && counts[1] == 0 && counts[2] == 0) return {};
++    RT_LOG(RT_TAG_RUNTIME) << "[callnames] " << names.size() << " name(s) in "
++                           << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count()
++                           << " ms" << std::endl;
++    return names;
++}
++
++}  // namespace callnames
+diff --git a/runtime/src/callnames/phrase_ids.cpp b/runtime/src/callnames/phrase_ids.cpp
+new file mode 100644
+index 0000000..479be7c
+--- /dev/null
++++ b/runtime/src/callnames/phrase_ids.cpp
+@@ -0,0 +1,98 @@
++// Phrase id -> bank and local index, as 0x8003B398 / 0x8003B530 compute them (callnames.h).
++#include "callnames.h"
++
++#include <algorithm>
++#include <atomic>
++
++namespace callnames {
++
++namespace {
++
++struct Range {
++    uint32_t base, count;
++};
++
++// The ranges written in 0x8003B398/0x8003B530, in their order; [18] (0x30000) has no voice18.bin.
++constexpr Range kRanges[19] = {
++    {0x4000, 0x3E3},  {0x4800, 0x653},  {0x5000, 0x960},   {0x6000, 0x76E},  {0x6800, 0xACD},
++    {0x7800, 0xAB5},  {0x8800, 0x182A}, {0xA800, 0x1235},  {0xC800, 0x36A},  {0xD000, 0x631},
++    {0xD800, 0x97F},  {0xE800, 0x67B},  {0xF000, 0xA21},   {0x10000, 0xAB1}, {0x11000, 0x1437},
++    {0x13000, 0xE42}, {0x15000, 0x334}, {0x16000, 0xE42},  {0x30000, 0x10000},
++};
++
++std::atomic<uint32_t> g_grown[3];  // banks 14, 15, 17
++
++uint32_t Count(uint32_t bank) {
++    const int grown = bank == 14 ? 0 : bank == 15 ? 1 : bank == 17 ? 2 : -1;
++    const uint32_t original = kRanges[bank].count;
++    return grown < 0 ? original : std::max(original, g_grown[grown].load(std::memory_order_relaxed));
++}
++
++}  // namespace
++
++void SetBankCounts(uint32_t bank14, uint32_t bank15, uint32_t bank17) {
++    g_grown[0] = bank14;
++    g_grown[1] = bank15;
++    g_grown[2] = bank17;
++}
++
++uint32_t PhraseBank(uint32_t id) {
++    if (id == 0) return 0;
++    for (uint32_t bank = 0; bank < 19; ++bank) {
++        if (id - kRanges[bank].base < Count(bank)) return bank;
++    }
++    return 0;
++}
++
++namespace {
++
++struct Span {
++    uint32_t first, last;
++};
++// The key ranges the converters accept (list B, the in-between gaps the game keeps, list C, list A,
++// and 0x963F-0x9A31), and the same + 0x8800 (bank-14 ids).
++constexpr Span kKeys[] = {{0x8803, 0x8DF5}, {0x8DF8, 0x8E3D}, {0x8E40, 0x91BB}, {0x91BE, 0x963C}, {0x963F, 0x9A31}};
++
++bool In(uint32_t x, const Span& s) { return x >= s.first && x <= s.last; }
++bool InKeys(uint32_t x, uint32_t offset, size_t count = std::size(kKeys)) {
++    for (size_t i = 0; i < count; ++i)
++        if (In(x - offset, kKeys[i]) && x >= offset) return true;
++    return false;
++}
++// A callname's key, bank-7 id or bank-14 id: x - base is a callname VoiceId.
++bool IsCallname(uint32_t x, uint32_t base) { return x >= base && x - base >= kFirstVoice && x - base <= kLastVoice; }
++
++}  // namespace
++
++uint32_t RemapKey(uint32_t x) {
++    if (IsCallname(x, 0x8000) || IsCallname(x, 0xA000)) return x + 0x8800;
++    if (In(x, kKeys[4])) return 0;
++    if (InKeys(x, 0, 4) || InKeys(x, 0x2000)) return x + 0x8800;
++    return x;
++}
++
++uint32_t Excited(uint32_t x) {
++    if (IsCallname(x, 0x8000) || IsCallname(x, 0x10800)) return x + 0x2000;
++    return InKeys(x, 0) || InKeys(x, 0x8800, 4) ? x + 0x2000 : 0;
++}
++
++uint32_t ColourName(uint32_t x) {
++    if (IsCallname(x, 0x8000)) return x + 0xD800;
++    return InKeys(x, 0) || InKeys(x, 0x8800, 4) ? x + 0xD800 : 0;
++}
++
++uint32_t Variant(uint32_t x, bool other) {
++    if (IsCallname(x, 0x8000)) return other ? 0 : x + 0x8800;
++    if (IsCallname(x, 0x10800)) return other ? 0 : x;
++    if (!In(x, kKeys[0]) && !In(x - 0x8800, kKeys[0])) return 0;
++    return other ? x + 0x1231 : RemapKey(x) + 0xE3E;
++}
++
++int32_t PhraseLocal(uint32_t id) {
++    for (uint32_t bank = 0; bank < 19; ++bank) {
++        if (id - kRanges[bank].base < Count(bank)) return int32_t(id - kRanges[bank].base);
++    }
++    return -1;
++}
++
++}  // namespace callnames
+diff --git a/runtime/src/callnames/voice_list.cpp b/runtime/src/callnames/voice_list.cpp
+new file mode 100644
+index 0000000..1c27e25
+--- /dev/null
++++ b/runtime/src/callnames/voice_list.cpp
+@@ -0,0 +1,141 @@
++// The editor's name lists (env_voice_data.pack) with callnames added (callnames.h).
++#include "callnames.h"
++
++#include <algorithm>
++#include <map>
++
++namespace callnames {
++
++namespace {
++
++constexpr uint32_t kNameBytes = 30;
++
++uint32_t Be32(const std::vector<uint8_t>& b, size_t at) { return uint32_t(b[at]) << 24 | b[at + 1] << 16 | b[at + 2] << 8 | b[at + 3]; }
++uint16_t Be16(const std::vector<uint8_t>& b, size_t at) { return uint16_t(b[at] << 8 | b[at + 1]); }
++void Push32(std::vector<uint8_t>& b, uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (24 - 8 * i))); }
++void Push16(std::vector<uint8_t>& b, uint16_t v) { b.push_back(uint8_t(v >> 8)); b.push_back(uint8_t(v)); }
++
++struct Entry {
++    uint32_t key = 0;
++    std::vector<uint8_t> name;  // 30 bytes as stored
++    std::u16string sortKey;
++};
++
++std::vector<uint8_t> StoredName(const std::u16string& text) {
++    std::vector<uint8_t> out;
++    for (size_t i = 0; i < 15; ++i) Push16(out, i < text.size() ? text[i] : i == text.size() ? 0xFFFF : 0);
++    return out;
++}
++
++std::u16string NameText(const std::vector<uint8_t>& stored) {
++    std::u16string out;
++    for (size_t i = 0; i < 15 && Be16(stored, 2 * i) != 0xFFFF; ++i) out.push_back(Be16(stored, 2 * i));
++    return out;
++}
++
++char16_t Upper(char16_t c) { return c >= 252 && c <= 277 ? char16_t(c - 32) : c; }
++
++// List B order: by surname, an initial ("T." of "T.Abreu") skipped, case folded.
++std::u16string SortKeyB(const std::u16string& text) {
++    std::u16string key = text.size() > 2 && text[1] == 4 ? text.substr(2) : text;
++    for (char16_t& c : key) c = Upper(c);
++    return key;
++}
++
++int LetterOf(char16_t c) {
++    c = Upper(c);
++    return c >= 220 && c <= 245 ? c - 220 : -1;
++}
++
++std::vector<Entry> ReadList(const std::vector<uint8_t>& pack, uint32_t keys, uint32_t names, uint32_t count) {
++    std::vector<Entry> out(count);
++    for (uint32_t i = 0; i < count; ++i) {
++        out[i].key = Be32(pack, keys + 4 * i);
++        out[i].name.assign(pack.begin() + names + kNameBytes * i, pack.begin() + names + kNameBytes * (i + 1));
++    }
++    return out;
++}
++
++// Inserts after every entry whose key is not greater: originals keep their order.
++void Insert(std::vector<Entry>& list, size_t first, size_t end, Entry entry) {
++    size_t at = first;
++    while (at < end && !(entry.sortKey < list[at].sortKey)) ++at;
++    list.insert(list.begin() + at, std::move(entry));
++}
++
++void Align4(std::vector<uint8_t>& b) {
++    while (b.size() % 4) b.push_back(0);
++}
++
++}  // namespace
++
++bool BuildVoiceList(const std::vector<uint8_t>& original, const std::vector<Callname>& names,
++                    std::vector<uint8_t>& out, VoiceListLayout& layout) {
++    const VoiceListLayout in = layout;
++    auto fits = [&](uint32_t at, uint32_t size) { return at <= original.size() && size <= original.size() - at; };
++    if (!fits(in.keysA, 4 * in.countA) || !fits(in.namesA, kNameBytes * in.countA) || !fits(in.keysB, 4 * in.countB) ||
++        !fits(in.namesB, kNameBytes * in.countB) || !fits(in.letters, 2 * 26)) {
++        return false;
++    }
++    // List A: sorted by its upper-case text.
++    std::vector<Entry> listA = ReadList(original, in.keysA, in.namesA, in.countA);
++    for (Entry& e : listA) e.sortKey = NameText(e.name);
++    // List B: groups, each a heading row (key kLetterHeading, name 0x2000 | letter) and its names.
++    std::map<int, std::vector<Entry>> groups;
++    int current = -1;
++    for (Entry& e : ReadList(original, in.keysB, in.namesB, in.countB)) {
++        const std::u16string text = NameText(e.name);
++        if (e.key == kLetterHeading && !text.empty()) current = LetterOf(char16_t(text[0] & 0x1FFF));
++        e.sortKey = SortKeyB(text);
++        groups[current].push_back(std::move(e));
++    }
++    for (const Callname& name : names) {
++        const uint32_t key = 0x8000 + name.voice;
++        if (!name.listUpper.empty()) {
++            Entry a{key, StoredName(name.listUpper), name.listUpper.substr(0, 15)};
++            Insert(listA, 0, listA.size(), std::move(a));
++        }
++        const std::u16string text = name.listGame.substr(0, 15);
++        const int letter = text.empty() ? -1 : LetterOf(SortKeyB(text).empty() ? 0 : SortKeyB(text)[0]);
++        if (letter < 0) continue;
++        std::vector<Entry>& group = groups[letter];
++        if (group.empty()) group.push_back({kLetterHeading, StoredName({char16_t(0x2000 | (220 + letter))}), {}});
++        Insert(group, 1, group.size(), {key, StoredName(text), SortKeyB(text)});
++    }
++    std::vector<Entry> listB;
++    int16_t letters[26];
++    std::fill(std::begin(letters), std::end(letters), int16_t(-1));
++    for (auto& [letter, group] : groups) {
++        if (letter >= 0 && letter < 26) letters[letter] = int16_t(listB.size());
++        for (Entry& e : group) listB.push_back(std::move(e));
++    }
++
++    out = original;
++    Align4(out);
++    layout = in;
++    layout.countA = uint32_t(listA.size());
++    layout.keysA = uint32_t(out.size());
++    for (const Entry& e : listA) Push32(out, e.key);
++    layout.namesA = uint32_t(out.size());
++    for (const Entry& e : listA) out.insert(out.end(), e.name.begin(), e.name.end());
++    Align4(out);
++    layout.countB = uint32_t(listB.size());
++    layout.keysB = uint32_t(out.size());
++    for (const Entry& e : listB) Push32(out, e.key);
++    layout.namesB = uint32_t(out.size());
++    for (const Entry& e : listB) out.insert(out.end(), e.name.begin(), e.name.end());
++    Align4(out);
++    layout.letters = uint32_t(out.size());
++    for (int16_t l : letters) Push16(out, uint16_t(l));
++    Align4(out);
++    return true;
++}
++
++namespace {
++VoiceListLayout g_layout;
++}
++
++void SetVoiceListLayout(const VoiceListLayout& layout) { g_layout = layout; }
++const VoiceListLayout& CurrentVoiceListLayout() { return g_layout; }
++
++}  // namespace callnames
+diff --git a/runtime/src/hle/mlb/callnames_natives.cpp b/runtime/src/hle/mlb/callnames_natives.cpp
+new file mode 100644
+index 0000000..b153d55
+--- /dev/null
++++ b/runtime/src/hle/mlb/callnames_natives.cpp
+@@ -0,0 +1,121 @@
++// Phrase id -> bank / local index with the ranges of the callname banks grown (callnames.h). With no
++// callname mod the answers are the original's for every id (callnames_tests.cpp checks all of them).
++#include "abi_bridge.h"
++#include "callnames.h"
++#include "hle_stubs.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++
++extern "C" void MLB_VoicePhraseBank_8003B398(CpuContext* ctx) {
++    ctx->gpr[3] = callnames::PhraseBank(static_cast<uint32_t>(ctx->gpr[3]));
++}
++PPC_NATIVE_OVERRIDE_VOID(8003B398, MLB_VoicePhraseBank_8003B398, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoicePhraseLocal_8003B530(CpuContext* ctx) {
++    ctx->gpr[3] = static_cast<uint32_t>(callnames::PhraseLocal(static_cast<uint32_t>(ctx->gpr[3])));
++}
++PPC_NATIVE_OVERRIDE_VOID(8003B530, MLB_VoicePhraseLocal_8003B530, (CpuContext* ctx), (ctx));
++
++// The editor's name lists (env_voice_data.pack, file 3081): the readers of 0x807EDF4C-0x807EE35C with
++// the lists' places and sizes from callnames::CurrentVoiceListLayout() instead of constants. Without
++// callnames the layout is the original's, so they read what the original did.
++extern "C" void func_8000BBFC(CpuContext*);
++
++namespace {
++
++constexpr uint32_t kVoiceDataFile = 3081;
++
++// 0x8000BBFC(3081, 0x40000000 | offset): the pack's bytes at `offset`, in guest memory.
++uint32_t PackAddress(CpuContext* ctx, uint32_t offset) {
++    const uint32_t lr = ctx->lr, r4 = ctx->gpr[4];
++    ctx->gpr[3] = kVoiceDataFile;
++    ctx->gpr[4] = 0x40000000u | offset;
++    ctx->lr = 0x807EDF9Cu;  // as if called from the original reader
++    func_8000BBFC(ctx);
++    ctx->lr = lr;
++    ctx->gpr[4] = r4;
++    return static_cast<uint32_t>(ctx->gpr[3]);
++}
++
++uint32_t NameByKey(CpuContext* ctx, uint32_t key, int* list) {
++    const callnames::VoiceListLayout& layout = callnames::CurrentVoiceListLayout();
++    const uint32_t base = PackAddress(ctx, 0);
++    if (base == 0) {
++        if (list) *list = 0;
++        return 0;
++    }
++    const uint32_t offset = callnames::FindVoiceName(layout, key, [&](uint32_t at) { return Memory::Read32(base + at); }, list);
++    return offset ? base + offset : 0;
++}
++
++}  // namespace
++
++extern "C" void MLB_VoiceNameByKey_807EDF4C(CpuContext* ctx) {
++    ctx->gpr[3] = NameByKey(ctx, static_cast<uint32_t>(ctx->gpr[3]), nullptr);
++}
++PPC_NATIVE_OVERRIDE_VOID(807EDF4C, MLB_VoiceNameByKey_807EDF4C, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceListOfKey_807EE0C8(CpuContext* ctx) {
++    int list = 0;
++    NameByKey(ctx, static_cast<uint32_t>(ctx->gpr[3]), &list);
++    ctx->gpr[3] = static_cast<uint32_t>(list);
++}
++PPC_NATIVE_OVERRIDE_VOID(807EE0C8, MLB_VoiceListOfKey_807EE0C8, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceLetterStartB_807EE200(CpuContext* ctx) {
++    const uint32_t letter = static_cast<uint32_t>(ctx->gpr[3]);
++    const uint32_t at = PackAddress(ctx, callnames::CurrentVoiceListLayout().letters);
++    ctx->gpr[3] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(Memory::Read16(at + 2 * letter))));
++}
++PPC_NATIVE_OVERRIDE_VOID(807EE200, MLB_VoiceLetterStartB_807EE200, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceKeyB_807EE240(CpuContext* ctx) {
++    const uint32_t i = static_cast<uint32_t>(ctx->gpr[3]);
++    ctx->gpr[3] = Memory::Read32(PackAddress(ctx, callnames::CurrentVoiceListLayout().keysB) + 4 * i);
++}
++PPC_NATIVE_OVERRIDE_VOID(807EE240, MLB_VoiceKeyB_807EE240, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceCountB_807EE280(CpuContext* ctx) { ctx->gpr[3] = callnames::CurrentVoiceListLayout().countB; }
++PPC_NATIVE_OVERRIDE_VOID(807EE280, MLB_VoiceCountB_807EE280, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceNameB_807EE288(CpuContext* ctx) {
++    const uint32_t i = static_cast<uint32_t>(ctx->gpr[3]);
++    ctx->gpr[3] = PackAddress(ctx, callnames::CurrentVoiceListLayout().namesB) + 30 * i;
++}
++PPC_NATIVE_OVERRIDE_VOID(807EE288, MLB_VoiceNameB_807EE288, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceKeyA_807EE2D0(CpuContext* ctx) {
++    const uint32_t i = static_cast<uint32_t>(ctx->gpr[3]);
++    ctx->gpr[3] = Memory::Read32(PackAddress(ctx, callnames::CurrentVoiceListLayout().keysA) + 4 * i);
++}
++PPC_NATIVE_OVERRIDE_VOID(807EE2D0, MLB_VoiceKeyA_807EE2D0, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceNameA_807EE310(CpuContext* ctx) {
++    const uint32_t i = static_cast<uint32_t>(ctx->gpr[3]);
++    ctx->gpr[3] = PackAddress(ctx, callnames::CurrentVoiceListLayout().namesA) + 30 * i;
++}
++PPC_NATIVE_OVERRIDE_VOID(807EE310, MLB_VoiceNameA_807EE310, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceCountA_807EE358(CpuContext* ctx) { ctx->gpr[3] = callnames::CurrentVoiceListLayout().countA; }
++PPC_NATIVE_OVERRIDE_VOID(807EE358, MLB_VoiceCountA_807EE358, (CpuContext* ctx), (ctx));
++
++// The commentary's voice-key converters (callnames.h): the original's answers, and a callname's too.
++extern "C" void MLB_VoiceRemapKey_80659DE8(CpuContext* ctx) {
++    ctx->gpr[3] = callnames::RemapKey(static_cast<uint32_t>(ctx->gpr[3]));
++}
++PPC_NATIVE_OVERRIDE_VOID(80659DE8, MLB_VoiceRemapKey_80659DE8, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceExcited_80659C98(CpuContext* ctx) {
++    ctx->gpr[3] = callnames::Excited(static_cast<uint32_t>(ctx->gpr[3]));
++}
++PPC_NATIVE_OVERRIDE_VOID(80659C98, MLB_VoiceExcited_80659C98, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceColourName_80659F70(CpuContext* ctx) {
++    ctx->gpr[3] = callnames::ColourName(static_cast<uint32_t>(ctx->gpr[3]));
++}
++PPC_NATIVE_OVERRIDE_VOID(80659F70, MLB_VoiceColourName_80659F70, (CpuContext* ctx), (ctx));
++
++extern "C" void MLB_VoiceVariant_8065A14C(CpuContext* ctx) {
++    ctx->gpr[3] = callnames::Variant(static_cast<uint32_t>(ctx->gpr[3]), static_cast<uint32_t>(ctx->gpr[4]) != 0);
++}
++PPC_NATIVE_OVERRIDE_VOID(8065A14C, MLB_VoiceVariant_8065A14C, (CpuContext* ctx), (ctx));
+diff --git a/runtime/tests/callnames_tests.cpp b/runtime/tests/callnames_tests.cpp
+new file mode 100644
+index 0000000..56c342c
+--- /dev/null
++++ b/runtime/tests/callnames_tests.cpp
+@@ -0,0 +1,669 @@
++// Host tests for the callnames module (synthetic data only, no game files).
++#include "callnames.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <algorithm>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <initializer_list>
++#include <iterator>
++#include <string>
++#include <vector>
++
++namespace fs = std::filesystem;
++
++static int g_failures = 0;
++#define CHECK(cond)                                                          \
++    do {                                                                     \
++        if (!(cond)) {                                                       \
++            std::fprintf(stderr, "%s:%d: CHECK(%s)\n", __FILE__, __LINE__, #cond); \
++            ++g_failures;                                                    \
++        }                                                                    \
++    } while (0)
++
++static fs::path TempDir() {
++    const fs::path dir = fs::temp_directory_path() / "callnames_tests";
++    fs::remove_all(dir);
++    fs::create_directories(dir);
++    return dir;
++}
++
++// A RIFF/WAVE file with a PCM-style fmt chunk; `format` 1 = PCM, 3 = float.
++static void WriteWav(const fs::path& path, uint16_t format, uint16_t channels, uint32_t rate, uint16_t bits,
++                     const std::vector<uint8_t>& data) {
++    auto u32 = [](std::vector<uint8_t>& out, uint32_t v) { for (int i = 0; i < 4; ++i) out.push_back(uint8_t(v >> (8 * i))); };
++    auto u16 = [](std::vector<uint8_t>& out, uint16_t v) { out.push_back(uint8_t(v)); out.push_back(uint8_t(v >> 8)); };
++    std::vector<uint8_t> out;
++    out.insert(out.end(), {'R', 'I', 'F', 'F'});
++    u32(out, uint32_t(36 + data.size()));
++    out.insert(out.end(), {'W', 'A', 'V', 'E', 'f', 'm', 't', ' '});
++    u32(out, 16);
++    u16(out, format);
++    u16(out, channels);
++    u32(out, rate);
++    u32(out, rate * channels * bits / 8);
++    u16(out, uint16_t(channels * bits / 8));
++    u16(out, bits);
++    out.insert(out.end(), {'d', 'a', 't', 'a'});
++    u32(out, uint32_t(data.size()));
++    out.insert(out.end(), data.begin(), data.end());
++    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
++}
++
++static std::vector<uint8_t> Pcm16(const std::vector<int16_t>& samples) {
++    std::vector<uint8_t> out;
++    for (int16_t s : samples) { out.push_back(uint8_t(s)); out.push_back(uint8_t(uint16_t(s) >> 8)); }
++    return out;
++}
++
++static std::vector<int16_t> Sine(double hz, uint32_t rate, uint32_t count, double amplitude) {
++    std::vector<int16_t> out(count);
++    for (uint32_t i = 0; i < count; ++i) out[i] = int16_t(std::lround(amplitude * std::sin(2 * 3.14159265358979 * hz * i / rate)));
++    return out;
++}
++
++static void TestAdpcmSizes() {
++    // Jeter's bank-14 phrase: 8738 samples, 0x1382 bytes, 0x2704 nibbles.
++    CHECK(callnames::AdpcmBytes(8738) == 0x1382);
++    CHECK(callnames::AdpcmBytes(8738) * 2 == 0x2704);
++    CHECK(callnames::AdpcmBytes(14) == 8);
++    CHECK(callnames::AdpcmBytes(15) == 10);
++    CHECK(callnames::AdpcmBytes(0) == 0);
++}
++
++static void TestRoundTrip() {
++    const std::vector<int16_t> sine = Sine(440, callnames::kRate, callnames::kRate, 20000);
++    const callnames::Adpcm adpcm = callnames::Encode(sine);
++    CHECK(adpcm.samples == sine.size());
++    CHECK(adpcm.data.size() == callnames::AdpcmBytes(uint32_t(sine.size())));
++    const std::vector<int16_t> back = callnames::Decode(adpcm);
++    CHECK(back.size() == sine.size());
++    double signal = 0, noise = 0;
++    for (size_t i = 0; i < sine.size() && i < back.size(); ++i) {
++        signal += double(sine[i]) * sine[i];
++        noise += double(sine[i] - back[i]) * (sine[i] - back[i]);
++    }
++    const double snr = 10 * std::log10(signal / (noise + 1));
++    std::printf("round trip SNR %.1f dB\n", snr);
++    CHECK(snr >= 20);
++}
++
++static void TestDeterministic() {
++    const std::vector<int16_t> sine = Sine(300, callnames::kRate, 5000, 12000);
++    CHECK(callnames::Encode(sine).data == callnames::Encode(sine).data);
++    CHECK(callnames::Encode(sine).coefs == callnames::Encode(sine).coefs);
++}
++
++static void TestReadWav(const fs::path& dir) {
++    std::string error;
++    std::vector<int16_t> mono;
++    // Stereo 44.1 kHz, one second: one second of mono at 22050.
++    std::vector<int16_t> stereo;
++    for (int16_t s : Sine(440, 44100, 44100, 10000)) { stereo.push_back(s); stereo.push_back(s); }
++    WriteWav(dir / "stereo.wav", 1, 2, 44100, 16, Pcm16(stereo));
++    CHECK(callnames::ReadWav(dir / "stereo.wav", mono, error));
++    CHECK(mono.size() >= callnames::kRate - 2 && mono.size() <= callnames::kRate + 2);
++
++    auto rejects = [&](const char* name) {
++        error.clear();
++        const bool ok = callnames::ReadWav(dir / name, mono, error);
++        if (ok || error.empty()) std::fprintf(stderr, "should reject %s\n", name);
++        return !ok && !error.empty();
++    };
++    WriteWav(dir / "8bit.wav", 1, 1, 22050, 8, std::vector<uint8_t>(1000, 128));
++    CHECK(rejects("8bit.wav"));
++    WriteWav(dir / "24bit.wav", 1, 1, 22050, 24, std::vector<uint8_t>(3000, 0));
++    CHECK(rejects("24bit.wav"));
++    WriteWav(dir / "float.wav", 3, 1, 22050, 32, std::vector<uint8_t>(4000, 0));
++    CHECK(rejects("float.wav"));
++    WriteWav(dir / "empty.wav", 1, 1, 22050, 16, {});
++    CHECK(rejects("empty.wav"));
++    WriteWav(dir / "long.wav", 1, 1, 22050, 16, Pcm16(std::vector<int16_t>(22050 * 6, 100)));
++    CHECK(rejects("long.wav"));
++    WriteWav(dir / "cut.wav", 1, 1, 22050, 16, Pcm16(Sine(440, 22050, 1000, 1000)));
++    fs::resize_file(dir / "cut.wav", 30);
++    CHECK(rejects("cut.wav"));
++    CHECK(rejects("missing.wav"));
++}
++
++static void TestNormalize() {
++    std::vector<int16_t> s = {0, 1000, -2000, 500};
++    callnames::Normalize(s);
++    CHECK(s[2] == -29000);
++    CHECK(s[1] == 14500);
++    std::vector<int16_t> silent(10, 0);
++    callnames::Normalize(silent);
++    CHECK(silent == std::vector<int16_t>(10, 0));
++}
++
++
++static std::u16string Codes(std::initializer_list<int> codes) {
++    std::u16string out;
++    for (int c : codes) out.push_back(char16_t(c));
++    return out;
++}
++
++static void TestToGameText() {
++    std::string dropped;
++    // A=220, c=254, u=272, n=265, a=252, space=0, J=229, r=269, .=4
++    CHECK(callnames::ToGameText("Acuña Jr.", dropped) == Codes({220, 254, 272, 265, 252, 0, 229, 269, 4}));
++    CHECK(dropped.empty());
++    CHECK(callnames::ToGameText("O'Neil-9", dropped) == Codes({234, 38, 233, 256, 260, 263, 60, 212}));
++    CHECK(callnames::ToGameText("大谷", dropped).empty());
++    CHECK(dropped == "大谷");
++}
++
++static mods::Mod CallnameMod(const fs::path& dir, const char* id, const std::string& toml,
++                             std::initializer_list<const char*> wavs) {
++    mods::Mod mod;
++    mod.id = id;
++    mod.name = id;
++    mod.root = dir / id;
++    mod.enabled = true;
++    mod.callnames = true;
++    fs::create_directories(mod.root / "callnames");
++    std::ofstream(mod.root / "callnames" / "callnames.toml") << toml;
++    for (const char* wav : wavs) WriteWav(mod.root / "callnames" / wav, 1, 1, 22050, 16, Pcm16(Sine(200, 22050, 4000, 8000)));
++    return mod;
++}
++
++static void TestCollect(const fs::path& dir) {
++    std::vector<std::string> warnings;
++    const mods::Mod first = CallnameMod(dir, "First",
++        "[[callname]]\nvoice = 7300\nlist = \"Acuña Jr.\"\nnormal = \"a.wav\"\n"
++        "[[callname]]\nvoice = 7222\nlist = \"Low\"\nnormal = \"a.wav\"\n"
++        "[[callname]]\nvoice = 10240\nlist = \"High\"\nnormal = \"a.wav\"\n"
++        "[[callname]]\nvoice = 7301\nlist = \"Sixteen chars xx\"\nnormal = \"a.wav\"\n"
++        "[[callname]]\nvoice = 7302\nlist = \"Ohtani\"\nnormal = \"a.wav\"\nexcited = \"b.wav\"\nfull = \"c.wav\"\n"
++        "[[callname]]\nvoice = 7303\nlist = \"Missing\"\nnormal = \"nope.wav\"\n",
++        {"a.wav", "b.wav", "c.wav"});
++    const mods::Mod second = CallnameMod(dir, "Second",
++        "[[callname]]\nvoice = 7300\nlist = \"Other\"\nnormal = \"x.wav\"\n"
++        "[[callname]]\nvoice = 10239\nlist = \"Last\"\nnormal = \"x.wav\"\n",
++        {"x.wav"});
++    mods::Mod plain;
++    plain.id = "Plain";
++    plain.root = dir / "Plain";
++    plain.enabled = true;
++    const auto names = callnames::Collect({first, plain, second}, warnings);
++    CHECK(names.size() == 3);
++    if (names.size() == 3) {
++        CHECK(names[0].voice == 7300 && names[0].mod == "First");
++        CHECK(names[0].excited == names[0].normal && names[0].full == names[0].normal);
++        CHECK(names[0].listUpper == Codes({220, 222, 240, 233, 220, 229, 237, 4}));  // ACUNAJR.
++        CHECK(names[1].voice == 7302);
++        CHECK(names[1].excited.filename() == "b.wav" && names[1].full.filename() == "c.wav");
++        CHECK(names[2].voice == 10239 && names[2].mod == "Second");
++    }
++    // 7222, 10240, the 16-character list, the missing WAV and Second's 7300.
++    CHECK(warnings.size() == 5);
++    for (const auto& w : warnings) std::printf("warning: %s\n", w.c_str());
++}
++
++static void Put32(std::vector<uint8_t>& b, size_t at, uint32_t v) { for (int i = 0; i < 4; ++i) b[at + i] = uint8_t(v >> (24 - 8 * i)); }
++static void Put16(std::vector<uint8_t>& b, size_t at, uint16_t v) { b[at] = uint8_t(v >> 8); b[at + 1] = uint8_t(v); }
++static uint32_t Get32(const std::vector<uint8_t>& b, size_t at) { return uint32_t(b[at]) << 24 | b[at + 1] << 16 | b[at + 2] << 8 | b[at + 3]; }
++static uint16_t Get16(const std::vector<uint8_t>& b, size_t at) { return uint16_t(b[at] << 8 | b[at + 1]); }
++
++// A bank like voiceN.bin: sector 0 header, 4 phrases (header sector + 1 data sector each, ms = 100 + i),
++// the index (sectors then ms) and a 0x80-byte tail.
++static fs::path SyntheticBank(const fs::path& dir) {
++    const uint32_t count = 4, indexSector = 1 + 2 * count;
++    std::vector<uint8_t> b((indexSector + 1) * callnames::kSector, 0);
++    Put32(b, 0, 0x005A8AAB);
++    Put32(b, 4, indexSector);
++    Put32(b, 8, count);
++    Put32(b, 12, count * 4);
++    Put32(b, 16, count);
++    Put32(b, 20, 0x80);
++    for (uint32_t i = 0; i < count; ++i) {
++        const size_t h = (1 + 2 * i) * callnames::kSector;
++        Put32(b, h + 0, 16);
++        Put32(b, h + 4, 0xB4u << 16 | 22050);
++        Put32(b, h + 0x10, 100 + i);
++        Put32(b, h + 0x88, 32);
++        Put32(b, h + 0x8C, 2);
++        b[h + callnames::kSector] = uint8_t(0xA0 + i);  // first data byte, to recognise the phrase
++        Put16(b, indexSector * callnames::kSector + 2 * i, uint16_t(1 + 2 * i));
++        Put16(b, indexSector * callnames::kSector + 2 * count + 2 * i, uint16_t(100 + i));
++    }
++    const size_t tail = indexSector * callnames::kSector + 4 * count;
++    for (size_t i = tail; i < tail + 0x80; ++i) b[i] = 0x5C;
++    const fs::path path = dir / "voice15.bin";
++    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), std::streamsize(b.size()));
++    return path;
++}
++
++static std::vector<uint8_t> ReadVirtual(const callnames::BankBuild& build) {
++    std::vector<uint8_t> out;
++    DvdReadContract::HostReadFailure failure;
++    const bool ok = DvdReadContract::Virtual::Read(build.file, 0, uint32_t(build.file.size), out, failure,
++        [](const fs::path& path, uint64_t offset, uint32_t length, uint8_t* dst, DvdReadContract::HostReadFailure&) {
++            std::ifstream in(path, std::ios::binary);
++            in.seekg(std::streamoff(offset));
++            in.read(reinterpret_cast<char*>(dst), length);
++            return in.gcount() == std::streamsize(length);
++        });
++    CHECK(ok);
++    return out;
++}
++
++static void TestBuildBank(const fs::path& dir) {
++    const fs::path original = SyntheticBank(dir);
++    const callnames::Adpcm six = callnames::Encode(Sine(300, callnames::kRate, 2205, 9000));   // 100 ms
++    const callnames::Adpcm nine = callnames::Encode(Sine(500, callnames::kRate, 4410, 9000));  // 200 ms
++    callnames::BankBuild build;
++    std::string error;
++    CHECK(callnames::BuildBank(15, original, {{6, six}, {9, nine}}, dir / "cache", build, error));
++    CHECK(error.empty());
++    CHECK(build.count == 10);
++    CHECK((build.added == std::vector<uint32_t>{6, 9}));
++    const std::vector<uint8_t> v = ReadVirtual(build);
++    if (v.size() < 0x1000) return;
++    CHECK(Get32(v, 0) == 0x005A8AAB);
++    const uint32_t indexSector = Get32(v, 4);
++    CHECK(Get32(v, 8) == 10 && Get32(v, 12) == 40 && Get32(v, 16) == 10 && Get32(v, 20) == 0x80);
++    const size_t index = size_t(indexSector) * callnames::kSector;
++    CHECK(v.size() >= index + 40 + 0x80);
++    if (v.size() < index + 40 + 0x80) return;
++    auto sector = [&](uint32_t local) { return Get16(v, index + 2 * local); };
++    auto ms = [&](uint32_t local) { return Get16(v, index + 20 + 2 * local); };
++    for (uint32_t i = 0; i < 4; ++i) {
++        CHECK(sector(i) == 1 + 2 * i);
++        CHECK(ms(i) == 100 + i);
++        CHECK(v[(sector(i) + 1) * callnames::kSector] == 0xA0 + i);  // original phrases untouched
++    }
++    for (uint32_t i : {4u, 5u, 7u, 8u}) CHECK(sector(i) == sector(0) && ms(i) == ms(0));
++    CHECK(sector(9) > sector(6) && sector(6) >= 9);
++    const size_t h9 = size_t(sector(9)) * callnames::kSector;
++    CHECK(Get32(v, h9 + 0x10) == 200 && ms(9) == 200);
++    CHECK(Get32(v, h9 + 0) == callnames::AdpcmBytes(4410));
++    CHECK(Get32(v, h9 + 0x88) == 2 * callnames::AdpcmBytes(4410));
++    CHECK(Get32(v, h9 + 4) == (0xB4u << 16 | 22050));
++    CHECK(Get32(v, h9 + 0x8C) == 2);
++    CHECK(int16_t(Get16(v, h9 + 0x92)) == nine.coefs[1]);
++    CHECK(Get16(v, h9 + 0xB2) == nine.data[0]);
++    CHECK(std::memcmp(&v[h9 + callnames::kSector], nine.data.data(), nine.data.size()) == 0);
++    CHECK(v[index + 40] == 0x5C && v[index + 40 + 0x7F] == 0x5C);  // the tail follows the new index
++
++    // A phrase that would start at the sector limit (0x10000 in the game; 11 here) or later is dropped.
++    callnames::BankBuild big;
++    CHECK(callnames::BuildBank(15, original, {{5, six}, {6, six}, {7, six}}, dir / "cache", big, error, 11));
++    CHECK((big.added == std::vector<uint32_t>{5}));
++    CHECK(big.warnings.size() == 2);
++}
++
++// The game's reads go through DvdReadContract::ReadExact: a registered virtual file is assembled
++// from its pieces, across piece boundaries, and a read past its end fails.
++static void TestReadExactVirtual(const fs::path& dir) {
++    const fs::path source = dir / "source.bin";
++    std::ofstream(source, std::ios::binary) << "0123456789";
++    DvdReadContract::Virtual::File file;
++    file.key = dir / "virtual.key";
++    file.dvdPath = "/sound/test.bin";
++    file.bytes = {'a', 'b', 'c'};
++    file.AppendBytes(0, 3);
++    file.AppendSource(source, 2, 5);  // "23456"
++    file.AppendZeros(2);
++    DvdReadContract::Virtual::Register(file);
++    std::vector<uint8_t> out;
++    DvdReadContract::HostReadFailure failure;
++    CHECK(DvdReadContract::ReadExact(file.key, 1, 8, out, failure));
++    CHECK((out == std::vector<uint8_t>{'b', 'c', '2', '3', '4', '5', '6', 0}));
++    CHECK(!DvdReadContract::ReadExact(file.key, 5, 10, out, failure));
++}
++
++// Game text of ASCII letters (A-Z 220.., a-z 252..), '.' 4, ' ' 0.
++static std::u16string G(const char* text) {
++    std::u16string out;
++    for (const char* p = text; *p; ++p) {
++        const char c = *p;
++        out.push_back(char16_t(c >= 'A' && c <= 'Z' ? 220 + (c - 'A') : c >= 'a' && c <= 'z' ? 252 + (c - 'a') : c == '.' ? 4 : 0));
++    }
++    return out;
++}
++
++static void PutName(std::vector<uint8_t>& b, size_t at, const std::u16string& name) {
++    for (size_t i = 0; i < 15; ++i) Put16(b, at + 2 * i, i < name.size() ? name[i] : i == name.size() ? 0xFFFF : 0);
++}
++
++static std::u16string GetName(const std::vector<uint8_t>& b, size_t at) {
++    std::u16string out;
++    for (size_t i = 0; i < 15 && Get16(b, at + 2 * i) != 0xFFFF; ++i) out.push_back(Get16(b, at + 2 * i));
++    return out;
++}
++
++static void TestVoiceList() {
++    // A small pack with the game's structure: A = ABAD, BELL, ZITO; B = [A] Aardsma, T.Abreu, [B] Bell,
++    // [Z] Zito; C = one legend.
++    callnames::VoiceListLayout in;
++    in.keysA = 0x20; in.namesA = 0x40; in.countA = 3;
++    in.letters = 0x100;
++    in.keysB = 0x140; in.namesB = 0x180; in.countB = 7;
++    in.keysC = 0x300; in.namesC = 0x310; in.countC = 1;
++    std::vector<uint8_t> pack(0x340, 0);
++    std::memcpy(pack.data(), "PACKWII ", 8);
++    const char* a[] = {"ABAD", "BELL", "ZITO"};
++    for (uint32_t i = 0; i < 3; ++i) { Put32(pack, in.keysA + 4 * i, 0x8E40 + i); PutName(pack, in.namesA + 30 * i, G(a[i])); }
++    const std::pair<uint32_t, std::u16string> b[] = {
++        {0xFEFE, {char16_t(0x2000 | 220)}}, {0x8804, G("Aardsma")}, {0x8805, G("T.Abreu")},
++        {0xFEFE, {char16_t(0x2000 | 221)}}, {0x8806, G("Bell")}, {0xFEFE, {char16_t(0x2000 | 245)}}, {0x8807, G("Zito")}};
++    for (uint32_t i = 0; i < 7; ++i) { Put32(pack, in.keysB + 4 * i, b[i].first); PutName(pack, in.namesB + 30 * i, b[i].second); }
++    for (int l = 0; l < 26; ++l) Put16(pack, in.letters + 2 * l, 0xFFFF);
++    Put16(pack, in.letters + 0, 0);
++    Put16(pack, in.letters + 2, 3);
++    Put16(pack, in.letters + 50, 5);
++    Put32(pack, in.keysC, 0x9172);
++    PutName(pack, in.namesC, G("Great Ruth"));
++
++    callnames::Callname acuna, xander;
++    acuna.voice = 7300; acuna.listGame = G("Acuna Jr."); acuna.listUpper = G("ACUNAJR.");
++    xander.voice = 7301; xander.listGame = G("Xander"); xander.listUpper = G("XANDER");
++    std::vector<uint8_t> out;
++    callnames::VoiceListLayout layout = in;
++    CHECK(callnames::BuildVoiceList(pack, {acuna, xander}, out, layout));
++    CHECK(std::equal(pack.begin(), pack.end(), out.begin()));  // the original bytes stay
++    CHECK(layout.countA == 5 && layout.countB == 10 && layout.countC == 1 && layout.keysC == in.keysC);
++    std::vector<std::u16string> namesA;
++    for (uint32_t i = 0; i < layout.countA; ++i) namesA.push_back(GetName(out, layout.namesA + 30 * i));
++    CHECK((namesA == std::vector<std::u16string>{G("ABAD"), G("ACUNAJR."), G("BELL"), G("XANDER"), G("ZITO")}));
++    CHECK(Get32(out, layout.keysA + 4) == 0x8000 + 7300 && Get32(out, layout.keysA + 12) == 0x8000 + 7301);
++    std::vector<std::u16string> namesB;
++    for (uint32_t i = 0; i < layout.countB; ++i) namesB.push_back(GetName(out, layout.namesB + 30 * i));
++    CHECK((namesB == std::vector<std::u16string>{{char16_t(0x2000 | 220)}, G("Aardsma"), G("T.Abreu"), G("Acuna Jr."),
++                                                 {char16_t(0x2000 | 221)}, G("Bell"), {char16_t(0x2000 | 243)}, G("Xander"),
++                                                 {char16_t(0x2000 | 245)}, G("Zito")}));
++    CHECK(Get32(out, layout.keysB + 4 * 6) == 0xFEFE && Get32(out, layout.keysB + 4 * 7) == 0x8000 + 7301);
++    CHECK(int16_t(Get16(out, layout.letters + 0)) == 0 && int16_t(Get16(out, layout.letters + 2)) == 4);
++    CHECK(int16_t(Get16(out, layout.letters + 2 * 23)) == 6);  // X now has a group
++    CHECK(int16_t(Get16(out, layout.letters + 2 * 25)) == 8);
++    CHECK(int16_t(Get16(out, layout.letters + 2 * 2)) == -1);
++
++    auto read32 = [&](uint32_t at) { return Get32(out, at); };
++    int list = -1;
++    CHECK(GetName(out, callnames::FindVoiceName(layout, 0x8000 + 7300, read32, &list)) == G("Acuna Jr.") && list == 1);
++    CHECK(GetName(out, callnames::FindVoiceName(layout, 0x8804, read32, &list)) == G("Aardsma") && list == 1);
++    CHECK(GetName(out, callnames::FindVoiceName(layout, 0x8E41, read32, &list)) == G("BELL") && list == 2);
++    CHECK(GetName(out, callnames::FindVoiceName(layout, 0x9172, read32, &list)) == G("Great Ruth") && list == 1);
++    CHECK(callnames::FindVoiceName(layout, 0x1234, read32, &list) == 0 && list == 0);
++    CHECK(callnames::FindVoiceName(layout, 0, read32, &list) == 0);
++    // Without callnames every original key finds the same name as before.
++    auto readIn = [&](uint32_t at) { return Get32(pack, at); };
++    for (uint32_t key : {0x8804u, 0x8805u, 0x8806u, 0x8807u, 0x8E40u, 0x8E41u, 0x8E42u, 0x9172u})
++        CHECK(GetName(pack, callnames::FindVoiceName(in, key, readIn)) == GetName(out, callnames::FindVoiceName(layout, key, read32)));
++}
++
++static void TestEncodeCached(const fs::path& dir) {
++    const fs::path wav = dir / "cached.wav", cache = dir / "encodecache";
++    WriteWav(wav, 1, 1, 22050, 16, Pcm16(Sine(300, 22050, 3000, 5000)));
++    callnames::Adpcm first, again, changed;
++    std::string error;
++    CHECK(callnames::EncodeCached(wav, cache, first, error));
++    CHECK(callnames::EncodeCached(wav, cache, again, error));
++    CHECK(first.data == again.data && first.samples == 3000);
++    size_t files = 0;
++    std::error_code ec;
++    for (const auto& entry : fs::directory_iterator(cache, ec)) files += entry.is_regular_file();
++    CHECK(files == 1);
++    WriteWav(wav, 1, 1, 22050, 16, Pcm16(Sine(700, 22050, 3000, 5000)));  // same name and size
++    CHECK(callnames::EncodeCached(wav, cache, changed, error));
++    CHECK(changed.data != first.data);
++    CHECK(!callnames::EncodeCached(dir / "nope.wav", cache, changed, error) && !error.empty());
++}
++
++struct RefRun { uint32_t first, last; int64_t value; };
++// Reference: 0x8003B398 (bank) and 0x8003B530 (local base, -1 = none) run on the original code for
++// every id 0..0x3FFFF (tools: a small PowerPC interpreter over main.dol); {first, last, value}.
++static const RefRun kRefBank[] = {
++    {0x0, 0x47ff, 0},
++    {0x4800, 0x4e52, 1},
++    {0x4e53, 0x4fff, 0},
++    {0x5000, 0x595f, 2},
++    {0x5960, 0x5fff, 0},
++    {0x6000, 0x676d, 3},
++    {0x676e, 0x67ff, 0},
++    {0x6800, 0x72cc, 4},
++    {0x72cd, 0x77ff, 0},
++    {0x7800, 0x82b4, 5},
++    {0x82b5, 0x87ff, 0},
++    {0x8800, 0xa029, 6},
++    {0xa02a, 0xa7ff, 0},
++    {0xa800, 0xba34, 7},
++    {0xba35, 0xc7ff, 0},
++    {0xc800, 0xcb69, 8},
++    {0xcb6a, 0xcfff, 0},
++    {0xd000, 0xd630, 9},
++    {0xd631, 0xd7ff, 0},
++    {0xd800, 0xe17e, 10},
++    {0xe17f, 0xe7ff, 0},
++    {0xe800, 0xee7a, 11},
++    {0xee7b, 0xefff, 0},
++    {0xf000, 0xfa20, 12},
++    {0xfa21, 0xffff, 0},
++    {0x10000, 0x10ab0, 13},
++    {0x10ab1, 0x10fff, 0},
++    {0x11000, 0x12436, 14},
++    {0x12437, 0x12fff, 0},
++    {0x13000, 0x13e41, 15},
++    {0x13e42, 0x14fff, 0},
++    {0x15000, 0x15333, 16},
++    {0x15334, 0x15fff, 0},
++    {0x16000, 0x16e41, 17},
++    {0x16e42, 0x2ffff, 0},
++    {0x30000, 0x3ffff, 18},
++};
++static const RefRun kRefBase[] = {
++    {0x0, 0x3fff, -1},
++    {0x4000, 0x43e2, 0x4000},
++    {0x43e3, 0x47ff, -1},
++    {0x4800, 0x4e52, 0x4800},
++    {0x4e53, 0x4fff, -1},
++    {0x5000, 0x595f, 0x5000},
++    {0x5960, 0x5fff, -1},
++    {0x6000, 0x676d, 0x6000},
++    {0x676e, 0x67ff, -1},
++    {0x6800, 0x72cc, 0x6800},
++    {0x72cd, 0x77ff, -1},
++    {0x7800, 0x82b4, 0x7800},
++    {0x82b5, 0x87ff, -1},
++    {0x8800, 0xa029, 0x8800},
++    {0xa02a, 0xa7ff, -1},
++    {0xa800, 0xba34, 0xa800},
++    {0xba35, 0xc7ff, -1},
++    {0xc800, 0xcb69, 0xc800},
++    {0xcb6a, 0xcfff, -1},
++    {0xd000, 0xd630, 0xd000},
++    {0xd631, 0xd7ff, -1},
++    {0xd800, 0xe17e, 0xd800},
++    {0xe17f, 0xe7ff, -1},
++    {0xe800, 0xee7a, 0xe800},
++    {0xee7b, 0xefff, -1},
++    {0xf000, 0xfa20, 0xf000},
++    {0xfa21, 0xffff, -1},
++    {0x10000, 0x10ab0, 0x10000},
++    {0x10ab1, 0x10fff, -1},
++    {0x11000, 0x12436, 0x11000},
++    {0x12437, 0x12fff, -1},
++    {0x13000, 0x13e41, 0x13000},
++    {0x13e42, 0x14fff, -1},
++    {0x15000, 0x15333, 0x15000},
++    {0x15334, 0x15fff, -1},
++    {0x16000, 0x16e41, 0x16000},
++    {0x16e42, 0x2ffff, -1},
++    {0x30000, 0x3ffff, 0x30000},
++};
++
++static void TestPhraseIds() {
++    callnames::SetBankCounts(0, 0, 0);
++    for (const RefRun& run : kRefBank)
++        for (uint32_t id : {run.first, run.last, (run.first + run.last) / 2})
++            CHECK(callnames::PhraseBank(id) == uint32_t(run.value));
++    for (const RefRun& run : kRefBase)
++        for (uint32_t id : {run.first, run.last, (run.first + run.last) / 2})
++            CHECK(callnames::PhraseLocal(id) == (run.value < 0 ? -1 : int32_t(id - uint32_t(run.value))));
++    // Every id, against the runs (a run never splits, so the endpoints above are not enough alone).
++    size_t b = 0, l = 0;
++    int mismatches = 0;
++    for (uint32_t id = 0; id < 0x40000; ++id) {
++        while (kRefBank[b].last < id) ++b;
++        while (kRefBase[l].last < id) ++l;
++        const int32_t local = kRefBase[l].value < 0 ? -1 : int32_t(id - uint32_t(kRefBase[l].value));
++        mismatches += callnames::PhraseBank(id) != uint32_t(kRefBank[b].value) || callnames::PhraseLocal(id) != local;
++    }
++    CHECK(mismatches == 0);
++    // Past 0x3FFFF the original answers bank 0 and no local.
++    CHECK(callnames::PhraseBank(0x40000) == 0 && callnames::PhraseLocal(0x40000) == -1);
++    CHECK(callnames::PhraseBank(0xFFFFFFFFu) == 0 && callnames::PhraseLocal(0xFFFFFFFFu) == -1);
++
++    // With callnames up to VoiceId 7300 (local 0x1484): banks 14, 15 and 17 grow, nothing else moves.
++    callnames::SetBankCounts(0x1485, 0x1485, 0x1485);
++    CHECK(callnames::PhraseBank(0x12484) == 14 && callnames::PhraseLocal(0x12484) == 0x1484);
++    CHECK(callnames::PhraseBank(0x14484) == 15 && callnames::PhraseLocal(0x14484) == 0x1484);
++    CHECK(callnames::PhraseBank(0x17484) == 17 && callnames::PhraseLocal(0x17484) == 0x1484);
++    CHECK(callnames::PhraseBank(0x14485) == 0 && callnames::PhraseLocal(0x14485) == -1);
++    CHECK(callnames::PhraseBank(0x15000) == 16 && callnames::PhraseLocal(0x15000) == 0);
++    CHECK(callnames::PhraseBank(0x12437) == 14);  // inside the grown bank 14
++    // A count below the original never shrinks a bank.
++    callnames::SetBankCounts(10, 10, 10);
++    CHECK(callnames::PhraseBank(0x13E41) == 15 && callnames::PhraseLocal(0x13E41) == 0xE41);
++    callnames::SetBankCounts(0, 0, 0);
++}
++
++struct ConvRun { uint32_t first, last, delta; bool zero; };
++// Reference: the key converters run on the original code for every input 0..0x1FFFF (a small
++// PowerPC interpreter over main.dol + the REL); {first, last, delta, zero}: value = zero ? 0 : x + delta.
++static const ConvRun kRefDE8[] = {
++    {0x0, 0x0, 0x0, true},
++    {0x1, 0x8802, 0x0, false},
++    {0x8803, 0x8df5, 0x8800, false},
++    {0x8df6, 0x8df7, 0x0, false},
++    {0x8df8, 0x8e3d, 0x8800, false},
++    {0x8e3e, 0x8e3f, 0x0, false},
++    {0x8e40, 0x91bb, 0x8800, false},
++    {0x91bc, 0x91bd, 0x0, false},
++    {0x91be, 0x963c, 0x8800, false},
++    {0x963d, 0x963e, 0x0, false},
++    {0x963f, 0x9a31, 0x0, true},
++    {0x9a32, 0xa802, 0x0, false},
++    {0xa803, 0xadf5, 0x8800, false},
++    {0xadf6, 0xadf7, 0x0, false},
++    {0xadf8, 0xae3d, 0x8800, false},
++    {0xae3e, 0xae3f, 0x0, false},
++    {0xae40, 0xb1bb, 0x8800, false},
++    {0xb1bc, 0xb1bd, 0x0, false},
++    {0xb1be, 0xb63c, 0x8800, false},
++    {0xb63d, 0xb63e, 0x0, false},
++    {0xb63f, 0xba31, 0x8800, false},
++    {0xba32, 0x1ffff, 0x0, false},
++};
++static const ConvRun kRefF70[] = {
++    {0x0, 0x8802, 0x0, true},
++    {0x8803, 0x8df5, 0xd800, false},
++    {0x8df6, 0x8df7, 0x0, true},
++    {0x8df8, 0x8e3d, 0xd800, false},
++    {0x8e3e, 0x8e3f, 0x0, true},
++    {0x8e40, 0x91bb, 0xd800, false},
++    {0x91bc, 0x91bd, 0x0, true},
++    {0x91be, 0x963c, 0xd800, false},
++    {0x963d, 0x963e, 0x0, true},
++    {0x963f, 0x9a31, 0xd800, false},
++    {0x9a32, 0x11002, 0x0, true},
++    {0x11003, 0x115f5, 0xd800, false},
++    {0x115f6, 0x115f7, 0x0, true},
++    {0x115f8, 0x1163d, 0xd800, false},
++    {0x1163e, 0x1163f, 0x0, true},
++    {0x11640, 0x119bb, 0xd800, false},
++    {0x119bc, 0x119bd, 0x0, true},
++    {0x119be, 0x11e3c, 0xd800, false},
++    {0x11e3d, 0x1ffff, 0x0, true},
++};
++static const ConvRun kRefC98[] = {
++    {0x0, 0x8802, 0x0, true},
++    {0x8803, 0x8df5, 0x2000, false},
++    {0x8df6, 0x8df7, 0x0, true},
++    {0x8df8, 0x8e3d, 0x2000, false},
++    {0x8e3e, 0x8e3f, 0x0, true},
++    {0x8e40, 0x91bb, 0x2000, false},
++    {0x91bc, 0x91bd, 0x0, true},
++    {0x91be, 0x963c, 0x2000, false},
++    {0x963d, 0x963e, 0x0, true},
++    {0x963f, 0x9a31, 0x2000, false},
++    {0x9a32, 0x11002, 0x0, true},
++    {0x11003, 0x115f5, 0x2000, false},
++    {0x115f6, 0x115f7, 0x0, true},
++    {0x115f8, 0x1163d, 0x2000, false},
++    {0x1163e, 0x1163f, 0x0, true},
++    {0x11640, 0x119bb, 0x2000, false},
++    {0x119bc, 0x119bd, 0x0, true},
++    {0x119be, 0x11e3c, 0x2000, false},
++    {0x11e3d, 0x1ffff, 0x0, true},
++};
++static const ConvRun kRefA14C0[] = {
++    {0x0, 0x8802, 0x0, true},
++    {0x8803, 0x8df5, 0x963e, false},
++    {0x8df6, 0x11002, 0x0, true},
++    {0x11003, 0x115f5, 0xe3e, false},
++    {0x115f6, 0x1ffff, 0x0, true},
++};
++static const ConvRun kRefA14C1[] = {
++    {0x0, 0x8802, 0x0, true},
++    {0x8803, 0x8df5, 0x1231, false},
++    {0x8df6, 0x11002, 0x0, true},
++    {0x11003, 0x115f5, 0x1231, false},
++    {0x115f6, 0x1ffff, 0x0, true},
++};
++
++static void CheckConverter(const char* name, const ConvRun* runs, size_t count, uint32_t (*fn)(uint32_t)) {
++    int mismatches = 0;
++    for (size_t r = 0; r < count; ++r)
++        for (uint32_t x = runs[r].first; x <= runs[r].last; ++x) {
++            const bool isCallname = (x - 0x8000 >= 7223 && x - 0x8000 <= 10239) || (x - 0xA000 >= 7223 && x - 0xA000 <= 10239) ||
++                                    (x - 0x10800 >= 7223 && x - 0x10800 <= 10239);
++            if (isCallname) continue;  // the callname inputs are the only ones allowed to differ
++            const uint32_t expected = runs[r].zero ? 0 : x + runs[r].delta;
++            if (fn(x) != expected && mismatches++ < 3) std::fprintf(stderr, "%s(%X) = %X, original %X\n", name, x, fn(x), expected);
++        }
++    CHECK(mismatches == 0);
++}
++
++static void TestKeyConverters() {
++    CheckConverter("RemapKey", kRefDE8, std::size(kRefDE8), callnames::RemapKey);
++    CheckConverter("ColourName", kRefF70, std::size(kRefF70), callnames::ColourName);
++    CheckConverter("Excited", kRefC98, std::size(kRefC98), callnames::Excited);
++    CheckConverter("Variant0", kRefA14C0, std::size(kRefA14C0), [](uint32_t x) { return callnames::Variant(x, false); });
++    CheckConverter("Variant1", kRefA14C1, std::size(kRefA14C1), [](uint32_t x) { return callnames::Variant(x, true); });
++    const uint32_t key = 0x8000 + 7300;  // local 0x1484
++    CHECK(callnames::RemapKey(key) == 0x12484);                      // bank 14: normal surname
++    CHECK(callnames::Excited(callnames::RemapKey(key)) == 0x14484);  // bank 15: excited
++    CHECK(callnames::RemapKey(callnames::Excited(key)) == 0x14484);  // the other order the game uses
++    CHECK(callnames::ColourName(key) == 0x17484);                    // bank 17: full name
++    CHECK(callnames::Variant(key, false) == 0x12484);                // no 4th recording: the normal one
++    CHECK(callnames::Variant(key, true) == 0);
++    CHECK(callnames::RemapKey(0x8000 + 7222) == 0x8000 + 7222);      // outside the range: as the original
++}
++
++int main() {
++    const fs::path dir = TempDir();
++    TestAdpcmSizes();
++    TestRoundTrip();
++    TestDeterministic();
++    TestReadWav(dir);
++    TestNormalize();
++    TestToGameText();
++    TestCollect(dir);
++    TestBuildBank(dir);
++    TestEncodeCached(dir);
++    TestReadExactVirtual(dir);
++    TestVoiceList();
++    TestKeyConverters();
++    TestPhraseIds();
++    if (g_failures) {
++        std::fprintf(stderr, "%d failure(s)\n", g_failures);
++        return 1;
++    }
++    std::printf("callnames tests passed\n");
++    return 0;
++}
