@@ -431,6 +431,18 @@ Investigado el 31 de octubre de 2026 para poder añadir nombres nuevos (desensam
 - El mismo jugador puede estar en dos listas: David Aardsma tiene `VoiceId` 2052 (lista B) y además hay un `AARDSMA` genérico en la A (clave `0x91BE`).
 - **Ojo:** el banco 14 tiene otras 1523 frases a partir del índice local `0xE41`. Un `VoiceId` nuevo por encima de `0x1640` no puede ir al final del banco 14 sin pisarlas.
 
+**Lo que usa el editor** (comprobado el 31 de octubre de 2026 en Arrange › un equipo › VOICE SETUP › un jugador):
+
+- **Select Type** («Choose a voice from the players used during a game»): rejilla de iniciales (la X, sin nombres, sale en otro color) y después la lista de esa letra con el nombre de la **lista B** («A», «Aardsma», «B.Abreu», «T.Abreu», «Accardo»…). Aardsma tiene la clave `0x8804` = `0x8000` + su `VoiceId` 2052.
+- **Search Type**: se teclea el nombre con las letras A-Z, `-` y `.`, y se busca en la **lista A** (mayúsculas).
+- Funciones de la interfaz que leen las listas (por quién llaman): lista A `0x807E5494`, `0x807E5A24`, `0x807E5C18`, `0x807E65C0`, `0x807E7480`, `0x807E7614`, `0x807E772C`; lista B `0x807E78B8`, `0x807E84DC`, `0x807E85F0` (número + letras), `0x807E867C`, `0x807E8EC0`, `0x807E974C`, `0x807E97F8`; nombre por clave `0x80581A68`, `0x807E57A8`, `0x807E5890`, `0x807E60A4`, `0x807E8B38`, `0x807EB8B8`, `0x807EBCBC`, `0x807ED7D8`.
+- Los tamaños solo están escritos en el lector: `0x77B` en `0x807EDF4C`, `0x807EE0C8` y `0x807EE358` (devuelve el número de la A, llamado desde `0x807E7480`, `0x807E7614` y `0x807E772C`); `0x3CA` en `0x807EDF4C`, `0x807EE0C8` y `0x807EE280`; `0x3D` en `0x807EDF4C` y `0x807EE0C8`. Hay otros `0x3CA` en `0x80754C3C`/`0x80754CB8` que comprueban `+0xF4 − 1` de otro objeto (sin relación comprobada).
+
+**Índices de los bancos en memoria** (leídos en el menú):
+
+- `0x8029C1A0 + banco × 12` = {puntero al índice, número de frases, sector del índice}. Los índices están en el montón de MEM2, seguidos (banco 0 en `0x97D84500` … banco 17 en `0x97DB5500`), cada uno de los bytes del índice redondeados a `0x1000`. El montón de MEM2 tiene unos 125 MB (parche `wiicompiled-mlb-mem2-heap`), así que un índice más grande cabe.
+- `0x8029C2D8 + banco × 0x80`: la primera palabra es `0x80000000` y las 31 siguientes, `0xFFFFFFFF`, sin umbrales: con sectores por debajo de `0x10000`, `k` = 0.
+
 Fuentes: desensamblado (`0x80025708`, `0x80032C74`-`0x80032F28`, `0x8065A0D4`, `0x807EDF4C`-`0x807EE354`, `0x8003A648`, `0x8003ACF0`, `0x8003AEB8`, `0x8003B220`, `0x8003B398`, `0x8003B530`); lecturas de `voiceN.bin` de un partido de prueba; roster de `game_data.pack`.
 
 ## 5. Disco y `project.bin`

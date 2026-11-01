@@ -430,6 +430,18 @@ Researched on October 31, 2026 to make adding new names possible (disassembly an
 - The same player can be in two lists: David Aardsma has `VoiceId` 2052 (list B) and there is also a generic `AARDSMA` in A (key `0x91BE`).
 - **Careful:** bank 14 holds another 1523 phrases from local index `0xE41` on. A new `VoiceId` above `0x1640` cannot go at the end of bank 14 without overwriting them.
 
+**What the editor uses** (checked on October 31, 2026 in Arrange › a team › VOICE SETUP › a player):
+
+- **Select Type** ("Choose a voice from the players used during a game"): a grid of initials (X, with no names, is shown in another colour), then that letter's list with the **list B** names ("A", "Aardsma", "B.Abreu", "T.Abreu", "Accardo"…). Aardsma's key is `0x8804` = `0x8000` + his `VoiceId` 2052.
+- **Search Type**: the name is typed with the letters A-Z, `-` and `.`, and searched in **list A** (upper case).
+- Interface functions that read the lists (by what they call): list A `0x807E5494`, `0x807E5A24`, `0x807E5C18`, `0x807E65C0`, `0x807E7480`, `0x807E7614`, `0x807E772C`; list B `0x807E78B8`, `0x807E84DC`, `0x807E85F0` (count + letters), `0x807E867C`, `0x807E8EC0`, `0x807E974C`, `0x807E97F8`; name by key `0x80581A68`, `0x807E57A8`, `0x807E5890`, `0x807E60A4`, `0x807E8B38`, `0x807EB8B8`, `0x807EBCBC`, `0x807ED7D8`.
+- The sizes are only hard-coded in the reader: `0x77B` in `0x807EDF4C`, `0x807EE0C8` and `0x807EE358` (returns list A's count, called from `0x807E7480`, `0x807E7614` and `0x807E772C`); `0x3CA` in `0x807EDF4C`, `0x807EE0C8` and `0x807EE280`; `0x3D` in `0x807EDF4C` and `0x807EE0C8`. Other `0x3CA`s at `0x80754C3C`/`0x80754CB8` check `+0xF4 − 1` of another object (no proven link).
+
+**Bank indexes in memory** (read in the menu):
+
+- `0x8029C1A0 + bank × 12` = {pointer to the index, phrase count, index sector}. The indexes live in the MEM2 heap, back to back (bank 0 at `0x97D84500` … bank 17 at `0x97DB5500`), each the index bytes rounded to `0x1000`. The MEM2 heap has about 125 MB (patch `wiicompiled-mlb-mem2-heap`), so a larger index fits.
+- `0x8029C2D8 + bank × 0x80`: the first word is `0x80000000` and the next 31 are `0xFFFFFFFF`, with no thresholds: with sectors below `0x10000`, `k` = 0.
+
 Sources: disassembly (`0x80025708`, `0x80032C74`-`0x80032F28`, `0x8065A0D4`, `0x807EDF4C`-`0x807EE354`, `0x8003A648`, `0x8003ACF0`, `0x8003AEB8`, `0x8003B220`, `0x8003B398`, `0x8003B530`); `voiceN.bin` reads of a test match; `game_data.pack` roster.
 
 ## 5. Disc and `project.bin`
