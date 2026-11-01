@@ -452,6 +452,67 @@ index ef7adb8..b7dea6e 100644
    async function exportRosterAsCsv() {
      const csvFile = await exportApiClientRef.current.executeCsv({
        rosterId: rosterId,
+diff --git a/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008CallnameTests.cs b/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008CallnameTests.cs
+new file mode 100644
+index 0000000..e17fc84
+--- /dev/null
++++ b/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008CallnameTests.cs
+@@ -0,0 +1,55 @@
++using NUnit.Framework;
++using PowerUp.GameSave.PowerPros2008;
++using Shouldly;
++using System.IO;
++using System.Linq;
++
++namespace PowerUp.Tests.GameSave.PowerPros2008
++{
++  // Callnames from the 2008 launcher's mods (mods/<mod>/callnames/callnames.toml): each becomes a
++  // voice-library line "Callname_<list>,<Only2008Voice + voice>", so the voice picker offers it and the
++  // 2008 export writes the callname's VoiceId.
++  public class PowerPros2008CallnameTests
++  {
++    string modsDirectory = "";
++
++    [SetUp]
++    public void SetUp()
++    {
++      modsDirectory = Path.Combine(Path.GetTempPath(), "powerup-callnames-tests");
++      if (Directory.Exists(modsDirectory))
++        Directory.Delete(modsDirectory, true);
++      Write("Acuna", "# test\n[[callname]]\nvoice = 7300\nlist = \"Acuña Jr.\"\nnormal = \"a.wav\"\n\n[[callname]]\nvoice = 7301\nlist = \"Chourio\"\nnormal = \"c.wav\"\n");
++      Write("Bad", "[[callname]]\nvoice = 7000\nlist = \"Low\"\nnormal = \"x.wav\"\n[[callname]]\nlist = \"NoVoice\"\n");
++      Directory.CreateDirectory(Path.Combine(modsDirectory, "NoCallnames"));
++    }
++
++    void Write(string mod, string toml)
++    {
++      var folder = Path.Combine(modsDirectory, mod, "callnames");
++      Directory.CreateDirectory(folder);
++      File.WriteAllText(Path.Combine(folder, "callnames.toml"), toml);
++    }
++
++    [Test]
++    public void CallnameLibraryLines_ListsTheModsCallnames()
++    {
++      var lines = PowerPros2008Roster.CallnameLibraryLines(modsDirectory).OrderBy(l => l).ToArray();
++      lines.ShouldBe(new[] { "Callname_Acuña Jr.,17300", "Callname_Chourio,17301" });
++    }
++
++    [Test]
++    public void CallnameVoices_ExportAsTheirVoiceId()
++    {
++      PowerPros2008Roster.Voice2008(17300).ShouldBe(7300);
++      PowerPros2008Roster.Voice2007(7300).ShouldBe(17300);
++    }
++
++    [Test]
++    public void CallnameLibraryLines_WithoutModsDirectory_IsEmpty()
++    {
++      PowerPros2008Roster.CallnameLibraryLines(null).ShouldBeEmpty();
++      PowerPros2008Roster.CallnameLibraryLines(Path.Combine(modsDirectory, "missing")).ShouldBeEmpty();
++    }
++  }
++}
 diff --git a/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008SkinTests.cs b/PowerUp/PowerUp.Tests/GameSave/PowerPros2008/PowerPros2008SkinTests.cs
 new file mode 100644
 index 0000000..49d5477
@@ -1380,10 +1441,10 @@ index 0000000..e330a50
 +}
 diff --git a/PowerUp/PowerUp/GameSave/PowerPros2008/PowerPros2008Roster.cs b/PowerUp/PowerUp/GameSave/PowerPros2008/PowerPros2008Roster.cs
 new file mode 100644
-index 0000000..010c9a4
+index 0000000..ce31ef2
 --- /dev/null
 +++ b/PowerUp/PowerUp/GameSave/PowerPros2008/PowerPros2008Roster.cs
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,389 @@
 +﻿using System;
 +using System.Collections.Generic;
 +using System.IO;
@@ -1461,7 +1522,58 @@ index 0000000..010c9a4
 +    /// one of the same name), and in 2008 mode the 2007 voices 2008 removed are left out, so every
 +    /// choice exists in the game.
 +    /// </summary>
-+    public static string[] VoiceLibraryLines(string dataDirectory, ICharacterLibrary characters)
++    /// <summary>
++    /// Callnames the launcher's mods add (mods/&lt;mod&gt;/callnames/callnames.toml, every mod in the folder):
++    /// "Callname_&lt;list&gt;,&lt;Only2008Voice + voice&gt;" for each [[callname]] with a voice in 7223-10239.
++    /// Only the voice and list keys are read.
++    /// </summary>
++    public static string[] CallnameLibraryLines(string? modsDirectory)
++    {
++      if (modsDirectory is null || !Directory.Exists(modsDirectory))
++        return [];
++      var lines = new List<string>();
++      foreach (var toml in Directory.GetFiles(modsDirectory, "callnames.toml", SearchOption.AllDirectories)
++                 .Where(path => Path.GetFileName(Path.GetDirectoryName(path)) == "callnames").OrderBy(path => path))
++      {
++        int? voice = null;
++        string? list = null;
++        void Flush()
++        {
++          if (voice is >= 7223 and <= 10239 && !string.IsNullOrWhiteSpace(list))
++            lines.Add($"Callname_{list.Replace(',', ' ')},{Only2008Voice + voice}");
++          voice = null;
++          list = null;
++        }
++        foreach (var raw in File.ReadAllLines(toml))
++        {
++          var line = raw.Trim();
++          if (line == "[[callname]]")
++          {
++            Flush();
++            continue;
++          }
++          var eq = line.IndexOf('=');
++          if (eq < 0 || line.StartsWith('#'))
++            continue;
++          var key = line[..eq].Trim();
++          var value = line[(eq + 1)..].Trim();
++          var hash = value.StartsWith('"') ? value.IndexOf('"', 1) + 1 : value.IndexOf('#');
++          if (hash > 0)
++            value = value[..hash].Trim();
++          if (key == "voice" && int.TryParse(value, out var number))
++            voice = number;
++          else if (key == "list" && value.Length >= 2 && value[0] == '"' && value[^1] == '"')
++            list = value[1..^1];
++        }
++        Flush();
++      }
++      return lines.ToArray();
++    }
++
++    public static string[] VoiceLibraryLines(string dataDirectory, ICharacterLibrary characters) =>
++      GameVoiceLibraryLines(dataDirectory, characters).Concat(CallnameLibraryLines(ModsDirectory)).ToArray();
++
++    static string[] GameVoiceLibraryLines(string dataDirectory, ICharacterLibrary characters)
 +    {
 +      var lines = File.ReadAllLines(Path.Combine(dataDirectory, "data", "Voice_Library.csv"));
 +      var packPath = Path.Combine(dataDirectory, "data", "PowerPros2008_game_data.pack");
