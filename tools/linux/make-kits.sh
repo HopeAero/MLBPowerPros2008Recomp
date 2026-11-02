@@ -15,7 +15,8 @@ python3 "$root/tools/check_no_game_data.py" --all >/dev/null || { echo "check_no
 make_kit() {  # $1 kit name, $2 installer file name, $3 installer body
     local name=MLB-Power-Pros-2008-$1-$version stage
     stage=$(mktemp -d)
-    git -C "$root" archive --format=tar --prefix="$name/" "$commit" | tar -x -C "$stage"
+    # core.autocrlf=false: on Windows, git archive would otherwise write CRLF files into the kit.
+    git -c core.autocrlf=false -C "$root" archive --format=tar --prefix="$name/" "$commit" | tar -x -C "$stage"
     printf '%s\n' "$3" > "$stage/$name/$2"
     chmod +x "$stage/$name/$2"
     tar -C "$stage" -czf "$out/$name.tar.gz" "$name"
