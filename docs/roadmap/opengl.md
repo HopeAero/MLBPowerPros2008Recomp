@@ -2,7 +2,7 @@
 
 *English: [../en/roadmap/opengl.md](../en/roadmap/opengl.md)*
 
-**Estado:** en curso (OpenGL ES en Linux, Direct3D 11 en Windows) · [Roadmap](../../ROADMAP.es.md)
+**Estado:** hecho (OpenGL ES en Linux, Direct3D 11 en Windows); faltan comprobaciones en Linux nativo y en una gráfica solo Direct3D 11. La Switch usa su propio renderizador (deko3d), no OpenGL · [Roadmap](../../ROADMAP.es.md)
 
 ## Por qué
 El juego dibuja con Dawn (WebGPU), que hoy usa Direct3D 12 o Vulkan. Gráficas antiguas y algunos controladores no tienen ninguno de los dos funcionando bien. OpenGL / OpenGL ES es además el camino más directo a Switch, donde Dawn no tiene backend propio.

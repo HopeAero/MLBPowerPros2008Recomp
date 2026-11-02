@@ -2,12 +2,13 @@
 
 *English: [../en/roadmap/performance.md](../en/roadmap/performance.md)*
 
-**Estado:** lo siguiente · [Roadmap](../../ROADMAP.es.md)
+**Estado:** en curso · [Roadmap](../../ROADMAP.es.md)
 
 ## Por qué
 El juego debería ir a 60 FPS estables en las PCs que la gente tiene: portátiles con gráfica integrada, CPUs de 4 núcleos de hace unos años, la Steam Deck. Hoy se ajusta y se mide en un solo escritorio (Ryzen 5 5500 + Radeon RX 5500).
 
 ## Dónde estamos
+- **v0.1.6:** optimizaciones de Switch portadas a PC (nativas exactas de reflejos `0x8000D770`, colores de luz `0x80061220`, reverb, `sqrt`/`__fill_mem`; write-back de registros solo si están sucios; atajos GX; despacho indirecto rápido; mipmaps más rápidos): hilo del juego 6,16 → 5,38 ms por cuadro (−13 %) en la RX 5500 / Ryzen 5 5500. Opciones de VIDEO: sombras, público, cámara de jugada y reflejos (todo al mínimo, ~4,4 ms). Resumen en `docs/traspaso.md`.
 - GPU a resolución nativa (x1) en un partido: unos 2,9 ms por cuadro en la RX 5500; x2 con filtrado 16x unos 7,5 ms. El launcher ya tiene calidades (Baja / Media / Alta), escalado AMD FSR 1, mipmaps y MSAA.
 - La lógica del juego está traducida de antemano a código nativo, así que no hay coste de emulación, pero el código traducido y el runtime aún no se han perfilado en CPUs lentas.
 - GPU por cuadro en un partido (RX 5500, `WIICOMPILED_GPU_BREAKDOWN=1`): 3,0 ms a x1 (939x528), 7,5 ms a x2, 11,6 ms a x4. Cada cuadro tiene 32 pasadas (`WIICOMPILED_GPU_BREAKDOWN=2` las lista): la escena 3D (~0,6–0,95 ms), 7 ciclos en que el juego dibuja en la esquina 188x128 del EFB y lo copia a textura (render a textura al estilo Wii, 28 pasadas) y la composición final (~0,65 ms). Esas 28 pasadas casi no dibujan píxeles: son ~22 µs fijos por pasada más ~20 µs por copia, la sincronización entre dibujar y copiar (~1,2 ms a x1). Fusionarlas ahorraría como mucho ~0,85 ms a x1, y en una GPU débil ese coste fijo pesa menos que el trabajo por píxel, que crece mucho más; en GPUs de PC y en Switch (no son de mosaico) cargar y guardar los destinos no cuesta ancho de banda. La palanca para gráficas débiles es el coste por píxel de la escena y de la composición final. El filtrado anisotrópico y los mods de texturas no cambian el coste.

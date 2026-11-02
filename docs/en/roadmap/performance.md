@@ -2,12 +2,13 @@
 
 *Español: [../../roadmap/rendimiento.md](../../roadmap/rendimiento.md)*
 
-**Status:** next up · [Roadmap](../../../ROADMAP.md)
+**Status:** in progress · [Roadmap](../../../ROADMAP.md)
 
 ## Why
 The game should run at a steady 60 FPS on the PCs people actually have: laptops with integrated graphics, 4-core CPUs from a few years ago, the Steam Deck. Today it is tuned and measured on one desktop (Ryzen 5 5500 + Radeon RX 5500).
 
 ## Where we are
+- **v0.1.6:** Switch optimizations ported to PC (bit-exact natives for the reflections `0x8000D770`, light colors `0x80061220`, reverb, `sqrt`/`__fill_mem`; translator writes back only dirty registers; GX fast paths; fast indirect dispatch; faster mipmaps): game thread 6.16 → 5.38 ms per frame (−13%) on the RX 5500 / Ryzen 5 5500. VIDEO options: shadows, crowd, play camera and reflections (all at minimum, ~4.4 ms). Summary in `docs/traspaso.md`.
 - GPU at native resolution (x1) in a match: about 2.9 ms per frame on the RX 5500; x2 with 16x filtering about 7.5 ms. Quality presets (Low / Medium / High), AMD FSR 1 upscaling, mipmaps and MSAA are already in the launcher.
 - The game logic is translated ahead of time to native code, so there is no emulation cost, but the translated code and the runtime have not been profiled on slow CPUs yet.
 - GPU per frame in a match (RX 5500, `WIICOMPILED_GPU_BREAKDOWN=1`): 3.0 ms at x1 (939x528), 7.5 ms at x2, 11.6 ms at x4. Each frame has 32 passes (`WIICOMPILED_GPU_BREAKDOWN=2` lists them): the 3D scene (~0.6–0.95 ms), 7 cycles where the game draws into the 188x128 corner of the EFB and copies it to a texture (Wii-style render to texture, 28 passes) and the final composition (~0.65 ms). Those 28 passes draw almost no pixels: ~22 µs fixed per pass plus ~20 µs per copy, the synchronization between drawing and copying (~1.2 ms at x1). Merging them would save at most ~0.85 ms at x1, and on a weak GPU that fixed cost weighs less than per-pixel work, which grows far more; on PC GPUs and on Switch (not tile-based) loading and storing targets costs no bandwidth. The lever for weak GPUs is the per-pixel cost of the scene and the final composition. Anisotropic filtering and texture mods do not change the cost.
