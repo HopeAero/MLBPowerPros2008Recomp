@@ -91,6 +91,7 @@ full = "acuna_full.wav"      # full name (optional: normal is used when missing)
 - **A roster that uses a callname needs the callname mod enabled.** Without it that player has no name (silence), as with an empty voice.
 - If two enabled mods use the same voice number, the first in alphabetical order wins and the log says so.
 - It works in every mode with commentary, MLB Life included.
+- **On the Switch:** copy the mod folder as it is to `sdmc:/switch/mlbpowerpros2008/mods/<Mod>/` (next to the `.nro`) and enable it in the Switch launcher (MODS); it applies on the next start. It works the same with `Data/` as with the ISO read directly (`game.iso`). The converted audio is kept in `sdmc:/switch/mlbpowerpros2008/UserData/Cache/mods/callnames`. The conversion happens before the first picture: the first start with new audio stays on the black screen a little longer, later starts do not. Make the mod and the roster on the PC (Callname Editor, PowerUp+) and copy them to the SD card.
 - How it works inside: `docs/en/reverse-engineering.md`, "Voice banks and player names".
 
 ## `project.bin`

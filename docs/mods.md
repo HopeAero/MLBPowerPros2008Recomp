@@ -91,6 +91,7 @@ full = "acuna_full.wav"      # nombre completo (opcional: si falta, se usa norma
 - **Un roster que use un callname necesita el mod de callnames activo.** Sin él, ese jugador queda sin nombre (silencio), como con una voz vacía.
 - Si dos mods activos usan el mismo número de voz, gana el primero en orden alfabético y el registro lo dice.
 - Vale en todos los modos que usan comentario, MLB Life incluido.
+- **En Switch:** copia la carpeta del mod tal cual a `sdmc:/switch/mlbpowerpros2008/mods/<Mod>/` (junto al `.nro`) y actívalo en el launcher de la Switch (MODS); se aplica en el siguiente arranque. Funciona igual con `Data/` que con la ISO directa (`game.iso`). Los audios convertidos se guardan en `sdmc:/switch/mlbpowerpros2008/UserData/Cache/mods/callnames`. La conversión ocurre antes de la primera imagen: el primer arranque con audio nuevo tarda algo más en salir de la pantalla negra y los siguientes no. El mod y el roster se preparan en el PC (Editor de callnames, PowerUp+) y se copian a la SD.
 - Cómo funciona por dentro: `docs/ingenieria-inversa.md`, «Bancos de voz y nombres de jugador».
 
 ## `project.bin`

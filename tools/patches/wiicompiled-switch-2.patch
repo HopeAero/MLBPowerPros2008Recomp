@@ -1,160 +1,3 @@
-diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
-index 3198082..d035de1 100644
---- a/runtime/include/runtime_config.h
-+++ b/runtime/include/runtime_config.h
-@@ -46,6 +46,14 @@ struct RuntimeUserConfig {
-     std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
-     std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
-     std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
-+    // Lighter graphics (hle/mlb/gfx_options.cpp), launcher VIDEO tab; all as on the Wii by default.
-+    std::optional<std::string> playerShadows;  // [video] shadows: "full", "simple" (round blob) or "off"
-+    std::optional<std::string> crowdLevel;     // [video] crowd: "full", "less" (half the stands) or "off"
-+    std::optional<uint32_t> fieldingFov;       // [video] fielding_fov: play-shot camera angle in percent, 60-100
-+    std::optional<std::string> reflections;    // [video] reflections: "on" (helmet and bat shine) or "off"
-+    // [video] experimental_gx: the Switch's GXF4 steps (texture objects and the raw-FIFO stream on the GX
-+    // threads), WIICOMPILED_GXF_TEX / WIICOMPILED_GXF_STREAM when those are not set (main.cpp, launcher VIDEO).
-+    std::optional<bool> experimentalGx;
-     std::optional<int32_t> windowPosX;
-     std::optional<int32_t> windowPosY;
-     std::optional<uint32_t> windowWidth;
-@@ -193,6 +201,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
- // only vulkan for linux
- #elif defined(__linux__)
-     static constexpr std::array<std::string_view, 4> values{"auto", "vulkan", "opengles", "null"};
-+#elif defined(__SWITCH__)
-+    static constexpr std::array<std::string_view, 3> values{"auto", "vulkan", "null"};
- #elif defined(_WIN32)
-     static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
- #endif
-@@ -228,6 +238,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
-     }
- #elif defined(__APPLE__)
-     return RuntimePlatform::ExecutableDirectory();
-+#elif defined(__SWITCH__)
-+    return std::filesystem::path("sdmc:/switch/mlbpowerpros2008");  // where the homebrew menu finds it
- #else
-     // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
-     // does not NUL-terminate and silently truncates if the buffer is too small, so this grows
-@@ -275,6 +287,9 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
- }
- 
- inline std::filesystem::path ApplicationDataDirectory() {
-+#if defined(__SWITCH__)
-+    return *ExecutableDirectory() / kPortableUserDataDirectoryName;  // always portable on the SD card
-+#endif
-     if (const auto& portableRoot = PortableRootDirectory()) {
-         return *portableRoot / kPortableUserDataDirectoryName;
-     }
-@@ -479,6 +494,21 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
-     config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
-     config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
-     config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
-+    if (auto value = FindConfigValue<std::string>(document, "video", "shadows");
-+        value && (*value == "full" || *value == "simple" || *value == "off")) {
-+        config.playerShadows = *value;
-+    }
-+    if (auto value = FindConfigValue<std::string>(document, "video", "crowd");
-+        value && (*value == "full" || *value == "less" || *value == "off")) {
-+        config.crowdLevel = *value;
-+    }
-+    if (auto value = FindConfigUint(document, "video", "fielding_fov"); value && *value >= 60 && *value <= 100) {
-+        config.fieldingFov = *value;
-+    }
-+    if (auto value = FindConfigValue<std::string>(document, "video", "reflections"); value && (*value == "on" || *value == "off")) {
-+        config.reflections = *value;
-+    }
-+    config.experimentalGx = FindConfigValue<bool>(document, "video", "experimental_gx");
-     config.windowPosX = FindConfigInt(document, "video", "window_x");
-     config.windowPosY = FindConfigInt(document, "video", "window_y");
-     if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
-@@ -695,6 +725,9 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
-         }
-     }
- 
-+#if defined(__SWITCH__)
-+    input.close();  // Horizon: a file open for reading cannot be opened for writing
-+#endif
-     std::error_code ec;
-     if (path.has_parent_path()) {
-         std::filesystem::create_directories(path.parent_path(), ec);
-@@ -978,6 +1011,51 @@ inline bool SetTwoWayPlayer(bool value) {
-     return WriteSetting("season", "two_way_player", value ? "true" : "false");
- }
- 
-+inline std::string PlayerShadows(std::string fallback = "full") {
-+    return Get().playerShadows.value_or(std::move(fallback));
-+}
-+
-+inline bool SetPlayerShadows(std::string value) {
-+    Mutable().playerShadows = value;
-+    return WriteSetting("video", "shadows", FormatString(value));
-+}
-+
-+inline std::string CrowdLevel(std::string fallback = "full") {
-+    return Get().crowdLevel.value_or(std::move(fallback));
-+}
-+
-+inline bool SetCrowdLevel(std::string value) {
-+    Mutable().crowdLevel = value;
-+    return WriteSetting("video", "crowd", FormatString(value));
-+}
-+
-+inline uint32_t FieldingFov(uint32_t fallback = 100) {
-+    return Get().fieldingFov.value_or(fallback);
-+}
-+
-+inline bool SetFieldingFov(uint32_t value) {
-+    Mutable().fieldingFov = value;
-+    return WriteSetting("video", "fielding_fov", std::to_string(value));
-+}
-+
-+inline std::string Reflections(std::string fallback = "on") {
-+    return Get().reflections.value_or(std::move(fallback));
-+}
-+
-+inline bool SetReflections(std::string value) {
-+    Mutable().reflections = value;
-+    return WriteSetting("video", "reflections", FormatString(value));
-+}
-+
-+inline bool ExperimentalGx(bool fallback = false) {
-+    return Get().experimentalGx.value_or(fallback);
-+}
-+
-+inline bool SetExperimentalGx(bool value) {
-+    Mutable().experimentalGx = value;
-+    return WriteSetting("video", "experimental_gx", value ? "true" : "false");
-+}
-+
- inline bool UniversalDh(bool fallback = false) {
-     return Get().universalDh.value_or(fallback);
- }
-@@ -1202,10 +1280,24 @@ inline std::filesystem::path ResolveRelativeToConfig(const std::string& value) {
-     return ResolveRelativeTo(ResolveConfigPath().parent_path(), value);
- }
- 
-+#if defined(__SWITCH__)
-+// platform/switch/switch_disc_image.cpp: "mlbdisc:/", the player's disc image mounted as a DATA
-+// folder, or null. Weak: the Switch unit tests that include this header do not link it.
-+extern "C" __attribute__((weak)) const char* MlbSwitchDiscImageRoot(void);
-+#endif
-+
- // The extracted DATA directory. Empty when nothing is configured.
- inline std::filesystem::path ResolvedDvdRoot() {
-     const std::string configured = DvdRoot();
--    return configured.empty() ? std::filesystem::path{} : ResolveRelativeToConfig(configured);
-+    std::filesystem::path root = configured.empty() ? std::filesystem::path{} : ResolveRelativeToConfig(configured);
-+#if defined(__SWITCH__)
-+    // No extracted DATA folder there: the disc image on the SD card, when there is a usable one.
-+    std::error_code ec;
-+    if (MlbSwitchDiscImageRoot && (root.empty() || !std::filesystem::is_regular_file(root / "sys" / "fst.bin", ec))) {
-+        if (const char* image = MlbSwitchDiscImageRoot()) return std::filesystem::path(image);
-+    }
-+#endif
-+    return root;
- }
- 
- /// The canonical Retro Rewind installation the frontend owns, or "" when none is recorded.
 diff --git a/runtime/include/season_text.h b/runtime/include/season_text.h
 index 6485bf0..cd2d43a 100644
 --- a/runtime/include/season_text.h
@@ -1015,6 +858,48 @@ index e65ecfb..540e8a2 100644
      const int lenBytes = static_cast<int>(sampleCount * sizeof(int16_t));
      if (!QueueHasCapacityLocked(lenBytes)) {
          return true;
+diff --git a/runtime/src/callnames/audio.cpp b/runtime/src/callnames/audio.cpp
+index b36cf02..0c67976 100644
+--- a/runtime/src/callnames/audio.cpp
++++ b/runtime/src/callnames/audio.cpp
+@@ -28,16 +28,24 @@ int16_t Clamp16(int64_t v) { return int16_t(std::clamp<int64_t>(v, -32768, 32767
+ 
+ // One frame: 14 samples coded against the decoder's history (h1, h2) with a coefficient pair and a
+ // scale exponent; returns the squared error and fills the nibbles and the new history.
+-int64_t CodeFrame(const int16_t* x, int count, int c1, int c2, int exponent, int& h1, int& h2, int8_t* nibbles) {
++// Once the error reaches `limit` it returns at once (a value >= limit, partial nibbles and history):
++// the search keeps only a smaller error, so its choice is the same. scale * 2048 is a power of two:
++// multiplying by its inverse gives the same quotient as dividing. The quotient is an integer over
++// 2^(11 + exponent) <= 2^22, so after the clamp to [-8, 7] adding a half and truncating rounds it
++// exactly as lround does (half away from zero), without libm.
++int64_t CodeFrame(const int16_t* x, int count, int c1, int c2, int exponent, int& h1, int& h2, int8_t* nibbles,
++                  int64_t limit = std::numeric_limits<int64_t>::max()) {
+     const int scale = 1 << exponent;
++    const double inverse = 1.0 / (double(scale) * 2048);
+     int64_t error = 0;
+     for (int i = 0; i < count; ++i) {
+         const int64_t predicted = int64_t(c1) * h1 + int64_t(c2) * h2;
+-        const double ideal = (double(x[i]) * 2048 - double(predicted)) / (double(scale) * 2048);
+-        const int n = int(std::clamp<long>(std::lround(ideal), -8, 7));
++        const double ideal = std::clamp((double(x[i]) * 2048 - double(predicted)) * inverse, -8.0, 7.0);
++        const int n = ideal >= 0 ? int(ideal + 0.5) : -int(0.5 - ideal);
+         const int v = Clamp16((int64_t(n) * scale * 2048 + predicted + 1024) >> 11);
+         nibbles[i] = int8_t(n);
+         error += int64_t(x[i] - v) * (x[i] - v);
++        if (error >= limit) return error;
+         h2 = h1;
+         h1 = v;
+     }
+@@ -235,7 +243,8 @@ Adpcm Encode(const std::vector<int16_t>& samples) {
+         for (int pair = 0; pair < 8; ++pair) {
+             for (int exponent = 0; exponent <= 11; ++exponent) {
+                 int t1 = h1, t2 = h2;
+-                const int64_t error = CodeFrame(&samples[start], count, out.coefs[2 * pair], out.coefs[2 * pair + 1], exponent, t1, t2, nibbles);
++                const int64_t error = CodeFrame(&samples[start], count, out.coefs[2 * pair], out.coefs[2 * pair + 1], exponent, t1, t2, nibbles,
++                                                bestError);
+                 if (error < bestError) { bestError = error; bestPair = pair; bestExponent = exponent; }
+             }
+         }
 diff --git a/runtime/src/discord_presence.cpp b/runtime/src/discord_presence.cpp
 index a7b9caa..1e4343a 100644
 --- a/runtime/src/discord_presence.cpp

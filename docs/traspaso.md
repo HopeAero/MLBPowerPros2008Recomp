@@ -2,6 +2,16 @@
 
 Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de trabajo; el historial está en `git log -p docs/traspaso.md`. Las secciones de abajo son notas por fase de sesiones anteriores.
 
+## Callnames en Switch (rama `switch-callnames`, 1 de noviembre de 2026)
+
+- **Conflicto resuelto:** `DvdReadContract::Virtual`, el gancho de `ReadExact` del PC y el registro en `DVDInit` vienen ahora de `wiicompiled-callnames` (antes en la cadena). La fase 102 de `switch_edit.py` solo conserva lo propio de Switch: `ReadHostRange` (caché de 8 archivos abiertos) y el `ReadExact` de Switch que sirve archivos virtuales. Copia previa: `local/tmp/switch_edit.pre-CALLNAMES.py`.
+- **Otros arreglos de cadena:** la fase 99 se ancla también en `kOpenCallnameStudio` (de `wiicompiled-callname-studio`); `wiicompiled-linux.patch` tenía como contexto la línea siguiente a EDITOR DE TEMPORADA y ya no aplicaba tras `wiicompiled-callname-studio` (rompía `build-nro.sh` y `tools/linux/build.sh`): ahora aplica en la cadena de Switch y en la de escritorio con `pc-*`.
+- **Fase 104 (codificador):** en Switch `mods::Apply` corre antes de `aurora_initialize` y del launcher, o sea antes de la primera imagen. La búsqueda DSP-ADPCM ahora multiplica por el inverso (potencia de 2), redondea sin `lround` tras el recorte y corta cada prueba cuando su error alcanza el mejor. Mismos bytes (33 salidas: audios de los mods de prueba y señales sintéticas, `local/analysis/switch-callnames/encode-exact`), así que la caché sigue valiendo. PC: 24,3 → 6,9 ms por segundo de audio.
+- **ISO y `Data/`:** el montaje lee `ResolvedDvdRoot()/files/sound/voiceNN.bin` y `project.bin` con `ifstream`/`fopen`/`stat`; con ISO eso es `mlbdisc:/files/...`, que el dispositivo de la fase 103 sirve igual que los demás archivos del disco. No hace falta código propio.
+- **Rutas en la SD:** mods en `sdmc:/switch/mlbpowerpros2008/mods/<Mod>/`; caché en `UserData/Cache/mods/callnames` (`encoded/*.adpcm`, `voiceNN.ext`, `env_voice_data.pack`). `rename` de Horizon no reemplaza, pero `switch_posix.cpp` ya lo envuelve.
+- **Pruebas en host:** `mkw_callnames_tests` y las 11 variantes de montaje compiladas desde el árbol de Switch con `DVD_READ_CONTRACT_FILE_CACHE` y `MODS_VIRTUAL_PROJECT_BIN` (`local/analysis/switch-callnames/host/build.sh`): 12/12. Los del PC siguen 12/12.
+- **Pendiente:** una prueba en consola (pasos en `local/analysis/switch-callnames/report.md`).
+
 ## Editor de callnames (rama `callnames`, 1 de noviembre de 2026)
 
 - `tools/callname-studio/` produce `CallnameStudio.exe`: SDL3/ImGui, aspecto y configuración compartidos con Season Studio, ES/EN, mods, alta/edición/borrado, importación WAV/MP3 y reproducción. Enlaza `ToGameText`, `Collect` y `ReadAudio` del runtime; conserva claves desconocidas y comentarios TOML.
@@ -28,7 +38,7 @@ Mods con nombres de jugador nuevos: diseño `docs/superpowers/specs/2026-10-31-c
   - sin mods, las lecturas de voz son las de siempre; con el roster en 7300 y sin el mod, silencio y sin cuelgue.
 - **Pruebas:** `mkw_callnames_tests` (comparan cada nativo con el original ejecutado en un intérprete PowerPC, para todas las entradas), `tools/test_callnames.py`, `tools/roster/test_voice_passthrough.py`, `PowerPros2008CallnameTests` en PowerUp+.
 - **Pendiente:**
-  - **Switch:** `local/tmp/switch_edit.py` añade su propio `DvdReadContract::Virtual` y cambia `ReadExact` en `dvd_contract.h`; con `wiicompiled-callnames` en la cadena ya existen. Hay que saltar esa parte del script (líneas ~27747-27960 y 11061-11140) o fusionarla, regenerar con `mkswitch.sh` y hacer que `BuildBank` lea los bancos de la ISO (fase 103: `ResolvedDvdRoot()/files/sound` no existe con ISO). Luego NRO y prueba en consola.
+  - **Switch:** hecho en la rama `switch-callnames` (sección de arriba); falta la prueba en consola.
   - **Escucha del usuario** de las tres variantes en un partido, y MLB Life (mismo código de comentario; sin sonda propia).
   - Publicar PowerUp+ (`tools/powerupplus.ps1 -Publish`) en la próxima versión.
   - Riesgo visto una vez: una ejecución con traza temporal se quedó colgada al arrancar; no se repitió en tres ejecuciones.
