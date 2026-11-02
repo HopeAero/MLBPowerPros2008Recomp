@@ -15,8 +15,8 @@ Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto
 | Línea de trabajo | Qué | Estado |
 |---|---|---|
 | [Corrección de fallos](docs/roadmap/fallos.md) | Lo que reportan los jugadores, ordenado y arreglado en versiones de corrección | Continuo |
-| [Rendimiento en PCs modestas](docs/roadmap/rendimiento.md) | Medir y bajar el coste de CPU y GPU para mantener 60 FPS en gráficas integradas y CPUs antiguas | Lo siguiente |
-| [OpenGL](docs/roadmap/opengl.md) | Un backend gráfico OpenGL / OpenGL ES para gráficas sin Vulkan ni Direct3D 12, y camino hacia Switch | En curso: OpenGL ES en Linux y Direct3D 11 en Windows juegan un partido |
+| [Rendimiento en PCs modestas](docs/roadmap/rendimiento.md) | Medir y bajar el coste de CPU y GPU para mantener 60 FPS en gráficas integradas y CPUs antiguas | En curso: la v0.1.6 trajo a PC las optimizaciones de Switch (13 % menos CPU en el hilo del juego) y opciones gráficas más ligeras |
+| [OpenGL](docs/roadmap/opengl.md) | Un backend gráfico OpenGL / OpenGL ES para gráficas sin Vulkan ni Direct3D 12 | Hecho: OpenGL ES en Linux y Direct3D 11 en Windows juegan un partido y se eligen en el launcher; falta comprobarlo en Linux nativo y en una gráfica solo Direct3D 11 |
 
 ## Siguiente
 
