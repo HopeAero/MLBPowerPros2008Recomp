@@ -6,7 +6,7 @@
 
 Para comentarlo: [discusión del roadmap](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/7).
 
-Actualizado: 1 de noviembre de 2026 · última versión [v0.1.6](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.6) (PC) y [Switch v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0).
+Actualizado: 1 de noviembre de 2026 · última versión [v0.1.6](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.6) (PC) y [Switch v0.1.1](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.1).
 
 Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto** (lo que cambie el juego se activa en el launcher), y **nunca se distribuyen archivos del juego**: en PC cada jugador lo compila desde su propio disco; en Switch se publica el NRO y el jugador pone su propio disco (ver [decisiones](docs/decisiones.md)).
 
@@ -36,6 +36,7 @@ Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto
 
 | Versión | Lo principal |
 |---|---|
+| [Switch v0.1.1](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.1) | Mods de callnames en la Switch; arreglo de la creación de dos vías en MLB Life |
 | [Switch v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0) | [Nintendo Switch](docs/roadmap/switch.md): homebrew nativo a 60 fps en portátil sin overclock, launcher con perfiles gráficos, mods, ISO directa ([repo de releases](https://github.com/HopeAero/MLBPR2008-NX)) |
 | [v0.1.6](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.6) | Nombres de jugador nuevos (callnames) para los comentaristas con mods y el Editor de callnames; optimizaciones de Switch portadas a PC (13 % menos CPU en el hilo principal); opciones gráficas más ligeras en VIDEO; el Setup ya no lo marcan las heurísticas de Defender |
 | [v0.1.5](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.5) | Jugadores de dos vías (regla Ohtani) en todos los modos; charla de rol con el mánager en MLB Life; escalado con IA y packs de Dolphin en el Texture Studio |
