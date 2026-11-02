@@ -8650,7 +8650,7 @@ index c73ad5e..08482bd 100644
    TRY(SDL_DisableScreenSaver(), "Error disabling screensaver: {}", SDL_GetError());
    if (g_config.allowJoystickBackgroundEvents) {
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index 0063653..3587f77 100644
+index 06f68de..5df23b9 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
 @@ -10,8 +10,9 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
@@ -9427,18 +9427,10 @@ index 2514913..4b52f5b 100644
  extern bool g_requiresCheckedAccess;
  inline bool RequiresCheckedAccess() noexcept { return g_requiresCheckedAccess; }
 diff --git a/runtime/include/hle/dvd_contract.h b/runtime/include/hle/dvd_contract.h
-index 9cb9576..f4c6dad 100644
+index 357eb14..f4c6dad 100644
 --- a/runtime/include/hle/dvd_contract.h
 +++ b/runtime/include/hle/dvd_contract.h
-@@ -6,6 +6,7 @@
- #include <cctype>
- #include <cstddef>
- #include <cstdint>
-+#include <cstring>
- #include <filesystem>
- #include <fstream>
- #include <limits>
-@@ -16,6 +17,10 @@
+@@ -17,6 +17,10 @@
  #include <string>
  #include <utility>
  #include <vector>
@@ -9449,133 +9441,7 @@ index 9cb9576..f4c6dad 100644
  
  namespace DvdFstContract {
  
-@@ -284,14 +289,223 @@ inline constexpr const char* Describe(HostReadFailure failure) noexcept {
-     return "unknown host read error";
- }
- 
-+// A disc file that exists only as a list of pieces: byte ranges of other host files, bytes held in
-+// memory and zeros. The Switch serves its modded PROJECT.BIN this way (mods.cpp): the PC writes a
-+// merged 406 MB copy, which on the SD card meant reading and writing 406 MB before the first frame.
-+// The DVD index stores `key` as the entry's host path (it is never opened); ReadExact recognises it
-+// and assembles the range. Register every virtual file before DVDInit (mods::Apply runs before
-+// aurora_initialize and any guest code) and never change the registry after that: reads take no lock.
-+namespace Virtual {
-+
-+inline constexpr int32_t kBytes = -1;  // Piece::source: File::bytes from Piece::from
-+inline constexpr int32_t kZeros = -2;  // Piece::source: zeros
-+
-+struct Piece {
-+    uint64_t start = 0;  // offset in the virtual file
-+    uint64_t length = 0;
-+    int32_t source = kZeros;  // index into File::sources, kBytes or kZeros
-+    uint64_t from = 0;        // offset in the source file or in File::bytes
-+};
-+
-+struct File {
-+    std::filesystem::path key;
-+    std::string dvdPath;  // e.g. "/project.bin"
-+    std::vector<uint8_t> bytes;
-+    std::vector<std::filesystem::path> sources;
-+    std::vector<Piece> pieces;  // contiguous from offset 0
-+    uint64_t size = 0;
-+
-+    // Pieces go on at the end; one that continues the last piece (zeros after zeros, the next bytes of
-+    // the same source) extends it.
-+    void Append(int32_t source, uint64_t from, uint64_t length) {
-+        if (length == 0) {
-+            return;
-+        }
-+        if (!pieces.empty()) {
-+            Piece& last = pieces.back();
-+            if (last.source == source && (source == kZeros || last.from + last.length == from)) {
-+                last.length += length;
-+                size += length;
-+                return;
-+            }
-+        }
-+        pieces.push_back({size, length, source, from});
-+        size += length;
-+    }
-+    void AppendBytes(uint64_t from, uint64_t length) { Append(kBytes, from, length); }
-+    void AppendZeros(uint64_t length) { Append(kZeros, 0, length); }
-+    void AppendSource(const std::filesystem::path& path, uint64_t from, uint64_t length) {
-+        if (length == 0) {
-+            return;
-+        }
-+        size_t index = 0;
-+        while (index < sources.size() && !(sources[index] == path)) {
-+            ++index;
-+        }
-+        if (index == sources.size()) {
-+            sources.push_back(path);
-+        }
-+        Append(static_cast<int32_t>(index), from, length);
-+    }
-+};
-+
-+inline std::vector<File>& Files() {
-+    static std::vector<File> files;
-+    return files;
-+}
-+
-+// A file with the same key replaces the earlier one.
-+inline void Register(File file) {
-+    for (File& existing : Files()) {
-+        if (existing.key == file.key) {
-+            existing = std::move(file);
-+            return;
-+        }
-+    }
-+    Files().push_back(std::move(file));
-+}
-+
-+inline const File* Find(const std::filesystem::path& key) {
-+    for (const File& file : Files()) {
-+        if (file.key == key) {
-+            return &file;
-+        }
-+    }
-+    return nullptr;
-+}
-+
-+// The same contract as ReadExact on a real file with these bytes. `readSource(path, offset, length,
-+// out, failure)` reads one complete range of a source file into `out`.
-+template <typename ReadSource>
-+inline bool Read(const File& file, uint64_t offset, uint32_t length, std::vector<uint8_t>& destination,
-+                 HostReadFailure& failure, ReadSource&& readSource) {
-+    failure = HostReadFailure::None;
-+    if (offset >= file.size) {
-+        failure = HostReadFailure::BadOffset;
-+        return false;
-+    }
-+    if (static_cast<uint64_t>(length) > file.size - offset) {
-+        failure = HostReadFailure::ShortRead;
-+        return false;
-+    }
-+    std::vector<uint8_t> staged(length);
-+    // The last piece starting at or before `offset` (the first starts at 0).
-+    auto piece = std::upper_bound(file.pieces.begin(), file.pieces.end(), offset,
-+                                  [](uint64_t value, const Piece& p) { return value < p.start; });
-+    --piece;
-+    for (uint64_t done = 0; done < length; ++piece) {
-+        const uint64_t at = offset + done - piece->start;
-+        const uint64_t n = std::min<uint64_t>(piece->length - at, length - done);
-+        uint8_t* const out = staged.data() + done;
-+        if (piece->source == kBytes) {
-+            std::memcpy(out, file.bytes.data() + piece->from + at, static_cast<size_t>(n));
-+        } else if (piece->source >= 0 &&
-+                   !readSource(file.sources[static_cast<size_t>(piece->source)], piece->from + at,
-+                               static_cast<uint32_t>(n), out, failure)) {
-+            return false;
-+        }
-+        done += n;
-+    }
-+    destination = std::move(staged);
-+    return true;
-+}
-+
-+} // namespace Virtual
-+
+@@ -411,6 +415,82 @@ inline bool Read(const File& file, uint64_t offset, uint32_t length, std::vector
  // Read into private storage first and publish it only after the complete host
  // range has been obtained. Callers can therefore leave a guest DMA destination
  // untouched for every failure, including a host file truncated after indexing.
@@ -9658,22 +9524,7 @@ index 9cb9576..f4c6dad 100644
  inline bool ReadExact(const std::filesystem::path& hostPath,
                        uint64_t offset,
                        uint32_t length,
-                       std::vector<uint8_t>& destination,
-                       HostReadFailure& failure) {
-+    if (const Virtual::File* file = Virtual::Find(hostPath)) {
-+        return Virtual::Read(*file, offset, length, destination, failure,
-+                             [](const std::filesystem::path& source, uint64_t from, uint32_t n, uint8_t* out,
-+                                HostReadFailure& why) {
-+                                 std::vector<uint8_t> range;
-+                                 if (!ReadExact(source, from, n, range, why)) return false;
-+                                 std::copy(range.begin(), range.end(), out);
-+                                 return true;
-+                             });
-+    }
-     failure = HostReadFailure::None;
- 
-     std::ifstream file(hostPath, std::ios::binary);
-@@ -334,5 +548,6 @@ inline bool ReadExact(const std::filesystem::path& hostPath,
+@@ -468,5 +548,6 @@ inline bool ReadExact(const std::filesystem::path& hostPath,
      destination = std::move(staged);
      return true;
  }
@@ -10923,3 +10774,160 @@ index f527424..b55cc83 100644
  
  class ScopedTranslatedExecutionAddress {
  public:
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index 3198082..d035de1 100644
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -46,6 +46,14 @@ struct RuntimeUserConfig {
+     std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
+     std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
+     std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
++    // Lighter graphics (hle/mlb/gfx_options.cpp), launcher VIDEO tab; all as on the Wii by default.
++    std::optional<std::string> playerShadows;  // [video] shadows: "full", "simple" (round blob) or "off"
++    std::optional<std::string> crowdLevel;     // [video] crowd: "full", "less" (half the stands) or "off"
++    std::optional<uint32_t> fieldingFov;       // [video] fielding_fov: play-shot camera angle in percent, 60-100
++    std::optional<std::string> reflections;    // [video] reflections: "on" (helmet and bat shine) or "off"
++    // [video] experimental_gx: the Switch's GXF4 steps (texture objects and the raw-FIFO stream on the GX
++    // threads), WIICOMPILED_GXF_TEX / WIICOMPILED_GXF_STREAM when those are not set (main.cpp, launcher VIDEO).
++    std::optional<bool> experimentalGx;
+     std::optional<int32_t> windowPosX;
+     std::optional<int32_t> windowPosY;
+     std::optional<uint32_t> windowWidth;
+@@ -193,6 +201,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
+ // only vulkan for linux
+ #elif defined(__linux__)
+     static constexpr std::array<std::string_view, 4> values{"auto", "vulkan", "opengles", "null"};
++#elif defined(__SWITCH__)
++    static constexpr std::array<std::string_view, 3> values{"auto", "vulkan", "null"};
+ #elif defined(_WIN32)
+     static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
+ #endif
+@@ -228,6 +238,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
+     }
+ #elif defined(__APPLE__)
+     return RuntimePlatform::ExecutableDirectory();
++#elif defined(__SWITCH__)
++    return std::filesystem::path("sdmc:/switch/mlbpowerpros2008");  // where the homebrew menu finds it
+ #else
+     // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
+     // does not NUL-terminate and silently truncates if the buffer is too small, so this grows
+@@ -275,6 +287,9 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
+ }
+ 
+ inline std::filesystem::path ApplicationDataDirectory() {
++#if defined(__SWITCH__)
++    return *ExecutableDirectory() / kPortableUserDataDirectoryName;  // always portable on the SD card
++#endif
+     if (const auto& portableRoot = PortableRootDirectory()) {
+         return *portableRoot / kPortableUserDataDirectoryName;
+     }
+@@ -479,6 +494,21 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
+     config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
+     config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
+     config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
++    if (auto value = FindConfigValue<std::string>(document, "video", "shadows");
++        value && (*value == "full" || *value == "simple" || *value == "off")) {
++        config.playerShadows = *value;
++    }
++    if (auto value = FindConfigValue<std::string>(document, "video", "crowd");
++        value && (*value == "full" || *value == "less" || *value == "off")) {
++        config.crowdLevel = *value;
++    }
++    if (auto value = FindConfigUint(document, "video", "fielding_fov"); value && *value >= 60 && *value <= 100) {
++        config.fieldingFov = *value;
++    }
++    if (auto value = FindConfigValue<std::string>(document, "video", "reflections"); value && (*value == "on" || *value == "off")) {
++        config.reflections = *value;
++    }
++    config.experimentalGx = FindConfigValue<bool>(document, "video", "experimental_gx");
+     config.windowPosX = FindConfigInt(document, "video", "window_x");
+     config.windowPosY = FindConfigInt(document, "video", "window_y");
+     if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
+@@ -695,6 +725,9 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
+         }
+     }
+ 
++#if defined(__SWITCH__)
++    input.close();  // Horizon: a file open for reading cannot be opened for writing
++#endif
+     std::error_code ec;
+     if (path.has_parent_path()) {
+         std::filesystem::create_directories(path.parent_path(), ec);
+@@ -978,6 +1011,51 @@ inline bool SetTwoWayPlayer(bool value) {
+     return WriteSetting("season", "two_way_player", value ? "true" : "false");
+ }
+ 
++inline std::string PlayerShadows(std::string fallback = "full") {
++    return Get().playerShadows.value_or(std::move(fallback));
++}
++
++inline bool SetPlayerShadows(std::string value) {
++    Mutable().playerShadows = value;
++    return WriteSetting("video", "shadows", FormatString(value));
++}
++
++inline std::string CrowdLevel(std::string fallback = "full") {
++    return Get().crowdLevel.value_or(std::move(fallback));
++}
++
++inline bool SetCrowdLevel(std::string value) {
++    Mutable().crowdLevel = value;
++    return WriteSetting("video", "crowd", FormatString(value));
++}
++
++inline uint32_t FieldingFov(uint32_t fallback = 100) {
++    return Get().fieldingFov.value_or(fallback);
++}
++
++inline bool SetFieldingFov(uint32_t value) {
++    Mutable().fieldingFov = value;
++    return WriteSetting("video", "fielding_fov", std::to_string(value));
++}
++
++inline std::string Reflections(std::string fallback = "on") {
++    return Get().reflections.value_or(std::move(fallback));
++}
++
++inline bool SetReflections(std::string value) {
++    Mutable().reflections = value;
++    return WriteSetting("video", "reflections", FormatString(value));
++}
++
++inline bool ExperimentalGx(bool fallback = false) {
++    return Get().experimentalGx.value_or(fallback);
++}
++
++inline bool SetExperimentalGx(bool value) {
++    Mutable().experimentalGx = value;
++    return WriteSetting("video", "experimental_gx", value ? "true" : "false");
++}
++
+ inline bool UniversalDh(bool fallback = false) {
+     return Get().universalDh.value_or(fallback);
+ }
+@@ -1202,10 +1280,24 @@ inline std::filesystem::path ResolveRelativeToConfig(const std::string& value) {
+     return ResolveRelativeTo(ResolveConfigPath().parent_path(), value);
+ }
+ 
++#if defined(__SWITCH__)
++// platform/switch/switch_disc_image.cpp: "mlbdisc:/", the player's disc image mounted as a DATA
++// folder, or null. Weak: the Switch unit tests that include this header do not link it.
++extern "C" __attribute__((weak)) const char* MlbSwitchDiscImageRoot(void);
++#endif
++
+ // The extracted DATA directory. Empty when nothing is configured.
+ inline std::filesystem::path ResolvedDvdRoot() {
+     const std::string configured = DvdRoot();
+-    return configured.empty() ? std::filesystem::path{} : ResolveRelativeToConfig(configured);
++    std::filesystem::path root = configured.empty() ? std::filesystem::path{} : ResolveRelativeToConfig(configured);
++#if defined(__SWITCH__)
++    // No extracted DATA folder there: the disc image on the SD card, when there is a usable one.
++    std::error_code ec;
++    if (MlbSwitchDiscImageRoot && (root.empty() || !std::filesystem::is_regular_file(root / "sys" / "fst.bin", ec))) {
++        if (const char* image = MlbSwitchDiscImageRoot()) return std::filesystem::path(image);
++    }
++#endif
++    return root;
+ }
+ 
+ /// The canonical Retro Rewind installation the frontend owns, or "" when none is recorded.
