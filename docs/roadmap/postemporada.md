@@ -13,6 +13,12 @@ Las mejoras de juego hasta ahora acercan Temporada y MLB Life al béisbol actual
 - Wild Card Series (al mejor de 3, todo en casa del mejor sembrado), Serie Divisional (al mejor de 5), Serie de Campeonato y Serie Mundial (al mejor de 7).
 
 ## Plan
+Hallazgos iniciales: [investigación de reglas, estructuras y consumidores](../postemporada-investigacion.md)
+(4 de noviembre de 2026). **En curso:** opción experimental implementada; en Temporada
+se comprobó en el juego de la clasificación a la Serie Mundial, guardado/carga y paso de año
+(desde una temporada regular inyectada); en MLB Life, de la clasificación a la Serie Mundial y
+guardado/carga. Falta una temporada completa jugada por el juego.
+
 1. **Investigar** cómo arma y guarda el juego su postemporada (cuadro, siembra, largo de las series, el calendario que escribe, qué guarda la partida).
 2. **Construirla como opción** (MEJORAS, y una clave de pack de temporada), para que el formato original siga por defecto.
 3. **También en MLB Life:** todo lo que funcione en Temporada debe funcionar en MLB Life.

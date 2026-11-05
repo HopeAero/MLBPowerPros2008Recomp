@@ -13,6 +13,12 @@ The gameplay updates so far bring Season mode and MLB Life closer to today's bas
 - Wild Card Series (best of 3, all at the better seed), Division Series (best of 5), League Championship Series and World Series (best of 7).
 
 ## Plan
+Initial findings: [rules, structures and consumers](../postseason-research.md)
+(November 4, 2026). **In progress:** experimental option implemented; in Season mode it was
+verified in game from qualification to the World Series, save/load and the year step (from an
+injected regular season); in MLB Life from qualification to the World Series and save/load. A
+full season played by the game remains.
+
 1. **Research:** how the game builds and stores its postseason (bracket, seeding, series length, the schedule it writes, what the save keeps).
 2. **Build it as an option** (ENHANCEMENTS, and a season pack key), so the original format stays the default.
 3. **MLB Life too:** everything that works in Season mode must work in MLB Life.

@@ -1,0 +1,2160 @@
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -45,6 +45,7 @@
+     std::optional<uint32_t> maxSeasons;  // [season] max_seasons: 10 (original), 20 or 0 (no limit)
+     std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
+     std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
++    std::optional<bool> modernPostseason;  // [season] modern_postseason: 12-team format for new games
+     std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
+     // Lighter graphics (hle/mlb/gfx_options.cpp), launcher VIDEO tab; all as on the Wii by default.
+     std::optional<std::string> playerShadows;  // [video] shadows: "full", "simple" (round blob) or "off"
+@@ -483,6 +484,7 @@
+     }
+     config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
+     config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
++    config.modernPostseason = FindConfigValue<bool>(document, "season", "modern_postseason");
+     config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
+     if (auto value = FindConfigValue<std::string>(document, "video", "shadows");
+         value && (*value == "full" || *value == "simple" || *value == "off")) {
+@@ -988,6 +990,15 @@
+     return WriteSetting("season", "modern_leagues", value ? "true" : "false");
+ }
+ 
++inline bool ModernPostseason(bool fallback = false) {
++    return Get().modernPostseason.value_or(fallback);
++}
++
++inline bool SetModernPostseason(bool value) {
++    Mutable().modernPostseason = value;
++    return WriteSetting("season", "modern_postseason", value ? "true" : "false");
++}
++
+ inline bool TwoWayPlayer(bool fallback = false) {
+     return Get().twoWayPlayer.value_or(fallback);
+ }
+--- a/runtime/include/mods.h
++++ b/runtime/include/mods.h
+@@ -56,6 +56,8 @@
+     std::vector<std::string> divisions[6];  // [divisions] al_east ... nl_west: team codes (empty: unchanged)
+     bool hasDivisions = false;
+     bool originalLeagues = false;  // leagues = "original": 2008's divisions whatever the option
++    bool modernPostseason = false;  // [season] postseason = "modern": 12 teams in new games
++    bool originalPostseason = false;  // [season] postseason = "original": override the launcher option
+     std::filesystem::path root;
+     bool textures = false;
+     bool disc = false;
+--- a/runtime/src/mods.cpp
++++ b/runtime/src/mods.cpp
+@@ -241,6 +241,11 @@
+                 mod.universalDh = dh == "both";
+                 mod.originalDh = dh == "original";
+                 mod.originalLeagues = Lower(toml::find_or<std::string>(document, "leagues", "")) == "original";
++                if (document.contains("season") && document.at("season").is_table()) {
++                    const std::string postseason = Lower(toml::find_or<std::string>(document.at("season"), "postseason", ""));
++                    mod.modernPostseason = postseason == "modern";
++                    mod.originalPostseason = postseason == "original";
++                }
+                 if (document.contains("divisions") && document.at("divisions").is_table()) {
+                     static constexpr const char* kKeys[6] = {"al_east", "al_central", "al_west",
+                                                              "nl_east", "nl_central", "nl_west"};
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -788,6 +788,15 @@
+                             "as they were. A mod can decide it on its own (TOOLS > SEASON EDITOR): 15 and 15, original or its divisions."),
+                          YesNo(), RuntimeConfigFile::ModernLeagues(false) ? 1 : 0};
+     modernLeagues.experimental = true;
++    Option modernPostseason{Tr("POSTEMPORADA DE 12 EQUIPOS", "12-TEAM POSTSEASON"),
++                            Tr("Seis equipos por liga, con ronda Wild Card y descansos para los dos mejores campeones "
++                               "divisionales. Se elige al crear una partida nueva de Temporada o MLB Life; cada partida "
++                               "conserva su formato al guardar y cargar. Un mod puede elegir moderno u original.",
++                               "Six teams per league, with a Wild Card round and byes for the top two division winners. "
++                               "Chosen when starting a new Season or MLB Life game; each save keeps its format when "
++                               "saved and loaded. A mod can choose modern or original."),
++                            YesNo(), RuntimeConfigFile::ModernPostseason(false) ? 1 : 0};
++    modernPostseason.experimental = true;
+ 
+     const std::string savedLanguage = RuntimeConfigFile::UiLanguage("auto");
+     Option language{"IDIOMA / LANGUAGE",
+@@ -935,7 +944,7 @@
+         {"AUDIO", {volume, mute}},
+         {Tr("CONTROLES", "CONTROLS"), {wiimote}},
+         {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
+-        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh, modernLeagues, twoWay}},
++        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh, modernLeagues, modernPostseason, twoWay}},
+     };
+     tabs.push_back(std::move(modsTab));
+     tabs.push_back(std::move(toolsTab));
+@@ -952,6 +961,18 @@
+             return std::filesystem::path();
+         });
+         seasonText = season_text::DescribeSeason(plan, RuntimeConfigFile::MaxSeasons(10));
++        bool postseason = RuntimeConfigFile::ModernPostseason(false);
++        std::string postseasonFrom;
++        for (const auto& mod : all) {
++            if (mod.enabled && (mod.modernPostseason || mod.originalPostseason)) {
++                postseason = mod.modernPostseason;
++                postseasonFrom = mod.name;
++                break;
++            }
++        }
++        seasonText.footer += std::string(Tr(" Postemporada: ", " Postseason: ")) +
++                             (postseason ? Tr("12 equipos", "12 teams") : Tr("original", "original")) +
++                             (postseasonFrom.empty() ? std::string() : " (mod " + postseasonFrom + ")") + ".";
+         tabs[kEnhancementsTab].footer = seasonText.footer.c_str();
+     };
+ 
+@@ -1056,6 +1077,7 @@
+         if (label == seasons.label) RuntimeConfigFile::SetMaxSeasons(o.value == 1 ? 20 : o.value == 2 ? 0 : 10);
+         if (label == universalDh.label) RuntimeConfigFile::SetUniversalDh(o.value != 0);
+         if (label == modernLeagues.label) RuntimeConfigFile::SetModernLeagues(o.value != 0);
++        if (label == modernPostseason.label) RuntimeConfigFile::SetModernPostseason(o.value != 0);
+         if (label == twoWay.label) RuntimeConfigFile::SetTwoWayPlayer(o.value != 0);
+         if (label == shadows.label) RuntimeConfigFile::SetPlayerShadows(kShadowModes[static_cast<size_t>(o.value)]);
+         if (label == crowd.label) RuntimeConfigFile::SetCrowdLevel(kCrowdLevels[static_cast<size_t>(o.value)]);
+--- a/runtime/tests/runtime_config_tests.cpp
++++ b/runtime/tests/runtime_config_tests.cpp
+@@ -14,6 +14,19 @@
+ } // namespace
+ 
+ int main() {
++    {
++        for (const char* value : {"true", "false", "\"modern\"", "12"}) {
++            std::istringstream input(std::string("[season]\nmodern_postseason = ") + value + "\n");
++            const auto config = RuntimeConfigFile::ParseConfig(input, "postseason.toml");
++            const std::optional<bool> expected = std::string(value) == "true" ? std::optional<bool>{true}
++                                                : std::string(value) == "false" ? std::optional<bool>{false}
++                                                                               : std::nullopt;
++            if (!Require(config.modernPostseason == expected, "invalid modern_postseason parsing")) return 1;
++        }
++        std::istringstream empty("");
++        if (!Require(!RuntimeConfigFile::ParseConfig(empty, "empty.toml").modernPostseason.value_or(false),
++                     "postseason must default to original")) return 1;
++    }
+     {
+         std::istringstream input("[video]\nmetalfx_spatial_upscaling = true\n");
+         const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "enabled.toml");
+--- a/runtime/tests/callnames_mount_tests.cpp
++++ b/runtime/tests/callnames_mount_tests.cpp
+@@ -81,6 +81,23 @@
+         std::filesystem::remove_all(root);
+         return ok ? 0 : 1;
+     };
++    if (test == "postseason") {
++        std::filesystem::create_directories(root / "mods/Test");
++        for (const char* value : {"\"modern\"", "\"original\"", "\"unknown\"", "true", "12", "[]"}) {
++            std::ofstream(root / "mods/Test/mod.toml") << "[season]\npostseason = " << value << '\n';
++            const auto found = mods::Discover();
++            if (found.size() != 1 || found[0].modernPostseason != (std::string(value) == "\"modern\"") ||
++                found[0].originalPostseason != (std::string(value) == "\"original\""))
++                return check(false, "postseason declaration did not validate its named format");
++        }
++        for (const char* text : {"", "season = true", "postseason = \"modern\""}) {
++            std::ofstream(root / "mods/Test/mod.toml") << text;
++            const auto found = mods::Discover();
++            if (found.size() != 1 || found[0].modernPostseason || found[0].originalPostseason)
++                return check(false, "missing or invalid [season] enabled postseason");
++        }
++        return check(true, "postseason parsing passed");
++    }
+     if (test.starts_with("layout-")) {
+         const auto mod = root / "mods/Test/project";
+         std::filesystem::create_directories(mod);
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -423,7 +423,7 @@
+ target_compile_features(mkw_callnames_mount_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_callnames_mount_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/src" "${CMAKE_CURRENT_LIST_DIR}/../aurora-main/include")
+ target_link_libraries(mkw_callnames_mount_tests PRIVATE mkw::toml11)
+-foreach(case normal encode-fail drop disc riivo-file riivo-folder riivo-name layout-failure layout-success empty-resets layout-write-failure)
++foreach(case postseason normal encode-fail drop disc riivo-file riivo-folder riivo-name layout-failure layout-success empty-resets layout-write-failure)
+     add_test(NAME mkw_callnames_mount_${case} COMMAND mkw_callnames_mount_tests ${case})
+ endforeach()
+ add_executable(mkw_auto_mips_tests "${CMAKE_CURRENT_LIST_DIR}/tests/auto_mips_tests.cpp")
+@@ -459,6 +459,15 @@
+ target_compile_features(mkw_season_pack_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_season_pack_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+ add_test(NAME mkw_season_pack_tests COMMAND mkw_season_pack_tests)
++
++foreach(case modern_postseason modern_postseason_save postseason_guest season_cap_modern)
++    add_executable(mkw_${case}_test "${CMAKE_CURRENT_LIST_DIR}/tests/${case}_test.cpp")
++    target_compile_features(mkw_${case}_test PRIVATE cxx_std_20)
++    target_compile_options(mkw_${case}_test PRIVATE -UNDEBUG)
++    target_include_directories(mkw_${case}_test PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
++    add_test(NAME mkw_${case}_test COMMAND mkw_${case}_test)
++endforeach()
++
+ add_executable(mkw_player_password_tests "${CMAKE_CURRENT_LIST_DIR}/tests/player_password_tests.cpp")
+ target_compile_features(mkw_player_password_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_player_password_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+diff --git a/runtime/include/season_cap.h b/runtime/include/season_cap.h
+--- a/runtime/include/season_cap.h
++++ b/runtime/include/season_cap.h
+@@ -19,6 +19,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <vector>
++#include "modern_postseason_save.h"
+ 
+ namespace season_cap {
+ 
+@@ -217,6 +218,7 @@
+     uint32_t yearOffset = 0;  // seasons that left the window
+     uint32_t startShift = 0;  // a season pack's start_year - 2008; the year shown is 2008 + both + index
+     bool pastTen = false;     // written for a game past season 10 (stored years, archive), not only for the start year
++    modern_postseason::SavedState postseason;
+     YearStore store;
+     std::vector<ArchivedYear> archive;  // oldest first
+ };
+@@ -230,10 +232,14 @@
+ constexpr size_t kTailHeaderV2 = 8 + 4 + 4 + sizeof(YearStore) + 4;
+ constexpr size_t kTailHeader = 8 + 4 + 4 + 4 + 4 + sizeof(YearStore) + 4;
+ constexpr size_t kArchiveCapacity = (kTailSize - kTailHeader) / kArchiveYearBytes;
++constexpr size_t kPostseasonTailOffset = kTailSize - modern_postseason::saveBytes;
++inline size_t ArchiveCapacity(const SeasonTail& tail) {
++    return (kTailSize - kTailHeader - (tail.postseason.enabled ? modern_postseason::saveBytes : 0)) / kArchiveYearBytes;
++}
+ 
+ // Keeps the newest kArchiveCapacity seasons.
+ inline void AddArchived(SeasonTail& tail, const ArchivedYear& year) {
+-    if (tail.archive.size() >= kArchiveCapacity) tail.archive.erase(tail.archive.begin());
++    if (tail.archive.size() >= ArchiveCapacity(tail)) tail.archive.erase(tail.archive.begin());
+     tail.archive.push_back(year);
+ }
+ 
+@@ -249,16 +255,17 @@
+ inline void WriteTail(const SeasonTail& tail, uint8_t* out) {
+     std::memset(out, 0, kTailSize);
+     std::memcpy(out, kTailMagic, 8);
+-    PutBe32(out + 8, kTailVersion);
++    PutBe32(out + 8, tail.postseason.enabled ? 4 : kTailVersion);
+     PutBe32(out + 12, tail.yearOffset);
+     PutBe32(out + 16, tail.startShift);
+     PutBe32(out + 20, tail.pastTen ? 1u : 0u);
+     std::memcpy(out + 24, &tail.store, sizeof(YearStore));
+-    const size_t count = tail.archive.size() < kArchiveCapacity ? tail.archive.size() : kArchiveCapacity;
++    const size_t count = std::min(tail.archive.size(), ArchiveCapacity(tail));
+     PutBe32(out + 24 + sizeof(YearStore), static_cast<uint32_t>(count));
+     for (size_t i = 0; i < count; ++i)
+         std::memcpy(out + kTailHeader + i * kArchiveYearBytes, tail.archive[tail.archive.size() - count + i].data(),
+                     kArchiveYearBytes);
++    if (tail.postseason.enabled) modern_postseason::writeSave(tail.postseason, out + kPostseasonTailOffset);
+ }
+ 
+ // False (and nothing stored) when the tail is not ours, e.g. the game's own zero padding.
+@@ -266,7 +273,10 @@
+     tail = {};
+     if (size < kTailSize || std::memcmp(in, kTailMagic, 8) != 0) return false;
+     const uint32_t version = GetBe32(in + 8);
+-    if (version != 2 && version != kTailVersion) return false;
++    if (version != 2 && version != kTailVersion && version != 4) return false;
++    if (version == 4 &&
++        (modern_postseason::readSave(in + kPostseasonTailOffset, modern_postseason::saveBytes, tail.postseason) !=
++         modern_postseason::SaveStatus::Valid || !tail.postseason.enabled)) return false;
+     tail.yearOffset = GetBe32(in + 12);
+     size_t at = 16;
+     if (version == 2) {
+@@ -279,7 +289,7 @@
+     std::memcpy(&tail.store, in + at, sizeof(YearStore));
+     const uint32_t count = GetBe32(in + at + sizeof(YearStore));
+     const size_t header = version == 2 ? kTailHeaderV2 : kTailHeader;
+-    for (uint32_t i = 0; i < count && i < kArchiveCapacity; ++i) {
++    for (uint32_t i = 0; i < count && i < ArchiveCapacity(tail); ++i) {
+         ArchivedYear year;
+         std::memcpy(year.data(), in + header + i * kArchiveYearBytes, kArchiveYearBytes);
+         tail.archive.push_back(year);
+@@ -314,6 +324,9 @@
+ constexpr uint32_t kLifeFileSize = 0xF8000, kLifeLoadEnd = 0xF4000, kLifeIndexOffset = 0x47EE8;
+ constexpr uint32_t kLifeTailOffset = 0xF7FC0;
+ constexpr size_t kLifeTailSize = 12;
++constexpr uint32_t kLifePostseasonOffset = 0xF6000;
++constexpr size_t kLifeReadTailSize = kLifeTailOffset + kLifeTailSize - kLifePostseasonOffset;
++static_assert(kLifePostseasonOffset + modern_postseason::saveBytes <= kLifeTailOffset);
+ constexpr char kLifeTailMagic[8] = {'P', 'P', 'L', 'I', 'F', 'E', '0', '1'};
+ inline void WriteLifeTail(uint32_t startShift, uint8_t* out) {
+     std::memcpy(out, kLifeTailMagic, 8);
+diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
+--- a/runtime/src/settings_overlay.cpp
++++ b/runtime/src/settings_overlay.cpp
+@@ -4,6 +4,7 @@
+ #include "season_probe.h"
+ #include "player_password.h"
+ #include "season_cap.h"
++#include "modern_postseason_runtime.h"
+ #include "audio_backend.h"
+ #include "aurora_events.h"
+ #include "controller_button_names.h"
+@@ -1731,6 +1732,7 @@
+     }
+     DrawFpsOverlay();
+     player_password::DrawNotice();
++    modern_postseason::draw();
+     DrawTopBar();
+     DrawExitPrompt();
+     controller_mapping_wizard::Draw();
+diff --git a/runtime/src/hle/mlb/season_cap.cpp b/runtime/src/hle/mlb/season_cap.cpp
+--- a/runtime/src/hle/mlb/season_cap.cpp
++++ b/runtime/src/hle/mlb/season_cap.cpp
+@@ -1,6 +1,7 @@
+ // Season mode past 10 seasons: the cap, years 10..19 of the 10-year tables, and the moving window
+ // with no limit (season_cap.h).
+ #include "season_cap.h"
++#include "modern_postseason_runtime.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -172,6 +173,8 @@
+     split(q + 44, kAnnualBytes, &g_tail.store.annual[0][0]);
+     split(q + 4, kYearlyBytes, &g_tail.store.yearly[0][0]);
+     split(b + 60, kRecordBytes, &g_tail.store.records[0][0]);
++    modern_postseason::shiftWindow(year + g_tail.startShift);
++    g_tail.postseason = modern_postseason::snapshot();
+     AddArchived(g_tail, archived);
+     ++g_tail.yearOffset;
+     std::fprintf(stderr, "[season] %u archived; the window is now %u-%u\n", year, 2008 + g_tail.yearOffset,
+@@ -262,6 +265,7 @@
+     // A new game of either mode (MLB Life's starts at index 0 too, then goes back to its off-season).
+     if ((!SeasonModeActive() && !LifeModeActive()) || CurrentIndex() != 0) return false;
+     g_tail = {};
++    modern_postseason::beginNewGame();
+     g_tail.startShift = startYear > 2008 ? static_cast<uint32_t>(startYear - 2008) : 0;
+     if (g_tail.startShift) {
+         // The roster's ages are for its own season (rosterYear, by default the first one): its players
+@@ -324,6 +328,7 @@
+         return;
+     }
+     if (!tail || fileIndex < 0) return;  // a load reads from the start
++    g_candidate.life = false;
+     g_candidate.ours = ReadTail(tail, kTailSize, g_candidate.tail);
+     g_candidate.index = fileIndex;
+     g_candidate.frame = g_frame.load();
+@@ -341,6 +346,7 @@
+                                     : NeededCount(g_candidate.index, g_candidate.ours && g_candidate.tail.pastTen,
+                                                   g_candidate.tail.yearOffset));
+     g_tail = std::move(g_candidate.tail);  // empty for a save without our tail
++    modern_postseason::restore(g_tail.postseason);
+     std::fprintf(stderr, "[season] season %d loaded; %s, year offset %u, start shift %u, %zu archived seasons\n",
+                  g_candidate.index + 1,
+                  g_candidate.ours ? "our tail" : "no tail", g_tail.yearOffset, g_tail.startShift,
+@@ -358,22 +364,34 @@
+     if (!tail || fileOffset > kLifeIndexOffset || kLifeIndexOffset >= fileOffset + length) return;
+     g_candidate = {};
+     g_candidate.life = true;
+-    g_candidate.ours = ReadLifeTail(tail, g_candidate.tail.startShift);
++    g_candidate.ours = ReadLifeTail(tail + kLifeTailOffset - kLifePostseasonOffset, g_candidate.tail.startShift);
++    modern_postseason::readSave(tail, modern_postseason::saveBytes, g_candidate.tail.postseason);
+     g_candidate.index = static_cast<int8_t>(data[kLifeIndexOffset - fileOffset]);
+     g_candidate.frame = g_frame.load();
+     g_candidate.set = true;
+ }
+ 
+ void OnLifeSaveWrite(uint32_t fileOffset, uint8_t* data, size_t length) {
+-    if (!LifeModeActive() || g_tail.startShift == 0) return;  // anything else stays byte for byte
+-    OverlayLifeTail(g_tail.startShift, fileOffset, data, length);
++    if (!LifeModeActive()) return;
++    if (g_tail.startShift != 0) OverlayLifeTail(g_tail.startShift, fileOffset, data, length);
++    const auto postseason = modern_postseason::snapshot();
++    if (!postseason.enabled) return;
++    const uint32_t from = std::max(fileOffset, kLifePostseasonOffset);
++    const uint32_t to = std::min<uint32_t>(fileOffset + static_cast<uint32_t>(length),
++                                         kLifePostseasonOffset + modern_postseason::saveBytes);
++    if (from < to) {
++        std::array<uint8_t, modern_postseason::saveBytes> bytes{};
++        modern_postseason::writeSave(postseason, bytes.data());
++        std::memcpy(data + from - fileOffset, bytes.data() + from - kLifePostseasonOffset, to - from);
++    }
+ }
+ 
+ void OnSeasonSaveWrite(uint32_t fileOffset, uint8_t* data, size_t length) {
+     // Only a game past season 10 (stored years) or from a season pack (its start year) needs the tail;
+     // anything else stays byte for byte.
+     g_tail.pastTen = Count() > kOriginalSeasons && (CurrentIndex() >= kOriginalSeasons || g_tail.yearOffset > 0);
+-    if (!g_tail.pastTen && g_tail.startShift == 0) return;
++    g_tail.postseason = modern_postseason::snapshot();
++    if (!g_tail.pastTen && g_tail.startShift == 0 && !g_tail.postseason.enabled) return;
+     OverlayTail(g_tail, fileOffset, data, length);
+     if (fileOffset + length >= kSaveFileSize && fileOffset < kSaveFileSize)
+         std::fprintf(stderr, "[season] tail written: year offset %u, start shift %u\n", g_tail.yearOffset,
+diff --git a/runtime/src/hle/storage/nand_isfs.cpp b/runtime/src/hle/storage/nand_isfs.cpp
+--- a/runtime/src/hle/storage/nand_isfs.cpp
++++ b/runtime/src/hle/storage/nand_isfs.cpp
+@@ -523,17 +523,32 @@
+                 tailBytes = tail;
+             std::fseek(handle->file, at, SEEK_SET);
+         }
++        if (tailBytes && season_cap::GetBe32(tailBytes + 8) == 4) {
++            season_cap::SeasonTail checked;
++            if (!season_cap::ReadTail(tailBytes, sizeof(tail), checked)) {
++                LogNandError("IOS_Read", "invalid modern postseason save extension");
++                return ISFS_EINVAL;
++            }
++        }
+         season_cap::OnSeasonSaveRead(readAt, buffer, bytesRead, tailBytes);
+     } else if (IsLifeSaveHandle(*handle)) {
+         // MLB Life: the chunk with the year index brings the small tail, read here from the file.
+-        static uint8_t tail[season_cap::kLifeTailSize];
++        static uint8_t tail[season_cap::kLifeReadTailSize];
+         const uint8_t* tailBytes = nullptr;
+         if (readAt <= season_cap::kLifeIndexOffset && season_cap::kLifeIndexOffset < readAt + bytesRead) {
+             const long at = std::ftell(handle->file);
+-            if (std::fseek(handle->file, season_cap::kLifeTailOffset, SEEK_SET) == 0 &&
++            if (std::fseek(handle->file, season_cap::kLifePostseasonOffset, SEEK_SET) == 0 &&
+                 std::fread(tail, 1, sizeof(tail), handle->file) == sizeof(tail))
+                 tailBytes = tail;
+             std::fseek(handle->file, at, SEEK_SET);
++        }
++        if (tailBytes) {
++            modern_postseason::SavedState checked;
++            if (modern_postseason::readSave(tailBytes, modern_postseason::saveBytes, checked) ==
++                modern_postseason::SaveStatus::Invalid) {
++                LogNandError("IOS_Read", "invalid MLB Life postseason save extension");
++                return ISFS_EINVAL;
++            }
+         }
+         season_cap::OnLifeSaveRead(readAt, buffer, bytesRead, tailBytes);
+     }
+diff --git a/runtime/include/modern_postseason.h b/runtime/include/modern_postseason.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/modern_postseason.h
+@@ -0,0 +1,244 @@
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <stdexcept>
++#include <vector>
++
++// MLB Rule 34(c), 35 and 38; current explainer: https://www.mlb.com/news/mlb-playoff-tiebreaker-rules
++namespace modern_postseason {
++constexpr int pending = 44;
++struct Team { int id=44, division=0, wins=0, losses=0; };
++struct GameResult { int home=44, away=44, homeRuns=0, awayRuns=0, day=0; };
++struct Series { int higher=44, lower=44, higherWins=0, lowerWins=0, target=0, winner=44; };
++using Seeds = std::array<std::array<int,6>,2>;
++struct State {
++    std::array<Team,30> teams{};
++    Seeds seeds = [] { Seeds s{}; for(auto& league:s) league.fill(pending); return s; }();
++    std::array<Series,12> series{};
++};
++
++namespace detail {
++struct Record { std::int64_t wins=0, games=0; };
++inline int compare(Record a, Record b) {
++    const auto left=a.wins*std::max<std::int64_t>(1,b.games);
++    const auto right=b.wins*std::max<std::int64_t>(1,a.games);
++    return (left>right)-(left<right);
++}
++inline Record standing(const Team& t) { return {t.wins,std::int64_t(t.wins)+t.losses}; }
++inline std::array<Team,30> validate(const std::array<Team,30>& teams,const std::vector<GameResult>& games) {
++    std::array<Team,30> result{};
++    std::array<bool,30> seen{};
++    std::array<int,6> counts{};
++    for(const auto& t:teams) {
++        if(t.id<0 || t.id>=30 || seen[t.id] || t.division<0 || t.division>=6 || t.wins<0 || t.losses<0)
++            throw std::invalid_argument("invalid postseason team standings");
++        seen[t.id]=true; ++counts[t.division]; result[t.id]=t;
++    }
++    for(int n:counts) if(n==0) throw std::invalid_argument("each division requires at least one team");
++    for(int league=0;league<2;++league)
++        if(counts[league*3]+counts[league*3+1]+counts[league*3+2]<6)
++            throw std::invalid_argument("each league requires at least six teams");
++    for(const auto& g:games)
++        if(g.home<0 || g.home>=30 || g.away<0 || g.away>=30 || g.home==g.away ||
++           g.homeRuns<0 || g.awayRuns<0 || g.homeRuns==g.awayRuns || g.day<0)
++            throw std::invalid_argument("invalid regular-season game result");
++    return result;
++}
++inline bool contains(const std::vector<int>& ids,int id) { return std::find(ids.begin(),ids.end(),id)!=ids.end(); }
++struct TieBreaker {
++    const std::array<Team,30>& teams;
++    const std::vector<GameResult>& games;
++    int allStarDay;
++    Record record(int id,const std::vector<int>& tied,int kind) const {
++        Record r;
++        for(const auto& g:games) {
++            if(g.home!=id && g.away!=id) continue;
++            int other=g.home==id?g.away:g.home;
++            if(kind==0 && !contains(tied,other)) continue;
++            if(kind==1 && teams[id].division!=teams[other].division) continue;
++            if(kind==2 && teams[id].division/3!=teams[other].division/3) continue;
++            ++r.games;
++            r.wins+=(g.home==id)==(g.homeRuns>g.awayRuns);
++        }
++        return r;
++    }
++    template<class Metric> std::vector<int> leaders(const std::vector<int>& ids,Metric metric) const {
++        std::vector<int> best;
++        Record score;
++        for(int id:ids) {
++            auto value=metric(id);
++            int cmp=best.empty()?1:compare(value,score);
++            if(cmp>0) { best.clear(); score=value; }
++            if(cmp>=0) best.push_back(id);
++        }
++        return best;
++    }
++    int winner(const std::vector<int>& ids) const {
++        if(ids.empty()) throw std::invalid_argument("empty tiebreak group");
++        if(ids.size()==1) return ids.front();
++        if(ids.size()>4) throw std::runtime_error("MLB tiebreak procedure for five or more clubs requires explicit adjudication");
++        // Rule 34(c): a club beating every tied opponent precedes aggregate percentages.
++        if(ids.size()>2) for(int id:ids) {
++            bool dominant=true;
++            for(int other:ids) if(other!=id) {
++                auto r=record(id,{other},0);
++                if(r.wins*2<=r.games || r.games==0) dominant=false;
++            }
++            if(dominant) return id;
++        }
++        for(int kind=0;kind<3;++kind) {
++            // No evidence is not a losing record; skip criteria lacking a club's results.
++            if(std::any_of(ids.begin(),ids.end(),[&](int id){return record(id,ids,kind).games==0;})) continue;
++            auto best=leaders(ids,[&](int id){return record(id,ids,kind);});
++            if(best.size()==1) return best.front();
++            if(best.size()<ids.size()) return winner(best);
++        }
++        // Rule 34(c) defines last half as after the All-Star break, not N/2 games.
++        if(allStarDay<0) throw std::runtime_error("unresolved MLB tie requires the All-Star break day");
++        std::vector<std::vector<const GameResult*>> history;
++        std::vector<std::size_t> starts;
++        for(int id:ids) {
++            std::vector<const GameResult*> list;
++            for(const auto& g:games) {
++                if(g.home!=id && g.away!=id) continue;
++                int other=g.home==id?g.away:g.home;
++                if(teams[id].division/3==teams[other].division/3) list.push_back(&g);
++            }
++            // Stable ordering preserves caller's doubleheader order within a day.
++            std::stable_sort(list.begin(),list.end(),[](auto a,auto b){return a->day<b->day;});
++            std::size_t start=0;
++            while(start<list.size() && list[start]->day<=allStarDay) ++start;
++            if(start==list.size()) throw std::runtime_error("unresolved MLB tie lacks post-All-Star intraleague results");
++            starts.push_back(start); history.push_back(std::move(list));
++        }
++        for(;;) {
++            auto best=leaders(ids,[&](int id) {
++                auto i=std::find(ids.begin(),ids.end(),id)-ids.begin();
++                Record r;
++                for(auto j=starts[i];j<history[i].size();++j) {
++                    const auto& g=*history[i][j];
++                    ++r.games; r.wins+=(g.home==id)==(g.homeRuns>g.awayRuns);
++                }
++                return r;
++            });
++            if(best.size()==1) return best.front();
++            if(best.size()<ids.size()) return winner(best);
++            bool extended=false;
++            for(std::size_t i=0;i<ids.size();++i) {
++                // In multi-club ties the added game must exclude the tied opponents.
++                while(starts[i]>0) {
++                    const auto& g=*history[i][--starts[i]];
++                    int other=g.home==ids[i]?g.away:g.home;
++                    if(ids.size()==2 || !contains(ids,other)) { extended=true; break; }
++                    // Excluded tied-club games must not enter the extended window.
++                    history[i].erase(history[i].begin()+starts[i]);
++                }
++            }
++            if(!extended) throw std::runtime_error("unresolved MLB tiebreak requires explicit adjudication");
++        }
++    }
++    int best(const std::vector<int>& ids) const {
++        return winner(leaders(ids,[&](int id){return standing(teams[id]);}));
++    }
++};
++}
++
++inline int resolveTie(const std::array<Team,30>& teams,const std::vector<GameResult>& games,
++                      const std::vector<int>& tied,int allStarDay=-1) {
++    const auto normalized=detail::validate(teams,games);
++    std::vector<int> seen;
++    for(int id:tied) {
++        if(id<0 || id>=30 || detail::contains(seen,id)) throw std::invalid_argument("invalid tiebreak group");
++        seen.push_back(id);
++    }
++    return detail::TieBreaker{normalized,games,allStarDay}.winner(tied);
++}
++
++inline Seeds selectSeeds(const std::array<Team,30>& teams,const std::vector<GameResult>& games,int allStarDay=-1) {
++    const auto normalized=detail::validate(teams,games);
++    detail::TieBreaker rank{normalized,games,allStarDay};
++    Seeds seeds{};
++    for(int league=0;league<2;++league) {
++        std::vector<int> champions,others;
++        for(int division=league*3;division<league*3+3;++division) {
++            std::vector<int> members;
++            for(const auto& t:normalized) if(t.division==division) members.push_back(t.id);
++            champions.push_back(rank.best(members));
++        }
++        for(const auto& t:normalized)
++            if(t.division/3==league && !detail::contains(champions,t.id)) others.push_back(t.id);
++        for(int seed=0;seed<6;++seed) {
++            auto& pool=seed<3?champions:others;
++            int id=rank.best(pool);
++            seeds[league][seed]=id;
++            pool.erase(std::find(pool.begin(),pool.end(),id));
++        }
++    }
++    return seeds;
++}
++
++inline int homeTeam(const Series& s,int game) {
++    if(s.higher<0 || s.higher>=30 || s.lower<0 || s.lower>=30 || s.higher==s.lower ||
++       (s.target!=2 && s.target!=3 && s.target!=4) || game<0 || game>=s.target*2-1)
++        throw std::invalid_argument("invalid postseason series game");
++    bool higher=s.target==2 || game<2 || (s.target==3?game==4:game>=5);
++    return higher?s.higher:s.lower;
++}
++inline int seedOf(const State& state,int id) {
++    for(const auto& league:state.seeds)
++        for(int i=0;i<6;++i) if(league[i]==id) return i;
++    throw std::invalid_argument("team is not a postseason qualifier");
++}
++inline void advance(State& state,const std::vector<GameResult>& games,int allStarDay=-1) {
++    auto next=state;
++    auto setup=[&](int index,int a,int b,int target,bool world=false) {
++        if(a==pending || b==pending || next.series[index].higher!=pending) return;
++        if(a<0 || a>=30 || b<0 || b>=30 || a==b)
++            throw std::invalid_argument("invalid postseason bracket participants");
++        int higher;
++        if(world) {
++            const auto teams=detail::validate(next.teams,games);
++            higher=detail::TieBreaker{teams,games,allStarDay}.best({a,b});
++        } else higher=seedOf(next,a)<seedOf(next,b)?a:b;
++        next.series[index]={higher,higher==a?b:a,0,0,target,pending};
++    };
++    for(int league=0;league<2;++league) {
++        int ds=league*2,wc=8+league*2;
++        setup(ds,next.seeds[league][0],next.series[wc+1].winner,3);
++        setup(ds+1,next.seeds[league][1],next.series[wc].winner,3);
++        setup(4+league,next.series[ds].winner,next.series[ds+1].winner,4);
++    }
++    setup(6,next.series[4].winner,next.series[5].winner,4,true);
++    state=next;
++}
++inline State create(const std::array<Team,30>& teams,const std::vector<GameResult>& games,int allStarDay=-1) {
++    State state;
++    state.teams=detail::validate(teams,games);
++    state.seeds=selectSeeds(state.teams,games,allStarDay);
++    for(int league=0;league<2;++league) {
++        const auto& s=state.seeds[league];
++        state.series[8+league*2]={s[2],s[5],0,0,2,pending};
++        state.series[9+league*2]={s[3],s[4],0,0,2,pending};
++    }
++    return state;
++}
++inline void recordWin(State& state,int index,int team,const std::vector<GameResult>& games,int allStarDay=-1) {
++    if(index<0 || index>=12 || index==7) throw std::invalid_argument("invalid postseason series index");
++    auto next=state;
++    auto& s=next.series[index];
++    if(s.higher<0 || s.higher>=30 || s.lower<0 || s.lower>=30 || s.higher==s.lower ||
++       s.winner!=pending || (team!=s.higher && team!=s.lower) ||
++       (s.target!=2 && s.target!=3 && s.target!=4) || s.higherWins<0 || s.lowerWins<0 ||
++       s.higherWins>=s.target || s.lowerWins>=s.target)
++        throw std::invalid_argument("postseason series is not accepting results");
++    int& wins=team==s.higher?s.higherWins:s.lowerWins;
++    if(++wins==s.target) s.winner=team;
++    advance(next,games,allStarDay);
++    state=next;
++}
++}
++
++
++
++
+diff --git a/runtime/include/modern_postseason_save.h b/runtime/include/modern_postseason_save.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/modern_postseason_save.h
+@@ -0,0 +1,120 @@
++#pragma once
++#include "modern_postseason.h"
++#include <cstddef>
++
++namespace modern_postseason {
++constexpr size_t saveBytes=6144;
++struct SavedYear {
++    bool qualified=false;
++    uint32_t firstDay=0;
++    Seeds seeds=[] { Seeds value{}; for(auto& league:value) league.fill(pending); return value; }();
++    std::array<std::array<uint8_t,20>,4> wildCards{};
++};
++struct SavedArchive { uint32_t year=0; SavedYear data; };
++struct SavedState {
++    bool enabled=false;
++    std::array<SavedYear,20> years{};
++    std::vector<SavedArchive> archive;
++};
++enum class SaveStatus { Missing, Valid, Invalid };
++
++namespace save_detail {
++constexpr std::array<uint8_t,8> magic{'M','L','B','P','O','S','T','S'};
++constexpr size_t yearBytes=100;
++constexpr size_t archiveOffset=17+20*yearBytes, archiveLimit=28;
++static_assert(archiveOffset+4+archiveLimit*(4+yearBytes)<=saveBytes);
++inline uint32_t get32(const uint8_t* data) {
++    return uint32_t(data[0])<<24 | uint32_t(data[1])<<16 | uint32_t(data[2])<<8 | data[3];
++}
++inline void put32(uint8_t* data,uint32_t value) {
++    for(int i=3;i>=0;--i) { data[i]=uint8_t(value); value>>=8; }
++}
++inline uint32_t checksum(const uint8_t* data) {
++    uint32_t hash=2166136261u;
++    for(size_t i=0;i<saveBytes;++i) hash=(hash^(i>=12&&i<16?0:data[i]))*16777619u;
++    return hash;
++}
++inline bool zero(const uint8_t* begin,const uint8_t* end) {
++    return std::all_of(begin,end,[](uint8_t byte){return byte==0;});
++}
++inline void writeYear(const SavedYear& year,uint8_t* row) {
++    if(!year.qualified) return;
++    row[0]=1;
++    put32(row+4,year.firstDay);
++    for(int l=0;l<2;++l) for(int s=0;s<6;++s) row[8+l*6+s]=uint8_t(year.seeds[l][s]);
++    for(int s=0;s<4;++s) std::copy(year.wildCards[s].begin(),year.wildCards[s].end(),row+20+s*20);
++}
++inline bool readYear(const uint8_t* row,SavedYear& year) {
++    if(row[0]>1 || !zero(row+1,row+4)) return false;
++    if(!row[0]) return zero(row,row+yearBytes);
++    year.qualified=true;
++    year.firstDay=get32(row+4);
++    if(year.firstDay!=275) return false;
++    std::array<bool,30> seen{};
++    for(int l=0;l<2;++l) for(int s=0;s<6;++s) {
++        const auto id=row[8+l*6+s];
++        if(id>=seen.size() || seen[id]) return false;
++        seen[id]=true; year.seeds[l][s]=id;
++    }
++    for(int s=0;s<4;++s) {
++        auto& series=year.wildCards[s];
++        std::copy_n(row+20+s*20,20,series.begin());
++        const auto home=get32(series.data()+8), away=get32(series.data()+12);
++        const auto& league=year.seeds[s/2];
++        const auto winner=(series[19]>>4)&7;
++        if(home!=uint32_t(league[2+s%2]) || away!=uint32_t(league[5-s%2]) ||
++           series[16]>2 || series[17]>2 || winner>2 ||
++           (winner==0 && (series[16]!=2 || series[17]>=2)) ||
++           (winner==1 && (series[17]!=2 || series[16]>=2)) ||
++           (winner==2 && (series[16]>=2 || series[17]>=2))) return false;
++    }
++    return true;
++}
++}
++
++// v1: magic[8], BE version/checksum, enabled byte, 20 x 100-byte years, BE archive count,
++// at most 28 x (BE calendar year + 100-byte year), zero padding.
++// Each year: qualified byte, 3 reserved bytes, BE firstDay, 12 seed bytes, 4 x 20 guest bytes.
++// Caller supplies saveBytes writable bytes; checksum is FNV-1a with bytes12..15 treated as zero.
++inline void writeSave(const SavedState& state,uint8_t* out) {
++    std::fill_n(out,saveBytes,uint8_t(0));
++    std::copy(save_detail::magic.begin(),save_detail::magic.end(),out);
++    save_detail::put32(out+8,1);
++    out[16]=state.enabled;
++    for(size_t y=0;y<state.years.size();++y)
++        save_detail::writeYear(state.years[y],out+17+y*save_detail::yearBytes);
++    const auto count=std::min(state.archive.size(),save_detail::archiveLimit);
++    save_detail::put32(out+save_detail::archiveOffset,uint32_t(count));
++    for(size_t i=0;i<count;++i) {
++        const auto& entry=state.archive[state.archive.size()-count+i];
++        auto* row=out+save_detail::archiveOffset+4+i*(4+save_detail::yearBytes);
++        save_detail::put32(row,entry.year);
++        save_detail::writeYear(entry.data,row+4);
++    }
++    save_detail::put32(out+12,save_detail::checksum(out));
++}
++
++inline SaveStatus readSave(const uint8_t* data,size_t size,SavedState& out) {
++    if(!data || size<save_detail::magic.size() ||
++       !std::equal(save_detail::magic.begin(),save_detail::magic.end(),data)) return SaveStatus::Missing;
++    if(size<saveBytes || save_detail::get32(data+8)!=1 ||
++       save_detail::get32(data+12)!=save_detail::checksum(data) || data[16]>1) return SaveStatus::Invalid;
++    const auto count=save_detail::get32(data+save_detail::archiveOffset);
++    if(count>save_detail::archiveLimit ||
++       !save_detail::zero(data+save_detail::archiveOffset+4+count*(4+save_detail::yearBytes),data+saveBytes))
++        return SaveStatus::Invalid;
++    SavedState state;
++    state.enabled=data[16]!=0;
++    for(size_t y=0;y<state.years.size();++y)
++        if(!save_detail::readYear(data+17+y*save_detail::yearBytes,state.years[y])) return SaveStatus::Invalid;
++    for(size_t i=0;i<count;++i) {
++        const auto* row=data+save_detail::archiveOffset+4+i*(4+save_detail::yearBytes);
++        SavedArchive entry; entry.year=save_detail::get32(row);
++        if(entry.year<2008 || entry.year>9999 || (!state.archive.empty() && entry.year<=state.archive.back().year) ||
++           !save_detail::readYear(row+4,entry.data) || !entry.data.qualified) return SaveStatus::Invalid;
++        state.archive.push_back(entry);
++    }
++    out=state;
++    return SaveStatus::Valid;
++}
++}
+diff --git a/runtime/include/postseason_guest.h b/runtime/include/postseason_guest.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/postseason_guest.h
+@@ -0,0 +1,42 @@
++#pragma once
++#include "modern_postseason_save.h"
++
++namespace modern_postseason {
++enum class GameStatus { Scheduled, Finished, Tied, Invalid };
++inline GameStatus decodeGame(const uint8_t* bytes,int day,GameResult& out) {
++    const uint32_t a=save_detail::get32(bytes),b=save_detail::get32(bytes+4);
++    const uint32_t flags=save_detail::get32(bytes+12),status=(flags>>23)&7,winner=(flags>>20)&7;
++    if(a>=30 || b>=30 || a==b || status>2) return GameStatus::Invalid;
++    if(status!=2) return GameStatus::Scheduled;
++    const int ar=bytes[8],br=bytes[9];
++    if(winner==2 && ar==br) return GameStatus::Tied;
++    if(winner>1 || (winner==0)!=(ar>br) || ar==br) return GameStatus::Invalid;
++    out={static_cast<int>(a),static_cast<int>(b),ar,br,day};
++    return GameStatus::Finished;
++}
++inline bool wildCardDay(int day) { return day>=275 && day<=277; }
++inline int classifyPostseasonDay(int day) {
++    if(day>=275 && day<=285) return 2;
++    if(day>=286 && day<=295) return 3;
++    if(day>=296 && day<=304) return 4;
++    return -1;
++}
++inline int roundSeries(int round,int slot) {
++    const int first[]={0,4,6},count[]={4,2,1};
++    return round>=0 && round<3 && slot>=0 && slot<count[round]?first[round]+slot:-1;
++}
++inline Series decodeSeries(const uint8_t* bytes,int target) {
++    const uint32_t state=(save_detail::get32(bytes+16)>>4)&7;
++    const int a=static_cast<int>(save_detail::get32(bytes+8)),b=static_cast<int>(save_detail::get32(bytes+12));
++    return {a,b,bytes[16],bytes[17],target,state==0?a:state==1?b:pending};
++}
++inline void encodeSeries(const Series& s,int day,uint8_t* bytes) {
++    save_detail::put32(bytes,8);
++    save_detail::put32(bytes+4,8);
++    save_detail::put32(bytes+8,static_cast<uint32_t>(s.higher));
++    save_detail::put32(bytes+12,static_cast<uint32_t>(s.lower));
++    const uint32_t state=s.winner==pending?2:s.winner==s.higher?0:1;
++    save_detail::put32(bytes+16,(static_cast<uint32_t>(s.higherWins)<<24)|
++        (static_cast<uint32_t>(s.lowerWins)<<16)|(static_cast<uint32_t>(day)<<7)|(state<<4)|8);
++}
++}
+diff --git a/runtime/include/modern_postseason_runtime.h b/runtime/include/modern_postseason_runtime.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/modern_postseason_runtime.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include "modern_postseason_save.h"
++namespace modern_postseason {
++bool enabled();
++void beginNewGame();
++void restore(const SavedState& saved);
++SavedState snapshot();
++void shiftWindow(uint32_t realYear);
++void draw();
++}
+diff --git a/runtime/src/hle/mlb/modern_postseason.cpp b/runtime/src/hle/mlb/modern_postseason.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/hle/mlb/modern_postseason.cpp
+@@ -0,0 +1,940 @@
++#include "modern_postseason_runtime.h"
++#include "postseason_guest.h"
++#include "abi_bridge.h"
++#include "aurora_events.h"
++#include "gx_guest_write.h"
++#include "hle_stubs.h"
++#include "memory.h"
++#include "mods.h"
++#include "ppc_runtime.h"
++#include "runtime_config.h"
++#include "season_cap.h"
++#include "season_schedule.h"
++#include <aurora/imgui.h>
++#include <imgui.h>
++#include <xxhash.h>
++#include <algorithm>
++#include <array>
++#include <vector>
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++// Original bodies preserve legacy saves and the game's non-postseason side effects.
++#define ORIGINAL(address) extern "C" void func_##address(CpuContext*)
++ORIGINAL(80B4BB28); ORIGINAL(80B88264); ORIGINAL(80B882B0); ORIGINAL(80B88458);
++ORIGINAL(80B8E8B4); ORIGINAL(80B8F444); ORIGINAL(80B8F5FC); ORIGINAL(80B8F97C);
++ORIGINAL(80B739AC); ORIGINAL(80B9841C); ORIGINAL(80B9849C); ORIGINAL(80B9853C);
++ORIGINAL(80B8ED34); ORIGINAL(80B8EF78); ORIGINAL(80B8A250); ORIGINAL(80B8A054);
++ORIGINAL(80B89FE0); ORIGINAL(80B8AC38); ORIGINAL(80B8AD28); ORIGINAL(80B899B8); ORIGINAL(80B897F0); ORIGINAL(80B88880);
++ORIGINAL(80B8D69C); ORIGINAL(80B8D6F4); ORIGINAL(80B9C4C0); ORIGINAL(80B9B5F8); ORIGINAL(80BA6854);
++#undef ORIGINAL
++
++namespace modern_postseason {
++namespace {
++SavedState saved;
++// The IOS-reserved top of MEM2, below the two-way dialogue's 0x97FFF000 area.
++constexpr uint32_t arena=0x97FFC000u;
++std::string error;
++uint32_t bracket=0;
++bool qualifying=false;
++int year() {
++    const uint32_t state=Memory::Read32(0x8104B5A8u);
++    return state && Memory::Contains(state,9)?static_cast<int8_t>(Memory::Read8(state+8)):-1;
++}
++int today() {
++    const uint32_t state=Memory::Read32(0x8104B5A8u);
++    return state && Memory::Contains(state,9)?Memory::Read16(state+4):-1;
++}
++uint32_t base() { return Memory::Read32(0x8104B5ACu); }
++SavedYear* current() {
++    const int y=year();
++    return y>=0 && y<20?&saved.years[y]:nullptr;
++}
++uint32_t seriesAddress(int y,int index) {
++    if(y<0 || y>=20 || index<0 || index>=12) return 0;
++    return index>=8?arena+static_cast<uint32_t>(y*80+(index-8)*20):
++        base()+648+static_cast<uint32_t>(y*160+index*20);
++}
++Series series(int index) {
++    const uint32_t at=seriesAddress(year(),index);
++    const auto* bytes=static_cast<const uint8_t*>(Memory::GetPointer(at,20));
++    return bytes?decodeSeries(bytes,index>=8?2:index<4?3:4):Series{};
++}
++void putSeries(int index,const Series& value,int completed=0) {
++    const uint32_t at=seriesAddress(year(),index);
++    std::array<uint8_t,20> bytes{};
++    encodeSeries(value,completed,bytes.data());
++    // Original highlighting stores the position in the eight-team qualifier row.
++    for(int side=0;side<2;++side)
++        for(int p=0;p<8;++p)
++            if(Memory::Read32(base()+static_cast<uint32_t>(year()*32+p*4))==
++               static_cast<uint32_t>(side?value.lower:value.higher)) {
++                save_detail::put32(bytes.data()+side*4,static_cast<uint32_t>(p)); break;
++            }
++    for(uint32_t i=0;i<20;++i) Memory::Write8(at+i,bytes[i]);
++}
++uint32_t gameAddress(int day,int slot) {
++    if(day<60 || day>304 || slot<0 || slot>=16) return 0;
++    return Memory::Read32(0x8104B5A0u)+season_schedule::kTableOffset+
++        static_cast<uint32_t>((day-60)*256+slot*16);
++}
++void clearGame(int day,int slot) {
++    const uint32_t at=gameAddress(day,slot);
++    if(!at || !Memory::Contains(at,16)) return;
++    // As the game empties a slot (0x80BA0DAC -> 0x80B72B8C): teams 44, no status, winner field 2
++    // (none) and bit 15. All-zero flags read as a decided game to parts of the simulation.
++    Memory::Write32(at,44); Memory::Write32(at+4,44);
++    Memory::Write32(at+8,0); Memory::Write32(at+12,(2u<<20)|(1u<<15));
++}
++void schedule(int round) {
++    static constexpr int dates[4][7]={{278,279,281,282,284,0,0},{286,287,289,290,291,293,294},
++        {296,297,299,300,301,303,304},{275,276,277,0,0,0,0}};
++    const int count=round==0?5:round==3?3:7,slots=round==1?2:round==2?1:4;
++    for(int slot=0;slot<slots;++slot) {
++        const int index=round==3?8+slot:roundSeries(round,slot);
++        const Series value=series(index);
++        if(value.higher==pending || value.lower==pending) continue;
++        for(int g=0;g<count;++g) {
++            const uint32_t at=gameAddress(dates[round][g],slot);
++            if(!at || !Memory::Contains(at,16) || ((Memory::Read32(at+12)>>23)&7)==2) continue;
++            if(value.winner!=pending) { clearGame(dates[round][g],slot); continue; }
++            const int home=homeTeam(value,g),away=home==value.higher?value.lower:value.higher;
++            Memory::Write32(at,static_cast<uint32_t>(home));
++            Memory::Write32(at+4,static_cast<uint32_t>(away));
++            Memory::Write32(at+8,season_schedule::TimeWord(18*60));
++            // 0x80B72928 (the original postseason game builder) marks the kind field, bits 17-19, as 1.
++            Memory::Write32(at+12,(season_schedule::FlagsWord(18*60)&~(7u<<17))|(1u<<17));
++        }
++    }
++}
++struct Regular {
++    std::array<Team,30> teams{};
++    std::vector<GameResult> games;
++    int allStar=-1;
++};
++Regular regular(bool requireFinished) {
++    Regular result;
++    const uint32_t words=Memory::Read32(0x8104B5A0u)+128;
++    for(int t=0;t<30;++t) {
++        const uint32_t word=Memory::Read32(words+static_cast<uint32_t>(t*4));
++        result.teams[t]={t,static_cast<int>((word>>24)&15)*3+static_cast<int>(word>>28),0,0};
++    }
++    for(int d=78;d<=274;++d) for(int slot=0;slot<16;++slot) {
++        const uint32_t at=gameAddress(d,slot),a=Memory::Read32(at),b=Memory::Read32(at+4);
++        if(a==44 || b==44) continue;
++        if(a>=30 || b>=30) { result.allStar=d; continue; }
++        GameResult game;
++        const auto status=decodeGame(static_cast<const uint8_t*>(Memory::GetPointer(at,16)),d,game);
++        if(status==GameStatus::Tied) continue;  // MLB standings exclude completed draws.
++        if(status!=GameStatus::Finished) {
++            if(requireFinished) throw std::runtime_error(status==GameStatus::Invalid?
++                "invalid regular-season result":"regular-season results are incomplete");
++            continue;
++        }
++        result.games.push_back(game);
++        const bool win=game.homeRuns>game.awayRuns;
++        ++result.teams[win?a:b].wins; ++result.teams[win?b:a].losses;
++    }
++    return result;
++}
++// Division within its league (0 East, 1 Central, 2 West), from the team's word as regular() reads it.
++int divisionOf(int id) {
++    return id>=0 && id<30?static_cast<int>(Memory::Read32(Memory::Read32(0x8104B5A0u)+128+static_cast<uint32_t>(id*4))>>28):0;
++}
++void fail(const char* message) {
++    if(error==message) return;
++    error=message;
++    std::fprintf(stderr,"[postseason] %s\n",message);
++}
++// Postponed games, as MLB does at the end of a season: the postseason dates never move. Once no
++// regular-season game is scheduled from today on, a game left unplayed on an earlier day is made up on
++// a free day before the Wild Card round (2008's schedule ends 9/28, leaving 9/29-10/1) if its result
++// can change the qualifiers or their seeds (seeds decide byes and home field); if it cannot, it is
++// dropped and the teams finish with fewer than 162 games. Without room before day 275 it is dropped
++// too (qualify() then counts only the games played).
++bool pendingGame(int day,int slot,int& a,int& b) {
++    const uint32_t at=gameAddress(day,slot);
++    if(!at || !Memory::Contains(at,16)) return false;
++    a=static_cast<int>(Memory::Read32(at)); b=static_cast<int>(Memory::Read32(at+4));
++    if(a>=30 || b>=30) return false;
++    GameResult unused;
++    return decodeGame(static_cast<const uint8_t*>(Memory::GetPointer(at,16)),day,unused)==GameStatus::Scheduled;
++}
++bool decides(const Regular& r,int home,int away,int day) {
++    try {
++        Seeds outcome[2];
++        for(int homeWins=0;homeWins<2;++homeWins) {
++            auto teams=r.teams; auto games=r.games;
++            ++teams[homeWins?home:away].wins; ++teams[homeWins?away:home].losses;
++            games.push_back({home,away,homeWins?1:0,homeWins?0:1,day});
++            outcome[homeWins]=selectSeeds(teams,games,r.allStar);
++        }
++        return outcome[0]!=outcome[1];
++    } catch(const std::exception&) { return true; }  // an unresolved tie: let the game decide it
++}
++bool playsOn(int day,int team) {
++    int a,b;
++    for(int slot=0;slot<16;++slot) {
++        const uint32_t at=gameAddress(day,slot);
++        if(!at || !Memory::Contains(at,16)) continue;
++        a=static_cast<int>(Memory::Read32(at)); b=static_cast<int>(Memory::Read32(at+4));
++        if(a==team || b==team) return true;
++    }
++    return false;
++}
++void makeups() {
++    const int now=today();
++    static int checked=-1;
++    if(now<78 || now>274 || now==checked || current()==nullptr || current()->qualified) return;
++    checked=now;
++    int a,b;
++    for(int d=now;d<=274;++d) for(int slot=0;slot<16;++slot) if(pendingGame(d,slot,a,b)) return;  // still scheduled
++    const Regular r=regular(false);
++    static std::vector<uint32_t> dropped;
++    for(int d=78;d<now;++d) for(int slot=0;slot<16;++slot) {
++        if(!pendingGame(d,slot,a,b)) continue;
++        const uint32_t at=gameAddress(d,slot);
++        if(std::find(dropped.begin(),dropped.end(),at)!=dropped.end()) continue;
++        int target=-1,free=-1;
++        if(decides(r,a,b,d))
++            for(int t=now;t<=274 && target<0;++t) {
++                if(playsOn(t,a) || playsOn(t,b)) continue;
++                for(int s=0;s<16 && free<0;++s) {
++                    const uint32_t to=gameAddress(t,s);
++                    if(to && Memory::Contains(to,16) && Memory::Read32(to)==44 && Memory::Read32(to+4)==44) free=s;
++                }
++                if(free>=0) target=t;
++            }
++        if(target<0) {
++            dropped.push_back(at);
++            std::fprintf(stderr,"[postseason] day %d: %d at %d not made up (%s)\n",d,b,a,
++                decides(r,a,b,d)?"no free day before the postseason":"it cannot change the postseason");
++            continue;
++        }
++        const uint32_t to=gameAddress(target,free);
++        for(uint32_t i=0;i<16;i+=4) Memory::Write32(to+i,Memory::Read32(at+i));
++        clearGame(d,slot);
++        std::fprintf(stderr,"[postseason] day %d: %d at %d made up on day %d\n",d,b,a,target);
++    }
++}
++void qualify() {
++    auto* row=current();
++    if(!enabled() || !row || row->qualified || qualifying || today()<274 || !error.empty()) return;
++    qualifying=true;
++    try {
++        // On the last regular day the early queries come before its games finish: wait for them.
++        // From the first postseason day on, a game left unplayed simply does not count, as in MLB
++        // (otherwise the year would have no postseason at all).
++        const Regular r=regular(today()<=274);
++        if(r.games.empty()) throw std::runtime_error("no completed regular-season games");
++        const State state=create(r.teams,r.games,r.allStar);
++        row->seeds=state.seeds; row->firstDay=275; row->qualified=true;
++        // The game reads the row as East, Central and West winners then the wild card (0x80B8D69C).
++        for(int league=0;league<2;++league) for(int s=0;s<4;++s) {
++            const int at=s<3?divisionOf(state.seeds[league][s]):3;
++            Memory::Write32(base()+static_cast<uint32_t>(year()*32+(league*4+at)*4),
++                static_cast<uint32_t>(state.seeds[league][s]));
++        }
++        for(int i=0;i<7;++i) putSeries(i,Series{});
++        for(int i=8;i<12;++i) putSeries(i,state.series[i]);
++        Memory::Write32(base()+640,0);
++        schedule(3);
++        std::fprintf(stderr,"[postseason] year %d: 12 qualifiers; Wild Card days 275-277\n",year());
++    } catch(const std::exception& e) {
++        // The last regular day's early queries occur before every game has finished.
++        if(today()>274) fail(e.what());
++    }
++    qualifying=false;
++}
++int seed(int id) {
++    auto* row=current();
++    if(row) for(const auto& league:row->seeds)
++        for(int s=0;s<6;++s) if(league[s]==id) return s;
++    return 99;
++}
++void setup(int index,int a,int b,int target) {
++    if(a==pending || b==pending || series(index).higher!=pending) return;
++    if(seed(a)>seed(b)) std::swap(a,b);
++    putSeries(index,{a,b,0,0,target,pending});
++}
++void finishWildCards() {
++    for(int i=8;i<12;++i) {
++        Series value=series(i);
++        if(value.winner==pending && (value.higherWins>=2 || value.lowerWins>=2)) {
++            value.winner=value.higherWins>=2?value.higher:value.lower;
++            putSeries(i,value,today());
++            std::fprintf(stderr,"[postseason] Wild Card %d won by team %d\n",i-8,value.winner);
++        }
++    }
++    schedule(3);
++    auto* row=current();
++    if(!row || !row->qualified) return;
++    for(int l=0;l<2;++l) {
++        setup(l*2,row->seeds[l][0],series(9+l*2).winner,3);
++        setup(l*2+1,row->seeds[l][1],series(8+l*2).winner,3);
++    }
++    schedule(0);
++}
++const char* teamName(int id) {
++    if(id==pending) return "--";
++    if(id<0 || id>=30) return "?";
++    const uint32_t word=Memory::Read32(Memory::Read32(0x8104B5A0u)+128+static_cast<uint32_t>(id*4));
++    const int code=static_cast<int>((word>>8)&0xFFFF);
++    if(code>=1 && code<=30)
++        for(const auto& t:season_schedule::kTeamCodes) if(t.number==season_schedule::kCodeTeam[code-1]) return t.code;
++    return "Team";
++}
++}
++bool enabled() {
++    const uint16_t first=Memory::Read16(0x8104B608u);
++    return saved.enabled && (first==7001 || first==9001);
++}
++void restore(const SavedState& state) {
++    saved=state; error.clear(); bracket=0;
++    for(int y=0;y<20;++y) for(int s=0;s<4;++s)
++        for(uint32_t b=0;b<20;++b) Memory::Write8(arena+static_cast<uint32_t>(y*80+s*20)+b,saved.years[y].wildCards[s][b]);
++}
++void beginNewGame() {
++    SavedState state;
++    state.enabled=RuntimeConfigFile::ModernPostseason(false);
++    for(const auto& mod:mods::Discover()) if(mod.enabled && (mod.modernPostseason || mod.originalPostseason)) {
++        state.enabled=mod.modernPostseason; break;
++    }
++    restore(state);
++    std::fprintf(stderr,"[postseason] new game: %s\n",saved.enabled?"12 teams":"original 8 teams");
++}
++SavedState snapshot() {
++    for(int y=0;y<20;++y) if(saved.years[y].qualified)
++        for(int s=0;s<4;++s) for(uint32_t b=0;b<20;++b)
++            saved.years[y].wildCards[s][b]=Memory::Read8(arena+static_cast<uint32_t>(y*80+s*20)+b);
++    return saved;
++}
++void shiftWindow(uint32_t realYear) {
++    auto next=snapshot();
++    if(next.years[0].qualified) next.archive.push_back({realYear,next.years[0]});
++    if(next.archive.size()>28) next.archive.erase(next.archive.begin());
++    std::move(next.years.begin()+1,next.years.end(),next.years.begin());
++    next.years.back()={}; restore(next);
++}
++// The Wild Card round on the game's postseason bracket (MLB DATA > Postseason and the screen between
++// games), drawn from the bracket's own pictures in MEM2: the team tile (64 x 256 C8), the small logos
++// (512 x 128 C8, cells of 36 x 42 by team code), the score digits (512 x 32 C8 with a blue and a red
++// palette) and the bracket lines (512 x 256 C8; the grey fill is the colour the game tints at draw
++// time). Each is found by the XXH64 of its texels, like two_way.cpp's help bar; nothing leaves the
++// running game. The pair of Wild Card series that feeds each Division Series slot goes in the side
++// margin next to that slot (0x80B899B8 below keeps the Wild Card winners on the outer slots).
++namespace {
++struct Atlas {
++    uint64_t hash;
++    int width, height;
++    uint32_t texels = 0;
++};
++Atlas g_tiles{0xEF74AAA7240C1F12ull, 64, 256}, g_logos{0xFAD79D2C4C04C957ull, 512, 128},
++    g_digits{0xB25BAC2CEE66C321ull, 512, 32}, g_lines{0xD6CE3E1468270ED9ull, 512, 256};
++enum Picture { kTiles, kLogos, kBlueDigits, kRedDigits, kWonLines, kLines, kPictures };
++std::array<ImTextureID, kPictures> g_pictures{};
++
++bool Valid(const Atlas& a) {
++    const uint32_t bytes = uint32_t(a.width * a.height);
++    if (!a.texels || !Memory::Contains(a.texels - 0x40, bytes + 0x40 + 0x420) || Memory::Read32(a.texels - 0x38) != a.texels)
++        return false;
++    return XXH64(Memory::GetPointer(a.texels, bytes), bytes, 0) == a.hash;
++}
++
++void Find(Atlas& a) {
++    a.texels = 0;
++    const uint32_t size = uint32_t(a.height) << 16 | uint32_t(a.width);
++    constexpr uint32_t kBlock = 0x1000;
++    for (uint32_t block = 0x90000000u; block < 0x98000000u; block += kBlock) {
++        if (!Memory::Contains(block, kBlock)) continue;
++        const uint8_t* p = static_cast<const uint8_t*>(Memory::GetPointer(block, kBlock));
++        for (uint32_t o = 0; o + 12 <= kBlock; o += 4) {
++            if (save_detail::get32(p + o) != size || save_detail::get32(p + o + 4) != 9 ||
++                save_detail::get32(p + o + 8) != block + o + 0x40) continue;
++            a.texels = block + o + 0x40;
++            if (Valid(a)) return;
++            a.texels = 0;
++        }
++    }
++}
++
++// C8 with an RGB5A3 palette `palette` bytes after the texels; `fill` replaces the lines' grey.
++ImTextureID Decode(const Atlas& a, uint32_t palette, const ImU32* fill = nullptr) {
++    std::vector<uint8_t> rgba(size_t(a.width) * a.height * 4);
++    for (int y = 0; y < a.height; ++y)
++        for (int x = 0; x < a.width; ++x) {
++            const uint8_t index = Memory::Read8(a.texels + season_cap::C8Offset(x, y, a.width));
++            const uint16_t v = Memory::Read16(a.texels + palette + index * 2u);
++            uint8_t* out = &rgba[(size_t(y) * a.width + x) * 4];
++            if (v & 0x8000) {
++                out[0] = ((v >> 10) & 31) * 255 / 31, out[1] = ((v >> 5) & 31) * 255 / 31, out[2] = (v & 31) * 255 / 31;
++                out[3] = 255;
++            } else {
++                out[0] = ((v >> 8) & 15) * 17, out[1] = ((v >> 4) & 15) * 17, out[2] = (v & 15) * 17;
++                out[3] = ((v >> 12) & 7) * 255 / 7;
++            }
++            // The fill is a flat grey (65) that the game tints: yellow on a winner's path, olive otherwise.
++            if (fill && out[3] == 255 && out[0] == out[1] && out[1] == out[2] && out[0] >= 40 && out[0] <= 120) {
++                const float k = out[0] / 65.0f;
++                for (int c = 0; c < 3; ++c) out[c] = uint8_t(std::min(255.0f, ((*fill >> (8 * c)) & 255) * k));
++            }
++        }
++    return aurora_imgui_add_texture(uint32_t(a.width), uint32_t(a.height), rgba.data());
++}
++
++bool Ready() {
++    bool fresh = false;
++    for (Atlas* a : {&g_tiles, &g_logos, &g_digits, &g_lines})
++        if (!Valid(*a)) {
++            Find(*a);
++            if (!a->texels) return false;
++            fresh = true;
++        }
++    if (fresh || !g_pictures[kTiles]) {
++        // Measured on the game's bracket: the winner's line is (231, 197, 0), the others (98, 84, 0).
++        static const ImU32 won = IM_COL32(231, 197, 0, 255), other = IM_COL32(98, 84, 0, 255);
++        const uint32_t bytes = uint32_t(g_digits.width * g_digits.height);
++        g_pictures = {Decode(g_tiles, 64 * 256), Decode(g_logos, 512 * 128), Decode(g_digits, bytes),
++                      Decode(g_digits, bytes + 0x220), Decode(g_lines, 512 * 256, &won), Decode(g_lines, 512 * 256, &other)};
++    }
++    return true;
++}
++
++// Where the Wild Card pairs go, in the coordinates of a screenshot of the game's bracket (its picture
++// spans x0 .. x0 + width, 0 .. height). The American League's left pair is given; the others mirror it
++// about mirrorX (right side) and mirrorY (National League).
++struct Layout {
++    float x0, width, height, mirrorX, mirrorY;
++    float tileW, tileH, stem, bar, digitW, digitH;
++    float ax, bx, tileY, barY, digitY, slotX, slotY;  // tile lefts, rows, the Division Series slot it feeds
++};
++// 16:9: the margins beside the untouched bracket (its slot tiles are 178 x 109), 1920 x 1009 window.
++constexpr Layout kWide{63, 1794, 1009, 960, 538.5f, 125, 76, 34, 26, 50, 32, 70, 215, 368, 303, 324, 340, 197.5f};
++// 4:3: beside the bracket shrunk by kNarrow (its slot tiles become 85 x 78), picture 1225 x 1009.
++constexpr Layout kNarrowLayout{347, 1225, 1009, 969, 548.5f, 80, 70, 20, 16, 32, 28, 378, 478, 392, 345, 356, 655, 291};
++// 4:3: the game's bracket shrunk about its centre (layout 270.5, 254.5) to make room at the sides.
++constexpr float kNarrow = 0.75f;
++
++struct Frame {
++    ImVec4 game;
++    const Layout& l;
++    float alpha;
++    bool flipX, flipY;  // right side, National League
++    ImVec2 at(float x, float y) const {
++        if (flipX) x = 2 * l.mirrorX - x;
++        if (flipY) y = 2 * l.mirrorY - y;
++        return ImVec2(game.x + (x - l.x0) * game.z / l.width, game.y + y * game.w / l.height);
++    }
++    void image(Picture p, float x0, float y0, float x1, float y1, ImVec2 uv0, ImVec2 uv1, float a = 1.0f) const {
++        ImVec2 p0 = at(x0, y0), p1 = at(x1, y1);
++        if (p0.x > p1.x) std::swap(p0.x, p1.x);
++        if (p0.y > p1.y) std::swap(p0.y, p1.y);
++        ImGui::GetForegroundDrawList()->AddImage(g_pictures[p], p0, p1, uv0, uv1,
++                                                 IM_COL32(255, 255, 255, int(255 * a * alpha)));
++    }
++};
++
++bool widescreen() { return RuntimeConfigFile::WidescreenEnabled(true) || MkwForceAspect169Requested(); }
++
++int teamCode(int id) {
++    if (id < 0 || id >= 30) return 0;
++    return int((Memory::Read32(Memory::Read32(0x8104B5A0u) + 128 + uint32_t(id * 4)) >> 8) & 0xFFFF);
++}
++
++// Out of the postseason: lost a series that has a winner.
++bool eliminated(int id) {
++    for (int i : {0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11}) {
++        const Series s = series(i);
++        if (s.winner != pending && (s.higher == id || s.lower == id) && s.winner != id) return true;
++    }
++    return false;
++}
++
++void tile(const Frame& f, int league, int id, float x, float y) {
++    const Layout& l = f.l;
++    const float a = eliminated(id) ? 0.45f : 1.0f;
++    const float row = league == 0 ? 48.0f : 0.0f;  // red tile for the American League, blue for the National
++    f.image(kTiles, x, y, x + l.tileW, y + l.tileH, ImVec2(0, row / 256), ImVec2(1, (row + 48) / 256), a);
++    const int code = teamCode(id);
++    if (code < 1 || code > 30) return;
++    const float u = float((code - 1) % 14 * 36), v = float((code - 1) / 14 * 42);
++    const float w = l.tileW * 0.64f, h = l.tileH * 0.82f, lx = x + (l.tileW - w) / 2, ly = y + (l.tileH - h) / 2;
++    f.image(kLogos, lx, ly, lx + w, ly + h, ImVec2(u / 512, v / 128), ImVec2((u + 36) / 512, (v + 42) / 128), a);
++}
++
++void digit(const Frame& f, int value, bool blue, float x, float y) {
++    static constexpr int kLeft[10] = {1, 35, 59, 89, 117, 146, 175, 204, 233, 262};
++    static constexpr int kRight[10] = {28, 53, 85, 114, 144, 173, 202, 230, 260, 289};
++    value = std::clamp(value, 0, 9);
++    const float w = f.l.digitW * (kRight[value] - kLeft[value]) / 27.0f;
++    f.image(blue ? kBlueDigits : kRedDigits, x - w / 2, y, x + w / 2, y + f.l.digitH, ImVec2(kLeft[value] / 512.0f, 1 / 32.0f),
++            ImVec2(kRight[value] / 512.0f, 28 / 32.0f));
++}
++
++// Straight pieces of the game's bracket lines: horizontal texels x 24..48, y 151..169; vertical x 1..17, y 136..149.
++void hline(const Frame& f, bool won, float x0, float x1, float y) {
++    f.image(won ? kWonLines : kLines, std::min(x0, x1), y - f.l.bar / 2, std::max(x0, x1), y + f.l.bar / 2,
++            ImVec2(24 / 512.0f, 151 / 256.0f), ImVec2(48 / 512.0f, 169 / 256.0f));
++}
++void vline(const Frame& f, bool won, float x, float y0, float y1) {
++    f.image(won ? kWonLines : kLines, x - f.l.stem / 2, std::min(y0, y1), x + f.l.stem / 2, std::max(y0, y1),
++            ImVec2(1 / 512.0f, 136 / 256.0f), ImVec2(17 / 512.0f, 149 / 256.0f));
++}
++
++// One Wild Card series: its two tiles under a bracket whose stem goes up and across into the
++// Division Series slot it feeds.
++void pair(const Frame& f, int league, int index) {
++    const Series s = series(index);
++    if (s.higher == pending || s.lower == pending) return;
++    const Layout& l = f.l;
++    const float ac = l.ax + l.tileW / 2, bc = l.bx + l.tileW / 2, mid = (ac + bc) / 2;
++    // As the game draws its own lines: yellow while the team is still in, olive once it is out.
++    const bool aWon = s.winner == s.higher, bWon = s.winner == s.lower;
++    const bool aIn = !eliminated(s.higher), bIn = !eliminated(s.lower);
++    const bool through = s.winner == pending ? aIn || bIn : !eliminated(s.winner);
++    vline(f, aIn, ac, l.tileY, l.barY);
++    vline(f, bIn, bc, l.tileY, l.barY);
++    hline(f, aIn, ac, mid, l.barY);
++    hline(f, bIn, mid, bc, l.barY);
++    vline(f, through, mid, l.barY, l.slotY - l.bar / 2);
++    hline(f, through, mid - l.stem / 2, l.slotX, l.slotY);
++    tile(f, league, s.higher, l.ax, l.tileY);
++    tile(f, league, s.lower, l.bx, l.tileY);
++    digit(f, s.higherWins, !bWon, ac + l.stem / 2 + l.digitW / 2 + 4, l.digitY);
++    digit(f, s.lowerWins, !aWon, bc - l.stem / 2 - l.digitW / 2 - 4, l.digitY);
++}
++}  // namespace
++
++void draw() {
++    if (!enabled()) return;
++    if (!error.empty()) {
++        ImGui::SetNextWindowBgAlpha(0.95f);
++        if (ImGui::Begin("Postseason", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
++            ImGui::TextWrapped("12-team postseason could not start: %s", error.c_str());
++        ImGui::End();
++    }
++    // The bracket screen (0x80B8A250), shown whole while it is not simulating ([screen + 2044] == 0).
++    static int shown = 0;
++    const auto* row = current();
++    if (!bracket || !Memory::Contains(bracket, 2048) || Memory::Read8(bracket + 2044) != 0 || !row || !row->qualified) {
++        shown = 0;
++        return;
++    }
++    if (shown == 0 && !Ready()) return;
++    ++shown;
++    const ImVec2 window = ImGui::GetIO().DisplaySize;
++    // As SCGetAspectRatio answers the game (sc_aspect_ratio.cpp): 16:9 with either setting.
++    const bool wide = widescreen();
++    const Layout& layout = wide ? kWide : kNarrowLayout;
++    // 4:3 shows the game's 640 x 528 picture (the 1225 x 1009 measured above).
++    const float aspect = !wide ? layout.width / layout.height : MkwForceAspect169Requested() ? 16.0f / 9.0f : window.x / window.y;
++    const float w = std::min(window.x, window.y * aspect), h = w / aspect;
++    const ImVec4 game((window.x - w) * 0.5f, (window.y - h) * 0.5f, w, h);
++    const float alpha = std::min(1.0f, shown / 20.0f);  // the screen fades in
++    for (int league = 0; league < 2; ++league) {
++        pair(Frame{game, layout, alpha, false, league == 1}, league, 9 + league * 2);  // 4 vs 5, next to seed 1
++        pair(Frame{game, layout, alpha, true, league == 1}, league, 8 + league * 2);   // 3 vs 6, next to seed 2
++    }
++}
++}  // namespace modern_postseason
++
++using namespace modern_postseason;
++extern "C" void MLB_PostseasonCalendar_80B4BB28(CpuContext* ctx) {
++    const int day=static_cast<int>(ctx->gpr[4]);
++    if(enabled()) {
++        makeups();
++        qualify();
++        if(const auto* row=current(); row && row->qualified && wildCardDay(day)) { ctx->gpr[3]=2; return; }
++    }
++    func_80B4BB28(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B4BB28, MLB_PostseasonCalendar_80B4BB28, "MLB_PostseasonCalendar_80B4BB28");
++extern "C" void MLB_PostseasonSeries_80B88264(CpuContext* ctx) {
++    if(enabled() && ctx->gpr[4]>=8 && ctx->gpr[4]<12) {
++        ctx->gpr[3]=seriesAddress(static_cast<int>(ctx->gpr[3]),static_cast<int>(ctx->gpr[4])); return;
++    }
++    func_80B88264(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B88264, MLB_PostseasonSeries_80B88264, "MLB_PostseasonSeries_80B88264");
++extern "C" void MLB_PostseasonCurrentSeries_80B882B0(CpuContext* ctx) {
++    if(enabled() && ctx->gpr[3]>=8 && ctx->gpr[3]<12) {
++        ctx->gpr[3]=seriesAddress(year(),static_cast<int>(ctx->gpr[3])); return;
++    }
++    func_80B882B0(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B882B0, MLB_PostseasonCurrentSeries_80B882B0, "MLB_PostseasonCurrentSeries_80B882B0");
++extern "C" void MLB_PostseasonMember_80B88458(CpuContext* ctx) {
++    const uint32_t y=ctx->gpr[3],team=ctx->gpr[4];
++    if(enabled() && y<20 && saved.years[y].qualified) {
++        bool found=false;
++        for(const auto& league:saved.years[y].seeds) for(int id:league) found=found || id==static_cast<int>(team);
++        ctx->gpr[3]=found; return;
++    }
++    func_80B88458(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B88458, MLB_PostseasonMember_80B88458, "MLB_PostseasonMember_80B88458");
++extern "C" void MLB_PostseasonQualify_80B8E8B4(CpuContext* ctx) {
++    if(enabled()) { qualify(); return; } func_80B8E8B4(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8E8B4, MLB_PostseasonQualify_80B8E8B4, "MLB_PostseasonQualify_80B8E8B4");
++extern "C" void MLB_PostseasonPrepare_80B8F97C(CpuContext* ctx) {
++    if(enabled()) qualify();
++    func_80B8F97C(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8F97C, MLB_PostseasonPrepare_80B8F97C, "MLB_PostseasonPrepare_80B8F97C");
++extern "C" void MLB_PostseasonResult_80B739AC(CpuContext* ctx) {
++    const bool wildCard=enabled() && current() && current()->qualified && wildCardDay(today()) && ctx->gpr[4]<4;
++    if(wildCard) ctx->gpr[4]+=8;
++    func_80B739AC(ctx);
++    if(wildCard) finishWildCards();
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B739AC, MLB_PostseasonResult_80B739AC, "MLB_PostseasonResult_80B739AC");
++extern "C" void MLB_PostseasonDaily_80B8F5FC(CpuContext* ctx) {
++    if(enabled() && current() && current()->qualified && wildCardDay(today())) { finishWildCards(); return; }
++    func_80B8F5FC(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8F5FC, MLB_PostseasonDaily_80B8F5FC, "MLB_PostseasonDaily_80B8F5FC");
++extern "C" void MLB_PostseasonDivisionSchedule_80B9841C(CpuContext* ctx) {
++    if(enabled() && current() && current()->qualified) { schedule(0); return; } func_80B9841C(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B9841C, MLB_PostseasonDivisionSchedule_80B9841C, "MLB_PostseasonDivisionSchedule_80B9841C");
++extern "C" void MLB_PostseasonChampionshipSchedule_80B9849C(CpuContext* ctx) {
++    if(enabled() && current() && current()->qualified) { schedule(1); return; } func_80B9849C(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B9849C, MLB_PostseasonChampionshipSchedule_80B9849C, "MLB_PostseasonChampionshipSchedule_80B9849C");
++extern "C" void MLB_PostseasonWorldSchedule_80B9853C(CpuContext* ctx) {
++    if(enabled() && current() && current()->qualified) { schedule(2); return; } func_80B9853C(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B9853C, MLB_PostseasonWorldSchedule_80B9853C, "MLB_PostseasonWorldSchedule_80B9853C");
++extern "C" void MLB_PostseasonChampionship_80B8ED34(CpuContext* ctx) {
++    if(enabled() && current() && current()->qualified && ctx->gpr[3]<2) {
++        const int l=static_cast<int>(ctx->gpr[3]);
++        setup(4+l,series(l*2).winner,series(l*2+1).winner,4); schedule(1); return;
++    }
++    func_80B8ED34(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8ED34, MLB_PostseasonChampionship_80B8ED34, "MLB_PostseasonChampionship_80B8ED34");
++extern "C" void MLB_PostseasonWorld_80B8EF78(CpuContext* ctx) {
++    if(enabled() && current() && current()->qualified) {
++        const int a=series(4).winner,b=series(5).winner;
++        if(a==pending || b==pending || series(6).higher!=pending) return;
++        try {
++            const Regular r=regular(false);
++            const int order=detail::compare(detail::standing(r.teams[a]),detail::standing(r.teams[b]));
++            const int higher=order>0?a:order<0?b:resolveTie(r.teams,r.games,{a,b},r.allStar);
++            putSeries(6,{higher,higher==a?b:a,0,0,4,pending}); schedule(2);
++        } catch(const std::exception& e) { fail(e.what()); }
++        return;
++    }
++    func_80B8EF78(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8EF78, MLB_PostseasonWorld_80B8EF78, "MLB_PostseasonWorld_80B8EF78");
++extern "C" void MLB_PostseasonOpen_80B8A250(CpuContext* ctx) {
++    // Set before the original fills the slots (0x80B899B8 reads it).
++    bracket=enabled()?static_cast<uint32_t>(ctx->gpr[3]):0;
++    func_80B8A250(ctx);
++    // In 4:3 there are no side margins: the game's own bracket is shrunk about its centre so the
++    // Wild Card pairs fit beside it. Layout nodes keep a translation at +64 and a scale at +96 (x, y,
++    // z, w floats; +168 bit 0x40 marks the node dirty). The bracket is the node at [screen + 0x7B8]
++    // and each series' highlighted path one of the eight nodes at [screen + 0x38 + 4i]; the stadium,
++    // title and trophy stay as they are. Layout x runs 0..541 with the trophy at 270.5.
++    const uint32_t screen=bracket;
++    if(screen && Memory::Read8(screen+2044)==0 && current() && current()->qualified &&
++       !widescreen()) {
++        auto narrow=[](uint32_t node) {
++            if(!node || !Memory::Contains(node,172)) return;
++            Memory::WriteFloat32(node+64,(1.0f-kNarrow)*270.5f);
++            Memory::WriteFloat32(node+68,(1.0f-kNarrow)*254.5f);
++            Memory::WriteFloat32(node+96,kNarrow);
++            Memory::WriteFloat32(node+100,kNarrow);
++            Memory::Write8(node+168,Memory::Read8(node+168)|0x40);
++        };
++        narrow(Memory::Read32(screen+0x7B8));
++        for(uint32_t i=0;i<8;++i) narrow(Memory::Read32(screen+0x38+i*4));
++    }
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8A250, MLB_PostseasonOpen_80B8A250, "MLB_PostseasonOpen_80B8A250");
++extern "C" void MLB_PostseasonClose_80B8A054(CpuContext* ctx) {
++    if(ctx->gpr[3]==bracket) bracket=0; func_80B8A054(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8A054, MLB_PostseasonClose_80B8A054, "MLB_PostseasonClose_80B8A054");
++extern "C" void MLB_PostseasonDestroy_80B89FE0(CpuContext* ctx) {
++    if(ctx->gpr[3]==bracket) bracket=0; func_80B89FE0(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B89FE0, MLB_PostseasonDestroy_80B89FE0, "MLB_PostseasonDestroy_80B89FE0");
++// After a game the bracket animates that day's games as series first[round] + slot. On Wild Card days the
++// stored round is 0, so a Wild Card game would be drawn as a Division Series whose teams are not on the
++// eight-team bracket (0x80B898FC returns -1 and 0x80B89A84 calls through a garbage object): skip it.
++extern "C" void MLB_PostseasonBracketGames_80B8AC38(CpuContext* ctx) {
++    if(enabled() && current() && current()->qualified && wildCardDay(today())) {
++        Memory::Write8(ctx->gpr[3]+2045,1); return;
++    }
++    func_80B8AC38(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8AC38, MLB_PostseasonBracketGames_80B8AC38, "MLB_PostseasonBracketGames_80B8AC38");
++// Same mapping for each game the bracket screen simulates (0x80B8AF30): no Division Series to update yet.
++extern "C" void MLB_PostseasonBracketGame_80B8AD28(CpuContext* ctx) {
++    if(enabled() && current() && current()->qualified && wildCardDay(today())) {
++        Memory::Write32(ctx->gpr[3]+2040,ctx->gpr[4]); return;
++    }
++    func_80B8AD28(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8AD28, MLB_PostseasonBracketGame_80B8AD28, "MLB_PostseasonBracketGame_80B8AD28");
++// 0x80B899B8 (score slots) and 0x80B897F0 (tiles), both (bracket, series 0-3, side 0 team, side 1
++// team), put side 1 (the lower seed) on the left
++// slot. The Division Series against seed 2 (1 and 3) swap, so that both Wild Card winners take the
++// outer slots, next to the margins where their Wild Card series are drawn. Not while simulating: that
++// view reads the slots as "left AT right" (visitor at home).
++// Before the Wild Card round ends the Division Series are empty; seeds 1 and 2 (the byes) are shown in
++// their slots anyway (display only: the series stay empty until setup()).
++static void bracketSlots(CpuContext* ctx) {
++    const uint32_t s=static_cast<uint32_t>(ctx->gpr[4]);
++    const auto* row=current();
++    if(!enabled() || !row || !row->qualified || !bracket || Memory::Read8(bracket+2044)!=0 || s>3) return;
++    if(ctx->gpr[5]==pending && ctx->gpr[6]==pending) ctx->gpr[5]=static_cast<uint32_t>(row->seeds[s/2][s%2]);
++    if(s==1 || s==3) std::swap(ctx->gpr[5],ctx->gpr[6]);
++}
++extern "C" void MLB_PostseasonBracketSlots_80B899B8(CpuContext* ctx) {
++    bracketSlots(ctx);
++    func_80B899B8(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B899B8, MLB_PostseasonBracketSlots_80B899B8, "MLB_PostseasonBracketSlots_80B899B8");
++extern "C" void MLB_PostseasonBracketTiles_80B897F0(CpuContext* ctx) {
++    bracketSlots(ctx);
++    func_80B897F0(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B897F0, MLB_PostseasonBracketTiles_80B897F0, "MLB_PostseasonBracketTiles_80B897F0");
++// MLB DATA's postseason title (0x80B52240, a table by the stored round [P + 640]; 3, POSTSEASON, once
++// the World Series is over) reads round 0 during the Wild Card round, DIVISIONAL SERIES: it gets 3.
++// Only that caller: the bracket itself (0x80B8A280) skips filling its slots on round 3.
++extern "C" void MLB_PostseasonRound_80B88880(CpuContext* ctx) {
++    const uint32_t caller=ctx->lr;
++    func_80B88880(ctx);
++    if(caller==0x80B52244u && enabled() && current() && current()->qualified && ctx->gpr[3]==0 &&
++       series(0).higher==pending) ctx->gpr[3]=3;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B88880, MLB_PostseasonRound_80B88880, "MLB_PostseasonRound_80B88880");
++
++// Standings badges (MLB DATA > Standings, 0x80B7B794 fills each row): DIVISION WINNER when
++// 0x80B8D69C(league, division, team) finds the team in its division's qualifier slot, WILD CARD
++// WINNER when 0x80B8D6F4(league, team) finds it in the league's single wild-card slot (2008 rules).
++// With 12 teams the three wild cards of each league are seeds 4-6. Before the regular season ends the
++// original clinch logic would mark one 2008 wild card: no wild-card badge until qualification.
++static int seedOf(int league,int team) {
++    const auto* row=current();
++    if(!row || !row->qualified || league<0 || league>1) return -1;
++    for(int s=0;s<6;++s) if(row->seeds[league][s]==team) return s;
++    return -1;
++}
++extern "C" void MLB_PostseasonClinched_80B8D69C(CpuContext* ctx) {
++    const int league=static_cast<int>(ctx->gpr[3]),slot=static_cast<int>(ctx->gpr[4]),team=static_cast<int>(ctx->gpr[5]);
++    if(enabled() && league>=0 && league<2) {
++        const auto* row=current();
++        if(row && row->qualified) {
++            const int s=seedOf(league,team);
++            ctx->gpr[3]=slot<3?(s>=0 && s<3 && divisionOf(team)==slot):(s>=3);
++            return;
++        }
++        if(slot>=3) { ctx->gpr[3]=0; return; }
++    }
++    func_80B8D69C(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8D69C, MLB_PostseasonClinched_80B8D69C, "MLB_PostseasonClinched_80B8D69C");
++extern "C" void MLB_PostseasonWildCard_80B8D6F4(CpuContext* ctx) {
++    const int league=static_cast<int>(ctx->gpr[3]),team=static_cast<int>(ctx->gpr[4]);
++    if(enabled() && league>=0 && league<2) {
++        const auto* row=current();
++        ctx->gpr[3]=row && row->qualified && seedOf(league,team)>=3;
++        return;
++    }
++    func_80B8D6F4(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B8D6F4, MLB_PostseasonWildCard_80B8D6F4, "MLB_PostseasonWildCard_80B8D6F4");
++
++// The Season calendar's WILD CARD days. 0x80B9C4C0(screen, month) builds a month of 37 day cells
++// ([[screen + 0x44] + 0xE0 + 4k], Sunday first); in October 0x80B9C938 marks the event days of
++// 0x80D2A7F0 (DIVISION 278.., LEAGUE 286.., WORLD 296..) through 0x80B9B5F8(cell, label, rival, yellow),
++// which shows label node [cell + 0xF4 + 4 label] (0 EXHIBITION .. 3 DIVISION .. 9 RETIREMENT). A label
++// node draws the picture (a 0x2C-byte SURF) at [node + 0xDC]. Days 275-277 (October 2-4) get the
++// DIVISION node with a WILD CARD picture: a copy of DIVISION's SURF whose rectangle points at a free
++// part of the same 256 x 256 C8 atlas, where the label is composed from the atlas's own letters
++// (W, R, L from WORLD; I, D and an O opened into a C from DIVISION; A from ALL-STAR) in DIVISION's
++// colours. The atlas is the calendar's, in MEM2; nothing leaves the running game.
++namespace calendar {
++constexpr uint32_t kSurf=0x97FFD000u, kRect=kSurf+0x40;  // IOS-reserved MEM2, after the Wild Card rows
++constexpr int kDstX=123, kDstY=164, kRows=26, kSrcY=104;  // composed rows 104..129 go to 164..189
++uint32_t g_divisionSurf=0, g_painted=0, g_oct5=0;
++int g_width=0;
++bool g_building=false;
++
++uint32_t texelAt(int x,int y) { return static_cast<uint32_t>(((y/4)*32+x/8)*32+(y%4)*8+x%8); }
++struct Atlas {
++    uint32_t texels=0,palette=0;
++    uint8_t index(int x,int y) const { return Memory::Read8(texels+texelAt(x,y)); }
++    void rgba(uint8_t i,int& r,int& g,int& b,int& a) const {
++        const uint16_t v=Memory::Read16(palette+i*2u);
++        if(v&0x8000) { r=((v>>10)&31)*8; g=((v>>5)&31)*8; b=(v&31)*8; a=255; }
++        else { r=((v>>8)&15)*17; g=((v>>4)&15)*17; b=(v&15)*17; a=((v>>12)&7)*36; }
++    }
++    bool fill(uint8_t i) const {  // a letter's colour, not its white or blue rim
++        int r,g,b,a; rgba(i,r,g,b,a);
++        return a>=250 && std::min({r,g,b})<190 && !(b>120 && r<60 && g>60);
++    }
++    float lum(uint8_t i) const { int r,g,b,a; rgba(i,r,g,b,a); return 0.3f*r+0.59f*g+0.11f*b; }
++};
++// The DIVISION SURF's texture: SURF + 0x1C -> {count, -> header}, header {h << 16 | w, format, texels}.
++bool atlasOf(uint32_t surf,Atlas& out) {
++    if(!Memory::Contains(surf,0x2C)) return false;
++    const uint32_t set=Memory::Read32(surf+0x1C);
++    if(!Memory::Contains(set,8) || Memory::Read32(set)!=1) return false;
++    const uint32_t list=Memory::Read32(set+4);
++    if(!Memory::Contains(list,4)) return false;
++    const uint32_t header=Memory::Read32(list);
++    if(!Memory::Contains(header,12) || Memory::Read32(header)!=0x01000100u || Memory::Read32(header+4)!=9) return false;
++    out.texels=Memory::Read32(header+8);
++    out.palette=out.texels+256*256;  // the RGB5A3 palette follows the texels
++    return Memory::Contains(out.texels,256*256+512);
++}
++// WILD CARD from the letters of WORLD (x 14..), DIVISION (x 71..) and ALL-STAR (x 139..), rows 104..129.
++void paint(const Atlas& t) {
++    struct Span { char ch; int x0,x1; };
++    static constexpr Span kSpans[]={{'W',14,25},{'I',81,84},{'L',155,161},{'D',71,81},{' ',0,0},
++                                    {'C',111,122},{'A',184,192},{'R',36,45},{'D',71,81}};
++    std::array<std::array<int16_t,kRows>,128> out{};
++    for(auto& col:out) col.fill(-1);
++    // DIVISION's colours by row, darkest first: each source colour takes the one of similar brightness.
++    std::array<std::vector<uint8_t>,kRows> rowColours;
++    for(int y=0;y<kRows;++y) {
++        for(int x=71;x<131;++x) {
++            const uint8_t i=t.index(x,kSrcY+y);
++            if(t.fill(i) && std::find(rowColours[y].begin(),rowColours[y].end(),i)==rowColours[y].end()) rowColours[y].push_back(i);
++        }
++    }
++    uint8_t white=0;  // the rim's white, from DIVISION's top rim
++    for(int x=71;x<131 && !white;++x) { int r,g,b,a; t.rgba(t.index(x,kSrcY+3),r,g,b,a); if(a==255 && std::min({r,g,b})>235) white=t.index(x,kSrcY+3); }
++    int x=2;
++    std::vector<std::pair<Span,int>> placed;
++    for(const Span& s:kSpans) {
++        if(s.ch==' ') { x+=3; continue; }
++        placed.push_back({s,x});
++        x+=s.x1-s.x0;  // letters touch as in DIVISION
++    }
++    g_width=std::min(x+2,128);
++    for(const auto& [s,dx]:placed)  // rims first, so that no rim covers a neighbour's colour
++        for(int sx=s.x0-2;sx<s.x1+2;++sx) for(int y=0;y<kRows;++y) {
++            const uint8_t i=t.index(sx,kSrcY+y);
++            int r,g,b,a; t.rgba(i,r,g,b,a);
++            const int ox=dx+sx-s.x0;
++            if(a && !t.fill(i) && ox>=0 && ox<128 && out[ox][y]<0) out[ox][y]=i;
++        }
++    for(const auto& [s,dx]:placed) {
++        for(int sx=s.x0;sx<s.x1;++sx) for(int y=0;y<kRows;++y) {
++            const uint8_t i=t.index(sx,kSrcY+y);
++            if(!t.fill(i)) continue;
++            uint8_t best=i; float d=1e9f;
++            for(uint8_t c:rowColours[y]) if(std::abs(t.lum(c)-t.lum(i))<d) { d=std::abs(t.lum(c)-t.lum(i)); best=c; }
++            out[dx+sx-s.x0][y]=best;
++        }
++        if(s.ch=='C') {  // open the O's right side and rim the cut
++            const int mid=kRows/2-1;
++            for(int sx=s.x0+6;sx<s.x1+2;++sx) for(int y=mid-3;y<=mid+3;++y) out[dx+sx-s.x0][y]=-1;
++            for(int sx=s.x0+5;sx<s.x1+2;++sx) for(int y=mid-4;y<=mid+4;++y) {
++                int16_t& v=out[dx+sx-s.x0][y];
++                if(v<0 || !t.fill(static_cast<uint8_t>(v))) continue;
++                bool edge=false;
++                for(int ax=-1;ax<=1;++ax) for(int ay=-1;ay<=1;++ay) {
++                    const int qx=dx+sx-s.x0+ax,qy=y+ay;
++                    if(qx>=0 && qx<128 && qy>=0 && qy<kRows && out[qx][qy]<0) edge=true;
++                }
++                if(edge) v=white;
++            }
++        }
++    }
++    for(int ox=0;ox<g_width;++ox) for(int y=0;y<kRows;++y)
++        Memory::Write8(t.texels+texelAt(kDstX+ox,kDstY+y),static_cast<uint8_t>(out[ox][y]<0?0:out[ox][y]));
++    GxGuestWrite::NotifyWrite(t.texels,256*256);  // the renderer uploads the atlas again
++}
++// The atlas's free part (x 123..255, y 164..193) is index 0; a painted label is not.
++bool painted(const Atlas& t) {
++    return g_painted==t.texels && t.index(kDstX+5,kDstY+12)!=0;
++}
++uint32_t wildCardSurf(uint32_t divisionSurf) {
++    Atlas t;
++    if(!atlasOf(divisionSurf,t)) return 0;
++    if(!painted(t)) { paint(t); g_painted=t.texels; }
++    for(uint32_t i=0;i<0x2C;i+=4) Memory::Write32(kSurf+i,Memory::Read32(divisionSurf+i));
++    Memory::Write32(kSurf+0x18,kRect);
++    // {0, 0, shown width << 16 | height, u0 << 16 | v0, u1 << 16 | v1, -1, 0}: shown 68 x 22 like
++    // DIVISION, so the wider label is squeezed into the cell.
++    const uint32_t rows[7]={0,0,(68u<<16)|22u,(uint32_t(kDstX)<<16)|uint32_t(kDstY+2),
++                            (uint32_t(kDstX+g_width)<<16)|uint32_t(kDstY+24),0xFFFFFFFFu,0};
++    for(uint32_t i=0;i<7;++i) Memory::Write32(kRect+i*4,rows[i]);
++    return kSurf;
++}
++int userTeam(CpuContext* ctx) {
++    const CpuContext saved=*ctx;
++    func_80BA6854(ctx);
++    const int team=static_cast<int>(ctx->gpr[3]);
++    *ctx=saved;
++    return team;
++}
++int rival(int day,int team) {
++    for(int slot=0;slot<16;++slot) {
++        const uint32_t at=gameAddress(day,slot);
++        if(!at || !Memory::Contains(at,16)) continue;
++        const int a=static_cast<int>(Memory::Read32(at)),b=static_cast<int>(Memory::Read32(at+4));
++        if(a==team) return b;
++        if(b==team) return a;
++    }
++    return pending;
++}
++}  // namespace calendar
++
++extern "C" void MLB_CalendarLabel_80B9B5F8(CpuContext* ctx) {
++    // The month's first DIVISION day is event 0, day 278 (October 5): its cell places the others.
++    if(calendar::g_building && ctx->gpr[4]==3 && !calendar::g_oct5) {
++        calendar::g_oct5=ctx->gpr[3];
++        const uint32_t node=Memory::Read32(ctx->gpr[3]+0xF4+12);
++        if(Memory::Contains(node,0xE0) && Memory::Read32(node+0xDC)!=calendar::kSurf) calendar::g_divisionSurf=Memory::Read32(node+0xDC);
++    }
++    func_80B9B5F8(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B9B5F8, MLB_CalendarLabel_80B9B5F8, "MLB_CalendarLabel_80B9B5F8");
++extern "C" void MLB_CalendarMonth_80B9C4C0(CpuContext* ctx) {
++    const uint32_t screen=ctx->gpr[3],month=ctx->gpr[4];
++    const uint32_t grid=Memory::Contains(screen,0x48)?Memory::Read32(screen+0x44)+0xE0:0;
++    // Cells are reused for every month: put DIVISION's picture back before the game fills them.
++    if(grid && calendar::g_divisionSurf && Memory::Contains(grid,37*4))
++        for(uint32_t k=0;k<37;++k) {
++            const uint32_t cell=Memory::Read32(grid+k*4);
++            if(!Memory::Contains(cell,0xF4+40)) continue;
++            const uint32_t node=Memory::Read32(cell+0xF4+12);
++            if(Memory::Contains(node,0xE0) && Memory::Read32(node+0xDC)==calendar::kSurf)
++                Memory::Write32(node+0xDC,calendar::g_divisionSurf);
++        }
++    calendar::g_building=true; calendar::g_oct5=0;
++    func_80B9C4C0(ctx);
++    calendar::g_building=false;
++    if(!enabled() || month!=10 || !calendar::g_oct5 || !calendar::g_divisionSurf || !grid || !Memory::Contains(grid,37*4)) return;
++    int k5=-1;
++    for(int k=0;k<37;++k) if(Memory::Read32(grid+static_cast<uint32_t>(k)*4)==calendar::g_oct5) k5=k;
++    const uint32_t surf=calendar::wildCardSurf(calendar::g_divisionSurf);
++    if(k5<3 || !surf) return;
++    const int team=calendar::userTeam(ctx);
++    for(int day=275;day<=277;++day) {
++        const uint32_t cell=Memory::Read32(grid+static_cast<uint32_t>(k5+day-278)*4);
++        if(!Memory::Contains(cell,0xF4+40)) continue;
++        const uint32_t node=Memory::Read32(cell+0xF4+12);
++        if(!Memory::Contains(node,0xE0)) continue;
++        Memory::Write32(node+0xDC,surf);
++        const int other=calendar::rival(day,team);
++        const CpuContext saved=*ctx;
++        // The day's pass has drawn the rival's logo already (a rival here adds a second, small one);
++        // a day without the user's game gets the EVENTS background, as the other postseason days.
++        ctx->gpr[3]=cell; ctx->gpr[4]=3; ctx->gpr[5]=static_cast<uint32_t>(pending); ctx->gpr[6]=other==pending?1u:0u;
++        func_80B9B5F8(ctx);
++        *ctx=saved;
++    }
++}
++REGISTER_NATIVE_FUNCTION_AS(0x80B9C4C0, MLB_CalendarMonth_80B9C4C0, "MLB_CalendarMonth_80B9C4C0");
+diff --git a/runtime/tests/modern_postseason_test.cpp b/runtime/tests/modern_postseason_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/tests/modern_postseason_test.cpp
+@@ -0,0 +1,135 @@
++#include "modern_postseason.h"
++#include <cassert>
++#include <iostream>
++using namespace modern_postseason;
++template<class F> void rejects(F f) {
++    bool threw=false;
++    try { f(); } catch(const std::exception&) { threw=true; }
++    assert(threw);
++}
++static std::array<Team,30> fixture() {
++    std::array<Team,30> teams{};
++    for(int i=0;i<30;++i) teams[i]={i,i/5,120-i,42+i};
++    return teams;
++}
++static void add(std::vector<GameResult>& games,int winner,int loser,int count=1,int day=0) {
++    for(int n=0;n<count;++n) games.push_back({winner,loser,4,2,day+n});
++}
++int main() {
++    auto teams=fixture();
++    auto state=create(teams,{});
++    assert((state.seeds[0]==std::array<int,6>{0,5,10,1,2,3}));
++    assert((state.seeds[1]==std::array<int,6>{15,20,25,16,17,18}));
++    assert(state.series[8].higher==10 && state.series[8].lower==3);
++    assert(state.series[9].higher==1 && state.series[9].lower==2);
++    assert(state.series[0].higher==pending && state.series[7].target==0);
++    for(int i=8;i<12;++i) for(int g=0;g<3;++g) assert(homeTeam(state.series[i],g)==state.series[i].higher);
++    // Fixed bracket, upset routing, early termination and all home-field patterns.
++    recordWin(state,9,2,{}); recordWin(state,9,2,{});
++    assert(state.series[0].higher==0 && state.series[0].lower==2);
++    rejects([&]{recordWin(state,9,2,{});});
++    assert(state.series[9].lowerWins==2);
++    for(int g=0;g<5;++g) assert(homeTeam(state.series[0],g)==(g==2||g==3?2:0));
++    for(int i:{8,10,11}) {
++        int winner=state.series[i].higher;
++        recordWin(state,i,winner,{}); recordWin(state,i,winner,{});
++    }
++    for(int i=0;i<4;++i) for(int n=0;n<3;++n) recordWin(state,i,state.series[i].lower,{});
++    assert(state.series[4].higher==10 && state.series[4].lower==2);
++    for(int g=0;g<7;++g) assert(homeTeam(state.series[4],g)==(g>=2&&g<=4?2:10));
++    for(int i=4;i<6;++i) for(int n=0;n<4;++n) recordWin(state,i,state.series[i].higher,{});
++    assert(state.series[6].target==4 && state.series[6].higher==10);
++    for(int n=0;n<4;++n) recordWin(state,6,10,{});
++    assert(state.series[6].winner==10 && state.series[7].higher==pending);
++    rejects([&]{recordWin(state,6,10,{});});
++    rejects([&]{recordWin(state,7,10,{});});
++    rejects([&]{homeTeam(state.series[6],7);});
++    rejects([&]{homeTeam(Series{-1,2,0,0,2,pending},0);});
++
++    // Percentage beats raw wins; division winners stay above wild cards.
++    auto pct=teams; pct[1].wins=70; pct[1].losses=20;
++    auto seeded=selectSeeds(pct,{});
++    assert(seeded[0][0]==1 && seeded[0][3]==0);
++    // Original alignment has 14/16 clubs with divisions of four, five and six.
++    auto original=teams;
++    for(int i=0;i<30;++i)
++        original[i].division=i<5?0:i<10?1:i<14?2:i<19?3:i<25?4:5;
++    auto originalSeeds=selectSeeds(original,{});
++    assert((originalSeeds[0]==std::array<int,6>{0,5,10,1,2,3}));
++    assert((originalSeeds[1]==std::array<int,6>{14,19,25,15,16,17}));
++    assert(resolveTie(original,{{14,0,5,1,1}},{0,14})==14);
++    auto emptyDivision=original;
++    for(auto& t:emptyDivision) if(t.division==2) t.division=1;
++    rejects([&]{selectSeeds(emptyDivision,{});});
++    auto shortLeague=original;
++    for(int i=5;i<14;++i) shortLeague[i].division=3;
++    shortLeague[3].division=1; shortLeague[4].division=2;
++    rejects([&]{selectSeeds(shortLeague,{});});
++    auto reordered=teams; std::reverse(reordered.begin(),reordered.end());
++    assert(selectSeeds(reordered,{})==selectSeeds(teams,{}));
++
++    std::vector<GameResult> games;
++    add(games,1,0,2);
++    auto tied=teams; tied[1].wins=tied[0].wins; tied[1].losses=tied[0].losses;
++    assert(selectSeeds(tied,games)[0][0]==1);
++    assert(selectSeeds(tied,games)[0][3]==0);
++    assert(resolveTie(teams,games,{0,1})==1);
++    // Dominant series winner has lower aggregate percentage than its opponent.
++    games.clear(); add(games,0,1,2); add(games,1,0); add(games,0,2); add(games,1,2,20);
++    assert(resolveTie(teams,games,{0,1,2})==0);
++    // Circular head-to-head requires group totals, independent of input order.
++    games.clear(); add(games,0,1,3); add(games,1,2,2); add(games,2,0);
++    assert(resolveTie(teams,games,{2,1,0})==0);
++    assert(resolveTie(teams,games,{1,0,2})==0);
++    // Two tied aggregate leaders revert to their direct matchup.
++    games.clear(); add(games,0,1); add(games,1,2); add(games,2,0); add(games,0,3); add(games,1,3);
++    assert(resolveTie(teams,games,{0,1,2,3})==0);
++    // Four-way dominant winner overrides aggregate games.
++    games.clear(); add(games,0,1,2); add(games,1,0); add(games,0,2); add(games,0,3);
++    add(games,1,2,20); add(games,1,3,20);
++    assert(resolveTie(teams,games,{3,2,1,0})==0);
++    // Identical group results fall through division, then league records.
++    games.clear(); add(games,0,2); add(games,3,5);
++    assert(resolveTie(teams,games,{0,5})==0);
++    games.clear(); add(games,0,10); add(games,10,5);
++    assert(resolveTie(teams,games,{0,5})==0);
++    // All-Star cutoff uses actual dates, independent of input result order.
++    games={{0,2,4,2,20},{2,0,4,2,1},{5,7,4,2,1},{7,5,4,2,20}};
++    assert(resolveTie(teams,games,{0,5},10)==0);
++    rejects([&]{resolveTie(teams,games,{0,5});});
++    // Late records tie; one earlier league game decides.
++    games={{0,2,4,2,20},{2,0,4,2,21},{0,2,4,2,9},{2,0,4,2,1},
++           {5,7,4,2,20},{7,5,4,2,21},{7,5,4,2,9},{5,7,4,2,1}};
++    assert(resolveTie(teams,games,{0,5},10)==0);
++    // Multi-club late extension skips mutual games, retaining actual chronological order.
++    games.clear();
++    for(int id:{0,5,10}) {
++        add(games,id,id+1,1,20); add(games,id+1,id,1,21);
++        if(id==0) { add(games,id,id+1,1,7); add(games,id+1,id,1,1); }
++        else { add(games,id+1,id,1,7); add(games,id,id+1,1,1); }
++    }
++    add(games,0,5,1,9); add(games,5,10,1,9); add(games,10,0,1,9);
++    assert(resolveTie(teams,games,{10,5,0},10)==0);
++    // A missing opponent history cannot silently become a zero winning percentage.
++    rejects([&]{resolveTie(teams,{{0,2,4,2,20}}, {0,5},10);});
++    rejects([&]{resolveTie(teams,{}, {0,5},10);});
++    rejects([&]{resolveTie(teams,{}, {0,1,2,3,4},10);});
++    rejects([&]{resolveTie(teams,{}, {0,0},10);});
++    rejects([&]{create(teams,{{0,1,2,2,0}});});
++    auto corrupt=state; corrupt.series[8]={-1,3,0,0,2,pending};
++    rejects([&]{recordWin(corrupt,8,-1,{});});
++    auto invalid=teams; invalid[0].id=1;
++    rejects([&]{create(invalid,{});});
++    // A World Series tiebreak failure must leave the accepted-result state untouched.
++    auto ws=create(teams,{});
++    ws.teams[15].wins=ws.teams[0].wins; ws.teams[15].losses=ws.teams[0].losses;
++    ws.series[4]={0,5,4,0,4,0}; ws.series[5]={15,20,3,0,4,pending};
++    rejects([&]{recordWin(ws,5,15,{});});
++    assert(ws.series[5].higherWins==3 && ws.series[5].winner==pending);
++    recordWin(ws,5,15,{{15,0,5,1,0}});
++    assert(ws.series[6].higher==15 && ws.series[6].lower==0);
++    std::cout << "modern postseason tests passed\n";
++}
++
++
++
+diff --git a/runtime/tests/modern_postseason_save_test.cpp b/runtime/tests/modern_postseason_save_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/tests/modern_postseason_save_test.cpp
+@@ -0,0 +1,138 @@
++#include "modern_postseason_save.h"
++#include <cassert>
++#include <iostream>
++
++using namespace modern_postseason;
++
++static void be32(uint8_t* out,uint32_t value) {
++    for(int i=3;i>=0;--i) { out[i]=uint8_t(value); value>>=8; }
++}
++static uint32_t checksum(const std::array<uint8_t,saveBytes>& bytes) {
++    uint32_t hash=2166136261u;
++    for(size_t i=0;i<bytes.size();++i) hash=(hash^(i>=12&&i<16?0:bytes[i]))*16777619u;
++    return hash;
++}
++static void resign(std::array<uint8_t,saveBytes>& bytes) { be32(bytes.data()+12,checksum(bytes)); }
++static bool sameYear(const SavedYear& left,const SavedYear& right) {
++    return left.qualified==right.qualified && left.firstDay==right.firstDay &&
++           left.seeds==right.seeds && left.wildCards==right.wildCards;
++}
++static bool same(const SavedState& a,const SavedState& b) {
++    if(a.enabled!=b.enabled || a.archive.size()!=b.archive.size()) return false;
++    for(size_t y=0;y<a.years.size();++y) if(!sameYear(a.years[y],b.years[y])) return false;
++    for(size_t i=0;i<a.archive.size();++i)
++        if(a.archive[i].year!=b.archive[i].year || !sameYear(a.archive[i].data,b.archive[i].data)) return false;
++    return true;
++}
++static SavedState fixture() {
++    SavedState state; state.enabled=true;
++    for(size_t y=0;y<state.years.size();++y) {
++        auto& year=state.years[y]; year.qualified=true; year.firstDay=275;
++        for(int l=0;l<2;++l) for(int s=0;s<6;++s) year.seeds[l][s]=l*15+s;
++        for(int s=0;s<4;++s) {
++            auto& series=year.wildCards[s];
++            be32(series.data()+8,uint32_t((s/2)*15+2+s%2));
++            be32(series.data()+12,uint32_t((s/2)*15+5-s%2));
++            series[16]=y%3==0?2:1; series[17]=y%3==1?2:1;
++            series[0]=8; series[4]=8; series[18]=uint8_t(y); series[19]=uint8_t((y%3)<<4)|8;
++        }
++    }
++    return state;
++}
++int main() {
++    SavedState original=fixture(), loaded;
++    std::array<uint8_t,saveBytes> bytes{};
++    writeSave(original,bytes.data());
++    assert(readSave(bytes.data(),bytes.size(),loaded)==SaveStatus::Valid && same(original,loaded));
++    assert(bytes[8]==0 && bytes[9]==0 && bytes[10]==0 && bytes[11]==1);
++    assert(bytes[16]==1 && bytes[17]==1 && bytes[21]==0 && bytes[23]==1 && bytes[24]==19);
++    std::array<uint8_t,saveBytes+2> guarded{}; guarded.front()=0xa5; guarded.back()=0x5a;
++    writeSave(original,guarded.data()+1);
++    assert(guarded.front()==0xa5 && guarded.back()==0x5a);
++    assert(std::equal(bytes.begin(),bytes.end(),guarded.begin()+1));
++    auto reject=[&](const auto& bad,size_t size,SaveStatus expected=SaveStatus::Invalid) {
++        auto out=original;
++        out.archive.push_back({2008,original.years[0]});
++        const auto before=out;
++        assert(readSave(bad.data(),size,out)==expected && same(out,before));
++    };
++    for(size_t size:{size_t(0),size_t(7),size_t(8),size_t(16),saveBytes-1})
++        reject(bytes,size,size<8?SaveStatus::Missing:SaveStatus::Invalid);
++    std::array<uint8_t,8> magicOnly{}; std::copy_n(bytes.begin(),8,magicOnly.begin());
++    reject(magicOnly,magicOnly.size());
++    auto unchanged=original;
++    assert(readSave(nullptr,saveBytes,unchanged)==SaveStatus::Missing && same(unchanged,original));
++    auto bad=bytes; bad[0]^=1; reject(bad,bad.size(),SaveStatus::Missing);
++    bad=bytes; bad[11]=2; resign(bad); reject(bad,bad.size());
++    bad=bytes; bad[30]^=1; reject(bad,bad.size());
++    for(size_t offset:{size_t(16),size_t(17)}) {
++        bad=bytes; bad[offset]=2; resign(bad); reject(bad,bad.size());
++    }
++    for(uint32_t day:{59u,60u,274u,276u,330u,331u,0xffffffffu}) {
++        bad=bytes; be32(bad.data()+21,day); resign(bad); reject(bad,bad.size());
++    }
++    for(uint8_t team:{uint8_t(30),uint8_t(44),uint8_t(255),uint8_t(1),uint8_t(15)}) {
++        bad=bytes; bad[25]=team; resign(bad); reject(bad,bad.size());
++    }
++    bad=bytes; be32(bad.data()+37+8,30); resign(bad); reject(bad,bad.size());
++    bad=bytes; be32(bad.data()+37+8,6); resign(bad); reject(bad,bad.size());
++    bad=bytes; be32(bad.data()+37+8,15); resign(bad); reject(bad,bad.size());
++    bad=bytes; be32(bad.data()+37+8,5); resign(bad); reject(bad,bad.size());
++    // Seeded clubs alone are insufficient: each Wild Card slot has a fixed ordered pairing.
++    for(const auto& pair:std::array<std::array<uint32_t,2>,3>{{{0,5},{5,2},{3,4}}}) {
++        bad=bytes; be32(bad.data()+37+8,pair[0]); be32(bad.data()+37+12,pair[1]);
++        resign(bad); reject(bad,bad.size());
++    }
++    // Winner flags and best-of-three win totals must describe the same series state.
++    for(const auto& result:std::array<std::array<uint8_t,3>,9>{{
++            {0,0,0x08},{1,0,0x08},{0,2,0x08},{0,0,0x18},{2,0,0x18},
++            {2,0,0x28},{0,2,0x28},{2,2,0x08},{2,2,0x18}}}) {
++        bad=bytes; bad[37+16]=result[0]; bad[37+17]=result[1]; bad[37+19]=result[2];
++        resign(bad); reject(bad,bad.size());
++    }
++    bad=bytes; bad[37+16]=3; resign(bad); reject(bad,bad.size());
++    bad=bytes; bad[37+17]=3; resign(bad); reject(bad,bad.size());
++    bad=bytes; bad[37+19]=0x38; resign(bad); reject(bad,bad.size());
++    bad=bytes; bad[18]=1; resign(bad); reject(bad,bad.size());
++    bad=bytes; bad[17+19*100]=2; resign(bad); reject(bad,bad.size());
++    bad=bytes; bad.back()=1; resign(bad); reject(bad,bad.size());
++    auto disabled=original; disabled.enabled=false;
++    writeSave(disabled,bytes.data());
++    assert(readSave(bytes.data(),bytes.size(),loaded)==SaveStatus::Valid && same(disabled,loaded));
++    SavedState empty;
++    for(const auto& year:empty.years) for(const auto& league:year.seeds) for(int id:league) assert(id==pending);
++    writeSave(empty,bytes.data());
++    assert(readSave(bytes.data(),bytes.size(),loaded)==SaveStatus::Valid && same(empty,loaded));
++    auto unused=empty; unused.years[0].firstDay=275;
++    for(auto& league:unused.years[0].seeds) league.fill(0);
++    for(auto& series:unused.years[0].wildCards) series.fill(255);
++    writeSave(unused,bytes.data());
++    assert(std::all_of(bytes.begin()+17,bytes.begin()+117,[](uint8_t value){return value==0;}));
++    assert(readSave(bytes.data(),bytes.size(),loaded)==SaveStatus::Valid && same(empty,loaded));
++    bad=bytes; bad[25]=1; resign(bad); reject(bad,bad.size());
++    bad=bytes; bad[2017]=1; resign(bad); reject(bad,bad.size());
++    bad=bytes; bad[2021]=1; resign(bad); reject(bad,bad.size());
++    // Archive rows are qualified, chronological, and bounded to the newest 28 entries.
++    auto archived=original;
++    for(uint32_t y=2008;y<2038;++y) archived.archive.push_back({y,original.years[(y-2008)%20]});
++    writeSave(archived,bytes.data());
++    archived.archive.erase(archived.archive.begin(),archived.archive.begin()+2);
++    assert(readSave(bytes.data(),bytes.size(),loaded)==SaveStatus::Valid && same(archived,loaded));
++    assert(bytes[2020]==28 && loaded.archive.front().year==2010 && loaded.archive.back().year==2037);
++    for(size_t size:{size_t(2017),size_t(2021),size_t(4932),saveBytes-1}) reject(bytes,size);
++    bad=bytes; be32(bad.data()+2017,29); resign(bad); reject(bad,bad.size());
++    for(uint32_t year:{2007u,10000u,0xffffffffu}) {
++        bad=bytes; be32(bad.data()+2021,year); resign(bad); reject(bad,bad.size());
++    }
++    bad=bytes; be32(bad.data()+2021+104,2010); resign(bad); reject(bad,bad.size());
++    bad=bytes; be32(bad.data()+2021+104,2009); resign(bad); reject(bad,bad.size());
++    bad=bytes; std::fill_n(bad.begin()+2025,100,0); resign(bad); reject(bad,bad.size());
++    bad=bytes; bad[2025+8]=30; resign(bad); reject(bad,bad.size());
++    bad=bytes; bad[4933]=1; resign(bad); reject(bad,bad.size());
++    for(uint32_t year:{2008u,9999u}) {
++        auto one=original; one.archive.push_back({year,original.years[0]});
++        writeSave(one,bytes.data());
++        assert(readSave(bytes.data(),bytes.size(),loaded)==SaveStatus::Valid && same(one,loaded));
++    }
++    std::cout<<"modern postseason save tests passed\n";
++}
+diff --git a/runtime/tests/postseason_guest_test.cpp b/runtime/tests/postseason_guest_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/tests/postseason_guest_test.cpp
+@@ -0,0 +1,36 @@
++#include "postseason_guest.h"
++#include <cassert>
++int main() {
++    using namespace modern_postseason;
++    std::array<uint8_t,20> bytes{};
++    Series series{4,9,2,1,2,4};
++    encodeSeries(series,275,bytes.data());
++    assert(save_detail::get32(bytes.data()+8)==4);
++    assert(save_detail::get32(bytes.data()+12)==9);
++    assert(bytes[16]==2 && bytes[17]==1);
++    assert(((save_detail::get32(bytes.data()+16)>>4)&7)==0);
++    assert(((save_detail::get32(bytes.data()+16)>>7)&511)==275);
++    auto read=decodeSeries(bytes.data(),2);
++    assert(read.higher==4 && read.lower==9 && read.winner==4);
++    series.winner=pending; series.higherWins=1;
++    encodeSeries(series,0,bytes.data());
++    assert(decodeSeries(bytes.data(),2).winner==pending);
++    assert(wildCardDay(275) && wildCardDay(277) && !wildCardDay(278));
++    assert(roundSeries(0,3)==3 && roundSeries(1,1)==5 && roundSeries(2,0)==6);
++    assert(roundSeries(0,4)==-1 && roundSeries(2,1)==-1);
++    assert(classifyPostseasonDay(277)==2 && classifyPostseasonDay(278)==2);
++    assert(classifyPostseasonDay(286)==3 && classifyPostseasonDay(296)==4);
++    assert(classifyPostseasonDay(274)==-1 && classifyPostseasonDay(305)==-1);
++    std::array<uint8_t,16> game{};
++    save_detail::put32(game.data(),4); save_detail::put32(game.data()+4,9);
++    game[8]=3; game[9]=2;
++    save_detail::put32(game.data()+12,2u<<23);
++    GameResult result;
++    assert(decodeGame(game.data(),200,result)==GameStatus::Finished && result.home==4);
++    save_detail::put32(game.data()+12,(2u<<23)|(2u<<20)); game[9]=3;
++    assert(decodeGame(game.data(),200,result)==GameStatus::Tied);
++    game[9]=1;
++    assert(decodeGame(game.data(),200,result)==GameStatus::Invalid);
++    save_detail::put32(game.data()+12,1u<<23);
++    assert(decodeGame(game.data(),200,result)==GameStatus::Scheduled);
++}
+diff --git a/runtime/tests/season_cap_modern_test.cpp b/runtime/tests/season_cap_modern_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/tests/season_cap_modern_test.cpp
+@@ -0,0 +1,35 @@
++#include "season_cap.h"
++#include "postseason_guest.h"
++#include <cassert>
++int main() {
++    using namespace season_cap;
++    SeasonTail original;
++    original.startShift=18;
++    std::array<uint8_t,kTailSize> bytes{};
++    WriteTail(original,bytes.data());
++    assert(GetBe32(bytes.data()+8)==3);
++    SeasonTail loaded;
++    assert(ReadTail(bytes.data(),bytes.size(),loaded) && !loaded.postseason.enabled && loaded.startShift==18);
++    original.postseason.enabled=true;
++    auto& row=original.postseason.years[0];
++    row.qualified=true; row.firstDay=275;
++    for(int l=0;l<2;++l) for(int i=0;i<6;++i) row.seeds[l][i]=l*6+i;
++    for(int l=0;l<2;++l) {
++        modern_postseason::encodeSeries({l*6+2,l*6+5,0,0,2,44},0,row.wildCards[l*2].data());
++        modern_postseason::encodeSeries({l*6+3,l*6+4,2,0,2,l*6+3},276,row.wildCards[l*2+1].data());
++    }
++    for(size_t i=0;i<kArchiveCapacity;++i) {
++        ArchivedYear year{}; year.fill(static_cast<uint8_t>(i)); AddArchived(original,year);
++    }
++    assert(original.archive.size()==ArchiveCapacity(original) && original.archive.size()<kArchiveCapacity);
++    WriteTail(original,bytes.data());
++    assert(GetBe32(bytes.data()+8)==4);
++    assert(ReadTail(bytes.data(),bytes.size(),loaded));
++    assert(loaded.postseason.enabled && loaded.postseason.years[0].qualified);
++    assert(loaded.postseason.years[0].wildCards==row.wildCards);
++    assert(loaded.archive==original.archive && loaded.startShift==18);
++    bytes.back()^=1;
++    assert(!ReadTail(bytes.data(),bytes.size(),loaded));
++    static_assert(kLifePostseasonOffset>=kLifeLoadEnd);
++    static_assert(kLifePostseasonOffset+modern_postseason::saveBytes<=kLifeTailOffset);
++}
