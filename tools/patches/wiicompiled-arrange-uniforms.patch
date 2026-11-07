@@ -1,0 +1,304 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -460,7 +460,7 @@
+ target_include_directories(mkw_season_pack_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+ add_test(NAME mkw_season_pack_tests COMMAND mkw_season_pack_tests)
+ 
+-foreach(case arrange_marks arrange_marks_save arrange_marks_texture modern_postseason modern_postseason_save postseason_guest season_cap_modern)
++foreach(case arrange_marks arrange_uniforms arrange_marks_save arrange_marks_texture modern_postseason modern_postseason_save postseason_guest season_cap_modern)
+     add_executable(mkw_${case}_test "${CMAKE_CURRENT_LIST_DIR}/tests/${case}_test.cpp")
+     target_compile_features(mkw_${case}_test PRIVATE cxx_std_20)
+     target_compile_options(mkw_${case}_test PRIVATE -UNDEBUG)
+diff --git a/runtime/include/arrange_uniforms.h b/runtime/include/arrange_uniforms.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/arrange_uniforms.h
+@@ -0,0 +1,142 @@
++#pragma once
++// Imported uniforms per Arrange team: folder catalog and .ppu reader (pure, no game dependencies).
++// The .ppu layout is written by tools/uniform-studio/bake.py (write_ppu) and must match exactly:
++//   magic "PPUNIF\0\0" (8) | version u32 BE (1) | FNV-1a 32 of the rest u32 BE |
++//   backup (10 bytes, 0..31) | per kind: id u8 (body 0, cap 1, helmet 2, number 3),
++//   w u16 LE, h u16 LE, palette 512 (256 x RGB5A3 BE), w*h C8 indices.
++#include "arrange_marks.h"
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <map>
++#include <string>
++#include <system_error>
++#include <vector>
++
++namespace arrange_uniforms {
++
++constexpr size_t kMaxEntries = 64;
++
++struct Entry {
++    std::string folder;  // subfolder name (UTF-8) holding uniform.ppu
++    std::string label;   // text the game draws
++};
++
++// Subfolders of root that contain a regular, non-empty uniform.ppu, sorted case-insensitively by
++// name, at most kMaxEntries. Labels as for marks, equal labels get " 2", " 3"... A missing root
++// gives an empty list.
++inline std::vector<Entry> scan(const std::filesystem::path& root) {
++    namespace fs = std::filesystem;
++    namespace cd = arrange_marks::catalog_detail;
++    struct Found {
++        std::string name, key;
++    };
++    std::vector<Found> found;
++    std::error_code ec;
++    fs::directory_iterator it(root, ec), end;
++    for (; !ec && it != end; it.increment(ec)) {
++        std::error_code e1, e2, e3;
++        if (!it->is_directory(e1) || e1) continue;
++        const fs::path ppu = it->path() / "uniform.ppu";
++        if (!fs::is_regular_file(ppu, e2) || e2) continue;
++        if (fs::file_size(ppu, e3) == 0 || e3) continue;
++        std::string name = cd::utf8(it->path().filename());
++        found.push_back({name, cd::lower(name)});
++    }
++    std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) {
++        return a.key != b.key ? a.key < b.key : a.name < b.name;
++    });
++    constexpr size_t kChars = arrange_marks::kNameChars;
++    std::vector<Entry> out;
++    for (const Found& f : found) {
++        if (out.size() >= kMaxEntries) break;
++        std::string base = arrange_marks::label(f.name);
++        if (base.empty()) base = "UNIFORM";
++        std::string name = base;
++        for (int n = 2;; n++) {
++            bool taken = std::any_of(out.begin(), out.end(), [&](const Entry& e) { return e.label == name; });
++            if (!taken) break;
++            std::string suffix = " " + std::to_string(n);
++            std::string head = base.substr(0, kChars - suffix.size());
++            while (!head.empty() && head.back() == ' ') head.pop_back();
++            name = head + suffix;
++        }
++        out.push_back({f.name, name});
++    }
++    return out;
++}
++
++struct Atlas {
++    uint16_t w = 0, h = 0;
++    std::array<uint8_t, 512> palette{};  // 256 x RGB5A3, big-endian, as the game's TLUT
++    std::vector<uint8_t> indices;        // w*h C8 indices
++};
++
++struct Uniform {
++    std::map<std::string, Atlas> atlases;  // keys "body", "cap", "helmet", "number"
++    std::array<uint8_t, 10> backup{};
++};
++
++enum class ReadStatus { Missing, Valid, Invalid };
++
++namespace detail {
++inline uint32_t fnv1a(const uint8_t* p, size_t n) {
++    uint32_t h = 0x811C9DC5u;
++    for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 0x01000193u;
++    return h;
++}
++inline uint32_t be32(const uint8_t* p) {
++    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
++}
++}  // namespace detail
++
++// Empty buffer or all zeros: Missing. Otherwise every field is validated; any failure (magic,
++// version, checksum, backup, kind, size, truncation, repeated kind) is Invalid. `out` is only
++// written on Valid.
++inline ReadStatus readPpu(const uint8_t* data, size_t size, Uniform& out) {
++    if (!data || size == 0) return ReadStatus::Missing;
++    if (std::all_of(data, data + size, [](uint8_t b) { return b == 0; })) return ReadStatus::Missing;
++    constexpr uint8_t kMagic[8] = {'P', 'P', 'U', 'N', 'I', 'F', 0, 0};
++    constexpr size_t kHeader = 16, kPalette = 512;
++    if (size < kHeader + 10 || std::memcmp(data, kMagic, 8) != 0) return ReadStatus::Invalid;
++    if (detail::be32(data + 8) != 1) return ReadStatus::Invalid;
++    const uint8_t* body = data + kHeader;
++    const size_t bodySize = size - kHeader;
++    if (detail::fnv1a(body, bodySize) != detail::be32(data + 12)) return ReadStatus::Invalid;
++    Uniform u;
++    for (size_t i = 0; i < 10; i++) {
++        if (body[i] > 31) return ReadStatus::Invalid;
++        u.backup[i] = body[i];
++    }
++    static constexpr const char* kNames[4] = {"body", "cap", "helmet", "number"};
++    static constexpr uint16_t kW[4] = {128, 64, 64, 64}, kH[4] = {128, 32, 32, 32};
++    bool seen[4] = {};
++    size_t o = 10;
++    while (o < bodySize) {
++        if (bodySize - o < 5) return ReadStatus::Invalid;
++        const uint8_t kind = body[o];
++        const uint16_t w = uint16_t(body[o + 1] | (body[o + 2] << 8));
++        const uint16_t h = uint16_t(body[o + 3] | (body[o + 4] << 8));
++        if (kind > 3 || seen[kind] || w != kW[kind] || h != kH[kind]) return ReadStatus::Invalid;
++        o += 5;
++        const size_t pixels = size_t(w) * h;
++        if (bodySize - o < kPalette + pixels) return ReadStatus::Invalid;
++        Atlas a;
++        a.w = w;
++        a.h = h;
++        std::memcpy(a.palette.data(), body + o, kPalette);
++        o += kPalette;
++        a.indices.assign(body + o, body + o + pixels);
++        o += pixels;
++        seen[kind] = true;
++        u.atlases.emplace(kNames[kind], std::move(a));
++    }
++    out = std::move(u);
++    return ReadStatus::Valid;
++}
++
++}  // namespace arrange_uniforms
+diff --git a/runtime/tests/arrange_uniforms_test.cpp b/runtime/tests/arrange_uniforms_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/tests/arrange_uniforms_test.cpp
+@@ -0,0 +1,140 @@
++#include "arrange_uniforms.h"
++#include <cassert>
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <string>
++#include <vector>
++
++using namespace arrange_uniforms;
++namespace fs = std::filesystem;
++using Bytes = std::vector<uint8_t>;
++
++static uint32_t fnv(const Bytes& b) {
++    uint32_t h = 0x811C9DC5u;
++    for (uint8_t c : b) h = (h ^ c) * 0x01000193u;
++    return h;
++}
++static void be32(Bytes& o, uint32_t v) {
++    for (int s = 24; s >= 0; s -= 8) o.push_back(uint8_t(v >> s));
++}
++// Same layout as tools/uniform-studio/bake.py write_ppu.
++struct K {
++    uint8_t id;
++    uint16_t w, h;
++};
++static Bytes build(const std::vector<K>& kinds, std::vector<uint8_t> backup = std::vector<uint8_t>(10, 3)) {
++    Bytes body(backup.begin(), backup.end());
++    for (const K& k : kinds) {
++        body.push_back(k.id);
++        body.push_back(uint8_t(k.w));
++        body.push_back(uint8_t(k.w >> 8));
++        body.push_back(uint8_t(k.h));
++        body.push_back(uint8_t(k.h >> 8));
++        for (int i = 0; i < 512; i++) body.push_back(uint8_t(i));
++        for (size_t i = 0; i < size_t(k.w) * k.h; i++) body.push_back(uint8_t(i * 7));
++    }
++    Bytes out = {'P', 'P', 'U', 'N', 'I', 'F', 0, 0};
++    be32(out, 1);
++    be32(out, fnv(body));
++    out.insert(out.end(), body.begin(), body.end());
++    return out;
++}
++// Re-seal after tampering with the body so only the targeted field is wrong.
++static void reseal(Bytes& b) {
++    Bytes body(b.begin() + 16, b.end());
++    uint32_t c = fnv(body);
++    for (int i = 0; i < 4; i++) b[12 + i] = uint8_t(c >> (24 - 8 * i));
++}
++static ReadStatus rd(const Bytes& b, Uniform* u = nullptr) {
++    Uniform tmp;
++    return readPpu(b.data(), b.size(), u ? *u : tmp);
++}
++static void put(const fs::path& p, const Bytes& b) {
++    std::ofstream(p, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), std::streamsize(b.size()));
++}
++
++int main() {
++    const std::vector<K> all = {{0, 128, 128}, {1, 64, 32}, {2, 64, 32}, {3, 64, 32}};
++    Uniform u;
++    Bytes good = build({{0, 128, 128}}, {0, 1, 2, 3, 4, 5, 6, 7, 8, 31});
++    assert(rd(good, &u) == ReadStatus::Valid);
++    assert(u.atlases.size() == 1 && u.atlases.count("body"));
++    const Atlas& a = u.atlases.at("body");
++    assert(a.w == 128 && a.h == 128 && a.indices.size() == 128 * 128);
++    assert(a.palette[0] == 0 && a.palette[511] == uint8_t(511) && a.indices[1] == 7);
++    assert(u.backup[9] == 31 && u.backup[3] == 3);
++    Uniform u4;
++    assert(rd(build(all), &u4) == ReadStatus::Valid);
++    assert(u4.atlases.size() == 4 && u4.atlases.count("cap") && u4.atlases.count("helmet") &&
++           u4.atlases.count("number"));
++    assert(u4.atlases.at("number").w == 64 && u4.atlases.at("number").h == 32);
++    assert(rd(build({})) == ReadStatus::Valid);  // backup only, like bake.read_ppu
++
++    assert(rd({}) == ReadStatus::Missing);
++    assert(rd(Bytes(4096, 0)) == ReadStatus::Missing);
++    assert(readPpu(nullptr, 0, u) == ReadStatus::Missing);
++
++    Bytes b = good;
++    b[0] = 'X';
++    assert(rd(b) == ReadStatus::Invalid);  // magic
++    b = good;
++    b[11] = 2;
++    reseal(b);
++    assert(rd(b) == ReadStatus::Invalid);  // version
++    b = good;
++    b[12] ^= 1;
++    assert(rd(b) == ReadStatus::Invalid);  // checksum
++    b = good;
++    b.back() ^= 0xFF;
++    assert(rd(b) == ReadStatus::Invalid);  // body altered, stale sum
++    b = good;
++    b[16 + 4] = 32;
++    reseal(b);
++    assert(rd(b) == ReadStatus::Invalid);  // backup
++    b = good;
++    b[16 + 10] = 4;
++    reseal(b);
++    assert(rd(b) == ReadStatus::Invalid);  // kind id
++    assert(rd(build({{0, 64, 32}})) == ReadStatus::Invalid);              // body wrong size
++    assert(rd(build({{1, 128, 128}})) == ReadStatus::Invalid);            // cap wrong size
++    assert(rd(build({{3, 64, 64}})) == ReadStatus::Invalid);              // number wrong size
++    assert(rd(build({{1, 64, 32}, {1, 64, 32}})) == ReadStatus::Invalid);  // repeated kind
++    b = good;
++    b.resize(b.size() - 1);
++    reseal(b);
++    assert(rd(b) == ReadStatus::Invalid);  // truncated pixels, valid sum
++    b = good;
++    b.resize(16 + 10 + 3);
++    reseal(b);
++    assert(rd(b) == ReadStatus::Invalid);  // truncated atlas header
++    b = good;
++    b.resize(10);
++    assert(rd(b) == ReadStatus::Invalid);  // shorter than header
++    b = good;
++    b.resize(b.size() - 1);
++    assert(rd(b) == ReadStatus::Invalid);  // truncated, stale sum
++    Uniform keep = u4;
++    b = good;
++    b[12] ^= 1;
++    assert(readPpu(b.data(), b.size(), keep) == ReadStatus::Invalid && keep.atlases.size() == 4);
++
++    fs::path tmp = fs::temp_directory_path() / ("mlb_arrange_uniforms_test_" +
++                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++    fs::remove_all(tmp);
++    for (const char* d : {"B", "A", "C", "E"}) fs::create_directories(tmp / d);
++    put(tmp / "A" / "uniform.ppu", good);
++    put(tmp / "B" / "uniform.ppu", good);
++    put(tmp / "E" / "uniform.ppu", {});  // empty file: ignored
++    put(tmp / "x.txt", {'h', 'i'});
++    put(tmp / "uniform.ppu", good);  // loose file at the root: ignored
++    auto e = scan(tmp);
++    assert(e.size() == 2);
++    assert(e[0].folder == "A" && e[0].label == "A" && e[1].folder == "B" && e[1].label == "B");
++    assert(scan(tmp / "nope").empty());
++    fs::remove_all(tmp);
++
++    std::puts("arrange_uniforms OK");
++    return 0;
++}
