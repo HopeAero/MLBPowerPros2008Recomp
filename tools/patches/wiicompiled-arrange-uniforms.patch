@@ -1,7 +1,7 @@
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
-@@ -460,7 +460,7 @@
+@@ -460,7 +460,7 @@ target_compile_features(mkw_season_pack_tests PRIVATE cxx_std_20)
  target_include_directories(mkw_season_pack_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
  add_test(NAME mkw_season_pack_tests COMMAND mkw_season_pack_tests)
  
@@ -10,6 +10,177 @@ diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
      add_executable(mkw_${case}_test "${CMAKE_CURRENT_LIST_DIR}/tests/${case}_test.cpp")
      target_compile_features(mkw_${case}_test PRIVATE cxx_std_20)
      target_compile_options(mkw_${case}_test PRIVATE -UNDEBUG)
+diff --git a/runtime/include/arrange_marks_save.h b/runtime/include/arrange_marks_save.h
+--- a/runtime/include/arrange_marks_save.h
++++ b/runtime/include/arrange_marks_save.h
+@@ -5,12 +5,15 @@
+ // tail of the main save pm3usma.dat. The game's data end at 0xD0050 (save descriptor 0xD0000 + 0x50
+ // header): a save kept markers placed at 0xD0060, 0xD0410, 0xD2000 and 0xD3F00, and a save with
+ // foreign bytes at 0xD3F00 loads (proven in game, docs/ingenieria-inversa.md, Arrange save). The block
+-// sits at 0xD3000, beyond anything the save descriptor (0xD0400) may verify, and the record stays
++// sits at 0xD2E00..0xD3E90 (version 3), beyond anything the save descriptor (0xD0400) may verify, and the record stays
+ // valid for the original game.
+-// Block (version 2): "MLBARRMK" (8), version u32 BE (4), FNV-1a 32 of the slot bytes u32 BE (4), then
++// Block (version 3): "MLBARRMK" (8), version u32 BE (4), FNV-1a 32 of the slot bytes u32 BE (4), then
+ // 32 x (mark 32 bytes + logo 32 bytes, UTF-8, zero padded + fingerprint u32 BE of the slot's team
+-// record when the choice was saved, recordFingerprint). Version 1 (no fingerprints) was never
+-// published: it reads as Invalid.
++// record when the choice was saved, recordFingerprint + imported uniform folder name for the home
++// side 32 bytes + for the road side 32 bytes, empty = no choice). Version 2 (the first 68 bytes of
++// each row, 2192 bytes in all, at 0xD3000) still reads, with empty uniforms. Version 1 (no
++// fingerprints) was never published: it reads as Invalid. Version 3 is 4240 bytes, which no longer
++// fit at 0xD3000 (the file ends at 0xD4000), so it starts at 0xD2E00 and ends at 0xD3E90.
+ #include <algorithm>
+ #include <array>
+ #include <cstddef>
+@@ -26,24 +29,36 @@ namespace arrange_marks {
+ constexpr size_t kSlots = 32;
+ constexpr size_t kNameBytes = 32;
+ constexpr size_t kFingerprintBytes = 4;
+-constexpr size_t kRowBytes = 2 * kNameBytes + kFingerprintBytes;
++constexpr size_t kRowBytesV2 = 2 * kNameBytes + kFingerprintBytes;  // mark, logo, fingerprint
++constexpr size_t kRowBytes = kRowBytesV2 + 2 * kNameBytes;          // + uniform home, uniform road
+ constexpr size_t kHeaderBytes = 16;
+-constexpr size_t kSaveBytes = 2192;
++constexpr size_t kSaveBytesV2 = 2192;
++constexpr size_t kSaveBytes = 4240;
++static_assert(kSaveBytesV2 == kHeaderBytes + kSlots * kRowBytesV2);
+ static_assert(kSaveBytes == kHeaderBytes + kSlots * kRowBytes);
+-constexpr uint32_t kVersion = 2;
+-// File offset of the block in pm3usma.dat (ends 0xD3890); the game's data end at 0xD0050 (save
++constexpr uint32_t kVersionV2 = 2;
++constexpr uint32_t kVersion = 3;
++// File offset of the block in pm3usma.dat (0xD2E00..0xD3E90); the game's data end at 0xD0050 (save
+ // descriptor 0xD0000 + 0x50 header), the file at 0xD4000.
+ // The game's load reads the file from 0 in 16 KB chunks and stops at 0xD0000 (NAND trace, Task 6):
+ // it never reaches the data end. The load hook keys on this offset.
+ constexpr uint32_t kMainSaveLoadEnd = 0xD0000;
+-constexpr uint32_t kSaveFileOffset = 0xD3000;
++// Version 3 starts earlier than version 2 did (0xD3000, kLegacyFileOffset: the old block only reads
++// there) and stays clear of the 0xD3F00 marker spot.
++constexpr uint32_t kSaveFileOffset = 0xD2E00;
++constexpr uint32_t kLegacyFileOffset = 0xD3000;
+ constexpr uint32_t kSaveFileSize = 0xD4000;
+-static_assert(kSaveFileOffset >= 0xD0400 && kSaveFileOffset + kSaveBytes <= kSaveFileSize);
++static_assert(kSaveFileOffset >= 0xD0400 && kSaveFileOffset + kSaveBytes <= 0xD3F00);
++static_assert(kLegacyFileOffset + kSaveBytesV2 <= kSaveFileSize);
+ 
+ struct Choice {
+     std::string mark, logo;
+-    bool empty() const { return mark.empty() && logo.empty(); }
+-    bool operator==(const Choice& other) const { return mark == other.mark && logo == other.logo; }
++    std::string uniformHome, uniformRoad;  // imported uniform folder names (UserData/arrange/uniforms)
++    bool empty() const { return mark.empty() && logo.empty() && uniformHome.empty() && uniformRoad.empty(); }
++    bool operator==(const Choice& other) const {
++        return mark == other.mark && logo == other.logo && uniformHome == other.uniformHome &&
++               uniformRoad == other.uniformRoad;
++    }
+     bool operator!=(const Choice& other) const { return !(*this == other); }
+ };
+ using Choices = std::array<Choice, kSlots>;
+@@ -108,8 +123,9 @@ inline uint32_t recordFingerprint(const uint8_t* record) {
+ inline std::array<uint8_t, kSaveBytes> writeChoices(const Choices& choices, const Fingerprints& fingerprints) {
+     std::array<uint8_t, kSaveBytes> out{};
+     for (const auto& choice : choices)
+-        if (choice.mark.size() > kNameBytes || choice.logo.size() > kNameBytes)
+-            throw std::invalid_argument("arrange marks: file name longer than 32 bytes");
++        if (choice.mark.size() > kNameBytes || choice.logo.size() > kNameBytes ||
++            choice.uniformHome.size() > kNameBytes || choice.uniformRoad.size() > kNameBytes)
++            throw std::invalid_argument("arrange marks: file or folder name longer than 32 bytes");
+     std::copy(detail::magic.begin(), detail::magic.end(), out.begin());
+     detail::put32(out.data() + 8, kVersion);
+     for (size_t i = 0; i < kSlots; ++i) {
+@@ -117,34 +133,48 @@ inline std::array<uint8_t, kSaveBytes> writeChoices(const Choices& choices, cons
+         std::copy(choices[i].mark.begin(), choices[i].mark.end(), row);
+         std::copy(choices[i].logo.begin(), choices[i].logo.end(), row + kNameBytes);
+         detail::put32(row + 2 * kNameBytes, choices[i].empty() ? 0 : fingerprints[i]);
++        std::copy(choices[i].uniformHome.begin(), choices[i].uniformHome.end(), row + kRowBytesV2);
++        std::copy(choices[i].uniformRoad.begin(), choices[i].uniformRoad.end(), row + kRowBytesV2 + kNameBytes);
+     }
+     detail::put32(out.data() + 12, detail::fnv1a(out.data() + kHeaderBytes, kSaveBytes - kHeaderBytes));
+     return out;
+ }
+ 
+-// out and fingerprints are left empty unless the result is Valid. Any other version (version 1 had
+-// no fingerprints) is Invalid.
++// out and fingerprints are left empty unless the result is Valid. Version 3 (kSaveBytes) and version 2
++// (kSaveBytesV2, read with empty uniforms) are read; any other version (version 1 had no
++// fingerprints) is Invalid.
+ inline ReadStatus readChoices(const uint8_t* data, size_t size, Choices& out, Fingerprints& fingerprints) {
+     out = Choices{};
+     fingerprints = Fingerprints{};
+     if (!data) return ReadStatus::Missing;
+     if (std::all_of(data, data + std::min(size, kSaveBytes), [](uint8_t b) { return b == 0; }))
+         return ReadStatus::Missing;
+-    if (size < kSaveBytes || !std::equal(detail::magic.begin(), detail::magic.end(), data) ||
+-        detail::get32(data + 8) != kVersion ||
+-        detail::get32(data + 12) != detail::fnv1a(data + kHeaderBytes, kSaveBytes - kHeaderBytes))
++    if (size < kSaveBytesV2 || !std::equal(detail::magic.begin(), detail::magic.end(), data))
++        return ReadStatus::Invalid;
++    const uint32_t version = detail::get32(data + 8);
++    size_t rowBytes = 0, total = 0;
++    if (version == kVersion) { rowBytes = kRowBytes; total = kSaveBytes; }
++    else if (version == kVersionV2) { rowBytes = kRowBytesV2; total = kSaveBytesV2; }
++    else return ReadStatus::Invalid;
++    if (size < total || detail::get32(data + 12) != detail::fnv1a(data + kHeaderBytes, total - kHeaderBytes))
+         return ReadStatus::Invalid;
+     Choices read;
+     Fingerprints prints{};
++    auto field = [](const uint8_t* at) {
++        const char* text = reinterpret_cast<const char*>(at);
++        size_t len = 0;
++        while (len < kNameBytes && text[len]) ++len;
++        return std::string(text, len);
++    };
+     for (size_t i = 0; i < kSlots; ++i) {
+-        const uint8_t* row = data + kHeaderBytes + i * kRowBytes;
+-        const char* text = reinterpret_cast<const char*>(row);
+-        size_t markLen = 0, logoLen = 0;
+-        while (markLen < kNameBytes && text[markLen]) ++markLen;
+-        while (logoLen < kNameBytes && text[kNameBytes + logoLen]) ++logoLen;
+-        read[i].mark.assign(text, markLen);
+-        read[i].logo.assign(text + kNameBytes, logoLen);
++        const uint8_t* row = data + kHeaderBytes + i * rowBytes;
++        read[i].mark = field(row);
++        read[i].logo = field(row + kNameBytes);
+         prints[i] = detail::get32(row + 2 * kNameBytes);
++        if (version == kVersion) {
++            read[i].uniformHome = field(row + kRowBytesV2);
++            read[i].uniformRoad = field(row + kRowBytesV2 + kNameBytes);
++        }
+     }
+     out = std::move(read);
+     fingerprints = prints;
+@@ -180,7 +210,7 @@ inline bool isChosen(const Choices& choices, bool logo, const std::string& file)
+ 
+ inline void copySlot(Choices& choices, int from, int to) {
+     if (from < 0 || to < 0 || from >= int(kSlots) || to >= int(kSlots)) return;
+-    choices[to] = choices[from];
++    choices[to] = choices[from];  // mark, logo and both uniforms
+ }
+ inline void clearSlot(Choices& choices, int slot) {
+     if (slot < 0 || slot >= int(kSlots)) return;
+@@ -219,9 +249,18 @@ inline ReadStatus OnMainSaveLoad(FILE* file, bool enabled) {
+     size_t got = 0;
+     if (std::fseek(file, long(kSaveFileOffset), SEEK_SET) == 0)
+         got = std::fread(block.data(), 1, block.size(), file);
+-    std::fseek(file, at, SEEK_SET);
+     SaveState& state = saveState();
+-    state.status = readChoices(block.data(), got, state.loaded, state.fingerprints);
++    if (got >= detail::magic.size() && std::equal(detail::magic.begin(), detail::magic.end(), block.data())) {
++        state.status = readChoices(block.data(), got, state.loaded, state.fingerprints);
++    } else {
++        // No version 3 block here: the version 2 one (0xD3000) or nothing.
++        std::array<uint8_t, kSaveBytesV2> legacy{};
++        size_t gotLegacy = 0;
++        if (std::fseek(file, long(kLegacyFileOffset), SEEK_SET) == 0)
++            gotLegacy = std::fread(legacy.data(), 1, legacy.size(), file);
++        state.status = readChoices(legacy.data(), gotLegacy, state.loaded, state.fingerprints);
++    }
++    std::fseek(file, at, SEEK_SET);
+     state.unchecked = state.status == ReadStatus::Valid &&
+                       std::any_of(state.loaded.begin(), state.loaded.end(), [](const Choice& c) { return !c.empty(); });
+     state.changed = false;
 diff --git a/runtime/include/arrange_uniforms.h b/runtime/include/arrange_uniforms.h
 new file mode 100644
 --- /dev/null
@@ -157,318 +328,55 @@ new file mode 100644
 +}
 +
 +}  // namespace arrange_uniforms
-diff --git a/runtime/tests/arrange_uniforms_test.cpp b/runtime/tests/arrange_uniforms_test.cpp
-new file mode 100644
---- /dev/null
-+++ b/runtime/tests/arrange_uniforms_test.cpp
-@@ -0,0 +1,140 @@
-+#include "arrange_uniforms.h"
-+#include <cassert>
-+#include <chrono>
-+#include <cstdio>
-+#include <filesystem>
-+#include <fstream>
-+#include <string>
-+#include <vector>
-+
-+using namespace arrange_uniforms;
-+namespace fs = std::filesystem;
-+using Bytes = std::vector<uint8_t>;
-+
-+static uint32_t fnv(const Bytes& b) {
-+    uint32_t h = 0x811C9DC5u;
-+    for (uint8_t c : b) h = (h ^ c) * 0x01000193u;
-+    return h;
-+}
-+static void be32(Bytes& o, uint32_t v) {
-+    for (int s = 24; s >= 0; s -= 8) o.push_back(uint8_t(v >> s));
-+}
-+// Same layout as tools/uniform-studio/bake.py write_ppu.
-+struct K {
-+    uint8_t id;
-+    uint16_t w, h;
-+};
-+static Bytes build(const std::vector<K>& kinds, std::vector<uint8_t> backup = std::vector<uint8_t>(10, 3)) {
-+    Bytes body(backup.begin(), backup.end());
-+    for (const K& k : kinds) {
-+        body.push_back(k.id);
-+        body.push_back(uint8_t(k.w));
-+        body.push_back(uint8_t(k.w >> 8));
-+        body.push_back(uint8_t(k.h));
-+        body.push_back(uint8_t(k.h >> 8));
-+        for (int i = 0; i < 512; i++) body.push_back(uint8_t(i));
-+        for (size_t i = 0; i < size_t(k.w) * k.h; i++) body.push_back(uint8_t(i * 7));
-+    }
-+    Bytes out = {'P', 'P', 'U', 'N', 'I', 'F', 0, 0};
-+    be32(out, 1);
-+    be32(out, fnv(body));
-+    out.insert(out.end(), body.begin(), body.end());
-+    return out;
-+}
-+// Re-seal after tampering with the body so only the targeted field is wrong.
-+static void reseal(Bytes& b) {
-+    Bytes body(b.begin() + 16, b.end());
-+    uint32_t c = fnv(body);
-+    for (int i = 0; i < 4; i++) b[12 + i] = uint8_t(c >> (24 - 8 * i));
-+}
-+static ReadStatus rd(const Bytes& b, Uniform* u = nullptr) {
-+    Uniform tmp;
-+    return readPpu(b.data(), b.size(), u ? *u : tmp);
-+}
-+static void put(const fs::path& p, const Bytes& b) {
-+    std::ofstream(p, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), std::streamsize(b.size()));
-+}
-+
-+int main() {
-+    const std::vector<K> all = {{0, 128, 128}, {1, 64, 32}, {2, 64, 32}, {3, 64, 32}};
-+    Uniform u;
-+    Bytes good = build({{0, 128, 128}}, {0, 1, 2, 3, 4, 5, 6, 7, 8, 31});
-+    assert(rd(good, &u) == ReadStatus::Valid);
-+    assert(u.atlases.size() == 1 && u.atlases.count("body"));
-+    const Atlas& a = u.atlases.at("body");
-+    assert(a.w == 128 && a.h == 128 && a.indices.size() == 128 * 128);
-+    assert(a.palette[0] == 0 && a.palette[511] == uint8_t(511) && a.indices[1] == 7);
-+    assert(u.backup[9] == 31 && u.backup[3] == 3);
-+    Uniform u4;
-+    assert(rd(build(all), &u4) == ReadStatus::Valid);
-+    assert(u4.atlases.size() == 4 && u4.atlases.count("cap") && u4.atlases.count("helmet") &&
-+           u4.atlases.count("number"));
-+    assert(u4.atlases.at("number").w == 64 && u4.atlases.at("number").h == 32);
-+    assert(rd(build({})) == ReadStatus::Valid);  // backup only, like bake.read_ppu
-+
-+    assert(rd({}) == ReadStatus::Missing);
-+    assert(rd(Bytes(4096, 0)) == ReadStatus::Missing);
-+    assert(readPpu(nullptr, 0, u) == ReadStatus::Missing);
-+
-+    Bytes b = good;
-+    b[0] = 'X';
-+    assert(rd(b) == ReadStatus::Invalid);  // magic
-+    b = good;
-+    b[11] = 2;
-+    reseal(b);
-+    assert(rd(b) == ReadStatus::Invalid);  // version
-+    b = good;
-+    b[12] ^= 1;
-+    assert(rd(b) == ReadStatus::Invalid);  // checksum
-+    b = good;
-+    b.back() ^= 0xFF;
-+    assert(rd(b) == ReadStatus::Invalid);  // body altered, stale sum
-+    b = good;
-+    b[16 + 4] = 32;
-+    reseal(b);
-+    assert(rd(b) == ReadStatus::Invalid);  // backup
-+    b = good;
-+    b[16 + 10] = 4;
-+    reseal(b);
-+    assert(rd(b) == ReadStatus::Invalid);  // kind id
-+    assert(rd(build({{0, 64, 32}})) == ReadStatus::Invalid);              // body wrong size
-+    assert(rd(build({{1, 128, 128}})) == ReadStatus::Invalid);            // cap wrong size
-+    assert(rd(build({{3, 64, 64}})) == ReadStatus::Invalid);              // number wrong size
-+    assert(rd(build({{1, 64, 32}, {1, 64, 32}})) == ReadStatus::Invalid);  // repeated kind
-+    b = good;
-+    b.resize(b.size() - 1);
-+    reseal(b);
-+    assert(rd(b) == ReadStatus::Invalid);  // truncated pixels, valid sum
-+    b = good;
-+    b.resize(16 + 10 + 3);
-+    reseal(b);
-+    assert(rd(b) == ReadStatus::Invalid);  // truncated atlas header
-+    b = good;
-+    b.resize(10);
-+    assert(rd(b) == ReadStatus::Invalid);  // shorter than header
-+    b = good;
-+    b.resize(b.size() - 1);
-+    assert(rd(b) == ReadStatus::Invalid);  // truncated, stale sum
-+    Uniform keep = u4;
-+    b = good;
-+    b[12] ^= 1;
-+    assert(readPpu(b.data(), b.size(), keep) == ReadStatus::Invalid && keep.atlases.size() == 4);
-+
-+    fs::path tmp = fs::temp_directory_path() / ("mlb_arrange_uniforms_test_" +
-+                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-+    fs::remove_all(tmp);
-+    for (const char* d : {"B", "A", "C", "E"}) fs::create_directories(tmp / d);
-+    put(tmp / "A" / "uniform.ppu", good);
-+    put(tmp / "B" / "uniform.ppu", good);
-+    put(tmp / "E" / "uniform.ppu", {});  // empty file: ignored
-+    put(tmp / "x.txt", {'h', 'i'});
-+    put(tmp / "uniform.ppu", good);  // loose file at the root: ignored
-+    auto e = scan(tmp);
-+    assert(e.size() == 2);
-+    assert(e[0].folder == "A" && e[0].label == "A" && e[1].folder == "B" && e[1].label == "B");
-+    assert(scan(tmp / "nope").empty());
-+    fs::remove_all(tmp);
-+
-+    std::puts("arrange_uniforms OK");
-+    return 0;
-+}
-diff --git a/runtime/include/arrange_marks_save.h b/runtime/include/arrange_marks_save.h
---- a/runtime/include/arrange_marks_save.h
-+++ b/runtime/include/arrange_marks_save.h
-@@ -7,10 +7,13 @@
- // foreign bytes at 0xD3F00 loads (proven in game, docs/ingenieria-inversa.md, Arrange save). The block
- // sits at 0xD3000, beyond anything the save descriptor (0xD0400) may verify, and the record stays
- // valid for the original game.
--// Block (version 2): "MLBARRMK" (8), version u32 BE (4), FNV-1a 32 of the slot bytes u32 BE (4), then
-+// Block (version 3): "MLBARRMK" (8), version u32 BE (4), FNV-1a 32 of the slot bytes u32 BE (4), then
- // 32 x (mark 32 bytes + logo 32 bytes, UTF-8, zero padded + fingerprint u32 BE of the slot's team
--// record when the choice was saved, recordFingerprint). Version 1 (no fingerprints) was never
--// published: it reads as Invalid.
-+// record when the choice was saved, recordFingerprint + imported uniform folder name for the home
-+// side 32 bytes + for the road side 32 bytes, empty = no choice). Version 2 (the first 68 bytes of
-+// each row, 2192 bytes in all, at 0xD3000) still reads, with empty uniforms. Version 1 (no
-+// fingerprints) was never published: it reads as Invalid. Version 3 is 4240 bytes, which no longer
-+// fit at 0xD3000 (the file ends at 0xD4000), so it starts at 0xD2E00 and ends at 0xD3E90.
- #include <algorithm>
- #include <array>
- #include <cstddef>
-@@ -26,24 +29,36 @@ namespace arrange_marks {
- constexpr size_t kSlots = 32;
- constexpr size_t kNameBytes = 32;
- constexpr size_t kFingerprintBytes = 4;
--constexpr size_t kRowBytes = 2 * kNameBytes + kFingerprintBytes;
-+constexpr size_t kRowBytesV2 = 2 * kNameBytes + kFingerprintBytes;  // mark, logo, fingerprint
-+constexpr size_t kRowBytes = kRowBytesV2 + 2 * kNameBytes;          // + uniform home, uniform road
- constexpr size_t kHeaderBytes = 16;
--constexpr size_t kSaveBytes = 2192;
-+constexpr size_t kSaveBytesV2 = 2192;
-+constexpr size_t kSaveBytes = 4240;
-+static_assert(kSaveBytesV2 == kHeaderBytes + kSlots * kRowBytesV2);
- static_assert(kSaveBytes == kHeaderBytes + kSlots * kRowBytes);
--constexpr uint32_t kVersion = 2;
-+constexpr uint32_t kVersionV2 = 2;
-+constexpr uint32_t kVersion = 3;
- // File offset of the block in pm3usma.dat (ends 0xD3890); the game's data end at 0xD0050 (save
- // descriptor 0xD0000 + 0x50 header), the file at 0xD4000.
- // The game's load reads the file from 0 in 16 KB chunks and stops at 0xD0000 (NAND trace, Task 6):
- // it never reaches the data end. The load hook keys on this offset.
- constexpr uint32_t kMainSaveLoadEnd = 0xD0000;
--constexpr uint32_t kSaveFileOffset = 0xD3000;
-+// Version 3 starts earlier than version 2 did (0xD3000, kLegacyFileOffset: the old block only reads
-+// there) and stays clear of the 0xD3F00 marker spot.
-+constexpr uint32_t kSaveFileOffset = 0xD2E00;
-+constexpr uint32_t kLegacyFileOffset = 0xD3000;
- constexpr uint32_t kSaveFileSize = 0xD4000;
--static_assert(kSaveFileOffset >= 0xD0400 && kSaveFileOffset + kSaveBytes <= kSaveFileSize);
-+static_assert(kSaveFileOffset >= 0xD0400 && kSaveFileOffset + kSaveBytes <= 0xD3F00);
-+static_assert(kLegacyFileOffset + kSaveBytesV2 <= kSaveFileSize);
- 
- struct Choice {
-     std::string mark, logo;
--    bool empty() const { return mark.empty() && logo.empty(); }
--    bool operator==(const Choice& other) const { return mark == other.mark && logo == other.logo; }
-+    std::string uniformHome, uniformRoad;  // imported uniform folder names (UserData/arrange/uniforms)
-+    bool empty() const { return mark.empty() && logo.empty() && uniformHome.empty() && uniformRoad.empty(); }
-+    bool operator==(const Choice& other) const {
-+        return mark == other.mark && logo == other.logo && uniformHome == other.uniformHome &&
-+               uniformRoad == other.uniformRoad;
-+    }
-     bool operator!=(const Choice& other) const { return !(*this == other); }
- };
- using Choices = std::array<Choice, kSlots>;
-@@ -108,8 +123,9 @@ inline uint32_t recordFingerprint(const uint8_t* record) {
- inline std::array<uint8_t, kSaveBytes> writeChoices(const Choices& choices, const Fingerprints& fingerprints) {
-     std::array<uint8_t, kSaveBytes> out{};
-     for (const auto& choice : choices)
--        if (choice.mark.size() > kNameBytes || choice.logo.size() > kNameBytes)
--            throw std::invalid_argument("arrange marks: file name longer than 32 bytes");
-+        if (choice.mark.size() > kNameBytes || choice.logo.size() > kNameBytes ||
-+            choice.uniformHome.size() > kNameBytes || choice.uniformRoad.size() > kNameBytes)
-+            throw std::invalid_argument("arrange marks: file or folder name longer than 32 bytes");
-     std::copy(detail::magic.begin(), detail::magic.end(), out.begin());
-     detail::put32(out.data() + 8, kVersion);
-     for (size_t i = 0; i < kSlots; ++i) {
-@@ -117,34 +133,48 @@ inline std::array<uint8_t, kSaveBytes> writeChoices(const Choices& choices, cons
-         std::copy(choices[i].mark.begin(), choices[i].mark.end(), row);
-         std::copy(choices[i].logo.begin(), choices[i].logo.end(), row + kNameBytes);
-         detail::put32(row + 2 * kNameBytes, choices[i].empty() ? 0 : fingerprints[i]);
-+        std::copy(choices[i].uniformHome.begin(), choices[i].uniformHome.end(), row + kRowBytesV2);
-+        std::copy(choices[i].uniformRoad.begin(), choices[i].uniformRoad.end(), row + kRowBytesV2 + kNameBytes);
-     }
-     detail::put32(out.data() + 12, detail::fnv1a(out.data() + kHeaderBytes, kSaveBytes - kHeaderBytes));
-     return out;
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -47,6 +47,7 @@ struct RuntimeUserConfig {
+     std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
+     std::optional<bool> modernPostseason;  // [season] modern_postseason: 12-team format for new games
+     std::optional<bool> arrangeCustomMarks;  // [arrange] custom_marks: PNG marks and logos per Arrange team
++    std::optional<bool> arrangeCustomUniforms;  // [arrange] custom_uniforms: imported uniforms per Arrange team
+     std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
+     // Lighter graphics (hle/mlb/gfx_options.cpp), launcher VIDEO tab; all as on the Wii by default.
+     std::optional<std::string> playerShadows;  // [video] shadows: "full", "simple" (round blob) or "off"
+@@ -487,6 +488,7 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
+     config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
+     config.modernPostseason = FindConfigValue<bool>(document, "season", "modern_postseason");
+     config.arrangeCustomMarks = FindConfigValue<bool>(document, "arrange", "custom_marks");
++    config.arrangeCustomUniforms = FindConfigValue<bool>(document, "arrange", "custom_uniforms");
+     config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
+     if (auto value = FindConfigValue<std::string>(document, "video", "shadows");
+         value && (*value == "full" || *value == "simple" || *value == "off")) {
+@@ -1010,6 +1012,15 @@ inline bool SetArrangeCustomMarks(bool value) {
+     return WriteSetting("arrange", "custom_marks", value ? "true" : "false");
  }
  
--// out and fingerprints are left empty unless the result is Valid. Any other version (version 1 had
--// no fingerprints) is Invalid.
-+// out and fingerprints are left empty unless the result is Valid. Version 3 (kSaveBytes) and version 2
-+// (kSaveBytesV2, read with empty uniforms) are read; any other version (version 1 had no
-+// fingerprints) is Invalid.
- inline ReadStatus readChoices(const uint8_t* data, size_t size, Choices& out, Fingerprints& fingerprints) {
-     out = Choices{};
-     fingerprints = Fingerprints{};
-     if (!data) return ReadStatus::Missing;
-     if (std::all_of(data, data + std::min(size, kSaveBytes), [](uint8_t b) { return b == 0; }))
-         return ReadStatus::Missing;
--    if (size < kSaveBytes || !std::equal(detail::magic.begin(), detail::magic.end(), data) ||
--        detail::get32(data + 8) != kVersion ||
--        detail::get32(data + 12) != detail::fnv1a(data + kHeaderBytes, kSaveBytes - kHeaderBytes))
-+    if (size < kSaveBytesV2 || !std::equal(detail::magic.begin(), detail::magic.end(), data))
-+        return ReadStatus::Invalid;
-+    const uint32_t version = detail::get32(data + 8);
-+    size_t rowBytes = 0, total = 0;
-+    if (version == kVersion) { rowBytes = kRowBytes; total = kSaveBytes; }
-+    else if (version == kVersionV2) { rowBytes = kRowBytesV2; total = kSaveBytesV2; }
-+    else return ReadStatus::Invalid;
-+    if (size < total || detail::get32(data + 12) != detail::fnv1a(data + kHeaderBytes, total - kHeaderBytes))
-         return ReadStatus::Invalid;
-     Choices read;
-     Fingerprints prints{};
-+    auto field = [](const uint8_t* at) {
-+        const char* text = reinterpret_cast<const char*>(at);
-+        size_t len = 0;
-+        while (len < kNameBytes && text[len]) ++len;
-+        return std::string(text, len);
-+    };
-     for (size_t i = 0; i < kSlots; ++i) {
--        const uint8_t* row = data + kHeaderBytes + i * kRowBytes;
--        const char* text = reinterpret_cast<const char*>(row);
--        size_t markLen = 0, logoLen = 0;
--        while (markLen < kNameBytes && text[markLen]) ++markLen;
--        while (logoLen < kNameBytes && text[kNameBytes + logoLen]) ++logoLen;
--        read[i].mark.assign(text, markLen);
--        read[i].logo.assign(text + kNameBytes, logoLen);
-+        const uint8_t* row = data + kHeaderBytes + i * rowBytes;
-+        read[i].mark = field(row);
-+        read[i].logo = field(row + kNameBytes);
-         prints[i] = detail::get32(row + 2 * kNameBytes);
-+        if (version == kVersion) {
-+            read[i].uniformHome = field(row + kRowBytesV2);
-+            read[i].uniformRoad = field(row + kRowBytesV2 + kNameBytes);
-+        }
-     }
-     out = std::move(read);
-     fingerprints = prints;
-@@ -180,7 +210,7 @@ inline bool isChosen(const Choices& choices, bool logo, const std::string& file)
- 
- inline void copySlot(Choices& choices, int from, int to) {
-     if (from < 0 || to < 0 || from >= int(kSlots) || to >= int(kSlots)) return;
--    choices[to] = choices[from];
-+    choices[to] = choices[from];  // mark, logo and both uniforms
++inline bool ArrangeCustomUniforms(bool fallback = false) {
++    return Get().arrangeCustomUniforms.value_or(fallback);
++}
++
++inline bool SetArrangeCustomUniforms(bool value) {
++    Mutable().arrangeCustomUniforms = value;
++    return WriteSetting("arrange", "custom_uniforms", value ? "true" : "false");
++}
++
+ inline bool TwoWayPlayer(bool fallback = false) {
+     return Get().twoWayPlayer.value_or(fallback);
  }
- inline void clearSlot(Choices& choices, int slot) {
-     if (slot < 0 || slot >= int(kSlots)) return;
-@@ -219,9 +249,18 @@ inline ReadStatus OnMainSaveLoad(FILE* file, bool enabled) {
-     size_t got = 0;
-     if (std::fseek(file, long(kSaveFileOffset), SEEK_SET) == 0)
-         got = std::fread(block.data(), 1, block.size(), file);
--    std::fseek(file, at, SEEK_SET);
-     SaveState& state = saveState();
--    state.status = readChoices(block.data(), got, state.loaded, state.fingerprints);
-+    if (got >= detail::magic.size() && std::equal(detail::magic.begin(), detail::magic.end(), block.data())) {
-+        state.status = readChoices(block.data(), got, state.loaded, state.fingerprints);
-+    } else {
-+        // No version 3 block here: the version 2 one (0xD3000) or nothing.
-+        std::array<uint8_t, kSaveBytesV2> legacy{};
-+        size_t gotLegacy = 0;
-+        if (std::fseek(file, long(kLegacyFileOffset), SEEK_SET) == 0)
-+            gotLegacy = std::fread(legacy.data(), 1, legacy.size(), file);
-+        state.status = readChoices(legacy.data(), gotLegacy, state.loaded, state.fingerprints);
-+    }
-+    std::fseek(file, at, SEEK_SET);
-     state.unchecked = state.status == ReadStatus::Valid &&
-                       std::any_of(state.loaded.begin(), state.loaded.end(), [](const Choice& c) { return !c.empty(); });
-     state.changed = false;
+diff --git a/runtime/src/hle/mlb/arrange_marks.cpp b/runtime/src/hle/mlb/arrange_marks.cpp
+--- a/runtime/src/hle/mlb/arrange_marks.cpp
++++ b/runtime/src/hle/mlb/arrange_marks.cpp
+@@ -651,7 +651,9 @@ const Choice& choiceFor(uint32_t teamRecordAddress) {
+     return slot >= 0 && slot < int(kSlots) ? liveChoices()[size_t(slot)] : kNone;
+ }
+ 
+-bool SaveHooksEnabled() { return RuntimeConfigFile::ArrangeCustomMarks(false) && Enabled(); }
++bool SaveHooksEnabled() {
++    return (RuntimeConfigFile::ArrangeCustomMarks(false) || RuntimeConfigFile::ArrangeCustomUniforms(false)) && Enabled();
++}
+ 
+ Fingerprints CurrentFingerprints() {
+     Fingerprints out{};
 diff --git a/runtime/src/hle/storage/nand_isfs.cpp b/runtime/src/hle/storage/nand_isfs.cpp
 --- a/runtime/src/hle/storage/nand_isfs.cpp
 +++ b/runtime/src/hle/storage/nand_isfs.cpp
@@ -498,6 +406,102 @@ diff --git a/runtime/src/hle/storage/nand_isfs.cpp b/runtime/src/hle/storage/nan
          }
      }
      
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -300,6 +300,7 @@ constexpr int kOpenSavesFolder = -5;
+ constexpr int kOpenSeasonStudio = -6;
+ constexpr int kOpenCallnameStudio = -7;
+ constexpr int kOpenAnimationStudio = -8;
++constexpr int kOpenUniformStudio = -9;
+ constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, MEJORAS; HERRAMIENTAS follows it
+ constexpr int kEnhancementsTab = 4;
+ 
+@@ -392,6 +393,10 @@ constexpr Phrase kCallnameStudioHelp{
+     "Crea callnames con tu audio WAV o MP3 y asígnalos en PowerUp+ (MODS > EDITAR ROSTER). Activa el mod para usarlos.",
+     "Create callnames with your WAV or MP3 audio and assign them in PowerUp+ (MODS > EDIT ROSTER). Enable the mod to use them."};
+ 
++constexpr Phrase kUniformStudioHelp{
++    "Convierte uniformes de PowerUp Pros 2008 en archivos .ppu y los guarda en UserData/arrange/uniforms para que un equipo de Arrange los lleve. Activa MEJORAS > UNIFORMES PROPIOS (ARRANGE).",
++    "Turns PowerUp Pros 2008 uniforms into .ppu files and saves them in UserData/arrange/uniforms so an Arrange team can wear them. Enable ENHANCEMENTS > CUSTOM UNIFORMS (ARRANGE)."};
++
+ constexpr Phrase kSeasonStudioHelp{
+     "Abre el Editor de temporada, en su propia ventana:\n\n"
+     "- Qué tendrá una partida nueva del modo Temporada o de MLB Life (año, calendario, DH, ligas) y de qué mod "
+@@ -516,6 +521,7 @@ void OpenStudio(const wchar_t* exe) {
+ void OpenTextureStudio() { OpenStudio(L"TextureStudio.exe"); }
+ void OpenSeasonStudio() { OpenStudio(L"SeasonStudio.exe"); }
+ void OpenCallnameStudio() { OpenStudio(L"CallnameStudio.exe"); }
++void OpenUniformStudio() { OpenStudio(L"UniformStudio.exe"); }
+ void OpenAnimationStudio() {
+ #if defined(_WIN32)
+     const auto directory = RuntimeConfigFile::ExecutableDirectory();
+@@ -806,6 +812,15 @@ Result Run(int argc, char** argv) {
+                            "initial."),
+                         YesNo(), RuntimeConfigFile::ArrangeCustomMarks(false) ? 1 : 0};
+     arrangeMarks.experimental = true;
++    Option arrangeUniforms{Tr("UNIFORMES PROPIOS (ARRANGE)", "CUSTOM UNIFORMS (ARRANGE)"),
++                           Tr("Permite elegir para un equipo de Arrange un uniforme importado de la carpeta "
++                              "UserData/arrange/uniforms (se crean con el Editor de uniformes). El equipo lleva el "
++                              "uniforme importado en lugar del de plantilla.",
++                              "Lets an Arrange team wear an imported uniform from the UserData/arrange/uniforms "
++                              "folder (made with the Uniform Studio). The team wears the imported uniform instead of "
++                              "the template one."),
++                           YesNo(), RuntimeConfigFile::ArrangeCustomUniforms(false) ? 1 : 0};
++    arrangeUniforms.experimental = true;
+ 
+     const std::string savedLanguage = RuntimeConfigFile::UiLanguage("auto");
+     Option language{"IDIOMA / LANGUAGE",
+@@ -847,6 +862,7 @@ Result Run(int argc, char** argv) {
+     toolsTab.options.push_back({Tr("EDITOR DE TEXTURAS", "TEXTURE EDITOR"), kTextureStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenTextureStudio});
+     toolsTab.options.push_back({Tr("EDITOR DE TEMPORADA", "SEASON EDITOR"), kSeasonStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenSeasonStudio});
+     toolsTab.options.push_back({Tr("EDITOR DE CALLNAMES", "CALLNAME EDITOR"), kCallnameStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenCallnameStudio});
++    toolsTab.options.push_back({Tr("EDITOR DE UNIFORMES", "UNIFORM STUDIO"), kUniformStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenUniformStudio});
+     toolsTab.options.push_back({Tr("EDITOR DE ANIMACIONES", "ANIMATION EDITOR"), kAnimationStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenAnimationStudio});
+     toolsTab.options.push_back({kRosterPlayersLabel, kRosterPlayersHelp, {Tr("Nativos", "Native"), Tr("Como en el editor", "As in the editor")},
+                                 RuntimeConfigFile::NativeRoster(true) ? 0 : 1});
+@@ -953,7 +969,7 @@ Result Run(int argc, char** argv) {
+         {"AUDIO", {volume, mute}},
+         {Tr("CONTROLES", "CONTROLS"), {wiimote}},
+         {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
+-        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh, modernLeagues, modernPostseason, arrangeMarks, twoWay}},
++        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh, modernLeagues, modernPostseason, arrangeMarks, arrangeUniforms, twoWay}},
+     };
+     tabs.push_back(std::move(modsTab));
+     tabs.push_back(std::move(toolsTab));
+@@ -1030,6 +1046,10 @@ Result Run(int argc, char** argv) {
+             OpenAnimationStudio();
+             return;
+         }
++        if (o.mod == kOpenUniformStudio) {
++            OpenUniformStudio();
++            return;
++        }
+         if (o.mod == kOpenCallnameStudio) {
+             OpenCallnameStudio();
+             return;
+@@ -1096,6 +1116,13 @@ Result Run(int argc, char** argv) {
+                 std::filesystem::create_directories(root / "logos", ec);
+             }
+         }
++        if (label == arrangeUniforms.label) {
++            RuntimeConfigFile::SetArrangeCustomUniforms(o.value != 0);
++            if (o.value != 0) {
++                std::error_code ec;
++                std::filesystem::create_directories(RuntimeConfigFile::ApplicationDataDirectory() / "arrange" / "uniforms", ec);
++            }
++        }
+         if (label == twoWay.label) RuntimeConfigFile::SetTwoWayPlayer(o.value != 0);
+         if (label == shadows.label) RuntimeConfigFile::SetPlayerShadows(kShadowModes[static_cast<size_t>(o.value)]);
+         if (label == crowd.label) RuntimeConfigFile::SetCrowdLevel(kCrowdLevels[static_cast<size_t>(o.value)]);
+@@ -1158,6 +1185,7 @@ Result Run(int argc, char** argv) {
+     if (testAction != nullptr && std::strcmp(testAction, "season-studio") == 0) OpenSeasonStudio();
+     if (testAction != nullptr && std::strcmp(testAction, "animation-studio") == 0) OpenAnimationStudio();
+     if (testAction != nullptr && std::strcmp(testAction, "callname-studio") == 0) OpenCallnameStudio();
++    if (testAction != nullptr && std::strcmp(testAction, "uniform-studio") == 0) OpenUniformStudio();
+     // =language-es / =language-en: switch the language once, as if chosen in INTERFAZ (the launcher is
+     // rebuilt on the same page; the rebuilt one finds the language already set and does nothing).
+     if (testAction != nullptr && std::strncmp(testAction, "language-", 9) == 0) {
 diff --git a/runtime/tests/arrange_marks_save_test.cpp b/runtime/tests/arrange_marks_save_test.cpp
 --- a/runtime/tests/arrange_marks_save_test.cpp
 +++ b/runtime/tests/arrange_marks_save_test.cpp
@@ -685,3 +689,170 @@ diff --git a/runtime/tests/arrange_marks_save_test.cpp b/runtime/tests/arrange_m
      // a missing block (zeros) is written by the first save
      {
          auto data = slurp(file);
+diff --git a/runtime/tests/arrange_uniforms_test.cpp b/runtime/tests/arrange_uniforms_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/tests/arrange_uniforms_test.cpp
+@@ -0,0 +1,140 @@
++#include "arrange_uniforms.h"
++#include <cassert>
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <string>
++#include <vector>
++
++using namespace arrange_uniforms;
++namespace fs = std::filesystem;
++using Bytes = std::vector<uint8_t>;
++
++static uint32_t fnv(const Bytes& b) {
++    uint32_t h = 0x811C9DC5u;
++    for (uint8_t c : b) h = (h ^ c) * 0x01000193u;
++    return h;
++}
++static void be32(Bytes& o, uint32_t v) {
++    for (int s = 24; s >= 0; s -= 8) o.push_back(uint8_t(v >> s));
++}
++// Same layout as tools/uniform-studio/bake.py write_ppu.
++struct K {
++    uint8_t id;
++    uint16_t w, h;
++};
++static Bytes build(const std::vector<K>& kinds, std::vector<uint8_t> backup = std::vector<uint8_t>(10, 3)) {
++    Bytes body(backup.begin(), backup.end());
++    for (const K& k : kinds) {
++        body.push_back(k.id);
++        body.push_back(uint8_t(k.w));
++        body.push_back(uint8_t(k.w >> 8));
++        body.push_back(uint8_t(k.h));
++        body.push_back(uint8_t(k.h >> 8));
++        for (int i = 0; i < 512; i++) body.push_back(uint8_t(i));
++        for (size_t i = 0; i < size_t(k.w) * k.h; i++) body.push_back(uint8_t(i * 7));
++    }
++    Bytes out = {'P', 'P', 'U', 'N', 'I', 'F', 0, 0};
++    be32(out, 1);
++    be32(out, fnv(body));
++    out.insert(out.end(), body.begin(), body.end());
++    return out;
++}
++// Re-seal after tampering with the body so only the targeted field is wrong.
++static void reseal(Bytes& b) {
++    Bytes body(b.begin() + 16, b.end());
++    uint32_t c = fnv(body);
++    for (int i = 0; i < 4; i++) b[12 + i] = uint8_t(c >> (24 - 8 * i));
++}
++static ReadStatus rd(const Bytes& b, Uniform* u = nullptr) {
++    Uniform tmp;
++    return readPpu(b.data(), b.size(), u ? *u : tmp);
++}
++static void put(const fs::path& p, const Bytes& b) {
++    std::ofstream(p, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), std::streamsize(b.size()));
++}
++
++int main() {
++    const std::vector<K> all = {{0, 128, 128}, {1, 64, 32}, {2, 64, 32}, {3, 64, 32}};
++    Uniform u;
++    Bytes good = build({{0, 128, 128}}, {0, 1, 2, 3, 4, 5, 6, 7, 8, 31});
++    assert(rd(good, &u) == ReadStatus::Valid);
++    assert(u.atlases.size() == 1 && u.atlases.count("body"));
++    const Atlas& a = u.atlases.at("body");
++    assert(a.w == 128 && a.h == 128 && a.indices.size() == 128 * 128);
++    assert(a.palette[0] == 0 && a.palette[511] == uint8_t(511) && a.indices[1] == 7);
++    assert(u.backup[9] == 31 && u.backup[3] == 3);
++    Uniform u4;
++    assert(rd(build(all), &u4) == ReadStatus::Valid);
++    assert(u4.atlases.size() == 4 && u4.atlases.count("cap") && u4.atlases.count("helmet") &&
++           u4.atlases.count("number"));
++    assert(u4.atlases.at("number").w == 64 && u4.atlases.at("number").h == 32);
++    assert(rd(build({})) == ReadStatus::Valid);  // backup only, like bake.read_ppu
++
++    assert(rd({}) == ReadStatus::Missing);
++    assert(rd(Bytes(4096, 0)) == ReadStatus::Missing);
++    assert(readPpu(nullptr, 0, u) == ReadStatus::Missing);
++
++    Bytes b = good;
++    b[0] = 'X';
++    assert(rd(b) == ReadStatus::Invalid);  // magic
++    b = good;
++    b[11] = 2;
++    reseal(b);
++    assert(rd(b) == ReadStatus::Invalid);  // version
++    b = good;
++    b[12] ^= 1;
++    assert(rd(b) == ReadStatus::Invalid);  // checksum
++    b = good;
++    b.back() ^= 0xFF;
++    assert(rd(b) == ReadStatus::Invalid);  // body altered, stale sum
++    b = good;
++    b[16 + 4] = 32;
++    reseal(b);
++    assert(rd(b) == ReadStatus::Invalid);  // backup
++    b = good;
++    b[16 + 10] = 4;
++    reseal(b);
++    assert(rd(b) == ReadStatus::Invalid);  // kind id
++    assert(rd(build({{0, 64, 32}})) == ReadStatus::Invalid);              // body wrong size
++    assert(rd(build({{1, 128, 128}})) == ReadStatus::Invalid);            // cap wrong size
++    assert(rd(build({{3, 64, 64}})) == ReadStatus::Invalid);              // number wrong size
++    assert(rd(build({{1, 64, 32}, {1, 64, 32}})) == ReadStatus::Invalid);  // repeated kind
++    b = good;
++    b.resize(b.size() - 1);
++    reseal(b);
++    assert(rd(b) == ReadStatus::Invalid);  // truncated pixels, valid sum
++    b = good;
++    b.resize(16 + 10 + 3);
++    reseal(b);
++    assert(rd(b) == ReadStatus::Invalid);  // truncated atlas header
++    b = good;
++    b.resize(10);
++    assert(rd(b) == ReadStatus::Invalid);  // shorter than header
++    b = good;
++    b.resize(b.size() - 1);
++    assert(rd(b) == ReadStatus::Invalid);  // truncated, stale sum
++    Uniform keep = u4;
++    b = good;
++    b[12] ^= 1;
++    assert(readPpu(b.data(), b.size(), keep) == ReadStatus::Invalid && keep.atlases.size() == 4);
++
++    fs::path tmp = fs::temp_directory_path() / ("mlb_arrange_uniforms_test_" +
++                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++    fs::remove_all(tmp);
++    for (const char* d : {"B", "A", "C", "E"}) fs::create_directories(tmp / d);
++    put(tmp / "A" / "uniform.ppu", good);
++    put(tmp / "B" / "uniform.ppu", good);
++    put(tmp / "E" / "uniform.ppu", {});  // empty file: ignored
++    put(tmp / "x.txt", {'h', 'i'});
++    put(tmp / "uniform.ppu", good);  // loose file at the root: ignored
++    auto e = scan(tmp);
++    assert(e.size() == 2);
++    assert(e[0].folder == "A" && e[0].label == "A" && e[1].folder == "B" && e[1].label == "B");
++    assert(scan(tmp / "nope").empty());
++    fs::remove_all(tmp);
++
++    std::puts("arrange_uniforms OK");
++    return 0;
++}
+diff --git a/runtime/tests/runtime_config_tests.cpp b/runtime/tests/runtime_config_tests.cpp
+--- a/runtime/tests/runtime_config_tests.cpp
++++ b/runtime/tests/runtime_config_tests.cpp
+@@ -40,6 +40,18 @@ int main() {
+         if (!Require(!RuntimeConfigFile::ParseConfig(empty, "empty.toml").arrangeCustomMarks.value_or(false),
+                      "arrange custom marks must default to off")) return 1;
+     }
++    {
++        for (const char* value : {"true", "false", "\"x\"", "1"}) {
++            std::istringstream input(std::string("[arrange]\ncustom_uniforms = ") + value + "\n");
++            const auto config = RuntimeConfigFile::ParseConfig(input, "arrange.toml");
++            const std::optional<bool> expected = std::string(value) == "true" ? std::optional<bool>{true}
++                                                : std::string(value) == "false" ? std::optional<bool>{false}
++                                                                               : std::nullopt;
++            if (!Require(config.arrangeCustomUniforms == expected, "invalid arrange custom_uniforms parsing")) return 1;
++        }
++        std::istringstream empty("");
++        if (!Require(!RuntimeConfigFile::ParseConfig(empty, "empty.toml").arrangeCustomUniforms.value_or(false), "arrange custom uniforms must default to off")) return 1;
++    }
+     {
+         std::istringstream input("[video]\nmetalfx_spatial_upscaling = true\n");
+         const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "enabled.toml");
