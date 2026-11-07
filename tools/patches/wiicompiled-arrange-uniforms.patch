@@ -1,4 +1,5 @@
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index fc9b090..4fe2791 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
 @@ -460,7 +460,7 @@ target_compile_features(mkw_season_pack_tests PRIVATE cxx_std_20)
@@ -11,6 +12,7 @@ diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
      target_compile_features(mkw_${case}_test PRIVATE cxx_std_20)
      target_compile_options(mkw_${case}_test PRIVATE -UNDEBUG)
 diff --git a/runtime/include/arrange_marks_save.h b/runtime/include/arrange_marks_save.h
+index e58f165..672f49a 100644
 --- a/runtime/include/arrange_marks_save.h
 +++ b/runtime/include/arrange_marks_save.h
 @@ -5,12 +5,15 @@
@@ -183,6 +185,7 @@ diff --git a/runtime/include/arrange_marks_save.h b/runtime/include/arrange_mark
      state.changed = false;
 diff --git a/runtime/include/arrange_uniforms.h b/runtime/include/arrange_uniforms.h
 new file mode 100644
+index 0000000..66ed077
 --- /dev/null
 +++ b/runtime/include/arrange_uniforms.h
 @@ -0,0 +1,142 @@
@@ -329,6 +332,7 @@ new file mode 100644
 +
 +}  // namespace arrange_uniforms
 diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+index 2ae8e46..32c99c8 100644
 --- a/runtime/include/runtime_config.h
 +++ b/runtime/include/runtime_config.h
 @@ -47,6 +47,7 @@ struct RuntimeUserConfig {
@@ -364,6 +368,7 @@ diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
      return Get().twoWayPlayer.value_or(fallback);
  }
 diff --git a/runtime/src/hle/mlb/arrange_marks.cpp b/runtime/src/hle/mlb/arrange_marks.cpp
+index fcc3345..6150355 100644
 --- a/runtime/src/hle/mlb/arrange_marks.cpp
 +++ b/runtime/src/hle/mlb/arrange_marks.cpp
 @@ -651,7 +651,9 @@ const Choice& choiceFor(uint32_t teamRecordAddress) {
@@ -377,7 +382,415 @@ diff --git a/runtime/src/hle/mlb/arrange_marks.cpp b/runtime/src/hle/mlb/arrange
  
  Fingerprints CurrentFingerprints() {
      Fingerprints out{};
+diff --git a/runtime/src/hle/mlb/arrange_uniforms.cpp b/runtime/src/hle/mlb/arrange_uniforms.cpp
+new file mode 100644
+index 0000000..b3dff84
+--- /dev/null
++++ b/runtime/src/hle/mlb/arrange_uniforms.cpp
+@@ -0,0 +1,375 @@
++// Imported uniforms for Arrange teams ([arrange] custom_uniforms): a team that chose an imported
++// uniform (a .ppu baked by Uniform Studio, in UserData/arrange/uniforms/<folder>) wears it natively
++// wherever the game draws that team. Addresses and evidence: docs/ingenieria-inversa.md ("Uniforme
++// importado: ganchos verificados G1-G4") and local/analysis/arrange/uniform/{re.md,spike/spike.md}.
++//
++// Design (verified in-game by Task 1):
++// - The character composes its body per character at 0x806CC2EC from its own slots: body texture
++//   char+0x8C, body palette char+0x9C; cap char+0x11C/+0x14C, helmet char+0x12C/+0x15C, chest
++//   char+0x10C/+0x13C; back number char+0xAC/+0xBC/+0xCC/+0xDC. 0x806DC9E8(char, desc) applies a
++//   uniform descriptor to a character and fills those slots (via 0x806DEFAC). We hook 0x806DC9E8:
++//   after the original, if the descriptor is an Arrange uniform descriptor (manager [0x81033438],
++//   gestor+0x2908+idx*0x44) whose idx has a chosen uniform, we overwrite the body / cap / helmet /
++//   chest slots with our own texture+palette objects, and leave the number slots untouched (G4).
++//   The body MUST be done here, not at 0x806BDC3C: desc+0x04 is a pack id resolved by
++//   fn_8000C330(0x6A1, id); only the resolved pointer char+0x8C+0xC can point at our texels.
++// - Per-character isolation (G1): we only write the character's own slots, never the global body
++//   atlas (0x977A2720) or the global cap/chest letter structs (0x974A2F80 / 0x974B3C20), which are
++//   shared by every team (R2: confirmed global in Task 1).
++// - The initial's red letter is removed because our cap / chest textures replace those slots (an
++//   opaque texture with the cap colour baked in by Uniform Studio, so no dark box: G2).
++// - idx -> (slot, side) -> folder: when the game fills a manager idx from a record we learn which
++//   folder (home or away) that idx should wear. Editor / Original Team: 0x805A83F0(record) fills
++//   idx 0 (home) and 1 (away). Match / Exhibition: 0x806C10FC(idx, bytes, initial) with bytes at
++//   record+0x1C (home) or +0x26 (away). The map is cleared when the manager is (re)loaded or
++//   destroyed (0x806BD974 / 0x806BD8D0).
++// - Textures live in a MEM2 arena reserved at boot (ReserveGuestMemory, chained after the marks
++//   arena in game_heaps.cpp); a small LRU cache holds the uniforms being shown (R1: arena lifetime,
++//   recycled, nothing leaks). With the option off nothing is reserved and every hook calls the
++//   original unchanged.
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <map>
++#include <string>
++#include <vector>
++
++#include "abi_bridge.h"
++#include "arrange_marks_save.h"
++#include "arrange_uniforms.h"
++#include "gx_guest_write.h"
++#include "hle_stubs.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++#include "runtime_config.h"
++
++// choiceFor and Enabled live in arrange_marks.cpp (the shared save/choice state).
++namespace arrange_marks {
++const Choice& choiceFor(uint32_t teamRecordAddress);
++}
++
++#define ORIGINAL(address) extern "C" void func_##address(CpuContext*)
++ORIGINAL(806DC9E8);
++ORIGINAL(805A83F0);
++ORIGINAL(806C10FC);
++ORIGINAL(806BD974);
++ORIGINAL(806BD8D0);
++#undef ORIGINAL
++
++namespace arrange_uniforms {
++namespace {
++namespace fs = std::filesystem;
++using arrange_marks::Choice;
++
++// --- Guest game data ----------------------------------------------------------------------------
++constexpr uint32_t kManagerPtr = 0x81033438;  // [.] = uniform manager (gestor)
++constexpr uint32_t kDescOffset = 0x2908, kDescStride = 0x44, kMaxIdx = 64;
++constexpr uint32_t kSlotBlock = 0x8104E1D8, kSlotsOffset = 0x3AC, kSlotStride = 0x2448, kRecord = 0x42;
++constexpr uint32_t kMatchSlot = 0x8102D730, kEditingSlot = 0x8102B2C8;
++const bool g_trace = std::getenv("WIICOMPILED_ARRANGE_TRACE") != nullptr;
++// Character slots {type, pack, id/v, resolved@+0xC}; textures are drawn through the resolved pointer
++// (+0xC), palettes through the whole palette-object pointer (+0xC).
++constexpr uint32_t kChBodyTex = 0x8C, kChBodyPal = 0x9C, kChCapTex = 0x11C, kChCapPal = 0x14C,
++                   kChHelmetTex = 0x12C, kChHelmetPal = 0x15C, kChChestTex = 0x10C, kChChestPal = 0x13C;
++constexpr uint32_t kSlotResolved = 0xC;
++
++// --- Cache arena --------------------------------------------------------------------------------
++// One entry: body (128x128) then cap, helmet, chest (64x32 each); each part is texels + palette
++// (256 x RGB5A3) + a texture descriptor (0x40) + a palette object (0x20), written as the game's own.
++constexpr uint32_t kBodyPixels = 128 * 128, kDecalPixels = 64 * 32, kPaletteBytes = 512;
++constexpr uint32_t kTexDescBytes = 0x40, kPalObjBytes = 0x20;
++constexpr uint32_t kBodyTexels = 0;
++constexpr uint32_t kBodyPalette = kBodyTexels + kBodyPixels;            // 0x4000
++constexpr uint32_t kBodyTexDesc = kBodyPalette + kPaletteBytes;         // 0x4200
++constexpr uint32_t kBodyPalObj = kBodyTexDesc + kTexDescBytes;          // 0x4240
++constexpr uint32_t kDecal0 = kBodyPalObj + kPalObjBytes;                // 0x4260
++constexpr uint32_t kDecalStride = kDecalPixels + kPaletteBytes + kTexDescBytes + kPalObjBytes;  // 0xA60
++constexpr uint32_t kEntryBytes = (kDecal0 + 3 * kDecalStride + 0x1Fu) & ~0x1Fu;  // body + cap/helmet/chest
++constexpr uint32_t kCacheSlots = 8;
++constexpr uint32_t kArenaBytes = kCacheSlots * kEntryBytes;
++
++uint32_t g_arena = 0;
++bool Enabled() { return g_arena != 0; }
++uint32_t EntryAddress(int slot) { return g_arena + uint32_t(slot) * kEntryBytes; }
++
++struct Part {
++    uint32_t texels, palette, texDesc, palObj, pixels;
++};
++// kind: 0 body, 1 cap, 2 helmet, 3 chest.
++Part PartOf(uint32_t base, int kind) {
++    if (kind == 0) return {base + kBodyTexels, base + kBodyPalette, base + kBodyTexDesc, base + kBodyPalObj, kBodyPixels};
++    const uint32_t d = base + kDecal0 + uint32_t(kind - 1) * kDecalStride;
++    return {d, d + kDecalPixels, d + kDecalPixels + kPaletteBytes,
++            d + kDecalPixels + kPaletteBytes + kTexDescBytes, kDecalPixels};
++}
++
++// The texture + its two descriptors into guest memory (the game's C8 format; same as marks).
++void PutTexture(const Part& p, uint16_t w, uint16_t h, const uint8_t* indices, const uint8_t* palette512) {
++    std::memcpy(Memory::GetPointer(p.texels, size_t(w) * h), indices, size_t(w) * h);
++    std::memcpy(Memory::GetPointer(p.palette, kPaletteBytes), palette512, kPaletteBytes);  // already big-endian
++    const uint32_t tex[16] = {uint32_t(h) << 16 | w, 9, p.texels, 0, 0, 1, 1};
++    for (uint32_t i = 0; i < 16; ++i) Memory::Write32(p.texDesc + i * 4, tex[i]);
++    const uint32_t pal[8] = {256u << 16, 2, p.palette};
++    for (uint32_t i = 0; i < 8; ++i) Memory::Write32(p.palObj + i * 4, pal[i]);
++}
++
++// --- Uniform cache ------------------------------------------------------------------------------
++struct Built {
++    // Per kind (body, cap, helmet, chest): texture-descriptor and palette-object addresses, 0 if the
++    // .ppu has no atlas for that kind (that slot is then left as the game set it).
++    uint32_t texDesc[4] = {}, palObj[4] = {};
++    bool valid = false;
++};
++struct Cached {
++    Built built;
++    fs::file_time_type time{};
++    uintmax_t size = 0;
++    uint64_t used = 0;
++    int slot = -1;
++    bool failed = false;
++    std::chrono::steady_clock::time_point checked{};
++};
++std::map<std::string, Cached> g_cache;           // folder -> cached build
++std::array<std::string, kCacheSlots> g_owner;    // arena slot -> folder
++uint64_t g_clock = 0;
++
++fs::path UniformsRoot() { return RuntimeConfigFile::ApplicationDataDirectory() / "arrange" / "uniforms"; }
++
++int FreeSlot() {
++    for (uint32_t i = 0; i < kCacheSlots; ++i)
++        if (g_owner[i].empty()) return int(i);
++    int oldest = 0;
++    uint64_t when = UINT64_MAX;
++    for (const auto& [folder, c] : g_cache)
++        if (c.slot >= 0 && c.used < when) { when = c.used; oldest = c.slot; }
++    g_cache[g_owner[size_t(oldest)]].slot = -1;
++    g_owner[size_t(oldest)].clear();
++    return oldest;
++}
++
++// Build (or reuse) the guest objects for a folder's uniform; false if missing/invalid (fallback).
++bool LoadUniform(const std::string& folder, Built& out) {
++    out = {};
++    if (!Enabled() || folder.empty()) return false;
++    const auto now = std::chrono::steady_clock::now();
++    const fs::path ppu = UniformsRoot() / folder / "uniform.ppu";
++    std::error_code ec;
++    const bool exists = fs::is_regular_file(ppu, ec) && !ec;
++    fs::file_time_type time = exists ? fs::last_write_time(ppu, ec) : fs::file_time_type{};
++    uintmax_t size = exists ? fs::file_size(ppu, ec) : 0;
++
++    Cached& c = g_cache[folder];
++    const bool fresh = exists && c.time == time && c.size == size;
++    if (fresh && c.slot >= 0 && g_owner[size_t(c.slot)] == folder) {
++        c.used = ++g_clock;
++        out = c.built;
++        return out.valid;
++    }
++    if (fresh && c.failed) return false;
++    if (!exists) {
++        if (!c.failed) std::fprintf(stderr, "[arrange] uniform '%s' not found: the game uniform is shown\n", folder.c_str());
++        c = {}; c.failed = true; c.time = time; c.size = size;
++        return false;
++    }
++
++    std::vector<uint8_t> bytes;
++    {
++        std::ifstream f(ppu, std::ios::binary);
++        if (f) bytes.assign(std::istreambuf_iterator<char>(f), {});
++    }
++    Uniform u;
++    const ReadStatus st = readPpu(bytes.data(), bytes.size(), u);
++    if (st != ReadStatus::Valid) {
++        std::fprintf(stderr, "[arrange] uniform '%s' not used (%s): the game uniform is shown\n", folder.c_str(),
++                     st == ReadStatus::Missing ? "empty" : "invalid");
++        if (c.slot >= 0 && g_owner[size_t(c.slot)] == folder) g_owner[size_t(c.slot)].clear();
++        c = {}; c.failed = true; c.time = time; c.size = size; c.slot = -1;
++        return false;
++    }
++
++    const int slot = (c.slot >= 0 && g_owner[size_t(c.slot)] == folder) ? c.slot : FreeSlot();
++    const uint32_t base = EntryAddress(slot);
++    static constexpr const char* kKinds[4] = {"body", "cap", "helmet", "chest"};
++    Built built;
++    for (int kind = 0; kind < 4; ++kind) {
++        const auto it = u.atlases.find(kKinds[kind]);
++        if (it == u.atlases.end()) continue;
++        const Atlas& a = it->second;
++        const Part p = PartOf(base, kind);
++        if (size_t(a.w) * a.h != p.pixels || a.indices.size() != p.pixels) continue;
++        PutTexture(p, a.w, a.h, a.indices.data(), a.palette.data());
++        built.texDesc[kind] = p.texDesc;
++        built.palObj[kind] = p.palObj;
++    }
++    built.valid = built.texDesc[0] != 0 || built.texDesc[1] != 0 || built.texDesc[2] != 0 || built.texDesc[3] != 0;
++    GxGuestWrite::NotifyWrite(base, kEntryBytes);
++    g_owner[size_t(slot)] = folder;
++    c = {built, time, size, ++g_clock, slot, false, now};
++    std::fprintf(stderr, "[arrange] uniform '%s' loaded (cache slot %d)\n", folder.c_str(), slot);
++    out = built;
++    return built.valid;
++}
++
++// --- (manager idx) -> folder --------------------------------------------------------------------
++// Set by the mapping hooks, read by the apply hook; cleared when the manager is (re)loaded/destroyed.
++std::array<std::string, kMaxIdx> g_idxFolder;
++void ClearIdx() { for (auto& s : g_idxFolder) s.clear(); }
++
++uint32_t Manager() { return Memory::Read32(kManagerPtr); }
++
++// desc is gestor+0x2908+idx*0x44 -> idx, or -1 if not an Arrange uniform descriptor.
++int IdxOfDescriptor(uint32_t desc) {
++    const uint32_t g = Manager();
++    if (!g || desc < g + kDescOffset) return -1;
++    const uint32_t off = desc - (g + kDescOffset);
++    if (off % kDescStride) return -1;
++    const uint32_t idx = off / kDescStride;
++    return idx < kMaxIdx ? int(idx) : -1;
++}
++
++bool ValidRecord(uint32_t record) { return record >= 0x80000000u && Memory::Contains(record, 0x37); }
++
++// The record of the slot being edited ([0x8102B2C8] + 0x42), or 0. The editor / Original Team work on
++// the real slot; 0x805A83F0 is handed a stack copy of its record, so choiceFor needs the real one.
++uint32_t EditingRecord() {
++    const uint32_t slot = Memory::Read32(kEditingSlot);
++    if (!slot) return 0;
++    const uint32_t block = Memory::Read32(kSlotBlock);
++    const uint32_t first = block ? block + kSlotsOffset : 0;
++    if (!block || slot < first || slot >= first + 32 * kSlotStride || (slot - first) % kSlotStride) return 0;
++    return slot + kRecord;
++}
++
++// bytes points at a record's home uniform (record+0x1C) or away (record+0x26); return the record and
++// whether it is the home side, by checking which candidate is a real team record.
++bool RecordFromBytes(uint32_t bytes, uint32_t& record, bool& home) {
++    for (int side = 0; side < 2; ++side) {
++        const uint32_t cand = bytes - (side == 0 ? 0x1C : 0x26);
++        if (cand < kRecord || !ValidRecord(cand)) continue;
++        const uint32_t block = Memory::Read32(kSlotBlock);
++        const uint32_t first = block ? block + kSlotsOffset : 0;
++        const bool inBlock = block && cand >= first + kRecord &&
++                             (cand - kRecord - first) % kSlotStride == 0 &&
++                             (cand - kRecord - first) / kSlotStride < 32;
++        const bool matchSlot = cand == kMatchSlot + kRecord;
++        if (inBlock || matchSlot) { record = cand; home = side == 0; return true; }
++    }
++    return false;
++}
++
++void SetIdxFromRecord(int idx, uint32_t record, bool home) {
++    if (idx < 0 || idx >= int(kMaxIdx) || !ValidRecord(record)) return;
++    const Choice& ch = arrange_marks::choiceFor(record);
++    g_idxFolder[size_t(idx)] = home ? ch.uniformHome : ch.uniformRoad;
++}
++
++// --- Apply --------------------------------------------------------------------------------------
++void WriteSlot(uint32_t ch, uint32_t texOffset, uint32_t palOffset, uint32_t texDesc, uint32_t palObj) {
++    if (texDesc) Memory::Write32(ch + texOffset + kSlotResolved, texDesc);
++    if (palObj) Memory::Write32(ch + palOffset + kSlotResolved, palObj);
++}
++
++void ApplyUniform(uint32_t ch, const Built& b) {
++    // Body (G1), cap/helmet/chest (G2). Number slots (char+0xAC/+0xBC/+0xCC/+0xDC) are left intact (G4).
++    // The cap letter shows through the cap (char+0x11C) and the helmet (char+0x12C) slots (both resolve
++    // to the game's shared letter struct, Task 1); the .ppu's cap atlas covers both, so the red initial
++    // is gone from either (a .ppu with its own helmet atlas overrides that one).
++    const uint32_t helmetTex = b.texDesc[2] ? b.texDesc[2] : b.texDesc[1];
++    const uint32_t helmetPal = b.texDesc[2] ? b.palObj[2] : b.palObj[1];
++    WriteSlot(ch, kChBodyTex, kChBodyPal, b.texDesc[0], b.palObj[0]);
++    WriteSlot(ch, kChCapTex, kChCapPal, b.texDesc[1], b.palObj[1]);
++    WriteSlot(ch, kChHelmetTex, kChHelmetPal, helmetTex, helmetPal);
++    WriteSlot(ch, kChChestTex, kChChestPal, b.texDesc[3], b.palObj[3]);
++}
++
++}  // namespace
++
++// --- Interfaces ---------------------------------------------------------------------------------
++uint32_t ReserveGuestMemory(uint32_t low, uint32_t high) {
++    g_arena = 0;
++    if (!RuntimeConfigFile::ArrangeCustomUniforms(false)) return high;
++    const uint32_t arena = (high - kArenaBytes) & ~0xFFFu;
++    if (high <= low || arena < low || high - low < kArenaBytes + 0x1000 || !Memory::Contains(arena, kArenaBytes)) {
++        std::fprintf(stderr, "[arrange] custom uniforms off: no room in the MEM2 arena\n");
++        return high;
++    }
++    std::memset(Memory::GetPointer(arena, kArenaBytes), 0, kArenaBytes);
++    g_arena = arena;
++    std::fprintf(stderr, "[arrange] custom uniforms on: %u KB of MEM2 at 0x%08x\n", kArenaBytes / 1024, arena);
++    return arena;
++}
++
++}  // namespace arrange_uniforms
++
++using namespace arrange_uniforms;
++
++// 0x806DC9E8(char, desc): after the game applies the uniform, overwrite this character's body / cap /
++// helmet / chest slots if its manager idx has a chosen imported uniform.
++extern "C" void MLB_ArrangeUniformApply_806DC9E8(CpuContext* ctx) {
++    const uint32_t ch = ctx->gpr[3], desc = ctx->gpr[4];
++    func_806DC9E8(ctx);
++    if (!Enabled()) return;
++    const int idx = IdxOfDescriptor(desc);
++    if (g_trace)
++        std::fprintf(stderr, "[arrange-uniform] 806DC9E8 enter char=%08x desc=%08x mgr=%08x idx=%d\n", ch, desc,
++                     Manager(), idx);
++    if (idx < 0 || ch < 0x80000000u || !Memory::Contains(ch, 0x170)) return;
++    const std::string& folder = g_idxFolder[size_t(idx)];
++    if (folder.empty()) return;
++    Built b;
++    const bool ok = LoadUniform(folder, b);
++    if (g_trace)
++        std::fprintf(stderr, "[arrange-uniform] 806DC9E8 char=%08x idx=%d folder='%s' ok=%d\n", ch, idx,
++                     folder.c_str(), ok ? 1 : 0);
++    if (ok) ApplyUniform(ch, b);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x806DC9E8, MLB_ArrangeUniformApply_806DC9E8, "MLB_ArrangeUniformApply_806DC9E8");
++
++// 0x805A83F0(record): the editor / Original Team path composes idx 0 (home) and 1 (away) of `record`.
++extern "C" void MLB_ArrangeUniformEditorMap_805A83F0(CpuContext* ctx) {
++    if (Enabled()) {
++        // The editor / Original Team hand a stack copy of the record; choiceFor needs the real slot.
++        uint32_t record = EditingRecord();
++        if (!record && ValidRecord(ctx->gpr[3])) record = ctx->gpr[3];
++        if (record) {
++            SetIdxFromRecord(0, record, true);
++            SetIdxFromRecord(1, record, false);
++            if (g_trace)
++                std::fprintf(stderr, "[arrange-uniform] 805A83F0 rec=%08x home='%s' road='%s'\n", record,
++                             g_idxFolder[0].c_str(), g_idxFolder[1].c_str());
++        }
++    }
++    func_805A83F0(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805A83F0, MLB_ArrangeUniformEditorMap_805A83F0, "MLB_ArrangeUniformEditorMap_805A83F0");
++
++// 0x806C10FC(idx, bytes, initial): match / exhibition fill of one manager idx from a record's home
++// (record+0x1C) or away (record+0x26) uniform bytes.
++extern "C" void MLB_ArrangeUniformMatchMap_806C10FC(CpuContext* ctx) {
++    if (Enabled()) {
++        const uint32_t idx = ctx->gpr[3], bytes = ctx->gpr[4];
++        uint32_t record = 0;
++        bool home = false;
++        if (idx < kMaxIdx && RecordFromBytes(bytes, record, home)) SetIdxFromRecord(int(idx), record, home);
++    }
++    func_806C10FC(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x806C10FC, MLB_ArrangeUniformMatchMap_806C10FC, "MLB_ArrangeUniformMatchMap_806C10FC");
++
++// 0x806BD974(manager, mode): the manager is (re)loaded; forget the previous idx->folder map.
++extern "C" void MLB_ArrangeUniformManagerLoad_806BD974(CpuContext* ctx) {
++    if (Enabled()) ClearIdx();
++    func_806BD974(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x806BD974, MLB_ArrangeUniformManagerLoad_806BD974, "MLB_ArrangeUniformManagerLoad_806BD974");
++
++// 0x806BD8D0: the manager is destroyed; forget the map.
++extern "C" void MLB_ArrangeUniformManagerFree_806BD8D0(CpuContext* ctx) {
++    if (Enabled()) ClearIdx();
++    func_806BD8D0(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x806BD8D0, MLB_ArrangeUniformManagerFree_806BD8D0, "MLB_ArrangeUniformManagerFree_806BD8D0");
+diff --git a/runtime/src/hle/mlb/game_heaps.cpp b/runtime/src/hle/mlb/game_heaps.cpp
+index 5c22428..5f8e92f 100644
+--- a/runtime/src/hle/mlb/game_heaps.cpp
++++ b/runtime/src/hle/mlb/game_heaps.cpp
+@@ -19,6 +19,12 @@
+ #include "hle_stubs.h"
+ #include "memory.h"
+ 
++// Custom Arrange uniforms ([arrange] custom_uniforms): reserves its MEM2 arena below the marks one
++// (src/hle/mlb/arrange_uniforms.cpp).
++namespace arrange_uniforms {
++uint32_t ReserveGuestMemory(uint32_t low, uint32_t high);
++}
++
+ namespace mlb_heaps {
+ 
+ constexpr uint32_t kMem1Heap = 0x802B57A8, kMem2Heap = 0x802B57C8;
+@@ -52,6 +58,8 @@ uint32_t Setup(CpuContext* cpu) {
+     set(kMem2Hi, animation_overrides::Reserve(lo2, get(kMem2Hi)));
+     // Custom Arrange marks ([arrange] custom_marks): their textures live above the heap.
+     set(kMem2Hi, arrange_marks::ReserveGuestMemory(lo2, get(kMem2Hi)));
++    // Custom Arrange uniforms ([arrange] custom_uniforms): their textures live below the marks arena.
++    set(kMem2Hi, arrange_uniforms::ReserveGuestMemory(lo2, get(kMem2Hi)));
+     const uint32_t arena2 = (get(kMem2Hi) - lo2) & ~31u;
+     const uint32_t size2 = std::max(arena2, kRetailMem2HeapSize);
+     set(kMem2Lo, (lo2 + size2 + 31) & ~31u);
 diff --git a/runtime/src/hle/storage/nand_isfs.cpp b/runtime/src/hle/storage/nand_isfs.cpp
+index d8f0c80..83ea471 100644
 --- a/runtime/src/hle/storage/nand_isfs.cpp
 +++ b/runtime/src/hle/storage/nand_isfs.cpp
 @@ -570,7 +570,7 @@ extern "C" int32_t NAND_IOS_Read_HLE(uint32_t fd, uint32_t bufferPtr, uint32_t l
@@ -407,6 +820,7 @@ diff --git a/runtime/src/hle/storage/nand_isfs.cpp b/runtime/src/hle/storage/nan
      }
      
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 1fa8ed1..18e5e19 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
 @@ -300,6 +300,7 @@ constexpr int kOpenSavesFolder = -5;
@@ -503,6 +917,7 @@ diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
      // rebuilt on the same page; the rebuilt one finds the language already set and does nothing).
      if (testAction != nullptr && std::strncmp(testAction, "language-", 9) == 0) {
 diff --git a/runtime/tests/arrange_marks_save_test.cpp b/runtime/tests/arrange_marks_save_test.cpp
+index 5a346e2..aae6193 100644
 --- a/runtime/tests/arrange_marks_save_test.cpp
 +++ b/runtime/tests/arrange_marks_save_test.cpp
 @@ -55,6 +55,26 @@ static std::vector<uint8_t> versionOneBlock() {
@@ -691,6 +1106,7 @@ diff --git a/runtime/tests/arrange_marks_save_test.cpp b/runtime/tests/arrange_m
          auto data = slurp(file);
 diff --git a/runtime/tests/arrange_uniforms_test.cpp b/runtime/tests/arrange_uniforms_test.cpp
 new file mode 100644
+index 0000000..96241ca
 --- /dev/null
 +++ b/runtime/tests/arrange_uniforms_test.cpp
 @@ -0,0 +1,140 @@
@@ -835,6 +1251,7 @@ new file mode 100644
 +    return 0;
 +}
 diff --git a/runtime/tests/runtime_config_tests.cpp b/runtime/tests/runtime_config_tests.cpp
+index 84bb6e5..8ae4615 100644
 --- a/runtime/tests/runtime_config_tests.cpp
 +++ b/runtime/tests/runtime_config_tests.cpp
 @@ -40,6 +40,18 @@ int main() {
