@@ -17,7 +17,11 @@ import numpy as np
 from PIL import Image
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+EXE = ROOT / "local" / "build" / "uniform-studio" / "UniformStudio.exe"
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(ROOT / "tools"))
+import packwii  # noqa: E402
 from bake import read_ppu, write_ppu  # noqa: E402
 
 
@@ -65,6 +69,41 @@ class T(unittest.TestCase):
             direct = t / "direct.ppu"
             write_ppu(direct, {"body": body, "cap": cap}, backup)
             self.assertEqual(out.read_bytes(), direct.read_bytes())
+
+    def test_decoded_content_survives(self):
+        # A known colour on known pixels must survive bake -> read_ppu -> decode (palette entry + C8 index).
+        color = (33, 198, 123)
+        a = np.zeros((128, 128, 4), np.uint8)
+        a[40:56, 40:56, :3] = color
+        a[40:56, 40:56, 3] = 255
+        with tempfile.TemporaryDirectory() as t:
+            ppu = Path(t) / "u.ppu"
+            write_ppu(ppu, {"body": Image.fromarray(a, "RGBA")}, [0] * 10)
+            w, h, pal, px = read_ppu(ppu)["atlases"]["body"]
+            self.assertEqual((w, h), (128, 128))
+            dec = packwii.decode(px, w, h, 9, np.frombuffer(pal, ">u2"))  # (h, w, 4) RGBA
+            self.assertEqual(int(dec[2, 2, 3]), 0)  # transparent corner stays index 0 -> alpha 0
+            self.assertEqual(int(dec[48, 48, 3]), 255)  # the block is opaque
+            for got, want in zip(dec[48, 48, :3], color):
+                self.assertLessEqual(abs(int(got) - want), 10)  # within RGB5A3 rounding
+
+    @unittest.skipUnless(EXE.exists(), "UniformStudio.exe not built")
+    def test_cpp_compose_and_text(self):
+        # Exercise the C++ Compose + RasterText via --compose-test (dumps the composed body atlas).
+        with tempfile.TemporaryDirectory() as t:
+            out = Path(t) / "composed.png"
+            r = subprocess.run([str(EXE), "--tooldir", str(EXE.parent), "--userdata", t,
+                                "--compose-test", str(out)], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            img = np.array(Image.open(out).convert("RGBA"))
+            self.assertEqual(img.shape, (128, 128, 4))
+            # The demo logo's centre (placed at x=40,y=18, 48x48) is the gold ring colour, fully opaque.
+            px = img[42, 64]
+            self.assertEqual(int(px[3]), 255)
+            for got, want in zip(px[:3], (250, 210, 60)):
+                self.assertLessEqual(abs(int(got) - want), 4)
+            # RasterText drew the "24" layer: some opaque pixels in its lower region.
+            self.assertGreater(int((img[66:110, 35:100, 3] > 0).sum()), 0)
 
     def test_bridge_import_png_is_handled_in_cpp(self):
         # PNG/DDS import needs no bridge (the editor loads them directly); the bridge only does .fsh/.iff.

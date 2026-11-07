@@ -2,7 +2,8 @@
 // Uniform Studio: an easy editor, in the look of MLB Power Pros' own menus, for the imported-uniform
 // feature of Arrange mode. The player imports PNG/.fsh/.iff art, drags logos and text over the uniform
 // mould, and saves UserData/arrange/uniforms/<name>/uniform.ppu (baked by tools/uniform-studio/bake.py).
-// No game assets ship with it: the only data is the generated region map (assets/body_regions.png).
+// No game assets ship with it: the body mould is drawn by the editor (BuildMould), and a precise,
+// game-derived region map is only ever loaded from the player's own UserData, never committed.
 #include "canvas.h"
 #include "config.h"
 #include "images.h"
@@ -23,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -143,9 +145,30 @@ void FinishImport(App& a, const std::string& path) {
     Toast(a, Tr("Importado. Arrastra las capas sobre el molde.", "Imported. Drag the layers over the mould."));
 }
 
+// A single safe path component: keeps [A-Za-z0-9 _-], turns anything else into '_', trims spaces/dots,
+// and returns "" for an empty or reserved name. It can never escape the uniforms/ folder.
+std::string SanitizeName(const std::string& raw) {
+    std::string s;
+    for (unsigned char c : raw)
+        s += (std::isalnum(c) || c == ' ' || c == '_' || c == '-') ? static_cast<char>(c) : '_';
+    const size_t a = s.find_first_not_of(" ."), b = s.find_last_not_of(" .");  // no leading/trailing dot or space
+    s = a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    std::string lower;
+    for (char c : s) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    static const char* reserved[] = {"", ".", "..", "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4",
+                                     "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4",
+                                     "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"};
+    for (const char* r : reserved) if (lower == r) return "";
+    return s;
+}
+
 void Save(App& a) {
-    std::string clean(a.name);
-    if (clean.empty()) clean = "nuevo";
+    const std::string clean = SanitizeName(a.name);
+    if (clean.empty()) {
+        Toast(a, Tr("Pon un nombre válido (letras, números, espacios, _ o -).",
+                    "Enter a valid name (letters, numbers, spaces, _ or -)."), true);
+        return;
+    }
     const fs::path out = a.userData / "arrange" / "uniforms" / clean / "uniform.ppu";
     const BridgeResult r = SaveUniform(a.pyExe, a.toolDir, a.tempDir, out, a.canvases, a.backup);
     if (r.ok) Toast(a, std::string(Tr("Guardado: ", "Saved: ")) + r.message);
@@ -345,24 +368,33 @@ int Run(const std::vector<std::string>& args) {
     // The body mould guide. An authored schematic is the default; a precise map generated from the player's
     // own install (never shipped) overrides it if present. Neither is game data committed to the repo.
     {
-        bool loaded = false;
-        for (const fs::path& p : {a.userData / "arrange" / "uniform" / "body_regions.png",
-                                  a.toolDir / "assets" / "body_regions.png"}) {
-            std::string err;
-            if (auto img = tstudio::LoadImage(p, &err)) { Upload(renderer, a.guideTex, *img); loaded = true; break; }
-        }
-        if (!loaded) Upload(renderer, a.guideTex, BuildMould(Kind::Body));
+        std::string err;
+        const fs::path precise = a.userData / "arrange" / "uniform" / "body_regions.png";
+        if (auto img = tstudio::LoadImage(precise, &err)) Upload(renderer, a.guideTex, *img);
+        else Upload(renderer, a.guideTex, BuildMould(Kind::Body));
         a.hasGuide = true;
     }
     for (const auto& arg : args)
         if (arg == "--demo") LoadDemo(a);
 
+    // Headless dump of the composed body atlas, so test_roundtrip.py can verify Compose/RasterText.
+    for (size_t i = 0; i + 1 < args.size(); ++i)
+        if (args[i] == "--compose-test") {
+            if (Active(a).layers.empty()) LoadDemo(a);
+            const Image img = Compose(a.canvases[0]);
+            std::string err;
+            const bool ok = tstudio::SavePng(tstudio::PathFromUtf8(args[i + 1]), img, &err);
+            std::fprintf(ok ? stdout : stderr, "%s\n", ok ? "COMPOSED" : err.c_str());
+            return ok ? 0 : 1;
+        }
+
     // Headless end-to-end check of the C++ -> Python save bridge (used by the build/test step).
     for (const auto& arg : args)
         if (arg == "--save-test") {
             if (Active(a).layers.empty()) LoadDemo(a);
+            const std::string clean = SanitizeName(a.name);
             const BridgeResult r = SaveUniform(a.pyExe, a.toolDir, a.tempDir,
-                                               a.userData / "arrange" / "uniforms" / a.name / "uniform.ppu",
+                                               a.userData / "arrange" / "uniforms" / (clean.empty() ? "nuevo" : clean) / "uniform.ppu",
                                                a.canvases, a.backup);
             std::fprintf(r.ok ? stdout : stderr, "%s: %s\n", r.ok ? "SAVED" : "ERROR", r.message.c_str());
             return r.ok ? 0 : 1;
