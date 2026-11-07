@@ -196,5 +196,8 @@ option. It is fixed when a game starts and travels in the save; original by defa
   wild-card race view while it is played.
 - **Real season:** the probe started from results injected in RAM, not a season simulated
   by the game. The roadmap's full integration check is still due.
-- **Ties of five or more clubs:** the model requires explicit adjudication and qualification
-  shows the error instead of inventing an order.
+- **Ties of five or more clubs:** MLB Rule 34(c) only spells out ties of two, three and four
+  clubs and leaves the rest to the Commissioner. The model applies the four-club steps to any
+  number of clubs (user decision, 2026-11-06). When every league game has been compared and
+  clubs are still tied, it draws one, seeded by the season's results, so a reloaded save draws
+  the same club.

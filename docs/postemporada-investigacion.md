@@ -208,5 +208,8 @@ sobre la opción. Se fija al crear la partida y viaja en ella; por defecto, orig
   vista de «carrera por el comodín» mientras se juega.
 - **Temporada real:** la sonda partió de resultados inyectados en RAM, no de una temporada
   simulada por el juego. Falta la integración completa del roadmap.
-- **Empates de cinco o más equipos:** el modelo pide decisión explícita y la clasificación
-  muestra el error en vez de inventar un orden.
+- **Empates de cinco o más equipos:** la regla 34(c) de MLB solo detalla empates de dos, tres
+  y cuatro equipos y deja el resto al Comisionado. El modelo aplica los pasos de cuatro equipos
+  a cualquier número (decisión del usuario, 6/11/2026). Si tras comparar todos los partidos de
+  liga siguen empatados, sortea uno con una semilla sacada de los resultados de la temporada:
+  al recargar la partida sale el mismo equipo.
