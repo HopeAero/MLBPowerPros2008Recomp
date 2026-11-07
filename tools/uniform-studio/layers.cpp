@@ -1,0 +1,273 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "layers.h"
+
+#include "images.h"  // tstudio::LoadImage / SavePng
+#include "lang.h"
+
+#include <imgui.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#undef LoadImage  // windows.h macro; tstudio::LoadImage is ours
+#else
+#include <spawn.h>
+#include <sys/wait.h>
+#include <cstring>
+extern char** environ;
+#endif
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iterator>
+#include <set>
+#include <sstream>
+
+namespace ustudio {
+namespace fs = std::filesystem;
+using tstudio::Image;
+
+namespace {
+const KindInfo kInfo[kKindCount] = {{"body", 128, 128}, {"cap", 64, 32}, {"helmet", 64, 32}, {"number", 64, 32}};
+
+void Over(Image& d, int x, int y, int r, int g, int b, int a) {
+    if (x < 0 || y < 0 || x >= static_cast<int>(d.width) || y >= static_cast<int>(d.height) || a <= 0) return;
+    const size_t i = (static_cast<size_t>(y) * d.width + x) * 4;
+    const float af = a / 255.0f, ia = 1.0f - af;
+    d.rgba[i] = static_cast<uint8_t>(r * af + d.rgba[i] * ia);
+    d.rgba[i + 1] = static_cast<uint8_t>(g * af + d.rgba[i + 1] * ia);
+    d.rgba[i + 2] = static_cast<uint8_t>(b * af + d.rgba[i + 2] * ia);
+    d.rgba[i + 3] = static_cast<uint8_t>(a + d.rgba[i + 3] * ia);
+}
+
+void BlitScaled(Image& out, const Layer& L) {
+    if (L.src.Empty()) return;
+    const int dw = std::max(1, static_cast<int>(std::lround(L.src.width * L.scale)));
+    const int dh = std::max(1, static_cast<int>(std::lround(L.src.height * L.scale)));
+    for (int dy = 0; dy < dh; ++dy) {
+        const int sy = std::min(static_cast<int>(L.src.height) - 1, dy * static_cast<int>(L.src.height) / dh);
+        for (int dx = 0; dx < dw; ++dx) {
+            const int sx = std::min(static_cast<int>(L.src.width) - 1, dx * static_cast<int>(L.src.width) / dw);
+            const uint8_t* p = &L.src.rgba[(static_cast<size_t>(sy) * L.src.width + sx) * 4];
+            Over(out, static_cast<int>(std::lround(L.x)) + dx, static_cast<int>(std::lround(L.y)) + dy,
+                 p[0], p[1], p[2], p[3]);
+        }
+    }
+}
+
+// Quote one argument for a Windows command line / keep it plain for posix_spawn (passed as argv).
+std::string NarrowPath(const fs::path& p) { return tstudio::Utf8(p); }
+
+// Run the interpreter with one job file; stdout+stderr go to <tempDir>/bridge.log, read back on failure.
+int RunPython(const fs::path& pyExe, const fs::path& script, const fs::path& jobFile, const fs::path& logFile,
+              std::string* output) {
+#if defined(_WIN32)
+    std::wstring cmd = L"\"" + pyExe.wstring() + L"\" -I \"" + script.wstring() + L"\" \"" + jobFile.wstring() + L"\"";
+    SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+    HANDLE log = CreateFileW(logFile.wstring().c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = log;
+    si.hStdError = log;
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (log) CloseHandle(log);
+    if (!ok) { if (output) *output = "no se pudo iniciar Python"; return -1; }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+#else
+    const std::string py = pyExe.string(), sc = script.string(), jb = jobFile.string(), lg = logFile.string();
+    std::string sh = "\"" + py + "\" -I \"" + sc + "\" \"" + jb + "\" > \"" + lg + "\" 2>&1";
+    const int rc = std::system(sh.c_str());
+    const int code = rc < 0 ? -1 : WEXITSTATUS(rc);
+#endif
+    if (output) {
+        std::ifstream f(logFile, std::ios::binary);
+        *output = std::string((std::istreambuf_iterator<char>(f)), {});
+    }
+    return static_cast<int>(code);
+}
+
+std::string JsonString(const fs::path& p) {
+    std::string out = "\"";
+    for (char c : NarrowPath(p)) {
+        if (c == '\\' || c == '"') out += '\\';
+        out += c;
+    }
+    return out + "\"";
+}
+} // namespace
+
+const KindInfo& Info(Kind k) { return kInfo[static_cast<int>(k)]; }
+
+float Layer::DrawnW() const { return isText ? 0.0f : src.width * scale; }
+float Layer::DrawnH() const { return isText ? 0.0f : src.height * scale; }
+
+void RasterText(Image& dst, ImFont* font, const Layer& L) {
+    if (!font || L.text.empty()) return;
+    unsigned char* atlas = nullptr;
+    int aw = 0, ah = 0;
+    ImGui::GetIO().Fonts->GetTexDataAsAlpha8(&atlas, &aw, &ah);
+    if (!atlas) return;
+    const float scale = L.fontPx / font->FontSize;
+    const float baseline = L.y + L.fontPx * 0.82f;  // top-of-box placement, approx ascent
+    float penX = L.x;
+    for (size_t i = 0; i < L.text.size(); ++i) {
+        const auto c = static_cast<unsigned char>(L.text[i]);
+        const ImFontGlyph* g = font->FindGlyph(static_cast<ImWchar>(c));
+        if (!g) continue;
+        if (g->Visible) {
+            const int sx0 = static_cast<int>(g->U0 * aw), sy0 = static_cast<int>(g->V0 * ah);
+            const int gw = static_cast<int>((g->U1 - g->U0) * aw), gh = static_cast<int>((g->V1 - g->V0) * ah);
+            const int dw = std::max(1, static_cast<int>(std::lround(gw * scale)));
+            const int dh = std::max(1, static_cast<int>(std::lround(gh * scale)));
+            const float dx0 = penX + g->X0 * scale, dy0 = baseline + g->Y0 * scale;
+            for (int dy = 0; dy < dh; ++dy) {
+                const int sy = sy0 + std::min(gh - 1, dy * gh / dh);
+                for (int dx = 0; dx < dw; ++dx) {
+                    const int sx = sx0 + std::min(gw - 1, dx * gw / dw);
+                    const int cov = atlas[static_cast<size_t>(sy) * aw + sx];
+                    if (cov <= 0) continue;
+                    Over(dst, static_cast<int>(std::lround(dx0)) + dx, static_cast<int>(std::lround(dy0)) + dy,
+                         L.color[0], L.color[1], L.color[2], cov * L.color[3] / 255);
+                }
+            }
+        }
+        penX += g->AdvanceX * scale;
+    }
+}
+
+Image BuildMould(Kind k) {
+    if (k != Kind::Body) return {};  // only the 128x128 body atlas has a mould guide
+    const int W = 128, H = 128;
+    Image out{static_cast<uint32_t>(W), static_cast<uint32_t>(H), std::vector<uint8_t>(static_cast<size_t>(W) * H * 4, 0)};
+    auto fill = [&](int x0, int y0, int x1, int y1, int r, int g, int b, int alpha) {
+        for (int y = std::max(0, y0); y < std::min(H, y1); ++y)
+            for (int x = std::max(0, x0); x < std::min(W, x1); ++x) {
+                uint8_t* p = &out.rgba[(static_cast<size_t>(y) * W + x) * 4];
+                p[0] = static_cast<uint8_t>(r); p[1] = static_cast<uint8_t>(g); p[2] = static_cast<uint8_t>(b);
+                p[3] = static_cast<uint8_t>(alpha);
+            }
+    };
+    // Schematic zones (authored approximation of the real atlas layout, same colour scheme as the analysis
+    // map): jersey chest+back, trousers, sleeves/belt/socks, cap crown, cap brim.
+    fill(0, 0, 84, 60, 230, 230, 230, 150);    // jersey (chest / back)
+    fill(0, 60, 56, 110, 80, 80, 220, 150);    // trousers
+    fill(0, 110, 84, 128, 220, 60, 60, 150);   // sleeves / belt / socks
+    fill(86, 0, 128, 64, 60, 200, 60, 150);    // cap crown
+    fill(118, 0, 128, 64, 240, 200, 0, 170);   // cap brim
+    return out;
+}
+
+Image Compose(const Canvas& c) {
+    const KindInfo& in = Info(c.kind);
+    Image out{static_cast<uint32_t>(in.w), static_cast<uint32_t>(in.h),
+              std::vector<uint8_t>(static_cast<size_t>(in.w) * in.h * 4, 0)};
+    for (const Layer& L : c.layers) {
+        if (!L.visible) continue;
+        if (L.isText) RasterText(out, power_pros_ui::g_bold, L);
+        else BlitScaled(out, L);
+    }
+    return out;
+}
+
+int CountColors(const Image& img) {
+    std::set<uint32_t> seen;
+    for (size_t i = 0; i < img.rgba.size(); i += 4) {
+        if (img.rgba[i + 3] < 0x80) continue;
+        seen.insert(static_cast<uint32_t>(img.rgba[i]) << 16 | img.rgba[i + 1] << 8 | img.rgba[i + 2]);
+        if (seen.size() > 100000) break;
+    }
+    return static_cast<int>(seen.size());
+}
+
+BridgeResult SaveUniform(const fs::path& pyExe, const fs::path& toolDir, const fs::path& tempDir, const fs::path& out,
+                         const std::array<Canvas, kKindCount>& canvases, const std::array<int, 10>& backup) {
+    std::error_code ec;
+    fs::create_directories(tempDir, ec);
+    fs::create_directories(out.parent_path(), ec);
+    std::string atlasJson;
+    for (int i = 0; i < kKindCount; ++i) {
+        const Image img = Compose(canvases[i]);
+        bool any = false;
+        for (size_t p = 3; p < img.rgba.size(); p += 4)
+            if (img.rgba[p] >= 0x80) { any = true; break; }
+        if (!any) continue;  // skip empty atlases
+        const fs::path png = tempDir / (std::string(Info(canvases[i].kind).id) + ".png");
+        std::string err;
+        if (!tstudio::SavePng(png, img, &err)) return {false, err};
+        atlasJson += (atlasJson.empty() ? "" : ",") + ("\"" + std::string(Info(canvases[i].kind).id) + "\":") + JsonString(png);
+    }
+    if (atlasJson.empty())
+        return {false, tstudio::Tr("No hay nada que guardar: todas las capas están vacías.",
+                                   "Nothing to save: every atlas is empty.")};
+    std::string backupJson;
+    for (int v : backup) backupJson += (backupJson.empty() ? "" : ",") + std::to_string(std::clamp(v, 0, 31));
+    const fs::path job = tempDir / "job.json";
+    {
+        std::ofstream f(job, std::ios::binary);
+        f << "{\"op\":\"bake\",\"out\":" << JsonString(out) << ",\"backup\":[" << backupJson
+          << "],\"atlases\":{" << atlasJson << "}}";
+    }
+    std::string log;
+    const int code = RunPython(pyExe, toolDir / "studio_bridge.py", job, tempDir / "bridge.log", &log);
+    if (code != 0) return {false, (log.empty() ? tstudio::Tr("falló el horneado", "bake failed") : log)};
+    return {true, NarrowPath(out)};
+}
+
+BridgeResult ImportSource(const fs::path& pyExe, const fs::path& toolDir, const fs::path& tempDir, const fs::path& file,
+                          std::vector<Layer>* out) {
+    std::string ext = tstudio::Utf8(file.extension());
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (ext == ".png" || ext == ".dds") {  // read directly, no Python needed
+        std::string err;
+        auto img = tstudio::LoadImage(file, &err);
+        if (!img) return {false, err};
+        Layer L;
+        L.name = tstudio::Utf8(file.stem());
+        L.src = std::move(*img);
+        out->push_back(std::move(L));
+        return {true, ""};
+    }
+    std::error_code ec;
+    const fs::path dir = tempDir / "import";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path job = tempDir / "job.json";
+    {
+        std::ofstream f(job, std::ios::binary);
+        f << "{\"op\":\"import\",\"src\":" << JsonString(file) << ",\"outdir\":" << JsonString(dir) << "}";
+    }
+    std::string log;
+    const int code = RunPython(pyExe, toolDir / "studio_bridge.py", job, tempDir / "bridge.log", &log);
+    if (code != 0) return {false, (log.empty() ? tstudio::Tr("no se pudo importar", "import failed") : log)};
+    std::ifstream index(dir / "index.txt", std::ios::binary);
+    std::string line;
+    int loaded = 0;
+    while (std::getline(index, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t tab = line.find('\t');
+        const std::string fname = line.substr(0, tab);
+        if (fname.empty()) continue;
+        std::string err;
+        auto img = tstudio::LoadImage(dir / fname, &err);
+        if (!img) continue;
+        Layer L;
+        L.name = tab == std::string::npos ? fname : (fname + "  [" + line.substr(tab + 1) + "]");
+        L.src = std::move(*img);
+        out->push_back(std::move(L));
+        ++loaded;
+    }
+    if (loaded == 0)
+        return {false, tstudio::Tr("El archivo no contiene capas reconocibles.",
+                                   "The file has no recognisable layers.")};
+    return {true, ""};
+}
+
+} // namespace ustudio
