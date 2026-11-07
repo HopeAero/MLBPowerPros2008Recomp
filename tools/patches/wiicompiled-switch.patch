@@ -8650,7 +8650,7 @@ index c73ad5e..08482bd 100644
    TRY(SDL_DisableScreenSaver(), "Error disabling screensaver: {}", SDL_GetError());
    if (g_config.allowJoystickBackgroundEvents) {
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index 06f68de..5df23b9 100644
+index 47437b6..7904017 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
 @@ -10,8 +10,9 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
@@ -10775,12 +10775,12 @@ index f527424..b55cc83 100644
  class ScopedTranslatedExecutionAddress {
  public:
 diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
-index 3198082..d035de1 100644
+index 89db517..61f5a5a 100644
 --- a/runtime/include/runtime_config.h
 +++ b/runtime/include/runtime_config.h
-@@ -46,6 +46,14 @@ struct RuntimeUserConfig {
-     std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
-     std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
+@@ -48,6 +48,14 @@ struct RuntimeUserConfig {
+     std::optional<bool> modernPostseason;  // [season] modern_postseason: 12-team format for new games
+     std::optional<bool> arrangeCustomMarks;  // [arrange] custom_marks: PNG marks and logos per Arrange team
      std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
 +    // Lighter graphics (hle/mlb/gfx_options.cpp), launcher VIDEO tab; all as on the Wii by default.
 +    std::optional<std::string> playerShadows;  // [video] shadows: "full", "simple" (round blob) or "off"
@@ -10793,7 +10793,7 @@ index 3198082..d035de1 100644
      std::optional<int32_t> windowPosX;
      std::optional<int32_t> windowPosY;
      std::optional<uint32_t> windowWidth;
-@@ -193,6 +201,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
+@@ -195,6 +203,8 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
  // only vulkan for linux
  #elif defined(__linux__)
      static constexpr std::array<std::string_view, 4> values{"auto", "vulkan", "opengles", "null"};
@@ -10802,7 +10802,7 @@ index 3198082..d035de1 100644
  #elif defined(_WIN32)
      static constexpr std::array<std::string_view, 4> values{"auto", "d3d12", "vulkan", "d3d11"};
  #endif
-@@ -228,6 +238,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
+@@ -230,6 +240,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
      }
  #elif defined(__APPLE__)
      return RuntimePlatform::ExecutableDirectory();
@@ -10811,7 +10811,7 @@ index 3198082..d035de1 100644
  #else
      // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
      // does not NUL-terminate and silently truncates if the buffer is too small, so this grows
-@@ -275,6 +287,9 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
+@@ -277,6 +289,9 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
  }
  
  inline std::filesystem::path ApplicationDataDirectory() {
@@ -10821,9 +10821,9 @@ index 3198082..d035de1 100644
      if (const auto& portableRoot = PortableRootDirectory()) {
          return *portableRoot / kPortableUserDataDirectoryName;
      }
-@@ -479,6 +494,21 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
-     config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
-     config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
+@@ -483,6 +498,21 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
+     config.modernPostseason = FindConfigValue<bool>(document, "season", "modern_postseason");
+     config.arrangeCustomMarks = FindConfigValue<bool>(document, "arrange", "custom_marks");
      config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
 +    if (auto value = FindConfigValue<std::string>(document, "video", "shadows");
 +        value && (*value == "full" || *value == "simple" || *value == "off")) {
@@ -10843,7 +10843,7 @@ index 3198082..d035de1 100644
      config.windowPosX = FindConfigInt(document, "video", "window_x");
      config.windowPosY = FindConfigInt(document, "video", "window_y");
      if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
-@@ -695,6 +725,9 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
+@@ -699,6 +729,9 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
          }
      }
  
@@ -10853,7 +10853,7 @@ index 3198082..d035de1 100644
      std::error_code ec;
      if (path.has_parent_path()) {
          std::filesystem::create_directories(path.parent_path(), ec);
-@@ -978,6 +1011,51 @@ inline bool SetTwoWayPlayer(bool value) {
+@@ -1000,6 +1033,51 @@ inline bool SetTwoWayPlayer(bool value) {
      return WriteSetting("season", "two_way_player", value ? "true" : "false");
  }
  
@@ -10905,7 +10905,7 @@ index 3198082..d035de1 100644
  inline bool UniversalDh(bool fallback = false) {
      return Get().universalDh.value_or(fallback);
  }
-@@ -1202,10 +1280,24 @@ inline std::filesystem::path ResolveRelativeToConfig(const std::string& value) {
+@@ -1224,10 +1302,24 @@ inline std::filesystem::path ResolveRelativeToConfig(const std::string& value) {
      return ResolveRelativeTo(ResolveConfigPath().parent_path(), value);
  }
  

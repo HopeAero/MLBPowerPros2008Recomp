@@ -204,6 +204,55 @@ Una carrera de MLB Life, una temporada o una liga empezadas con un roster modifi
   - con solo uniformes y texturas, en la NAND normal.
   - La creación de una partida dentro de esa carpeta no se probó todavía.
 
+## Marcas y logotipos propios (Arrange)
+
+Imágenes PNG propias como marca (escudo) y logotipo de los equipos de Arrange. No es un mod: no va en `mods\`.
+
+- **Activación:** opción **MARCAS Y LOGOTIPOS PROPIOS (ARRANGE)** en la pestaña MEJORAS del launcher. Está apagada por defecto y marcada EXPERIMENTAL. En `Config.toml` es `[arrange] custom_marks = true`.
+- **Carpetas** (el launcher las crea al encender la opción):
+
+```
+UserData\arrange\
+  marks\   marcas: salen al final de la lista Team Mark
+  logos\   logotipos: salen en una fila nueva de Logo Text
+```
+
+  En Switch son `sdmc:/switch/mlbpowerpros2008/UserData/arrange/marks` y `.../arrange/logos`.
+
+**Cómo se usa**
+- Copia los PNG en `marks` o `logos`. Valen con transparencia y de cualquier tamaño dentro de los límites; el juego los encaja sin deformarlos, con relleno transparente.
+- **Marca:** Arrange › un equipo › Team Name/Mark › MARK. Los PNG salen después de las 38 marcas del juego, con el nombre del archivo. Elige uno y confirma. Si el PNG ya no se puede usar (se ha cambiado o estropeado desde que se abrió la lista), suena el aviso y la lista sigue abierta.
+- **Logotipo:** Arrange › un equipo › Logo Text. La fila nueva está entre LETTERS y DELETE. Izquierda/derecha recorre «- - -» y los logotipos, TEAM LOGO muestra la vista previa y OK lo guarda. La fila solo sale si hay logotipos válidos o si el equipo ya tenía uno.
+- La elección se guarda con la partida (`pm3usma.dat`), en una extensión que el juego original no lee. Cada elección va con una huella del equipo: su nombre, su inicial y su equipo base.
+- Se ve en la lista de equipos de Arrange, en las pantallas del equipo, en la cuadrícula y el VS de Exhibición, en HOME/ROAD, en «X AT Y», en la alineación titular y en el marcador.
+
+**Comportamiento**
+- Una marca PNG oculta la inicial, la letra que el juego pone sobre la marca.
+- Un logotipo PNG sustituye a las letras. Las letras del juego se conservan como respaldo. Teclear letras nuevas en Logo Text y confirmarlas quita el logotipo PNG.
+- Si el PNG se borra, se renombra o no es válido, el equipo vuelve a la marca o a las letras del juego que tenía.
+- COPY copia también la marca y el logotipo propios al hueco de destino. DELETE los borra.
+- Cambiar el nombre, la inicial, el equipo base, los colores o el uniforme de un equipo con la opción encendida conserva su marca y su logotipo: al guardar, la huella se actualiza. «Reset to Base Team» y «Save as Arrange» sí quitan la marca y el logotipo propios del hueco que cambian.
+- Con la opción apagada, el juego es el original y no lee ni escribe la extensión. Guardar no la borra: al volver a encender la opción, las elecciones siguen ahí.
+- Salvo las de los equipos que cambiaron mientras la opción estaba apagada (en otra sesión, en Dolphin o en una Wii): si se borró el equipo, se creó otro en su hueco o se le cambió el nombre, la inicial o el equipo base, la huella ya no coincide y ese equipo pierde su marca y su logotipo propios. Vuelve a lo del juego y se pueden elegir de nuevo. Cambiar con la opción apagada la marca del juego, los colores, las letras o el uniforme no cuenta como otro equipo. Límite: la huella solo mira el nombre, la inicial y el equipo base, así que un equipo nuevo creado con la opción apagada con esos tres datos iguales (por ejemplo, el nombre por defecto y el mismo equipo base) se toma por el mismo y conserva la elección.
+- Una extensión que esta versión no entiende (de una versión posterior, o dañada) se ignora y no se borra al guardar, hasta que se elige una marca o un logotipo en esa sesión.
+
+**Límites**
+- Se listan los 64 primeros `.png` de cada carpeta por orden de nombre (sin distinguir mayúsculas; los de más de 8 MiB no cuentan). Los que luego se descartan, por nombre largo o por no ser un PNG válido, también ocupan sitio: con más de 64 archivos, alguno válido puede quedarse fuera.
+- Los nombres de archivo de más de 31 bytes en UTF-8 no salen en la lista: acórtalos.
+- Archivos de 8 MiB y 4096×4096 píxeles como máximo.
+- Los archivos truncados, los que no son PNG y los que tienen datos después del final del PNG (el bloque IEND) se ignoran, sin aviso en pantalla.
+- El nombre sale en mayúsculas, solo con letras de la fuente del juego y recortado a 10 caracteres visibles. Si dos nombres coinciden, el segundo lleva un número.
+
+**Pendiente**
+- Temporada y Liga copian el equipo a su propia tabla: allí se ven la marca y la inicial del juego.
+- Home Run no se ha probado.
+- La tecla Z (subrayado) de Logo Text no cambia nada visible con un logotipo PNG.
+- La primera vez que se ve un PNG grande en la vista previa puede haber una pausa mientras se decodifica, sobre todo en Switch. Las siguientes van de la caché.
+- En 16:9, las unidades 2D del juego no son cuadradas. Una marca o un logotipo se ven unas 1,5 veces más anchos que el archivo, igual que las marcas del juego.
+- Falta la prueba en una Switch.
+
+Parche `wiicompiled-arrange-marks`. Detalles técnicos en `docs/ingenieria-inversa.md` («Marcas y logotipos propios»).
+
 ## Reglas
 
 Un mod solo debe traer sus propios archivos o diferencias, **nunca copias del juego** (ni texturas originales sin modificar, ni `project.bin`, ni el ejecutable).

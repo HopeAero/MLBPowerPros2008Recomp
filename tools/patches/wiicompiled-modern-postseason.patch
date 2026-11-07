@@ -1,21 +1,17 @@
 --- a/runtime/include/runtime_config.h
 +++ b/runtime/include/runtime_config.h
-@@ -45,6 +45,7 @@
+@@ -45,4 +45,5 @@
      std::optional<uint32_t> maxSeasons;  // [season] max_seasons: 10 (original), 20 or 0 (no limit)
      std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
      std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
 +    std::optional<bool> modernPostseason;  // [season] modern_postseason: 12-team format for new games
      std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
-     // Lighter graphics (hle/mlb/gfx_options.cpp), launcher VIDEO tab; all as on the Wii by default.
-     std::optional<std::string> playerShadows;  // [video] shadows: "full", "simple" (round blob) or "off"
-@@ -483,6 +484,7 @@
+@@ -483,4 +484,5 @@
      }
      config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
      config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
 +    config.modernPostseason = FindConfigValue<bool>(document, "season", "modern_postseason");
      config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
-     if (auto value = FindConfigValue<std::string>(document, "video", "shadows");
-         value && (*value == "full" || *value == "simple" || *value == "off")) {
 @@ -988,6 +990,15 @@
      return WriteSetting("season", "modern_leagues", value ? "true" : "false");
  }
@@ -103,14 +99,12 @@
          tabs[kEnhancementsTab].footer = seasonText.footer.c_str();
      };
  
-@@ -1056,6 +1077,7 @@
+@@ -1056,4 +1077,5 @@
          if (label == seasons.label) RuntimeConfigFile::SetMaxSeasons(o.value == 1 ? 20 : o.value == 2 ? 0 : 10);
          if (label == universalDh.label) RuntimeConfigFile::SetUniversalDh(o.value != 0);
          if (label == modernLeagues.label) RuntimeConfigFile::SetModernLeagues(o.value != 0);
 +        if (label == modernPostseason.label) RuntimeConfigFile::SetModernPostseason(o.value != 0);
          if (label == twoWay.label) RuntimeConfigFile::SetTwoWayPlayer(o.value != 0);
-         if (label == shadows.label) RuntimeConfigFile::SetPlayerShadows(kShadowModes[static_cast<size_t>(o.value)]);
-         if (label == crowd.label) RuntimeConfigFile::SetCrowdLevel(kCrowdLevels[static_cast<size_t>(o.value)]);
 --- a/runtime/tests/runtime_config_tests.cpp
 +++ b/runtime/tests/runtime_config_tests.cpp
 @@ -14,6 +14,19 @@

@@ -913,7 +913,7 @@ October 14, 2026, from the REL data; for adding stadiums.
 
 **Record getters in the code (disassembly).** The game reads each field with a small function: `lwz rX, D(r3)` + field extraction + `blr`, one after another from `0x8082B000` (`ovl_main.rel` + `0x2B5A80`) in record order. It is the field list as the game sees it, with position, width and sign:
 - The following match the table above: batting and pitching form (9 bits), clutch `0x6F.5`/3, mood `0x70.1`/2, all batting abilities from `0x70.3` to `0x73.0` (push hitter `0x71.0`, free swinger `0x71.7`…), the fielding ones and the pitcher ones up to `0x80.7`, and the birth date.
-- **"Table setter" `0x70.0` is still alive in 2008:** getter `0x8082B068` (`srwi 31`), Edit mode setter at `0x8085EF74` (clamps to 0–1) and two gameplay functions that read it together with "rally hitter": `0x80985E4C` and `0x80A30C54`. No 2008 player has it, but it works if one is given it.
+- **"Table setter" `0x70.0` is still alive in 2008:** getter `0x8082B068` (`srwi 31`), per-player-ID setter at `0x8085EF74` (clamps to 0–1; not an editor: Arrange does not edit abilities) and two gameplay functions that read it together with "rally hitter": `0x80985E4C` and `0x80A30C54`. No 2008 player has it, but it works if one is given it.
 - Some fields that PowerUp treats as a single bit are **2 bits** for the game. The other bit travels as an "unnamed bit", so the converter keeps the full value:
   - `0x73.5`/2 (head-first slide): only 0 and 2 appear; the bit PowerUp models is the right one.
   - `0x75.4`/2 signed ("cannon arm" for PowerUp): +1 in 96 players (Carpenter, Randy Johnson, Dye…) and −1 in 11 (Furcal, Rollins, Eckstein…). It does not appear on the player card: it is a hidden trait.
@@ -954,6 +954,90 @@ October 14, 2026, from the REL data; for adding stadiums.
 **Renumbered voices.** 2008 keeps the order of the 2007 voices, but inserts and removes some. Between two players present in both games whose gaps are the same size, the voices map one to one, unless a known 2008 name contradicts it. This places 810 of PowerUp's 968 voices, in 206 runs (`VOICE_RUNS`). Hiding 10% of the reference players, all 739 cases land on their real voice. Ryan Braun and two "Great" players have their voice re-recorded somewhere else.
 
 Sources: `docs/en/roster-2008.md`, `tools/roster/powerup_to_2008.py`, `tools/roster/align_2007_2008.py --voices`, `wiicompiled-mods.patch`, `wiicompiled-roster-flags.patch`, `wiicompiled-roster-voices.patch`, disassembly of `ovl_main.rel`.
+
+**Abilities by ID and Arrange mode** (6 November 2026; disassembly, MEM1 dumps and game screens):
+
+*Accessors*
+- Besides the per-record getters (`0x8082AF38`–`0x8082D63C`) there are per-player-ID getters and setters (`0x8085E820`–`0x80860990`).
+- They go through `0x80862314`, which maps the ID to the record by ranges: 1–1300 are MLB; from 4001, other groups.
+- A game does not read the record: `0x8082A02C` copies it into the game's player struct, with abilities packed at `+0x7C`.
+
+*Abilities by ID*
+- There are 131. IDs 1–17 are graded, with function tables at `0x80DA704C`/`0x80DA7008`; 18–131 are booleans (`0x80DA7090`).
+- The lookup is `0x807FBCF4 (player, id, grade)`.
+- With an ID and read by gameplay, but held by no 2008 player:
+  - 30 (`0x70.0`, table setter);
+  - 87/88 (`0x70.1` ±1);
+  - 28 (`0x70.6`), 38 (`0x72.7`), 71 (`0x7D.2`), 72 (`0x7D.3`), 52 (`0x7F.1`) and 85 (`0x80.6`).
+
+*Fields without an ID that gameplay reads*
+- `0x75.4`/2 (11 functions, e.g. `0x8095DAE0`; they set the game's `+0x228D` to 2/1/0).
+- `0x75.6`/1 (Delgado, Helton, Hunter, Kent, Thome, Chávez and Ichiro; read by `0x808B1E0C`, `0x809623C8` and `0x809597B8`).
+
+*Table of 33 obtainable abilities* (`0x80E8D278`, copy at `0x80E8F700`)
+- 20-byte entries: {getter, setter, index, ID, random flag}.
+- 33 is hard-coded at `0x80B72330`, `0x80BB0F24`, `0x80BB0FFC` and `0x80BB1120`. Probably Success or MLB Life (unverified).
+
+*Arrange mode* (seen in game)
+- A team's menu: Original Team, Pitcher Select, Fielder Select, Role Setup, Voice Setup, Uniform Number and Save. There is no ability editor.
+- 32 slots, each starting from a base MLB or AAA team. Editable:
+  - name, city and initial;
+  - emblem: 38 drawings with colours A–D;
+  - wordmark: up to 7 letters, 3 underlines and 12 colours;
+  - stadium;
+  - home and away uniforms: 10 pieces, 32-colour palette.
+- Untouched, the team uses the base team's emblem, wordmark and uniform. Changing a colour switches to the generic Arrange uniform, with the initial on the cap.
+- Team record (working copy at `0x8106D84E`):
+
+| Offset | Contents |
+|---|---|
+| `+0x00` | name, 10 two-byte characters |
+| `+0x16` | city |
+| `+0x17` | emblem |
+| `+0x18` | emblem colour |
+| `+0x19` | wordmark colour |
+| `+0x1B` | flags: `0x01` name, `0x02` emblem, `0x04` custom uniform, `0x10` wordmark, `0x20` city, `0x40` initial (details below) |
+| `+0x1C`–`0x25` | home uniform (cap at `+0x21`) |
+| `+0x26`–`0x2F` | away uniform |
+| `+0x30`… | wordmark letters |
+
+*Arrange assets*
+- Emblems: `env_arrange_logo01`–`38.pack`, 256×256 C8 with 4 palettes.
+- Icons and letters: `env_arrange_teamflag` and `env_arrange_teamlogo`.
+- Cap and chest letters: `PWM_arrange_uniform`, 52 64×32 textures.
+- MLB uniforms (`PWM_mdl_uniform_MLB_*`, ~6.9 KB) carry a colour table and 2–3 64×32 textures. The body is composed per character at `0x806CC2EC`.
+
+*Arrange teams in memory, in the save and on screen* (6 November 2026; disassembly and runs with an isolated NAND, memory pokes and screenshots)
+- **Slots:** the main save block is at `[0x8104E1D8]`; slot i (0..31) at `+0x3AC + i × 0x2448`: `+0` in use, `+1` slot index, `+2` base team, `+0x42` team record (`0x37` bytes), `+0x7C` players. Arrange teams have ids `0x21`–`0x40` (`0x80C88E18`); `0x8059E108(id)` and `0x8059E134(i)` return the slot. The editor works on the real slot (`[0x8102B2C8]`; `0x8059E1F4` returns its record). Seen at run time.
+- **Record, more fields:** `+0x14` wordmark underline (0..2), `+0x15` initial (0..25 = A..Z), `+0x1A` base team, wordmark letters at `+0x30`–`0x36` (1..26 = A..Z, `0xFF` end). `+0x1B` flags (by who sets or reads them, disassembly): `0x01` the name (`0x805C07A4`; `0x805BA770` sets the default name), `0x02` the Team Mark confirmation (`0x805BD1E4`), `0x04` the custom uniform (copied by `0x805CB1F4`; read by `0x806C07C8`/`0x806C0878` when composing the uniform), `0x10` Logo Text (`0x805B87CC`) and Logo Color (`0x805B969C`), `0x20` the city (`0x805B5104`), `0x40` the initial (`0x805B71A0`); "Reset to Base Team" (`0x805BC394`) clears it. `0x805BFB64` treats `+0x1B != 0` as "customised team": with any flag set, the icon switches from the base team's logo to emblem + initial. Values seen at run time: `0x03` and `0x13`.
+- **Save:** `pm3usma.dat` (`0xD4000` bytes; `"PAWAMAJOR3"` at 0, u32 check value at `0x50`). It is not a copy of the block: it is bit-packed (about `0x1B58` bytes per slot from ≈`0x21A1A`; letters take 5 bits). Saving a team changed only the check value and its record's bytes; loading brings the record back. The game does not write from `0xD0060` on (expected end of its data: `0x50` + `0xD0000`): markers changed on disk at `0xD0060`, `0xD0410`, `0xD2000` and `0xD3F00` with the game already loaded were still there after saving, and the rest of the file did not change. Seen at run time. The check value at `0x50` is not a byte, u16 or u32 sum; its function has not been found (untested what the game does with a wrong value).
+- **Team Mark list** (vtable `0x80D3D4B0`): builds 38 fixed entries (`0x805BD300`: cells at `screen + 0x3050 + i × 0x100`, labels at `+0x5650`), 12 visible rows × 2 columns; position → emblem through table `0x80CEDE44`; refresh `0x805BDCE0`, cursor `0x805BD240`/`0x805BD28C`. The names are images from the `env_arrange_original_common` pack (SURF table `0x80CEB658`), not text; the label (`0x8059A9D0`) also carries a number display at `+0xF4` (`0x8065AC44`; `0x8065B0F4` writes numbers, not text). Colours A–D only apply to emblems 0–23. Changing the SURF table in memory changed the name in the list and under MARK (seen at run time).
+- **Emblem:** packs per emblem at `0x80D3D590` (`0x805BE740`); widget `0x805BE408`/`0x805BE664` (it only gets the emblem index); team → pack at `0x807B3250(id)` (in a match, `0x80612434`); 64×64 icon `0x805BEFB8` (`env_arrange_teamflag` pack, table `0x80CEDF00`). Changing `0x80D3D590[0]` in memory drew the LION instead of DOG (seen at run time). Only `0x805BE408`/`0x805BE664` bind the texture; `0x807B3250`, `0x80B2F1C4`, `0x80924BE8` and the preloads of the Original Team (`0x805BADE8`) and Team Name/Mark (`0x805C1250`) screens only ask for the pack to be loaded.
+- **Letter wordmark:** `0x807B4740` (wordmark widget; team `0x92` + record = letters), per-slot entries `0x807B5118`/`0x807B5184`, composer `0x807B2054` (`env_arrange_teamlogo` pack). Letters poked in memory showed in TEAM LOGO and in the Exhibition VS panel (seen at run time).
+- **Initial:** the team icon (`0x805BFA58`/`0x805BFB74`) draws the emblem icon with the initial on top (`0x805BF9C0`); the standalone red letter is class `0x805B76E4` (`0x805B7940`, atlas in the `env_arrange_teamflag` pack). Mode dispatcher: `0x807B34FC(icon, slot)` / `0x807B336C(icon, record)`.
+- **Text in the game font:** the team name is a text widget (`0x805C28D4(parent, 0, style)`, vtable `0x80D3DB98`) that draws a u16 string from memory: vtable `+0x40` = `0x805C2684(text, string)` (up to 10 characters) → `0x807B3E3C`. Putting "Leones CCS" into a slot's name in memory made TEAM NAME show it in the game font (seen at run time).
+- **COPY / DELETE:** `0x8059E2E8(source, destination)` copies the whole slot except its index; `0x8059EC78(slot)` zeroes it except the index. Both set the "changes pending" flag (`0x8102FBE8`). Seen at run time.
+
+*Custom marks and logos: what implementing them showed* (7 November 2026; disassembly, `WIICOMPILED_ARRANGE_TRACE` traces and screenshots with an isolated NAND; patch `wiicompiled-arrange-marks`, user guide in `docs/en/mods.md`)
+- **Screen nodes** (base class, vtable `0x80146A88`): `+0x14` parent, `+0x18` next sibling, `+0x20` first child; visible = bit `0x40` of byte `+0x24` (vt `+0x10` = `0x800127F0`); position `+0x40/+0x44` (`fn_8001A7B0`), scale `+0x60/+0x64` (`fn_8001ABA0`). New node: `fn_8005B060(0x100)` + `fn_8001E9BC(node)` + `8057A180(node, parent)`; deleted with vt `+0x08(node, 1)`. The base destructor `fn_8001305C` only deletes children with bit `0x80` of byte `+4`, which nodes made this way lack: custom nodes are deleted from their parent's destructor. Seen at run time.
+- **Text widget `0x805C28D4`:** glyphs at `[+0x130]`, `0x1C` bytes each (`+4` x0, `+8` x1, u16), count at `+0x10A`; space has no glyph; a letter is 34 high. Colour with `807B4090(w, c)`: 0 pink, 1 blue (list names), 2 green (team name), 3 and 4 pale. It animates its own scale `+0x60`: scaling it needs a parent node (the list uses 0.45).
+- **Mark texture (`env_arrange_logoNN`):** descriptor `{0x01000100, 9 (C8), texels, 0, 0, 1, 1}` (`0x40` bytes, texels right after) and palette `{0x01000000, 2 (RGB5A3), data}` (`0x200` bytes of data right before). The mark widget only draws texels `(0, 0)-(158, 190)` (the `0x9E × 0xBE` rectangle of `fn_8000ABBC` in `0x805BE408`). In the widget: `+0xE4` texture, `+0xE8..+0xF4` the four palettes, then `fn_8000A77C(material, 1, w+0xE4)` / `fn_8000A790(material, 4, w+0xE8)`.
+- **Team Mark list:** 24 drawings + 14 flags (24 UNITED STATES … 37 SOUTH AFRICA). Confirming with A goes through vt `+0xB8` (`0x805BD1AC`, always 1) and vt `+0xDC` (`0x805BD1E4`). In Team Name/Mark the "COLOR" label is made by the build (`0x805C1840`) only if `+0x17 ≤ 0x17`; the A–D letter is `screen+0x3940` and its pair `[screen+0x3DC4]`; the game's CANCEL only refreshes (`0x805C2340`).
+- **"Cancel" copies of the edited record** (`0x8102FB78 + i × 0x38`): keep `0x8059EE10`, restore `0x8059EFE0`, "changed?" `0x8059EF94`.
+- **Logo Text screen** (vtable `0x80D3CEC8`, constructor `0x805B7BD8`, base = keyboard `0x8063F7A8`): vt `+0x24` `0x805B7ED0` pack set (`0x8064FEB0(0x8064ED54(), list, 1)` copies the ids into a set; what is missing gets unloaded), `+0x38` `0x805B7FEC` input, `+0xE8` `0x805B8838` build widgets, `+0xEC` `0x805B8CE4` start, `+0xF0` `0x805B8E98` side cursor, `+0xF4` `0x805B87CC` confirm, `+0x08`/`+0x18` destructor and release. Side column: LETTERS, DELETE (`0x805B85AC`), CANCEL = undo (`0x805B6FFC` compares 7 letters), OK; there is a free gap between LETTERS and DELETE. Z (`0x805B86CC`) writes the underline `rec+0x14` at once, not on confirm.
+- **Letters widget** (`0x805BA65C`, `0x300` bytes, vtable `0x80D3D378`, destructor `0x805B9F14`): `+0x210` container (position by mode, `0x805BA61C`: 0 → (0, 0), 1 → (−79, −43)) with the underline at `+0xE0` and the letter composer at `[+0xDC]`. Hiding `+0x210` hides letters and underline, and nothing in the game shows it again.
+- **Sprite class** (constructor `fn_8001D098`, `0x110` bytes, vtable `0x80146A48`): `fn_8001D25C(sprite, desc)` sets up a `SPRD` descriptor (`0x1C` bytes: `"SPRD"`, `0x1C`, texture, palette, s16 pivot x/y, origin u/v, width/height in texels). UVs divide by the power of two ≥ the side: keep sides at powers of two.
+- **2D units in 16:9:** not square (≈ 3.2–3.5 px per unit across and 2.3 down at 1920 × 1080). All of the game's 2D stretches like this, its marks too: a PNG looks ~1.5 times wider than the file. Logo Text's TEAM LOGO box ≈ 160 × 87 units.
+- **Team flag** (class `0x80D3D960`, destructor `0x805BE7FC` = vt `+0x08`): `+0x3E0` image node with the mark (pack `0x219`), `+0x4E0` palette list, `+0x4EC` the letter (class `0x805B76E4`), `+0x4FC` MLB logo. `0x805BFC04(b, mode)`: mode 0 mark + letter (the letter is hidden for marks 24–37, the flags), mode 1 MLB logo.
+- **Heap wrappers** (translated code; the heaps themselves are under "Game heaps" near the top): `fn_8005B060(size)` allocates from the MEM1 heap (`0x802B57A8`); `fn_8005B1B8(size, r4)` uses that same MEM1 heap with `r4 = 0` and the MEM2 heap (`0x802B57C8`) with any other value; both go through `0x8005A804(heap, size, 32)`. `fn_8005B088(p)` frees from either: it checks whether `p` lies in `[+0, +0 + [+4])` of the MEM1 heap, else of the MEM2 heap, and calls `0x8005ABAC` with the one it belongs to (a pointer from neither does nothing). Each flag's own `0x60`-byte block (SURF, quad, texture and palette lists) comes from `fn_8005B1B8(0x60, 1)` and is freed **after** the destructor `0x805BE7FC`: until then the flag's image node `+0x3E0` points to it at `+0xDC` and the draw reads it.
+- **Image node** (`fn_8001E9BC`): `+0xDC` SURF descriptor, `+0xE0` texture list {n, ptr}, `+0xE4` palette list. SURF: `+0x14` u16 mode (bit 0: palette per row), `+0x16` quad count, `+0x18` quads, `+0x1C` textures, `+0x20` palettes. Quad (`0x1C`): `+4..+A` s16 x0, y0, x1, y1; `+C..+12` s16 u0, v0, u1, v1 in texels; `+18` texture index, `+19` palette index. The draw reads the SURF every frame. Marks LION (2) and UNITED STATES (24) share the quad (0,0)-(35,38).
+- **Initial field** (class `0x805C6898`, TEAM FLAG and scoreboard): `+0x300` letter sprite (`0x140` bytes, SPRD at `+0x110`: pivot `+0x120`, cell `+0x128`/`+0x12A`, e.g. 26 × 34). `0x805C6A98(field, letter, colour)` sets letter and palette; `0x805C6B58(field, slot)` → `0x805C6BCC(field, record)`.
+- **Logo widget `0x807B4740`:** `+0xDC` mode; 0, 1 and 3 draw letters at `+0x7D0`, 2 (the "X AT Y" one) only the image `+0x3D0`. `+0xE4/E8/EC/F4` cache the last call.
+- **Where mark and initial show** (traced in game): slot list and Exhibition grid `0x807B34FC` mode 1 (LR `0x807B95F8`); Exhibition VS `0x807B5118` from `0x80CDB1DC`, **every frame**; HOME/ROAD `0x80CDADFC` → `0x807B34FC` mode 2; "X AT Y" `0x80638678` → `0x807B34FC` mode 2; starting lineup `0x8063A400` → mode 1; **scoreboard `0x80624840`** → `0x807B34FC` mode 3 → field `0x805C6B58`. In a match the record is the temporary slot's `0x8102D730` (record `0x8102D772`, slot index at `+1`). Season and League copy the team into their table (`[0x8104B5F8]`, slot at `+0x3C`, record at `+0x40`, `0x80924674`).
+- **Save extension (version 2):** an `MLBARRMK` block (u32 version = 2, FNV-1a 32 of the data, 32 slots × {mark 32 bytes, logo 32 bytes, fingerprint u32}; 2192 bytes, `0xD3000` to `0xD3890`) in `pm3usma.dat`, in the free tail the game never writes (its data ends at `0xD0050`; a save kept markers placed by hand at `0xD0060`, `0xD0410`, `0xD2000` and `0xD3F00`). Version 1 (no fingerprints, 2064 bytes) was never published and reads as invalid. An invalid block (another version, a bad checksum, a torn write) is ignored and not rewritten until some choice changes in that session. The **fingerprint** is the FNV-1a 32 of the team record's identity as the save keeps it: the 10 name codes (`+0x00`, 13 bits; `0x1FFF` and up read back as `0xFFFF`), the initial (`+0x15`, 5 bits) and the base team (`+0x1A`, 6 bits). It is computed from the live records at every save (renaming with the option on keeps the choice) and checked once after each load: the choice of an empty slot or of one with another fingerprint (team deleted, replaced or changed with the option off) is dropped. The match's temporary slot (`0x8102D730`) takes the choice of the slot in its `+1` only when its record has the same fingerprint. The game's load reads the file from 0 in 16 KB chunks and stops at `0xD0000`: the chunk that reaches `0xD0000` is when to read the block. **On save, NANDSafeOpen first copies the original file** (a mode 1 read that crosses `0xD0050`) to `/tmp/sys/pm3usma.dat`: that read must not reload the block, or unsaved choices are lost. With the block present the original game loads and saves the game as before.
+- **Slots in the save:** `0x805A25D4(buffer)` packs the 32 slots (`0x805A2738` per slot, `0x1B58` bytes each in the file) and `0x805A263C(buffer)` unpacks them: per slot `0x805A31EC(buffer, slot)` reads the header and the record, then the 40 players (`0xE4`), and sets `+0x01` = index. They are called by the main save's section table (`0x805A3E94` / `0x805A3EB0`, which do `lwz r3, 0x68(r3)` and branch; table at `0x80D3BE98`) and, `0x805A263C`, also by `0x80839700` and the boot load `0x80C89A9C`.
+- **Fields and widths in the file:** `0x805A31EC` decodes with `0x8080C0C8(source, destination, table)`, a bit-field reader (one output byte per field, each field's width in the table, `0xFF` end). Header and record table `0x80CEB828` (162 fields): `+0x00` in use 2 bits, `+0x01` index 5, `+0x02` base team 7, … `+0x5D` (= record `+0x1B`, flags) **5 bits: flags `0x20` and `0x40` are not saved**; name 10 × (5 + 8) = 13 bits; `+0x14` underline 2, initial 5, city 8, mark 6, mark colour 2, logo colour 4, the record's base team (`+0x1A`) 6; letters `+0x30..+0x36` 5 bits each (hence `0xFF` coming back as `0x1F`). A value wider than its field comes back with its low bits.
+- **Boot load** `0x80C89A9C` (traced in game): reserves `0xD0000` on the MEM2 heap, reads the save and, for each section (`0x805DA828(i)`, valid when `0x805D54D4` returns 0), unpacks it; an invalid one gets defaults (`0x8059CD60` for the Arrange slots). The last chunk read (`0xD0000`) comes before the unpack: at that point the slots at `[0x8104E1D8] + 0x3AC` are still empty (`+0x00` = 0), and right after `0x805A263C` they hold the save's teams, before anything draws them.
 
 ## 8. Scenes, menus and setting up a match
 

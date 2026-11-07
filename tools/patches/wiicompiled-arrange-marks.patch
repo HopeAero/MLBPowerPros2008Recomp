@@ -1,0 +1,3747 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -478,7 +478,7 @@
+ target_include_directories(mkw_season_pack_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+ add_test(NAME mkw_season_pack_tests COMMAND mkw_season_pack_tests)
+ 
+-foreach(case modern_postseason modern_postseason_save postseason_guest season_cap_modern)
++foreach(case arrange_marks arrange_marks_save arrange_marks_texture modern_postseason modern_postseason_save postseason_guest season_cap_modern)
+     add_executable(mkw_${case}_test "${CMAKE_CURRENT_LIST_DIR}/tests/${case}_test.cpp")
+     target_compile_features(mkw_${case}_test PRIVATE cxx_std_20)
+     target_compile_options(mkw_${case}_test PRIVATE -UNDEBUG)
+@@ -611,6 +611,16 @@
+ 
+     set(MKW_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+     include("${CMAKE_CURRENT_LIST_DIR}/cmake/PublicProducts.cmake")
++    # Custom Arrange marks (src/hle/mlb/arrange_marks.cpp) decode PNG with the libpng aurora links.
++    set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/hle/mlb/arrange_marks.cpp" PROPERTIES
++        SKIP_UNITY_BUILD_INCLUSION ON)
++    if(TARGET mkw_runtime_common AND TARGET PNG::PNG)
++        target_link_libraries(mkw_runtime_common PRIVATE PNG::PNG)
++        set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/hle/mlb/arrange_marks.cpp" APPEND PROPERTY
++            COMPILE_DEFINITIONS MKW_HAVE_LIBPNG=1)
++    else()
++        message(WARNING "libpng (PNG::PNG) or the mkw_runtime_common target is missing: custom Arrange marks and logos are disabled in this build")
++    endif()
+ else()
+     if(MKW_PLATFORM_MACOS)
+         # Compile-only audit of native runtime sources. It deliberately avoids
+diff --git a/runtime/include/arrange_marks.h b/runtime/include/arrange_marks.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/arrange_marks.h
+@@ -0,0 +1,238 @@
++#pragma once
++// Custom PNG marks and logos per Arrange team: folder catalog and image fit (pure, no game
++// dependencies). Names the game draws come from label(); pixels are fitted to the game's texture
++// size by fit().
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <filesystem>
++#include <string>
++#include <string_view>
++#include <system_error>
++#include <vector>
++
++namespace arrange_marks {
++
++constexpr size_t kMaxEntries = 64;
++constexpr size_t kMaxFileBytes = 8u << 20;
++constexpr size_t kNameChars = 12;
++
++// file is UTF-8 (not the ANSI code page); rebuild the path with pathOf().
++struct Entry {
++    std::string file;   // real file name on disk
++    std::string label;  // text the game draws
++};
++
++namespace catalog_detail {
++
++// ASCII fold of U+0100..U+017F (Latin Extended-A).
++inline constexpr char kLatinExtA[] =
++    "AaAaAaCcCcCcCcDd"
++    "DdEeEeEeEeEeGgGg"
++    "GgGgHhHhIiIiIiIi"
++    "IiIiJjKkkLlLlLlL"
++    "lLlNnNnNnnNnOoOo"
++    "OoOoRrRrRrSsSsSs"
++    "SsTtTtTtUuUuUuUu"
++    "UuUuWwYyYZzZzZzs";
++
++inline char fold(uint32_t cp) {
++    if (cp < 0x80) return static_cast<char>(cp);
++    if (cp >= 0xC0 && cp <= 0xFF) {
++        switch (cp) {
++        case 0xC0: case 0xC1: case 0xC2: case 0xC3: case 0xC4: case 0xC5: return 'A';
++        case 0xC7: return 'C';
++        case 0xC8: case 0xC9: case 0xCA: case 0xCB: return 'E';
++        case 0xCC: case 0xCD: case 0xCE: case 0xCF: return 'I';
++        case 0xD0: return 'D';
++        case 0xD1: return 'N';
++        case 0xD2: case 0xD3: case 0xD4: case 0xD5: case 0xD6: case 0xD8: return 'O';
++        case 0xD9: case 0xDA: case 0xDB: case 0xDC: return 'U';
++        case 0xDD: return 'Y';
++        case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: return 'A';
++        case 0xE7: return 'C';
++        case 0xE8: case 0xE9: case 0xEA: case 0xEB: return 'E';
++        case 0xEC: case 0xED: case 0xEE: case 0xEF: return 'I';
++        case 0xF0: return 'D';
++        case 0xF1: return 'N';
++        case 0xF2: case 0xF3: case 0xF4: case 0xF5: case 0xF6: case 0xF8: return 'O';
++        case 0xF9: case 0xFA: case 0xFB: case 0xFC: return 'U';
++        case 0xFD: case 0xFF: return 'Y';
++        default: return 0;  // AE, Thorn, sharp s, multiplication and division signs
++        }
++    }
++    if (cp >= 0x100 && cp <= 0x17F) return kLatinExtA[cp - 0x100];
++    return 0;
++}
++
++// Lenient UTF-8 decode: invalid bytes yield 0xFFFD (dropped later).
++inline uint32_t next(std::string_view s, size_t& i) {
++    unsigned char c = static_cast<unsigned char>(s[i++]);
++    if (c < 0x80) return c;
++    int extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : -1;
++    if (extra < 0 || c >= 0xF8) return 0xFFFD;
++    uint32_t cp = c & (0x3F >> extra);
++    for (int k = 0; k < extra; k++) {
++        if (i >= s.size() || (static_cast<unsigned char>(s[i]) & 0xC0) != 0x80) return 0xFFFD;
++        cp = (cp << 6) | (static_cast<unsigned char>(s[i++]) & 0x3F);
++    }
++    return cp;
++}
++
++inline std::string utf8(const std::filesystem::path& p) {
++    const std::u8string t = p.u8string();
++    return std::string(t.begin(), t.end());
++}
++
++inline std::string lower(std::string s) {
++    for (char& c : s)
++        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
++    return s;
++}
++
++}  // namespace catalog_detail
++
++// Text the game draws for a file stem: A-Z 0-9 space '-', Latin diacritics stripped, uppercase,
++// everything else dropped, spaces collapsed and trimmed, at most kNameChars characters.
++inline std::string label(std::string_view stem) {
++    std::string out;
++    for (size_t i = 0; i < stem.size();) {
++        char c = catalog_detail::fold(catalog_detail::next(stem, i));
++        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
++        bool keep = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ' || c == '-';
++        if (!keep) continue;
++        if (c == ' ' && (out.empty() || out.back() == ' ')) continue;
++        out.push_back(c);
++    }
++    if (out.size() > kNameChars) out.resize(kNameChars);
++    while (!out.empty() && out.back() == ' ') out.pop_back();
++    return out;
++}
++
++inline std::filesystem::path pathOf(const std::filesystem::path& folder, const Entry& entry) {
++    return folder / std::filesystem::path(std::u8string(entry.file.begin(), entry.file.end()));
++}
++
++// PNG files of a folder (by extension, size at most kMaxFileBytes), sorted case-insensitively by
++// stem, at most kMaxEntries. Equal labels get " 2", " 3"... A missing folder gives an empty list.
++inline std::vector<Entry> scan(const std::filesystem::path& folder) {
++    namespace fs = std::filesystem;
++    struct Found {
++        std::string file, stem, key;
++    };
++    std::vector<Found> found;
++    std::error_code ec;
++    fs::directory_iterator it(folder, ec), end;
++    for (; !ec && it != end; it.increment(ec)) {
++        std::error_code e1, e2;
++        if (!it->is_regular_file(e1) || e1) continue;
++        const fs::path& p = it->path();
++        std::string ext = catalog_detail::lower(catalog_detail::utf8(p.extension()));
++        if (ext != ".png") continue;
++        auto size = it->file_size(e2);
++        if (e2 || size == 0 || size > kMaxFileBytes) continue;
++        std::string stem = catalog_detail::utf8(p.stem());
++        found.push_back({catalog_detail::utf8(p.filename()), stem, catalog_detail::lower(stem)});
++    }
++    std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) {
++        return a.key != b.key ? a.key < b.key : a.file < b.file;
++    });
++    std::vector<Entry> out;
++    for (const Found& f : found) {
++        if (out.size() >= kMaxEntries) break;
++        std::string base = label(f.stem);
++        if (base.empty()) base = "IMG";
++        std::string name = base;
++        for (int n = 2;; n++) {
++            bool taken = std::any_of(out.begin(), out.end(), [&](const Entry& e) { return e.label == name; });
++            if (!taken) break;
++            std::string suffix = " " + std::to_string(n);
++            std::string head = base.substr(0, kNameChars - suffix.size());
++            while (!head.empty() && head.back() == ' ') head.pop_back();
++            name = head + suffix;
++        }
++        out.push_back({f.file, name});
++    }
++    return out;
++}
++
++// The labels as the game shows them in a cell: at most `chars` characters (the room of the game's
++// text widget), trailing spaces trimmed, still unique (" 2", " 3"... replace the tail).
++inline std::vector<std::string> shownLabels(const std::vector<Entry>& entries, size_t chars = 10) {
++    std::vector<std::string> out;
++    for (const Entry& e : entries) {
++        std::string base = e.label.substr(0, chars);
++        while (!base.empty() && base.back() == ' ') base.pop_back();
++        std::string name = base;
++        for (int n = 2; std::find(out.begin(), out.end(), name) != out.end(); ++n) {
++            const std::string suffix = " " + std::to_string(n);
++            std::string head = base.substr(0, chars - std::min(chars, suffix.size()));
++            while (!head.empty() && head.back() == ' ') head.pop_back();
++            name = head + suffix;
++        }
++        out.push_back(name);
++    }
++    return out;
++}
++
++// A selector over "none" (-1) and `count` entries (0..count-1), one step left (-1) or right (+1),
++// wrapping at both ends. A current value outside -1..count-1 (a choice whose file is gone) moves
++// to "none" first.
++inline int cycleChoice(int count, int current, int step) {
++    if (count <= 0) return -1;
++    if (current < -1 || current >= count) return -1;
++    const int span = count + 1, at = current + 1;
++    return (at + (step < 0 ? span - 1 : 1)) % span - 1;
++}
++
++struct Rgba {
++    uint32_t width = 0, height = 0;
++    std::vector<uint8_t> pixels;
++};
++
++// Scale source uniformly to fit inside width x height (area-average box filter, alpha-weighted),
++// centered over transparent (all-zero) padding. Empty or malformed source gives a transparent image.
++inline Rgba fit(const Rgba& source, uint32_t width, uint32_t height) {
++    Rgba out;
++    out.width = width;
++    out.height = height;
++    out.pixels.assign(static_cast<size_t>(width) * height * 4, 0);
++    if (!width || !height || !source.width || !source.height ||
++        source.pixels.size() < static_cast<size_t>(source.width) * source.height * 4)
++        return out;
++    double scale = std::min(double(width) / source.width, double(height) / source.height);
++    uint32_t nw = std::clamp<uint32_t>(static_cast<uint32_t>(std::lround(source.width * scale)), 1, width);
++    uint32_t nh = std::clamp<uint32_t>(static_cast<uint32_t>(std::lround(source.height * scale)), 1, height);
++    uint32_t ox = (width - nw) / 2, oy = (height - nh) / 2;
++    double stepX = double(source.width) / nw, stepY = double(source.height) / nh;
++    for (uint32_t y = 0; y < nh; y++) {
++        double y0 = y * stepY, y1 = std::min<double>(source.height, y0 + stepY);
++        for (uint32_t x = 0; x < nw; x++) {
++            double x0 = x * stepX, x1 = std::min<double>(source.width, x0 + stepX);
++            double sr = 0, sg = 0, sb = 0, sa = 0, sw = 0;
++            for (uint32_t sy = static_cast<uint32_t>(y0); sy < y1 && sy < source.height; sy++) {
++                double wy = std::min<double>(sy + 1, y1) - std::max<double>(sy, y0);
++                for (uint32_t sx = static_cast<uint32_t>(x0); sx < x1 && sx < source.width; sx++) {
++                    double w = wy * (std::min<double>(sx + 1, x1) - std::max<double>(sx, x0));
++                    const uint8_t* px = &source.pixels[(static_cast<size_t>(sy) * source.width + sx) * 4];
++                    double a = px[3] * w;
++                    sr += px[0] * a;
++                    sg += px[1] * a;
++                    sb += px[2] * a;
++                    sa += a;
++                    sw += w;
++                }
++            }
++            if (sw <= 0 || sa <= 0) continue;
++            uint8_t* dst = &out.pixels[(static_cast<size_t>(oy + y) * width + ox + x) * 4];
++            dst[0] = static_cast<uint8_t>(std::lround(sr / sa));
++            dst[1] = static_cast<uint8_t>(std::lround(sg / sa));
++            dst[2] = static_cast<uint8_t>(std::lround(sb / sa));
++            dst[3] = static_cast<uint8_t>(std::lround(sa / sw));
++        }
++    }
++    return out;
++}
++
++}  // namespace arrange_marks
+diff --git a/runtime/include/arrange_marks_native.h b/runtime/include/arrange_marks_native.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/arrange_marks_native.h
+@@ -0,0 +1,64 @@
++#pragma once
++// Custom PNG marks for Arrange teams in the running game (src/hle/mlb/arrange_marks.cpp), behind the
++// launcher option [arrange] custom_marks. A custom mark is a virtual mark index >= kGameMarks that is
++// never written to the team record (+0x17 keeps a game mark, valid for the original game); the
++// chosen file lives in liveChoices() and travels in the main save's tail (arrange_marks_save.h).
++#include <cstdint>
++#include <string>
++
++#include "arrange_marks_save.h"
++
++namespace arrange_marks {
++
++constexpr uint32_t kGameMarks = 38;
++
++// Called once at boot by the heap setup (game_heaps.cpp) with the MEM2 arena [low, high): with the
++// option on, the marks' guest memory is taken from the top of the arena; returns the new high
++// (unchanged with the option off, or when the game's retail heap would not fit).
++uint32_t ReserveGuestMemory(uint32_t low, uint32_t high);
++
++// A custom mark in the game's own texture format, in guest memory reserved at boot. The two
++// descriptors are what the game's loaders return for a mark pack (fn_8000C330 / fn_8000C3E0):
++//   texture: {height << 16 | width, 9 (GX_TF_C8), texels, 0, 0, 1, 1, 0...}   (0x40 bytes)
++//   palette: {256 << 16, 2 (GX_TL_RGB5A3), entries, 0...}                     (0x20 bytes)
++// A mark widget (class 0x805BE408, vtable 0x80D3D920) draws it with +0xE4 = texture, the four
++// palette slots +0xE8..+0xF4 = palette, then fn_8000A77C(material +0xF8, 1, widget + 0xE4) and
++// fn_8000A790(material, 4, widget + 0xE8), as 0x805BE664 does for a game mark. The icon pair is the
++// same picture fitted to 64 x 64 (the size of the team-flag mark cells of pack 0x219).
++struct TextureRef {
++    uint32_t texture = 0, palette = 0;          // 256 x 256
++    uint32_t iconTexture = 0, iconPalette = 0;  // 64 x 64
++};
++
++// The main save hooks (nand_isfs.cpp) run only with the option on and its guest memory reserved: if
++// the reservation failed, a block already in the save is neither loaded nor rewritten.
++bool SaveHooksEnabled();
++// The fingerprints (recordFingerprint) of the 32 slots' team records as they are now, for the store.
++Fingerprints CurrentFingerprints();
++
++// The choice of the Arrange slot a team record belongs to: a record of the 32 slots of the main
++// block ([0x8104E1D8] + 0x3AC + i * 0x2448 + 0x42) or of the match's temporary slot (0x8102D730,
++// slot index at +1, used only while its record is that slot's team: same fingerprint). Empty for any
++// other record, and with the option off.
++const Choice& choiceFor(uint32_t teamRecordAddress);
++// The choice's mark, loaded lazily (only this file, cached by file name and date). False when the
++// option is off, nothing is chosen, or the file is missing, not a PNG, damaged or over 4096 x 4096.
++bool markTexture(const Choice& choice, TextureRef& out);
++// A custom logo replaces the letter logo of the TEAM LOGO box (the letters widget 0x805BA65C; on
++// Logo Text a box of about 160 x 87 of the widget's units, 560 x 199 px inside at 1920 x 1080 since
++// the 2D units are not square on 16:9), so it keeps about that box's proportions: the PNG is
++// fitted, centred and unstretched, into a kLogoWidth x kLogoHeight (2:1, the nearest the game's
++// sprites take: both sides powers of two, fn_8001D25C) C8 texture with an RGB5A3 palette (texture
++// and palette descriptors as above; iconTexture and iconPalette are 0). A wordmark fills the width
++// as the game's letters do; a tall picture gets the box's height. Same caps, lazy load and cache as
++// marks; from UserData/arrange/logos.
++constexpr uint32_t kLogoWidth = 256, kLogoHeight = 128;
++bool logoTexture(const Choice& choice, TextureRef& out);
++// The virtual mark index (>= kGameMarks, stable while the game runs) of a mark file, and back.
++uint32_t markIndexFor(const std::string& file);
++const std::string* markFileFor(uint32_t index);
++// COPY / DELETE (and every other path that rewrites a slot) keep the choices with the slots.
++void onSlotCopied(int from, int to);
++void onSlotDeleted(int slot);
++
++}  // namespace arrange_marks
+diff --git a/runtime/include/arrange_marks_save.h b/runtime/include/arrange_marks_save.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/arrange_marks_save.h
+@@ -0,0 +1,267 @@
++#pragma once
++// Custom PNG marks and logos per Arrange team (launcher option [arrange] custom_marks).
++//
++// The choices (a file name for the mark and one for the logo, per Arrange slot) travel in the free
++// tail of the main save pm3usma.dat. The game's data end at 0xD0050 (save descriptor 0xD0000 + 0x50
++// header): a save kept markers placed at 0xD0060, 0xD0410, 0xD2000 and 0xD3F00, and a save with
++// foreign bytes at 0xD3F00 loads (proven in game, docs/ingenieria-inversa.md, Arrange save). The block
++// sits at 0xD3000, beyond anything the save descriptor (0xD0400) may verify, and the record stays
++// valid for the original game.
++// Block (version 2): "MLBARRMK" (8), version u32 BE (4), FNV-1a 32 of the slot bytes u32 BE (4), then
++// 32 x (mark 32 bytes + logo 32 bytes, UTF-8, zero padded + fingerprint u32 BE of the slot's team
++// record when the choice was saved, recordFingerprint). Version 1 (no fingerprints) was never
++// published: it reads as Invalid.
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace arrange_marks {
++
++constexpr size_t kSlots = 32;
++constexpr size_t kNameBytes = 32;
++constexpr size_t kFingerprintBytes = 4;
++constexpr size_t kRowBytes = 2 * kNameBytes + kFingerprintBytes;
++constexpr size_t kHeaderBytes = 16;
++constexpr size_t kSaveBytes = 2192;
++static_assert(kSaveBytes == kHeaderBytes + kSlots * kRowBytes);
++constexpr uint32_t kVersion = 2;
++// File offset of the block in pm3usma.dat (ends 0xD3890); the game's data end at 0xD0050 (save
++// descriptor 0xD0000 + 0x50 header), the file at 0xD4000.
++// The game's load reads the file from 0 in 16 KB chunks and stops at 0xD0000 (NAND trace, Task 6):
++// it never reaches the data end. The load hook keys on this offset.
++constexpr uint32_t kMainSaveLoadEnd = 0xD0000;
++constexpr uint32_t kSaveFileOffset = 0xD3000;
++constexpr uint32_t kSaveFileSize = 0xD4000;
++static_assert(kSaveFileOffset >= 0xD0400 && kSaveFileOffset + kSaveBytes <= kSaveFileSize);
++
++struct Choice {
++    std::string mark, logo;
++    bool empty() const { return mark.empty() && logo.empty(); }
++    bool operator==(const Choice& other) const { return mark == other.mark && logo == other.logo; }
++    bool operator!=(const Choice& other) const { return !(*this == other); }
++};
++using Choices = std::array<Choice, kSlots>;
++using Fingerprints = std::array<uint32_t, kSlots>;
++enum class ReadStatus { Missing, Valid, Invalid };
++
++// Process-wide current choices: loaded when the main save is read, written when it is saved.
++inline Choices& liveChoices() {
++    static Choices choices;
++    return choices;
++}
++
++// What the last load of the main save brought, and what the store must respect.
++struct SaveState {
++    ReadStatus status = ReadStatus::Missing;  // of the last load (Missing before any)
++    Choices loaded;                           // the choices it brought (empty unless Valid)
++    Fingerprints fingerprints{};              // their teams' fingerprints (0 for empty rows)
++    bool unchecked = false;                   // loaded choices not yet checked against the records
++    bool changed = false;                     // a choice differed from the loaded ones at a store
++};
++inline SaveState& saveState() {
++    static SaveState state;
++    return state;
++}
++
++namespace detail {
++inline uint32_t fnv1a(const uint8_t* data, size_t size) {
++    uint32_t hash = 2166136261u;
++    for (size_t i = 0; i < size; ++i) hash = (hash ^ data[i]) * 16777619u;
++    return hash;
++}
++inline void put32(uint8_t* out, uint32_t value) {
++    for (int i = 3; i >= 0; --i) { out[i] = uint8_t(value); value >>= 8; }
++}
++inline uint32_t get32(const uint8_t* in) {
++    return uint32_t(in[0]) << 24 | uint32_t(in[1]) << 16 | uint32_t(in[2]) << 8 | in[3];
++}
++constexpr std::array<uint8_t, 8> magic{'M', 'L', 'B', 'A', 'R', 'R', 'M', 'K'};
++}  // namespace detail
++
++// The team record's identity (record = slot + 0x42, 0x37 bytes, big endian as in guest memory): the
++// name (+0x00, 10 font codes), the initial (+0x15) and the base team (+0x1A), each reduced to the bits
++// the main save keeps (field table 0x80CEB828 of the slot (un)packer 0x805A2738 / 0x805A31EC: a name
++// code is 13 bits, 0x1FFF and up reading back as 0xFFFF; the initial 5 bits; the base team 6 bits), so
++// a record and the same record after a save and a reload give the same value. Mark, colours, flags,
++// letters and uniform are left out: editing them is not a different team.
++constexpr size_t kRecordIdentityBytes = 0x1B;
++inline uint32_t recordFingerprint(const uint8_t* record) {
++    uint8_t identity[22];
++    for (size_t i = 0; i < 10; ++i) {
++        uint16_t code = uint16_t((record[2 * i] << 8 | record[2 * i + 1]) & 0x1FFF);
++        if (code == 0x1FFF) code = 0xFFFF;
++        identity[2 * i] = uint8_t(code >> 8);
++        identity[2 * i + 1] = uint8_t(code);
++    }
++    identity[20] = uint8_t(record[0x15] & 0x1F);
++    identity[21] = uint8_t(record[0x1A] & 0x3F);
++    return detail::fnv1a(identity, sizeof identity);
++}
++
++// fingerprints[i] goes with a non-empty choice only (an empty row stores 0).
++inline std::array<uint8_t, kSaveBytes> writeChoices(const Choices& choices, const Fingerprints& fingerprints) {
++    std::array<uint8_t, kSaveBytes> out{};
++    for (const auto& choice : choices)
++        if (choice.mark.size() > kNameBytes || choice.logo.size() > kNameBytes)
++            throw std::invalid_argument("arrange marks: file name longer than 32 bytes");
++    std::copy(detail::magic.begin(), detail::magic.end(), out.begin());
++    detail::put32(out.data() + 8, kVersion);
++    for (size_t i = 0; i < kSlots; ++i) {
++        uint8_t* row = out.data() + kHeaderBytes + i * kRowBytes;
++        std::copy(choices[i].mark.begin(), choices[i].mark.end(), row);
++        std::copy(choices[i].logo.begin(), choices[i].logo.end(), row + kNameBytes);
++        detail::put32(row + 2 * kNameBytes, choices[i].empty() ? 0 : fingerprints[i]);
++    }
++    detail::put32(out.data() + 12, detail::fnv1a(out.data() + kHeaderBytes, kSaveBytes - kHeaderBytes));
++    return out;
++}
++
++// out and fingerprints are left empty unless the result is Valid. Any other version (version 1 had
++// no fingerprints) is Invalid.
++inline ReadStatus readChoices(const uint8_t* data, size_t size, Choices& out, Fingerprints& fingerprints) {
++    out = Choices{};
++    fingerprints = Fingerprints{};
++    if (!data) return ReadStatus::Missing;
++    if (std::all_of(data, data + std::min(size, kSaveBytes), [](uint8_t b) { return b == 0; }))
++        return ReadStatus::Missing;
++    if (size < kSaveBytes || !std::equal(detail::magic.begin(), detail::magic.end(), data) ||
++        detail::get32(data + 8) != kVersion ||
++        detail::get32(data + 12) != detail::fnv1a(data + kHeaderBytes, kSaveBytes - kHeaderBytes))
++        return ReadStatus::Invalid;
++    Choices read;
++    Fingerprints prints{};
++    for (size_t i = 0; i < kSlots; ++i) {
++        const uint8_t* row = data + kHeaderBytes + i * kRowBytes;
++        const char* text = reinterpret_cast<const char*>(row);
++        size_t markLen = 0, logoLen = 0;
++        while (markLen < kNameBytes && text[markLen]) ++markLen;
++        while (logoLen < kNameBytes && text[kNameBytes + logoLen]) ++logoLen;
++        read[i].mark.assign(text, markLen);
++        read[i].logo.assign(text + kNameBytes, logoLen);
++        prints[i] = detail::get32(row + 2 * kNameBytes);
++    }
++    out = std::move(read);
++    fingerprints = prints;
++    return ReadStatus::Valid;
++}
++
++// Loaded choices against the records they were saved for: current[i] is the fingerprint of slot i's
++// record now, or nothing when the slot holds no team. A choice whose slot is empty or holds another
++// team (changed while the option was off: another run, Dolphin or a Wii) is dropped. Returns the
++// dropped slots.
++struct SlotNow {
++    bool used = false;
++    uint32_t fingerprint = 0;
++};
++inline std::vector<int> dropChangedTeams(Choices& choices, const Fingerprints& saved,
++                                         const std::array<SlotNow, kSlots>& current) {
++    std::vector<int> dropped;
++    for (size_t i = 0; i < kSlots; ++i) {
++        if (choices[i].empty()) continue;
++        if (current[i].used && current[i].fingerprint == saved[i]) continue;
++        choices[i] = Choice{};
++        dropped.push_back(int(i));
++    }
++    return dropped;
++}
++
++// Whether some slot has chosen `file` as its logo (logo = true) or its mark.
++inline bool isChosen(const Choices& choices, bool logo, const std::string& file) {
++    if (file.empty()) return false;
++    return std::any_of(choices.begin(), choices.end(),
++                       [&](const Choice& c) { return (logo ? c.logo : c.mark) == file; });
++}
++
++inline void copySlot(Choices& choices, int from, int to) {
++    if (from < 0 || to < 0 || from >= int(kSlots) || to >= int(kSlots)) return;
++    choices[to] = choices[from];
++}
++inline void clearSlot(Choices& choices, int slot) {
++    if (slot < 0 || slot >= int(kSlots)) return;
++    choices[slot] = Choice{};
++}
++
++inline bool IsMainSaveName(const char* fileName) {
++    return fileName && std::strcmp(fileName, "pm3usma.dat") == 0;
++}
++
++// A read of the main save loads the choices only when its chunk reaches the end of what the game's
++// load reads (kMainSaveLoadEnd, the Season precedent): the single-chunk reads from offset 0 the game
++// also makes (open checks) must not discard unsaved picks.
++inline bool LoadChunkReachesLoadEnd(uint32_t readAt, size_t bytesRead) {
++    return readAt < kMainSaveLoadEnd && uint64_t(readAt) + bytesRead >= kMainSaveLoadEnd;
++}
++// Reading the whole file is not always a load: to save, the SDK's NANDSafeOpen copies the old file
++// (read-only handle on pm3usma.dat) into /tmp/sys/pm3usma.dat (write handle) before the game writes
++// it, and that copy crosses the load end too. Loading then would replace unsaved picks with the old
++// file's (seen in game, Task 6). So no load while any main-save handle is open for writing.
++inline bool ShouldLoadOnRead(uint32_t readAt, size_t bytesRead, bool mainSaveWriteOpen) {
++    return !mainSaveWriteOpen && LoadChunkReachesLoadEnd(readAt, bytesRead);
++}
++
++// Main save hooks on the host file. `enabled` is the option with its guest memory reserved
++// (SaveHooksEnabled): off, nothing is read or written, so a block the file already has stays as it
++// is. The file position is preserved.
++// Load: fills liveChoices() and saveState(); a missing or Invalid block leaves the choices empty
++// (Invalid is reported). The loaded choices still have to be checked against the records once the
++// game has unpacked them (saveState().unchecked; dropChangedTeams).
++inline ReadStatus OnMainSaveLoad(FILE* file, bool enabled) {
++    if (!enabled || !file) return ReadStatus::Missing;
++    const long at = std::ftell(file);
++    if (at < 0) return ReadStatus::Missing;
++    std::array<uint8_t, kSaveBytes> block{};
++    size_t got = 0;
++    if (std::fseek(file, long(kSaveFileOffset), SEEK_SET) == 0)
++        got = std::fread(block.data(), 1, block.size(), file);
++    std::fseek(file, at, SEEK_SET);
++    SaveState& state = saveState();
++    state.status = readChoices(block.data(), got, state.loaded, state.fingerprints);
++    state.unchecked = state.status == ReadStatus::Valid &&
++                      std::any_of(state.loaded.begin(), state.loaded.end(), [](const Choice& c) { return !c.empty(); });
++    state.changed = false;
++    liveChoices() = state.loaded;
++    return state.status;
++}
++
++// Store: writes the block from liveChoices() with `current` (the fingerprints of the slots' records
++// now) at kSaveFileOffset, only when the file already spans it (a partial or fresh file is never
++// grown). After an Invalid load (a later version, a torn write) the block on disk is kept until a
++// choice differs from the loaded (empty) ones in this run: a save without changes must not erase
++// what a newer runtime wrote.
++enum class StoreResult { Written, NotSpanned, KeptInvalid, Disabled, Failed };
++inline StoreResult OnMainSaveStore(FILE* file, bool enabled, const Fingerprints& current) {
++    if (!enabled || !file) return StoreResult::Disabled;
++    SaveState& state = saveState();
++    if (liveChoices() != state.loaded) state.changed = true;
++    if (state.status == ReadStatus::Invalid && !state.changed) return StoreResult::KeptInvalid;
++    std::array<uint8_t, kSaveBytes> block;
++    try {
++        block = writeChoices(liveChoices(), current);
++    } catch (const std::invalid_argument&) {
++        return StoreResult::Failed;
++    }
++    const long at = std::ftell(file);
++    if (at < 0) return StoreResult::Failed;
++    bool ok = std::fseek(file, 0, SEEK_END) == 0;
++    if (ok) {
++        const long end = std::ftell(file);
++        if (end < 0) ok = false;
++        else if (uint64_t(end) < uint64_t(kSaveFileOffset) + kSaveBytes) {
++            std::fseek(file, at, SEEK_SET);
++            return StoreResult::NotSpanned;
++        }
++    }
++    ok = ok && std::fseek(file, long(kSaveFileOffset), SEEK_SET) == 0 &&
++         std::fwrite(block.data(), 1, block.size(), file) == block.size();
++    std::fflush(file);
++    std::fseek(file, at, SEEK_SET);
++    return ok ? StoreResult::Written : StoreResult::Failed;
++}
++
++}  // namespace arrange_marks
+diff --git a/runtime/include/arrange_marks_texture.h b/runtime/include/arrange_marks_texture.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/arrange_marks_texture.h
+@@ -0,0 +1,234 @@
++#pragma once
++// Custom PNG marks for Arrange teams: the game-side texture format (pure, no game dependencies).
++// The game's marks (env_arrange_logoNN) are C8 textures with RGB5A3 palettes; a custom mark is
++// converted to the same format so the game's own widgets draw it: pngHeader() checks a file
++// cheaply before it is listed, quantize() reduces the fitted RGBA picture to 256 RGB5A3 colours and
++// toC8() lays the indices out in GX 8x4 tiles.
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++#include "arrange_marks.h"
++
++namespace arrange_marks {
++
++// Larger decoded pictures are rejected (a 4096 x 4096 RGBA picture is 64 MB while it is fitted).
++constexpr uint32_t kMaxPngSide = 4096;
++
++struct PngInfo {
++    uint32_t width = 0, height = 0;
++};
++
++namespace texture_detail {
++inline uint32_t crc32(const uint8_t* data, size_t size) {
++    uint32_t crc = 0xFFFFFFFFu;
++    for (size_t i = 0; i < size; ++i) {
++        crc ^= data[i];
++        for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
++    }
++    return ~crc;
++}
++inline uint32_t be32(const uint8_t* p) {
++    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
++}
++}  // namespace texture_detail
++
++// The first 33 bytes of a PNG file: signature, then an IHDR chunk with a valid CRC and a size of
++// 1..kMaxPngSide on each side. Anything else (another format, a damaged start) is not a mark.
++inline bool pngHeader(const uint8_t* data, size_t size, PngInfo& out) {
++    static constexpr uint8_t kSignature[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
++    out = {};
++    if (!data || size < 33 || !std::equal(kSignature, kSignature + 8, data)) return false;
++    if (texture_detail::be32(data + 8) != 13 || data[12] != 'I' || data[13] != 'H' || data[14] != 'D' || data[15] != 'R')
++        return false;
++    if (texture_detail::crc32(data + 12, 17) != texture_detail::be32(data + 29)) return false;
++    const uint32_t width = texture_detail::be32(data + 16), height = texture_detail::be32(data + 20);
++    if (!width || !height || width > kMaxPngSide || height > kMaxPngSide) return false;
++    out = {width, height};
++    return true;
++}
++
++// The chunk headers (length, type) from the signature to IEND, which must end the file exactly: a
++// file cut short (or padded) is not offered, without decompressing anything. read(offset, out8)
++// reads 8 bytes of the file. Walks at most kMaxPngChunks chunks.
++constexpr uint32_t kMaxPngChunks = 100000;
++template <typename Read>
++bool pngChunksComplete(uint64_t fileSize, Read read) {
++    uint64_t at = 8;
++    for (uint32_t n = 0; n < kMaxPngChunks; ++n) {
++        uint8_t head[8];
++        if (at + 12 > fileSize || !read(at, head)) return false;
++        const uint64_t next = at + 12 + texture_detail::be32(head);
++        if (next > fileSize) return false;
++        if (head[4] == 'I' && head[5] == 'E' && head[6] == 'N' && head[7] == 'D') return next == fileSize;
++        at = next;
++    }
++    return false;
++}
++
++// RGB5A3 as GX reads it: opaque 1RRRRRGGGGGBBBBB, otherwise 0AAARRRRGGGGBBBB. Nearly invisible
++// pixels become the single transparent value 0.
++inline uint16_t toRgb5a3(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
++    if (a >= 0xE0) return uint16_t(0x8000 | (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3));
++    if (a < 0x20) return 0;
++    return uint16_t((a >> 5) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | (b >> 4));
++}
++inline std::array<uint8_t, 4> fromRgb5a3(uint16_t v) {
++    if (v & 0x8000)
++        return {uint8_t(((v >> 10) & 31) * 255 / 31), uint8_t(((v >> 5) & 31) * 255 / 31), uint8_t((v & 31) * 255 / 31), 255};
++    return {uint8_t(((v >> 8) & 15) * 17), uint8_t(((v >> 4) & 15) * 17), uint8_t((v & 15) * 17),
++            uint8_t(((v >> 12) & 7) * 255 / 7)};
++}
++
++struct Indexed {
++    uint32_t width = 0, height = 0;
++    std::array<uint16_t, 256> palette{};  // RGB5A3; unused entries are 0 (transparent)
++    std::vector<uint8_t> indices;         // row-major, one per pixel
++};
++
++// At most 256 RGB5A3 colours: the picture's own colours when they fit, otherwise a median cut of
++// them (weighted by how many pixels use each). Transparent pixels keep palette entry 0.
++inline Indexed quantize(const Rgba& image) {
++    Indexed out;
++    out.width = image.width;
++    out.height = image.height;
++    const size_t count = size_t(image.width) * image.height;
++    out.indices.assign(count, 0);
++    if (image.pixels.size() < count * 4) return out;
++    std::vector<uint16_t> values(count);
++    std::vector<uint32_t> uses(65536, 0);
++    for (size_t i = 0; i < count; ++i) {
++        const uint8_t* p = &image.pixels[i * 4];
++        values[i] = toRgb5a3(p[0], p[1], p[2], p[3]);
++        ++uses[values[i]];
++    }
++    struct Colour {
++        uint16_t value;
++        uint32_t weight;
++        std::array<int, 4> c;
++    };
++    std::vector<Colour> colours;
++    for (uint32_t v = 1; v < 65536; ++v)
++        if (uses[v]) {
++            const auto e = fromRgb5a3(uint16_t(v));
++            colours.push_back({uint16_t(v), uses[v], {e[0], e[1], e[2], e[3]}});
++        }
++    std::vector<int16_t> map(65536, -1);
++    map[0] = 0;  // transparent
++    const size_t room = 255;  // entry 0 stays transparent
++    if (colours.size() <= room) {
++        for (size_t i = 0; i < colours.size(); ++i) {
++            out.palette[i + 1] = colours[i].value;
++            map[colours[i].value] = int16_t(i + 1);
++        }
++    } else {
++        struct Box {
++            size_t begin, end;
++        };
++        std::vector<Box> boxes{{0, colours.size()}};
++        const auto spread = [&](const Box& b, int& channel) {
++            int best = -1;
++            for (int ch = 0; ch < 4; ++ch) {
++                int lo = 255, hi = 0;
++                for (size_t i = b.begin; i < b.end; ++i) {
++                    lo = std::min(lo, colours[i].c[ch]);
++                    hi = std::max(hi, colours[i].c[ch]);
++                }
++                if (hi - lo > best) { best = hi - lo; channel = ch; }
++            }
++            return best;
++        };
++        while (boxes.size() < room) {
++            size_t pick = boxes.size();
++            int pickChannel = 0;
++            uint64_t pickScore = 0;
++            for (size_t k = 0; k < boxes.size(); ++k) {
++                if (boxes[k].end - boxes[k].begin < 2) continue;
++                int channel = 0;
++                const int s = spread(boxes[k], channel);
++                uint64_t weight = 0;
++                for (size_t i = boxes[k].begin; i < boxes[k].end; ++i) weight += colours[i].weight;
++                const uint64_t score = uint64_t(s + 1) * weight;
++                if (s > 0 && score > pickScore) { pickScore = score; pick = k; pickChannel = channel; }
++            }
++            if (pick == boxes.size()) break;
++            Box b = boxes[pick];
++            std::sort(colours.begin() + long(b.begin), colours.begin() + long(b.end),
++                      [&](const Colour& x, const Colour& y) { return x.c[pickChannel] < y.c[pickChannel]; });
++            uint64_t total = 0, half = 0;
++            for (size_t i = b.begin; i < b.end; ++i) total += colours[i].weight;
++            size_t cut = b.begin + 1;
++            for (size_t i = b.begin; i < b.end - 1; ++i) {
++                half += colours[i].weight;
++                cut = i + 1;
++                if (half * 2 >= total) break;
++            }
++            boxes[pick] = {b.begin, cut};
++            boxes.push_back({cut, b.end});
++        }
++        std::vector<std::array<int, 4>> entries;
++        for (const Box& b : boxes) {
++            double sum[4] = {0, 0, 0, 0}, weight = 0;
++            for (size_t i = b.begin; i < b.end; ++i) {
++                for (int ch = 0; ch < 4; ++ch) sum[ch] += double(colours[i].c[ch]) * colours[i].weight;
++                weight += colours[i].weight;
++            }
++            uint8_t avg[4];
++            for (int ch = 0; ch < 4; ++ch) avg[ch] = uint8_t(std::clamp(sum[ch] / weight + 0.5, 0.0, 255.0));
++            const uint16_t value = toRgb5a3(avg[0], avg[1], avg[2], std::max<uint8_t>(avg[3], 0x20));
++            out.palette[entries.size() + 1] = value;
++            const auto e = fromRgb5a3(value);
++            entries.push_back({e[0], e[1], e[2], e[3]});
++        }
++        for (const Colour& c : colours) {
++            int best = 0;
++            long bestDistance = -1;
++            for (size_t k = 0; k < entries.size(); ++k) {
++                long d = 0;
++                for (int ch = 0; ch < 4; ++ch) {
++                    const long diff = long(c.c[ch]) - entries[k][ch];
++                    d += diff * diff * (ch == 3 ? 2 : 1);
++                }
++                if (bestDistance < 0 || d < bestDistance) { bestDistance = d; best = int(k); }
++            }
++            map[c.value] = int16_t(best + 1);
++        }
++    }
++    for (size_t i = 0; i < count; ++i) out.indices[i] = uint8_t(map[values[i]] < 0 ? 0 : map[values[i]]);
++    return out;
++}
++
++// GX C8: 8 x 4 texel tiles, tiles row by row. Width and height must be multiples of 8 and 4.
++inline size_t c8Offset(uint32_t x, uint32_t y, uint32_t width) {
++    return (size_t(y / 4) * (width / 8) + x / 8) * 32 + (y % 4) * 8 + x % 8;
++}
++inline std::vector<uint8_t> toC8(const Indexed& image) {
++    std::vector<uint8_t> out(size_t(image.width) * image.height, 0);
++    if (image.width % 8 || image.height % 4 || image.indices.size() < out.size()) return out;
++    for (uint32_t y = 0; y < image.height; ++y)
++        for (uint32_t x = 0; x < image.width; ++x)
++            out[c8Offset(x, y, image.width)] = image.indices[size_t(y) * image.width + x];
++    return out;
++}
++
++// A side x side icon drawn by a letter sprite of the game (cell w x h, pivot px, py: the sprite draws
++// its cell from -pivot to size - pivot, in its units) instead of the letter: the icon's sprite has its
++// pivot at the icon's centre, is moved by (dx, dy) of the sprite's units (the cell's centre) and scaled
++// by `scale` (the icon as tall as the cell's longer side).
++struct IconInCell {
++    float dx = 0, dy = 0;
++    float scale = 0;  // 0: no cell
++};
++inline IconInCell iconInCell(float w, float h, float px, float py, uint32_t side = 64) {
++    IconInCell out;
++    if (w <= 0 || h <= 0 || !side) return out;
++    out.scale = std::max(w, h) / float(side);
++    out.dx = w / 2 - px;
++    out.dy = h / 2 - py;
++    return out;
++}
++
++}  // namespace arrange_marks
+diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
+--- a/runtime/include/runtime_config.h
++++ b/runtime/include/runtime_config.h
+@@ -46,4 +46,5 @@
+     std::optional<bool> universalDh;     // [season] universal_dh: the DH in every Season mode game
+     std::optional<bool> modernLeagues;   // [season] modern_leagues: Houston in the AL West (15 and 15)
+     std::optional<bool> modernPostseason;  // [season] modern_postseason: 12-team format for new games
++    std::optional<bool> arrangeCustomMarks;  // [arrange] custom_marks: PNG marks and logos per Arrange team
+     std::optional<bool> twoWayPlayer;    // [season] two_way_player: a starting pitcher can also be the DH
+@@ -485,4 +486,5 @@
+     config.universalDh = FindConfigValue<bool>(document, "season", "universal_dh");
+     config.modernLeagues = FindConfigValue<bool>(document, "season", "modern_leagues");
+     config.modernPostseason = FindConfigValue<bool>(document, "season", "modern_postseason");
++    config.arrangeCustomMarks = FindConfigValue<bool>(document, "arrange", "custom_marks");
+     config.twoWayPlayer = FindConfigValue<bool>(document, "season", "two_way_player");
+@@ -999,6 +1001,15 @@
+     return WriteSetting("season", "modern_postseason", value ? "true" : "false");
+ }
+ 
++inline bool ArrangeCustomMarks(bool fallback = false) {
++    return Get().arrangeCustomMarks.value_or(fallback);
++}
++
++inline bool SetArrangeCustomMarks(bool value) {
++    Mutable().arrangeCustomMarks = value;
++    return WriteSetting("arrange", "custom_marks", value ? "true" : "false");
++}
++
+ inline bool TwoWayPlayer(bool fallback = false) {
+     return Get().twoWayPlayer.value_or(fallback);
+ }
+diff --git a/runtime/src/hle/mlb/arrange_marks.cpp b/runtime/src/hle/mlb/arrange_marks.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/hle/mlb/arrange_marks.cpp
+@@ -0,0 +1,2051 @@
++// Custom PNG marks for Arrange teams ([arrange] custom_marks): the Team Mark list of the Arrange team
++// creator ("Please set the team's mark", vtable 0x80D3D4B0) gets the user's PNG files after its 38
++// game marks, as cells of its own kind (pack 0x929 cell picture, the game's team-name text widget for
++// the name), chosen with the game's cursor, sounds and confirm, previewed in its TEAM MARK box.
++// Addresses and evidence: docs/ingenieria-inversa.md (Arrange teams; custom marks and logos).
++//
++// - A custom mark is a virtual mark index >= 38 (markIndexFor). It is never written to the team
++//   record: +0x17 keeps the game mark the team had (the original game, and anything not hooked,
++//   keeps reading a valid mark) and +0x1B keeps the 0x02 "own mark" flag. The file name goes to
++//   liveChoices()[slot] (saved in the main save's tail with the team's fingerprint, nand_isfs.cpp;
++//   checked against the teams when the game unpacks the slots, 0x805A263C).
++// - Its texture is the PNG fitted to the 158 x 190 art area of a 256 x 256 mark (and to 64 x 64),
++//   converted to the game's mark format (C8 with an RGB5A3 palette), in guest memory reserved at boot
++//   at the top of the MEM2 arena
++//   (ReserveGuestMemory, called by game_heaps.cpp). Only the file being shown is loaded.
++// - With the option off nothing is reserved, every override calls the original unchanged and the
++//   list is the game's 38 marks.
++// - Custom logos (UserData/arrange/logos) are chosen on the Logo Text screen (section at the end):
++//   one more row in its side column, previewed in its TEAM LOGO box; liveChoices()[slot].logo.
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <map>
++#include <new>
++#include <set>
++#include <string>
++#include <system_error>
++#include <utility>
++#include <vector>
++
++#ifdef MKW_HAVE_LIBPNG
++#include <png.h>
++#endif
++
++#include "abi_bridge.h"
++#include "arrange_marks.h"
++#include "arrange_marks_native.h"
++#include "arrange_marks_save.h"
++#include "arrange_marks_texture.h"
++#include "gx_guest_write.h"
++#include "hle_stubs.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++#include "runtime_config.h"
++
++#define ORIGINAL(address) extern "C" void func_##address(CpuContext*)
++ORIGINAL(805BD300); ORIGINAL(805BCEE8); ORIGINAL(805BDCE0); ORIGINAL(805BD28C); ORIGINAL(805BE158);
++ORIGINAL(805BE15C); ORIGINAL(805BD1E4); ORIGINAL(805BE408); ORIGINAL(805BE664); ORIGINAL(805BCBF8);
++ORIGINAL(805BCAC0); ORIGINAL(8059EE10); ORIGINAL(8059EFE0); ORIGINAL(8059EF94); ORIGINAL(805C2340);
++ORIGINAL(8059E2E8); ORIGINAL(8059EC78); ORIGINAL(8059ECC4); ORIGINAL(8059CE4C); ORIGINAL(8059CD60);
++ORIGINAL(805BC394); ORIGINAL(805BEFB8); ORIGINAL(805C1840);
++ORIGINAL(805B7ED0); ORIGINAL(805B8838); ORIGINAL(805B8CE4); ORIGINAL(805B7FEC); ORIGINAL(805B8E98);
++ORIGINAL(805B87CC); ORIGINAL(805B7D68); ORIGINAL(805B7CB4);
++ORIGINAL(805BFA58); ORIGINAL(805BFB74); ORIGINAL(805BF048); ORIGINAL(805C6A98); ORIGINAL(805C6BCC);
++ORIGINAL(807B34FC); ORIGINAL(807B336C); ORIGINAL(807B5118); ORIGINAL(807B5184); ORIGINAL(805B9F14);
++ORIGINAL(8059AB98); ORIGINAL(8059AA90); ORIGINAL(805BE7FC); ORIGINAL(805A263C);
++#undef ORIGINAL
++
++namespace arrange_marks {
++namespace {
++namespace fs = std::filesystem;
++
++// --- Guest memory -------------------------------------------------------------------------------
++// [arena, arena + kArenaBytes): a scratch page (anchor vectors, list names), then kCacheSlots marks.
++// The cache holds every picture the 32 slots can have chosen (a mark and a logo each) and two more, so
++// browsing a list never has to evict a chosen picture (Chosen, FreeSlot).
++constexpr uint32_t kCacheSlots = uint32_t(2 * kSlots + 2);
++static_assert(kCacheSlots >= 2 * kSlots + 1);
++constexpr uint32_t kSlotBytes = 0x11540;
++constexpr uint32_t kHeadBytes = 0x1000;
++constexpr uint32_t kArenaBytes = kHeadBytes + kCacheSlots * kSlotBytes;
++constexpr uint32_t kRetailMem2Heap = 0x033E0000u - 0x800u;  // as game_heaps.cpp keeps it
++// Within a slot: texels, palette, texture and palette descriptors, then the same for the icon.
++constexpr uint32_t kTexels = 0, kPalette = 0x10000, kTexDesc = 0x10200, kPalDesc = 0x10240;
++constexpr uint32_t kIconTexels = 0x10280, kIconPalette = 0x11280, kIconTexDesc = 0x11480, kIconPalDesc = 0x114C0;
++// Then the sprite descriptors (SPRD, 0x1C) that draw the slot's picture in the game's widgets (Task 8):
++// the mark's icon in a TEAM FLAG field and the logo. Both are the same for every widget that uses the
++// picture (whole texture, pivot at its centre); each widget's place and size are its own.
++constexpr uint32_t kFieldSprd = 0x11500, kLogoSprd = 0x11520;
++static_assert(kIconPalDesc + 0x20 <= kFieldSprd && kLogoSprd + 0x1C <= kSlotBytes && kSlotBytes % 32 == 0);
++constexpr uint32_t kScratch = 0x0, kNames = 0x100, kNameStride = 0x20;
++static_assert(kNames + kMaxEntries * kNameStride <= kHeadBytes);
++
++uint32_t g_arena = 0;
++
++bool Enabled() { return g_arena != 0; }
++
++// --- Game data ----------------------------------------------------------------------------------
++constexpr uint32_t kSlotBlock = 0x8104E1D8, kSlotsOffset = 0x3AC, kSlotStride = 0x2448, kRecord = 0x42;
++constexpr uint32_t kEditingSlot = 0x8102B2C8, kMatchSlot = 0x8102D730;
++constexpr uint32_t kStyle = 0x80CFFBB8;      // the team name's text style
++// Team Mark screen fields.
++constexpr uint32_t kCursor = 0x2938, kChoice = 0x293C, kColour = 0x29A8, kRow = 0x2A14, kColumn = 0x2A18,
++                   kScroll = 0x2A1C, kRowStep = 0x2A20, kBar = 0x2A44, kContainer = 0x2E50, kCells = 0x3050,
++                   kLabels = 0x5650;
++constexpr uint32_t kVisibleRows = 12;
++// Floats of the screen's layout (rodata 0x80CEDD90 + 0x108 / 0x10C / 0xE0).
++constexpr uint32_t kCursorX = 0x80CEDE98, kCursorY = 0x80CEDE9C, kContainerX = 0x80CEDE70;
++
++int SlotOf(uint32_t slot) {
++    const uint32_t block = Memory::Read32(kSlotBlock);
++    if (!block) return -1;
++    const uint32_t first = block + kSlotsOffset;
++    if (slot < first || slot >= first + kSlots * kSlotStride || (slot - first) % kSlotStride) return -1;
++    return int((slot - first) / kSlotStride);
++}
++int EditingSlot() {
++    const uint32_t slot = Memory::Read32(kEditingSlot);
++    return slot ? SlotOf(slot) : -1;
++}
++uint32_t EditingRecord() {
++    const uint32_t slot = Memory::Read32(kEditingSlot);
++    return slot && Memory::Contains(slot + kRecord, 0x37) ? slot + kRecord : 0;
++}
++uint8_t GameMarkOf(uint32_t record) {
++    const uint8_t mark = record ? Memory::Read8(record + 0x17) : 0;
++    return mark < kGameMarks ? mark : 0;
++}
++
++// A team record's fingerprint (recordFingerprint: name, initial, base team), read from guest memory.
++bool RecordPrint(uint32_t record, uint32_t& out) {
++    if (!record || !Memory::Contains(record, uint32_t(kRecordIdentityBytes))) return false;
++    uint8_t bytes[kRecordIdentityBytes];
++    for (uint32_t i = 0; i < kRecordIdentityBytes; ++i) bytes[i] = Memory::Read8(record + i);
++    out = recordFingerprint(bytes);
++    return true;
++}
++// Slot i of the main block now: whether it holds a team (+0x00) and its record's fingerprint.
++SlotNow SlotState(uint32_t i) {
++    SlotNow now;
++    const uint32_t block = i < kSlots ? Memory::Read32(kSlotBlock) : 0;
++    const uint32_t slot = block ? block + kSlotsOffset + i * kSlotStride : 0;
++    if (slot && Memory::Contains(slot, kRecord + uint32_t(kRecordIdentityBytes)) && Memory::Read8(slot))
++        now.used = RecordPrint(slot + kRecord, now.fingerprint);
++    return now;
++}
++
++// --- Calls into the game ------------------------------------------------------------------------
++uint32_t Call(CpuContext* ctx, uint32_t target, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0, uint32_t d = 0,
++              uint32_t e = 0) {
++    const uint32_t lr = ctx->lr;
++    ctx->gpr[3] = a;
++    ctx->gpr[4] = b;
++    ctx->gpr[5] = c;
++    ctx->gpr[6] = d;
++    ctx->gpr[7] = e;
++    ctx->lr = target;
++    InvokeIndirectCpu(target, ctx);
++    ctx->lr = lr;
++    return ctx->gpr[3];
++}
++uint32_t CallF(CpuContext* ctx, uint32_t target, uint32_t a, float f1, float f2) {
++    ctx->fpr[1].d = double(f1);
++    ctx->fpr[2].d = double(f2);
++    return Call(ctx, target, a);
++}
++uint32_t VCall(CpuContext* ctx, uint32_t object, uint32_t offset, uint32_t b = 0, uint32_t c = 0) {
++    if (!object || !Memory::Contains(object, 4)) return 0;
++    const uint32_t table = Memory::Read32(object);
++    if (!Memory::Contains(table + offset, 4)) return 0;
++    const uint32_t function = Memory::Read32(table + offset);
++    return function ? Call(ctx, function, object, b, c) : 0;
++}
++void SetVisible(CpuContext* ctx, uint32_t node, bool visible) { VCall(ctx, node, 0x10, visible ? 1 : 0); }
++void Sound(CpuContext* ctx, uint32_t id) { Call(ctx, 0x80020254, Call(ctx, 0x80010F8C), id); }
++float F(uint32_t address) { return Memory::ReadFloat32(address); }
++// A layout point of pack `pack` (fn_80020CA0 fills a 2D vector initialised by 0x80584748).
++std::array<float, 2> Anchor(CpuContext* ctx, uint32_t pack, uint32_t id) {
++    const uint32_t vec = g_arena + kScratch;
++    Call(ctx, 0x80584748, vec);
++    Call(ctx, 0x80020CA0, vec, pack, id);
++    return {F(vec), F(vec + 4)};
++}
++
++// --- Logging ------------------------------------------------------------------------------------
++std::set<std::string> g_logged;
++void LogOnce(const std::string& key, const std::string& message) {
++    if (g_logged.insert(key).second) std::fprintf(stderr, "[arrange] %s\n", message.c_str());
++}
++
++// --- Catalog ------------------------------------------------------------------------------------
++// The two kinds of custom picture: marks (UserData/arrange/marks) and logos (UserData/arrange/logos).
++enum class Kind { Mark, Logo };
++const char* KindName(Kind kind) { return kind == Kind::Mark ? "mark" : "logo"; }
++fs::path FolderOf(Kind kind) {
++    return RuntimeConfigFile::ApplicationDataDirectory() / "arrange" / (kind == Kind::Mark ? "marks" : "logos");
++}
++fs::path MarksFolder() { return FolderOf(Kind::Mark); }
++// Cache and slot owner key: the kind and the file name.
++std::string KeyOf(Kind kind, const std::string& file) { return std::string(KindName(kind)) + "/" + file; }
++
++std::vector<std::string> g_registry;  // virtual index kGameMarks + i <-> file
++
++struct Cached {
++    int slot = -1;
++    bool failed = false;
++    fs::file_time_type time{};
++    uintmax_t size = 0;
++    uint64_t used = 0;
++    std::chrono::steady_clock::time_point checked{};  // the last stat of the file
++};
++// A loaded picture is re-checked on disk (stat) at most this often: the draw hooks may run on many
++// frames in a row, and a file changed or removed meanwhile is picked up on the next check.
++constexpr std::chrono::milliseconds kRecheck{1000};
++std::map<std::string, Cached> g_cache;
++std::array<std::string, kCacheSlots> g_owner;
++uint64_t g_clock = 0;
++
++bool Stat(const fs::path& path, fs::file_time_type& time, uintmax_t& size) {
++    std::error_code e1, e2;
++    size = fs::file_size(path, e1);
++    time = fs::last_write_time(path, e2);
++    return !e1 && !e2;
++}
++
++bool ReadFile(const fs::path& path, std::vector<uint8_t>& data, size_t limit) {
++    std::ifstream in(path, std::ios::binary);
++    if (!in) return false;
++    in.seekg(0, std::ios::end);
++    const std::streamoff size = in.tellg();
++    if (size <= 0 || size_t(size) > limit) return false;
++    in.seekg(0);
++    data.resize(size_t(size));
++    return bool(in.read(reinterpret_cast<char*>(data.data()), size));
++}
++
++// A PNG worth offering: a valid start (signature, IHDR with its CRC, at most 4096 x 4096) and chunk
++// headers that end with IEND exactly at the end of the file. Seeks over the data, decodes nothing.
++bool Header(const fs::path& path, PngInfo& info) {
++    std::ifstream in(path, std::ios::binary);
++    uint8_t head[33] = {};
++    if (!in || !in.read(reinterpret_cast<char*>(head), sizeof head) || !pngHeader(head, sizeof head, info)) return false;
++    std::error_code ec;
++    const uintmax_t size = fs::file_size(path, ec);
++    return !ec && pngChunksComplete(size, [&](uint64_t at, uint8_t* out) {
++        in.clear();
++        in.seekg(std::streamoff(at));
++        return bool(in.read(reinterpret_cast<char*>(out), 8));
++    });
++}
++
++// The folder's marks or logos a list offers: scan() (PNG by name, sorted, labelled), minus names
++// that do not fit a Choice (31 bytes), files that are not a whole PNG of at most 4096 x 4096
++// (Header), and files that already failed to decode (until they change). Nothing without a PNG
++// decoder.
++std::vector<Entry> Catalog(Kind kind = Kind::Mark) {
++    std::vector<Entry> out;
++    const std::string what = KindName(kind);
++#ifndef MKW_HAVE_LIBPNG
++    LogOnce("nodecoder", "custom marks and logos unavailable: this build has no PNG decoder");
++    return out;  // never offer pictures that cannot load
++#endif
++    const fs::path folder = FolderOf(kind);
++    for (Entry& entry : scan(folder)) {
++        if (entry.file.size() >= kNameBytes) {
++            LogOnce("long:" + what + entry.file, what + " '" + entry.file + "' skipped: file names are limited to 31 bytes");
++            continue;
++        }
++        const fs::path path = pathOf(folder, entry);
++        PngInfo info;
++        if (!Header(path, info)) {
++            LogOnce("bad:" + what + entry.file, what + " '" + entry.file + "' skipped: not a whole PNG of at most 4096 x 4096");
++            continue;
++        }
++        const auto cached = g_cache.find(KeyOf(kind, entry.file));
++        fs::file_time_type time;
++        uintmax_t size = 0;
++        if (cached != g_cache.end() && cached->second.failed && Stat(path, time, size) &&
++            time == cached->second.time && size == cached->second.size)
++            continue;
++        out.push_back(std::move(entry));
++    }
++    return out;
++}
++
++// The game's font codes: ASCII + 0x9B for letters and digits, 0 space, 0x1D hyphen, 0xFFFF end.
++uint32_t WriteName(uint32_t at, const std::string& name) {
++    size_t i = 0;
++    for (; i < name.size() && i < 10; ++i) {
++        const char c = name[i];
++        const uint16_t code = c == ' ' ? 0 : c == '-' ? 0x1D : uint16_t(uint8_t(c) + 0x9B);
++        Memory::Write16(at + uint32_t(i) * 2, code);
++    }
++    Memory::Write16(at + uint32_t(i) * 2, 0xFFFF);
++    return at;
++}
++
++// --- Textures -----------------------------------------------------------------------------------
++bool Decode(const fs::path& path, Rgba& out, std::string& why) {
++#ifdef MKW_HAVE_LIBPNG
++    std::vector<uint8_t> data;
++    if (!ReadFile(path, data, kMaxFileBytes)) { why = "unreadable"; return false; }
++    png_image image{};
++    image.version = PNG_IMAGE_VERSION;
++    if (!png_image_begin_read_from_memory(&image, data.data(), data.size())) { why = "not a PNG"; return false; }
++    if (!image.width || !image.height || image.width > kMaxPngSide || image.height > kMaxPngSide) {
++        png_image_free(&image);
++        why = "larger than 4096 x 4096";
++        return false;
++    }
++    image.format = PNG_FORMAT_RGBA;
++    out.width = image.width;
++    out.height = image.height;
++    out.pixels.assign(PNG_IMAGE_SIZE(image), 0);
++    if (!png_image_finish_read(&image, nullptr, out.pixels.data(), 0, nullptr)) {
++        why = image.message[0] ? image.message : "damaged PNG";
++        png_image_free(&image);
++        return false;
++    }
++    return true;
++#else
++    (void)path; (void)out;
++    why = "no PNG decoder in this build";
++    return false;
++#endif
++}
++
++// The game's marks draw texels (0, 0)-(158, 190) of their 256 x 256 texture (the mark widget's
++// rectangle, 0x805BE408); the picture is fitted there. The icon fills its 64 x 64 texture.
++constexpr uint32_t kMarkArtWidth = 0x9E, kMarkArtHeight = 0xBE;
++Rgba Canvas(const Rgba& picture, uint32_t side) {
++    if (side != 256) return fit(picture, side, side);
++    const Rgba art = fit(picture, kMarkArtWidth, kMarkArtHeight);
++    Rgba out;
++    out.width = out.height = side;
++    out.pixels.assign(size_t(side) * side * 4, 0);
++    for (uint32_t y = 0; y < art.height; ++y)
++        std::memcpy(&out.pixels[size_t(y) * side * 4], &art.pixels[size_t(y) * art.width * 4], size_t(art.width) * 4);
++    return out;
++}
++
++// A canvas (already fitted) as a C8 texture with its RGB5A3 palette, made on the host (it may throw
++// std::bad_alloc) before any guest memory is touched.
++struct Texture {
++    uint32_t width = 0, height = 0;
++    std::vector<uint8_t> c8;
++    std::array<uint16_t, 256> palette{};
++};
++Texture MakeTexture(const Rgba& canvas) {
++    const Indexed indexed = quantize(canvas);
++    return {canvas.width, canvas.height, toC8(indexed), indexed.palette};
++}
++
++// The texture into guest memory, with its two descriptors.
++void PutTexture(uint32_t texels, uint32_t palette, uint32_t texDesc, uint32_t palDesc, const Texture& texture) {
++    std::memcpy(Memory::GetPointer(texels, texture.c8.size()), texture.c8.data(), texture.c8.size());
++    for (uint32_t i = 0; i < 256; ++i) Memory::Write16(palette + i * 2, texture.palette[i]);
++    const uint32_t tex[16] = {texture.height << 16 | texture.width, 9, texels, 0, 0, 1, 1};
++    for (uint32_t i = 0; i < 16; ++i) Memory::Write32(texDesc + i * 4, tex[i]);
++    const uint32_t pal[8] = {256u << 16, 2, palette};
++    for (uint32_t i = 0; i < 8; ++i) Memory::Write32(palDesc + i * 4, pal[i]);
++}
++
++uint32_t SlotAddress(int slot) { return g_arena + kHeadBytes + uint32_t(slot) * kSlotBytes; }
++
++void Fill(int slot, TextureRef& out) {
++    const uint32_t base = SlotAddress(slot);
++    out = {base + kTexDesc, base + kPalDesc, base + kIconTexDesc, base + kIconPalDesc};
++}
++
++// A free cache slot, else the least recently used one. Pictures some slot has chosen (liveChoices)
++// are kept while another can go: the widgets showing a team's mark or logo keep pointing at their
++// slot's texels and are not redrawn when the cache moves on (browsing many logos must not repaint
++// them). Only when every slot holds a chosen picture does plain LRU apply.
++bool Chosen(const std::string& key) {  // key = KeyOf(kind, file)
++    const size_t slash = key.find('/');
++    return slash != std::string::npos &&
++           isChosen(liveChoices(), key.compare(0, slash, "logo") == 0, key.substr(slash + 1));
++}
++int FreeSlot() {
++    for (uint32_t i = 0; i < kCacheSlots; ++i)
++        if (g_owner[i].empty()) return int(i);
++    int oldest = -1, oldestAny = 0;
++    uint64_t when = UINT64_MAX, whenAny = UINT64_MAX;
++    for (const auto& [key, cached] : g_cache) {
++        if (cached.slot < 0) continue;
++        if (cached.used < whenAny) { whenAny = cached.used; oldestAny = cached.slot; }
++        if (cached.used < when && !Chosen(key)) { when = cached.used; oldest = cached.slot; }
++    }
++    if (oldest < 0) oldest = oldestAny;
++    g_cache[g_owner[size_t(oldest)]].slot = -1;  // keys are KeyOf(kind, file)
++    std::fprintf(stderr, "[arrange] cache slot %d reused (was '%s')\n", oldest, g_owner[size_t(oldest)].c_str());
++    return oldest;
++}
++
++// --- The Team Mark list -------------------------------------------------------------------------
++// The list names of the folder's marks, from the last list built (the MARK legend shows them).
++std::map<std::string, std::string> g_markLabels;
++bool g_markLabelsScanned = false;
++void RememberMarkLabels(const std::vector<Entry>& entries, const std::vector<std::string>& names) {
++    g_markLabels.clear();
++    for (size_t i = 0; i < entries.size() && i < names.size(); ++i) g_markLabels[entries[i].file] = names[i];
++}
++
++struct List {
++    uint32_t screen = 0;
++    // Per custom entry: cell panel, name holder node, name text widget, virtual mark index.
++    std::vector<uint32_t> cells, labels, texts, marks;
++};
++List g_list;
++// The team-name font is 34 units high; colour 1 is the blue of the list's own names (0 pink, 2 green).
++constexpr float kNameScale = 0.45f, kGlyphHeight = 34.0f;
++constexpr uint32_t kNameColour = 1;
++
++bool Active(uint32_t screen) { return Enabled() && screen && g_list.screen == screen && !g_list.marks.empty(); }
++uint32_t Total() { return kGameMarks + uint32_t(g_list.marks.size()); }
++uint32_t Rows() { return (Total() + 1) / 2; }
++uint32_t Cell(uint32_t screen, uint32_t i) {
++    return i < kGameMarks ? screen + kCells + i * 0x100 : g_list.cells[i - kGameMarks];
++}
++uint32_t Label(uint32_t screen, uint32_t i) {
++    return i < kGameMarks ? Memory::Read32(screen + kLabels + i * 4) : g_list.labels[i - kGameMarks];
++}
++
++void Teardown(CpuContext* ctx, uint32_t screen) {
++    if (!screen || g_list.screen != screen) return;
++    for (uint32_t text : g_list.texts)
++        if (text) VCall(ctx, text, 0x08, 1);
++    for (uint32_t label : g_list.labels)
++        if (label) VCall(ctx, label, 0x08, 1);
++    for (uint32_t cell : g_list.cells)
++        if (cell) VCall(ctx, cell, 0x08, 1);
++    g_list = {};
++}
++
++// After the game built its 38 cells (0x805BD300): one more cell and name per folder mark, placed by
++// the same layout points (pack 0x929: cell 0x400736B8, next column 0x400736BC, next row 0x400736C0)
++// and hidden until the refresh shows them.
++void BuildCustomCells(CpuContext* ctx, uint32_t screen) {
++    const std::vector<Entry> entries = Catalog();
++    const std::vector<std::string> names = shownLabels(entries);
++    RememberMarkLabels(entries, names);
++    g_markLabelsScanned = true;
++    if (entries.empty()) return;
++    const auto origin = Anchor(ctx, 0x929, 0x400736B8), column = Anchor(ctx, 0x929, 0x400736BC),
++               row = Anchor(ctx, 0x929, 0x400736C0);
++    const float dx = column[0] - origin[0], dy = row[1] - origin[1];
++    const uint32_t container = screen + kContainer;
++    const uint32_t style = Memory::Read32(kStyle) & 0xFFFF;
++    g_list.screen = screen;
++    for (size_t k = 0; k < entries.size(); ++k) {
++        const uint32_t position = kGameMarks + uint32_t(k);
++        const float x = origin[0] + float(position % 2) * dx, y = origin[1] + float(position / 2) * dy;
++        const uint32_t cell = Call(ctx, 0x8005B060, 0x100);
++        if (!cell) break;
++        Call(ctx, 0x8001E9BC, cell);
++        Call(ctx, 0x8057A180, cell, container);
++        Call(ctx, 0x8001AC60, cell, 0);
++        Call(ctx, 0x8001DFB8, cell, 0x929, 0x40073EB0);
++        CallF(ctx, 0x8001A7B0, cell, x, y);
++        SetVisible(ctx, cell, false);
++        // The name: the team-name text widget, in a holder node that scales it to the cell's height
++        // and centres it (the widget animates its own scale, and lays its glyphs out from its origin).
++        const uint32_t holder = Call(ctx, 0x8005B060, 0x100);
++        uint32_t text = 0;
++        if (holder) {
++            Call(ctx, 0x8001E9BC, holder);
++            Call(ctx, 0x8057A180, holder, container);
++            Call(ctx, 0x8001AC60, holder, 0);
++            CallF(ctx, 0x8001ABA0, holder, kNameScale, kNameScale);
++            text = Call(ctx, 0x805C28D4, holder, 0, style);
++        }
++        float width = 0;
++        if (text) {
++            Call(ctx, 0x8001AC60, text, 0);
++            CallF(ctx, 0x8001A7B0, text, 0, 0);
++            Call(ctx, 0x807B4090, text, kNameColour);
++            VCall(ctx, text, 0x40, WriteName(g_arena + kNames + uint32_t(k) * kNameStride, names[k]));
++            Call(ctx, 0x807B4090, text, kNameColour);
++            const uint32_t glyphs = Memory::Read32(text + 0x130), count = Memory::Read16(text + 0x10A);
++            if (count && Memory::Contains(glyphs + (count - 1) * 0x1C, 0x1C))
++                width = float(Memory::Read16(glyphs + (count - 1) * 0x1C + 8));
++        }
++        if (holder) {
++            const float cellWidth = dx - 3, cellHeight = dy - 4;
++            CallF(ctx, 0x8001A7B0, holder, x + (cellWidth - width * kNameScale) / 2,
++                  y + (cellHeight - kGlyphHeight * kNameScale) / 2);
++            SetVisible(ctx, holder, false);
++        }
++        g_list.cells.push_back(cell);
++        g_list.labels.push_back(holder);
++        g_list.texts.push_back(text);
++        g_list.marks.push_back(markIndexFor(entries[k].file));
++    }
++    if (g_list.marks.empty()) { g_list = {}; return; }
++    // The cursor starts on the team's custom mark, as the game starts it on its game mark.
++    const int slot = EditingSlot();
++    const uint32_t record = EditingRecord();
++    if (slot < 0 || !record || !(Memory::Read8(record + 0x1B) & 0x02)) return;
++    const std::string& chosen = liveChoices()[size_t(slot)].mark;
++    for (size_t k = 0; k < entries.size() && k < g_list.marks.size(); ++k) {
++        if (entries[k].file != chosen) continue;
++        const uint32_t position = kGameMarks + uint32_t(k);
++        Memory::Write32(screen + kRow, 0);
++        Memory::Write32(screen + kScroll, 0);
++        Memory::Write32(screen + kColumn, position % 2);
++        for (uint32_t n = 0; n < position / 2; ++n) Call(ctx, 0x805BD28C, screen);
++        break;
++    }
++}
++
++// 0x805BDCE0 for 38 + N entries: cursor, the 12 visible rows, scroll bar, list position, preview.
++void Refresh(CpuContext* ctx, uint32_t s) {
++    const uint32_t cursor = Memory::Read32(s + kCursor);
++    SetVisible(ctx, cursor, true);
++    const uint32_t row = Memory::Read32(s + kRow), column = Memory::Read32(s + kColumn),
++                   scroll = Memory::Read32(s + kScroll);
++    const int32_t step = int32_t(Memory::Read32(s + kRowStep));
++    CallF(ctx, 0x8001A7B0, cursor, F(kCursorX) + float(int32_t(column * 0x74)), F(kCursorY) + float(step * int32_t(row)));
++    const uint32_t total = Total();
++    for (uint32_t i = 0; i < total; ++i) {
++        SetVisible(ctx, Cell(s, i), false);
++        SetVisible(ctx, Label(s, i), false);
++    }
++    for (uint32_t i = scroll * 2; i < std::min(total, scroll * 2 + kVisibleRows * 2); ++i) {
++        SetVisible(ctx, Cell(s, i), true);
++        SetVisible(ctx, Label(s, i), true);
++    }
++    const uint32_t bar = Memory::Read32(s + kBar);
++    Call(ctx, 0x8072FBE8, bar, Rows());
++    Call(ctx, 0x8072FC18, bar, scroll + 0xB, 1);
++    CallF(ctx, 0x8001A7B0, s + kContainer, F(kContainerX), float(-(int32_t(scroll) * step)));
++    Call(ctx, 0x805BDF44, s);
++}
++
++// The column on a last row with a single entry.
++void ClampColumn(uint32_t s) {
++    const uint32_t position = (Memory::Read32(s + kScroll) + Memory::Read32(s + kRow)) * 2 + Memory::Read32(s + kColumn);
++    if (position >= Total()) Memory::Write32(s + kColumn, 0);
++}
++
++uint32_t Position(uint32_t s) {
++    return (Memory::Read32(s + kScroll) + Memory::Read32(s + kRow)) * 2 + Memory::Read32(s + kColumn);
++}
++
++// One row up (0x805BD240) or down (0x805BD28C), then the refresh; the cursor sound only if it moved.
++void Move(CpuContext* ctx, uint32_t s, uint32_t step) {
++    const uint32_t before = Memory::Read32(s + kScroll) + Memory::Read32(s + kRow);
++    Call(ctx, step, s);
++    ClampColumn(s);
++    Call(ctx, 0x805BDCE0, s);
++    if (Memory::Read32(s + kScroll) + Memory::Read32(s + kRow) != before) Sound(ctx, 0x1000);
++}
++void Colour(CpuContext* ctx, uint32_t s, uint32_t step) {
++    if (Call(ctx, 0x805BE158, s) >= 0x18) return;
++    Call(ctx, step, s + kColour);
++    Call(ctx, 0x805BDCE0, s);
++    Sound(ctx, 0x1004);
++}
++
++// 0x805BCEE8 (vt +0x38) for 38 + N entries; the same buttons, calls and sounds as the game's.
++void Input(CpuContext* ctx, uint32_t s) {
++    Call(ctx, 0x807A58E8, s);
++    const auto pressed = [&](uint32_t query) { return Call(ctx, query, 0) != 0; };
++    const auto line = [&]() { return Memory::Read32(s + kScroll) + Memory::Read32(s + kRow); };
++    if (pressed(0x805EF2F8)) {  // A
++        // A PNG that cannot be used (damaged, changed into something else since the list was built)
++        // is refused as Logo Text refuses one (0x1003), and the list stays open.
++        const uint32_t position = Position(s);
++        if (position >= kGameMarks && position < Total()) {
++            const std::string* file = markFileFor(g_list.marks[position - kGameMarks]);
++            TextureRef ref;
++            if (!file || EditingSlot() < 0 || !EditingRecord() || !markTexture(Choice{*file, {}}, ref)) {
++                Sound(ctx, 0x1003);
++                return;
++            }
++        }
++        const uint32_t value = Call(ctx, 0x805F7A60, s + kChoice);
++        if (VCall(ctx, s, 0xB8, value)) {
++            VCall(ctx, s, 0xDC);
++            Call(ctx, 0x80588710, s, 7);
++            Sound(ctx, 0x1001);
++            SetVisible(ctx, Memory::Read32(s + kCursor), false);
++        }
++    } else if (pressed(0x805EF300)) {  // B
++        if (VCall(ctx, s, 0xBC)) {
++            Call(ctx, 0x80588710, s, 7);
++            Sound(ctx, 0x1002);
++            SetVisible(ctx, Memory::Read32(s + kCursor), false);
++        }
++    } else if (pressed(0x805EF2F0)) {  // left
++        Call(ctx, 0x805F83B8, s + kChoice);
++        if (Memory::Read32(s + kColumn) == 1) {
++            Memory::Write32(s + kColumn, 0);
++            Call(ctx, 0x805BDCE0, s);
++            Sound(ctx, 0x1000);
++        }
++    } else if (pressed(0x805EF2E8)) {  // right
++        if (Memory::Read32(s + kColumn) == 0 && line() * 2 + 1 < Total()) {
++            Memory::Write32(s + kColumn, 1);
++            Call(ctx, 0x805BDCE0, s);
++            Sound(ctx, 0x1000);
++        }
++    } else if (pressed(0x805EF2D8)) {  // up
++        Move(ctx, s, 0x805BD240);
++    } else if (pressed(0x805EF2E0)) {  // down
++        Move(ctx, s, 0x805BD28C);
++    } else if (pressed(0x805EF5F4)) {  // L: the colour, game marks below 24 only
++        Colour(ctx, s, 0x805F83B8);
++    } else if (pressed(0x805EF564)) {  // R
++        Colour(ctx, s, 0x805F8690);
++    }
++}
++
++// Choices of the two "Cancel" copies of the record being edited (0x8102FB78 + i * 0x38).
++struct Snapshot {
++    int slot = -1;
++    Choice choice;
++};
++std::array<Snapshot, 2> g_snapshots;
++
++bool SameChoice(const Choice& a, const Choice& b) { return a.mark == b.mark && a.logo == b.logo; }
++
++}  // namespace
++
++// --- Interfaces ---------------------------------------------------------------------------------
++uint32_t ReserveGuestMemory(uint32_t low, uint32_t high) {
++    g_arena = 0;
++    if (!RuntimeConfigFile::ArrangeCustomMarks(false)) return high;
++    const uint32_t arena = (high - kArenaBytes) & ~0xFFFu;
++    if (high <= low || high - low < kArenaBytes + 0x1000 || arena - low < kRetailMem2Heap ||
++        !Memory::Contains(arena, kArenaBytes)) {
++        std::fprintf(stderr, "[arrange] custom marks off: no room in the MEM2 arena\n");
++        return high;
++    }
++    std::memset(Memory::GetPointer(arena, kArenaBytes), 0, kArenaBytes);
++    g_arena = arena;
++    std::fprintf(stderr, "[arrange] custom marks on: %u KB of MEM2 at 0x%08x\n", kArenaBytes / 1024, arena);
++    return arena;
++}
++
++const Choice& choiceFor(uint32_t teamRecordAddress) {
++    static const Choice kNone;
++    if (!Enabled() || teamRecordAddress < kRecord) return kNone;
++    int slot = SlotOf(teamRecordAddress - kRecord);
++    if (slot < 0 && teamRecordAddress == kMatchSlot + kRecord) {
++        // The match's copy of a slot: only while it is that slot's team (a stale copy, or another
++        // team's, must not take the slot's choice).
++        const uint32_t index = Memory::Read8(kMatchSlot + 1);
++        const SlotNow now = SlotState(index);
++        uint32_t print = 0;
++        if (now.used && RecordPrint(teamRecordAddress, print) && print == now.fingerprint) slot = int(index);
++    }
++    return slot >= 0 && slot < int(kSlots) ? liveChoices()[size_t(slot)] : kNone;
++}
++
++bool SaveHooksEnabled() { return RuntimeConfigFile::ArrangeCustomMarks(false) && Enabled(); }
++
++Fingerprints CurrentFingerprints() {
++    Fingerprints out{};
++    for (uint32_t i = 0; i < kSlots; ++i) out[i] = SlotState(i).fingerprint;
++    return out;
++}
++
++uint32_t markIndexFor(const std::string& file) {
++    const auto found = std::find(g_registry.begin(), g_registry.end(), file);
++    if (found != g_registry.end()) return kGameMarks + uint32_t(found - g_registry.begin());
++    g_registry.push_back(file);
++    return kGameMarks + uint32_t(g_registry.size() - 1);
++}
++
++const std::string* markFileFor(uint32_t index) {
++    return index >= kGameMarks && index - kGameMarks < g_registry.size() ? &g_registry[index - kGameMarks] : nullptr;
++}
++
++namespace {
++// One custom picture, loaded lazily (only this file) into a cache slot: a mark as its 256 x 256
++// texture (art in 158 x 190) and 64 x 64 icon, a logo as its kLogoWidth x kLogoHeight texture.
++bool LoadPicture(Kind kind, const std::string& file, TextureRef& out) {
++    out = {};
++    if (!Enabled() || file.empty()) return false;
++    const std::string what = KindName(kind), key = KeyOf(kind, file);
++    const auto now = std::chrono::steady_clock::now();
++    if (const auto found = g_cache.find(key); found != g_cache.end() && found->second.slot >= 0 &&
++        g_owner[size_t(found->second.slot)] == key && now - found->second.checked < kRecheck) {
++        found->second.used = ++g_clock;
++        Fill(found->second.slot, out);
++        if (kind == Kind::Logo) out.iconTexture = out.iconPalette = 0;
++        return true;
++    }
++    static std::map<std::string, std::chrono::steady_clock::time_point> missing;  // file -> last failed stat
++    if (const auto gone = missing.find(key); gone != missing.end() && now - gone->second < kRecheck) return false;
++    const fs::path path = pathOf(FolderOf(kind), Entry{file, {}});
++    fs::file_time_type time;
++    uintmax_t size = 0;
++    if (!Stat(path, time, size)) {
++        LogOnce("missing:" + key, what + " '" + file + "' not found: the game " + what + " is shown");
++        missing[key] = now;
++        return false;
++    }
++    missing.erase(key);
++    Cached& cached = g_cache[key];
++    const bool same = cached.time == time && cached.size == size;
++    if (same && cached.slot >= 0 && g_owner[size_t(cached.slot)] == key) {
++        cached.used = ++g_clock;
++        cached.checked = now;
++        Fill(cached.slot, out);
++        if (kind == Kind::Logo) out.iconTexture = out.iconPalette = 0;
++        return true;
++    }
++    if (same && cached.failed) return false;
++    Rgba picture;
++    std::string why;
++    PngInfo info;
++    // Decode, fit and quantize on the host first: a picture this machine has no memory for (a
++    // 4096 x 4096 PNG is 64 MB of RGBA; Switch applet mode is short) fails like a damaged file.
++    Texture main, icon;
++    bool ok = false;
++    try {
++        ok = size <= kMaxFileBytes && Header(path, info) && Decode(path, picture, why);
++        if (ok && kind == Kind::Mark) {
++            main = MakeTexture(Canvas(picture, 256));
++            icon = MakeTexture(Canvas(picture, 64));
++        } else if (ok) {
++            main = MakeTexture(fit(picture, kLogoWidth, kLogoHeight));
++        }
++    } catch (const std::bad_alloc&) {
++        ok = false;
++        why = "out of memory";
++    }
++    if (!ok) {
++        if (why.empty()) why = size > kMaxFileBytes ? "larger than 8 MB" : "not a PNG of at most 4096 x 4096";
++        // The cache slot the file had (an older version of it) is free again.
++        if (cached.slot >= 0 && g_owner[size_t(cached.slot)] == key) g_owner[size_t(cached.slot)].clear();
++        cached = {-1, true, time, size, 0};
++        LogOnce("decode:" + key + ":" + std::to_string(size), what + " '" + file + "' not used: " + why);
++        return false;
++    }
++    const int slot = cached.slot >= 0 && g_owner[size_t(cached.slot)] == key ? cached.slot : FreeSlot();
++    const uint32_t base = SlotAddress(slot);
++    PutTexture(base + kTexels, base + kPalette, base + kTexDesc, base + kPalDesc, main);
++    if (kind == Kind::Mark) PutTexture(base + kIconTexels, base + kIconPalette, base + kIconTexDesc, base + kIconPalDesc, icon);
++    GxGuestWrite::NotifyWrite(base, kSlotBytes);
++    g_owner[size_t(slot)] = key;
++    cached = {slot, false, time, size, ++g_clock, now};
++    std::fprintf(stderr, "[arrange] %s '%s' loaded (%ux%u)\n", what.c_str(), file.c_str(), picture.width, picture.height);
++    Fill(slot, out);
++    if (kind == Kind::Logo) out.iconTexture = out.iconPalette = 0;
++    return true;
++}
++}  // namespace
++
++bool markTexture(const Choice& choice, TextureRef& out) { return LoadPicture(Kind::Mark, choice.mark, out); }
++
++bool logoTexture(const Choice& choice, TextureRef& out) { return LoadPicture(Kind::Logo, choice.logo, out); }
++
++void onSlotCopied(int from, int to) {
++    if (Enabled()) copySlot(liveChoices(), from, to);
++}
++
++void onSlotDeleted(int slot) {
++    if (Enabled()) clearSlot(liveChoices(), slot);
++}
++
++}  // namespace arrange_marks
++
++using namespace arrange_marks;
++
++namespace {
++// A mark widget (0x805BE408 / 0x805BE664, +0xDC mark) showing a custom mark: the game's set-up for
++// a fallback game mark first (material, colour, size), then the custom texture and palettes.
++bool ApplyCustomMark(CpuContext* ctx, uint32_t widget, uint32_t index) {
++    const std::string* file = markFileFor(index);
++    TextureRef ref;
++    if (!widget || !file || !markTexture(Choice{*file, {}}, ref)) return false;
++    Memory::Write32(widget + 0xDC, index);
++    Memory::Write32(widget + 0xE4, ref.texture);
++    for (uint32_t i = 0; i < 4; ++i) Memory::Write32(widget + 0xE8 + i * 4, ref.palette);
++    const uint32_t material = Memory::Read32(widget + 0xF8);
++    Call(ctx, 0x8000A77C, material, 1, widget + 0xE4);
++    Call(ctx, 0x8000A790, material, 4, widget + 0xE8);
++    return true;
++}
++}  // namespace
++
++// --- Task 8: a team's custom mark and logo wherever the game draws that team ---------------------
++// The game draws a team from its slot or record through a few widgets; each hook below learns the
++// team from the slot or record it is given (choiceFor), never from the screen, so MLB and AAA teams,
++// Season/League copies and Arrange teams without a custom choice keep the game's drawing:
++// - the team flag (class 0x80D3D960: the mark icon is the image node +0x3E0, the initial is the
++//   letter sprite +0x4EC) gets an image SURF of the custom 64 x 64 icon with the game quad's
++//   geometry, and no initial;
++// - the TEAM FLAG field (class 0x805C6898: the initial is the letter sprite +0x300 over the cap
++//   colour) shows the icon in the letter's cell instead of the letter;
++// - the big mark widget of an icon (0x807B34FC / 0x807B336C mode 2, +0x208) gets the custom texture;
++// - the logo (0x807B4740) takes the letters path and its letters widget (+0x7D0) shows the custom
++//   logo with a sprite of its own (as Logo Text's preview, Task 7);
++// - the MARK legend of Team Name/Mark shows the mark's list name in the game's font.
++// All of it happens when the game sets a widget up. In a match that is once per widget; the Exhibition
++// team select sets its VS logos on every frame, and then the logo hook only finds the picture already
++// shown. Nothing is decoded while drawing, and a cached picture is checked on disk at most once a
++// second (LoadPicture).
++namespace {
++const bool g_trace = std::getenv("WIICOMPILED_ARRANGE_TRACE") != nullptr;
++std::map<std::pair<std::string, uint32_t>, int> g_traced;
++// WIICOMPILED_ARRANGE_TRACE=1: the first calls of each draw hook from each call site, then how many
++// calls each site has made (at 64, 128, 256... calls: a site called on every frame shows up).
++void Trace(const char* what, uint32_t lr, uint32_t a, uint32_t b, uint32_t record, bool custom) {
++    if (!g_trace) return;
++    const int n = ++g_traced[{what, lr}];
++    if (n >= 64 && (n & (n - 1)) == 0)
++        std::fprintf(stderr, "[arrange-trace] %s lr=%08x called %d times\n", what, lr, n);
++    if (n > 3) return;
++    const int slot = record >= kRecord ? SlotOf(record - kRecord) : -1;
++    std::fprintf(stderr, "[arrange-trace] %s lr=%08x a=%08x b=%08x rec=%08x slot=%d custom=%d\n", what, lr, a, b,
++                 record, slot, custom ? 1 : 0);
++}
++
++// A pointer to a game object (cached RAM: low addresses also map, to physical memory).
++bool GuestObject(uint32_t address, uint32_t size) { return address >= 0x80000000u && Memory::Contains(address, size); }
++bool ValidRecord(uint32_t record) { return GuestObject(record, 0x37); }
++
++// The record's custom mark: an Arrange slot's (choiceFor) imported PNG, with the record's "own mark"
++// flag (0x02, set by Task 6 when the PNG is chosen), loaded.
++bool TeamMark(uint32_t record, TextureRef& ref) {
++    if (!Enabled() || !ValidRecord(record)) return false;
++    const Choice& choice = choiceFor(record);
++    return !choice.mark.empty() && (Memory::Read8(record + 0x1B) & 0x02) && markTexture(choice, ref);
++}
++bool TeamLogo(uint32_t record, TextureRef& ref) {
++    if (!Enabled() || !ValidRecord(record)) return false;
++    const Choice& choice = choiceFor(record);
++    return !choice.logo.empty() && logoTexture(choice, ref);
++}
++uint32_t BaseOf(const TextureRef& ref) { return ref.texture - kTexDesc; }
++
++// The flag's mark icon (+0x3E0, already set by the game with a fallback game mark): a SURF of its own
++// for each flag, with the game SURF's header and first quad (its place and size in this flag, which
++// the fallback mark decides), whose single quad maps the whole 64 x 64 icon (texels 0-64), texture and
++// palette from its own lists (palette mode 0: the quad's palette index 0). The draw reads the SURF on
++// every frame, so it cannot be shared by flags of different fallback marks: each flag gets a block
++// from the game's MEM2 heap (fn_8005B1B8(size, 1); fn_8005B088 frees from either heap by address),
++// freed after the flag's destructor (0x805BE7FC). The game's next 0x805BEFB8 on the flag points it
++// back at the game's own descriptors.
++constexpr uint32_t kFlagBlock = 0x60;  // SURF 0x24, quad 0x1C, texture list 8 + entry 4, palette list 8 + entry 4
++constexpr uint32_t kFbQuad = 0x24, kFbTexList = 0x40, kFbTexEntry = 0x48, kFbPalList = 0x4C, kFbPalEntry = 0x54;
++static_assert(kFbPalEntry + 4 <= kFlagBlock);
++constexpr uint32_t kFlagVtable = 0x80D3D960;
++std::map<uint32_t, uint32_t> g_flagBlocks;  // flag -> its block
++
++uint32_t FlagBlock(CpuContext* ctx, uint32_t flag) {
++    if (const auto found = g_flagBlocks.find(flag); found != g_flagBlocks.end()) return found->second;
++    // Blocks of flags that are gone without their destructor (not expected) are freed here.
++    for (auto it = g_flagBlocks.begin(); it != g_flagBlocks.end();) {
++        if (GuestObject(it->first, 0x500) && Memory::Read32(it->first) == kFlagVtable) { ++it; continue; }
++        Call(ctx, 0x8005B088, it->second);
++        it = g_flagBlocks.erase(it);
++    }
++    const uint32_t block = Call(ctx, 0x8005B1B8, kFlagBlock, 1);  // MEM2 heap
++    if (block) g_flagBlocks[flag] = block;
++    return block;
++}
++
++// The flag's block, out of the table (0 if it has none); the caller frees it.
++uint32_t TakeFlagBlock(uint32_t flag) {
++    const auto found = g_flagBlocks.find(flag);
++    if (found == g_flagBlocks.end()) return 0;
++    const uint32_t block = found->second;
++    g_flagBlocks.erase(found);
++    return block;
++}
++
++bool IsFlagBlock(uint32_t flag, uint32_t surf) {
++    const auto found = g_flagBlocks.find(flag);
++    return found != g_flagBlocks.end() && found->second == surf;
++}
++
++bool FlagIcon(CpuContext* ctx, uint32_t flag, const TextureRef& ref) {
++    const uint32_t node = flag + 0x3E0, game = Memory::Read32(node + 0xDC);
++    if (!ref.iconTexture || !GuestObject(game, 0x24) || Memory::Read32(flag) != kFlagVtable) return false;
++    const uint32_t quads = Memory::Read32(game + 0x18);
++    if (!Memory::Read16(game + 0x16) || !GuestObject(quads, 0x1C)) return false;
++    // Already ours (no fallback set up since): the geometry stays, the picture and the initial are
++    // set again (another team's mark may have come to this flag).
++    const bool ours = IsFlagBlock(flag, game);
++    const uint32_t block = ours ? game : FlagBlock(ctx, flag);
++    if (!GuestObject(block, kFlagBlock)) return false;
++    if (!ours) {
++        uint8_t head[0x24], quad[0x1C];
++        std::memcpy(head, Memory::GetPointer(game, sizeof head), sizeof head);
++        std::memcpy(quad, Memory::GetPointer(quads, sizeof quad), sizeof quad);
++        std::memcpy(Memory::GetPointer(block, sizeof head), head, sizeof head);
++        std::memcpy(Memory::GetPointer(block + kFbQuad, sizeof quad), quad, sizeof quad);
++        Memory::Write16(block + 0x14, uint16_t(Memory::Read16(block + 0x14) & ~1u));
++        Memory::Write16(block + 0x16, 1);
++        Memory::Write32(block + 0x18, block + kFbQuad);
++        Memory::Write32(block + 0x1C, block + kFbTexList);
++        Memory::Write32(block + 0x20, block + kFbPalList);
++        const uint16_t uv[4] = {0, 0, 64, 64};
++        for (uint32_t i = 0; i < 4; ++i) Memory::Write16(block + kFbQuad + 0xC + i * 2, uv[i]);
++        Memory::Write8(block + kFbQuad + 0x18, 0);
++        Memory::Write8(block + kFbQuad + 0x19, 0);
++    }
++    Memory::Write32(block + kFbTexList, 1);
++    Memory::Write32(block + kFbTexList + 4, block + kFbTexEntry);
++    Memory::Write32(block + kFbTexEntry, ref.iconTexture);
++    Memory::Write32(block + kFbPalList, 1);
++    Memory::Write32(block + kFbPalList + 4, block + kFbPalEntry);
++    Memory::Write32(block + kFbPalEntry, ref.iconPalette);
++    Memory::Write32(node + 0xDC, block);
++    Memory::Write32(node + 0xE0, block + kFbTexList);
++    Memory::Write32(node + 0xE4, block + kFbPalList);
++    SetVisible(ctx, Memory::Read32(flag + 0x4EC), false);  // no initial
++    return true;
++}
++
++// TEAM FLAG field (0x805C6898): the letter sprite +0x300 (class 0x805B76E4, SPRD at +0x110: pivot
++// +0x120, cell size +0x128) shows the 64 x 64 icon centred on the letter's cell. The SPRD is the
++// image's own and the same for every sprite (pivot at the icon's centre); each sprite is moved to its
++// cell's centre and scaled to the cell (iconInCell) with its own translation and scale, which go back
++// before the game sets a letter again (0x805C6A98).
++struct FieldPose {
++    float x = 0, y = 0, sx = 1, sy = 1;  // the game's
++    float setX = 0, setY = 0, setSx = 1, setSy = 1;  // ours
++    uint64_t order = 0;  // when it was set (the oldest go first when the table is full)
++};
++std::map<uint32_t, FieldPose> g_fieldPoses;  // letter sprite -> its pose before / with the icon
++constexpr size_t kMaxFieldPoses = 256;
++uint64_t g_poseClock = 0;
++
++// Position and scale are checked apart: the game may set one again and leave ours in the other.
++bool OurPosition(uint32_t letter, const FieldPose& pose) {
++    return GuestObject(letter, 0x140) && F(letter + 0x40) == pose.setX && F(letter + 0x44) == pose.setY;
++}
++bool OurScale(uint32_t letter, const FieldPose& pose) {
++    return GuestObject(letter, 0x140) && F(letter + 0x60) == pose.setSx && F(letter + 0x64) == pose.setSy;
++}
++
++void FieldRestore(CpuContext* ctx, uint32_t letter) {
++    const auto found = g_fieldPoses.find(letter);
++    if (found == g_fieldPoses.end()) return;
++    const FieldPose pose = found->second;
++    g_fieldPoses.erase(found);
++    // Only what is still as we left it (not a sprite destroyed and allocated again, nor a value the
++    // game has set since).
++    if (OurPosition(letter, pose)) CallF(ctx, 0x8001A7B0, letter, pose.x, pose.y);
++    if (OurScale(letter, pose)) CallF(ctx, 0x8001ABA0, letter, pose.sx, pose.sy);
++}
++
++// Sprites the game reset or freed since are forgotten; over the cap, the oldest go.
++void PruneFieldPoses() {
++    for (auto it = g_fieldPoses.begin(); it != g_fieldPoses.end();)
++        it = OurPosition(it->first, it->second) || OurScale(it->first, it->second) ? std::next(it)
++                                                                                   : g_fieldPoses.erase(it);
++    while (g_fieldPoses.size() >= kMaxFieldPoses) {
++        auto oldest = g_fieldPoses.begin();
++        for (auto it = g_fieldPoses.begin(); it != g_fieldPoses.end(); ++it)
++            if (it->second.order < oldest->second.order) oldest = it;
++        g_fieldPoses.erase(oldest);
++    }
++}
++
++bool FieldIcon(CpuContext* ctx, uint32_t field, const TextureRef& ref) {
++    const uint32_t letter = Memory::Read32(field + 0x300);
++    if (!ref.iconTexture || !GuestObject(letter, 0x140)) return false;
++    FieldRestore(ctx, letter);
++    const float w = float(int16_t(Memory::Read16(letter + 0x128))), h = float(int16_t(Memory::Read16(letter + 0x12A)));
++    const float px = float(int16_t(Memory::Read16(letter + 0x120))), py = float(int16_t(Memory::Read16(letter + 0x122)));
++    // The square icon as tall as the letter's cell (a letter is taller than wide, the field box wider).
++    const IconInCell cell = iconInCell(w, h, px, py);
++    if (cell.scale <= 0) return false;
++    const uint32_t desc = BaseOf(ref) + kFieldSprd;
++    Memory::Write32(desc + 0x00, 0x53505244);  // "SPRD"
++    Memory::Write32(desc + 0x04, 0x1C);
++    Memory::Write32(desc + 0x08, ref.iconTexture);
++    Memory::Write32(desc + 0x0C, ref.iconPalette);
++    const int16_t rect[6] = {32, 32, 0, 0, 64, 64};
++    for (uint32_t i = 0; i < 6; ++i) Memory::Write16(desc + 0x10 + i * 2, uint16_t(rect[i]));
++    Call(ctx, 0x8001D25C, letter, desc);
++    PruneFieldPoses();
++    FieldPose pose{F(letter + 0x40), F(letter + 0x44), F(letter + 0x60), F(letter + 0x64)};
++    CallF(ctx, 0x8001A7B0, letter, pose.x + cell.dx * pose.sx, pose.y + cell.dy * pose.sy);
++    CallF(ctx, 0x8001ABA0, letter, pose.sx * cell.scale, pose.sy * cell.scale);
++    pose.setX = F(letter + 0x40);
++    pose.setY = F(letter + 0x44);
++    pose.setSx = F(letter + 0x60);
++    pose.setSy = F(letter + 0x64);
++    pose.order = ++g_poseClock;
++    g_fieldPoses[letter] = pose;
++    SetVisible(ctx, letter, true);
++    return true;
++}
++
++// The logo: the letters widget (class 0x805BA65C) of a team logo widget gets a child sprite with the
++// custom logo, centred on its letters (their container +0x210 is hidden meanwhile), as Logo Text's
++// preview (Task 7: 0.6 scale; centre 79.6, 42.5 from the container, which mode 1 puts at -79, -43).
++// The sprite goes with the letters widget (its destructor, 0x805B9F14).
++constexpr float kLogoCentreX = 79.6f, kLogoCentreY = 42.5f, kLogoScale = 0.6f;
++std::map<uint32_t, uint32_t> g_logoSprites;  // letters widget -> our sprite
++
++uint32_t LogoSprite(uint32_t letters) {
++    const auto found = g_logoSprites.find(letters);
++    if (found == g_logoSprites.end()) return 0;
++    const uint32_t sprite = found->second;
++    if (GuestObject(sprite, 0x110) && Memory::Read32(sprite) == 0x80146A48 && Memory::Read32(sprite + 0x14) == letters)
++        return sprite;
++    g_logoSprites.erase(found);  // gone with a widget we did not see go
++    return 0;
++}
++
++bool ShowLogo(CpuContext* ctx, uint32_t letters, const TextureRef& ref) {
++    if (!GuestObject(letters, 0x300)) return false;
++    uint32_t sprite = LogoSprite(letters);
++    if (!sprite) {
++        sprite = Call(ctx, 0x8005B060, 0x110);
++        if (!sprite) return false;
++        Call(ctx, 0x8001D098, sprite);
++        Call(ctx, 0x8057A180, sprite, letters);
++        Call(ctx, 0x8001AC60, sprite, 0);
++        g_logoSprites[letters] = sprite;
++    }
++    const uint32_t desc = BaseOf(ref) + kLogoSprd, box = letters + 0x210;
++    // Already shown (some screens, the Exhibition team select, set their logos on every frame).
++    const auto visible = [](uint32_t node) { return (Memory::Read8(node + 0x24) & 0x40) != 0; };
++    const bool shown = Memory::Read32(sprite + 0xE8) == desc && Memory::Read32(desc + 0x08) == ref.texture &&
++                       visible(sprite) && !visible(box);
++    if (g_trace) {  // WIICOMPILED_ARRANGE_TRACE: how often the fast path is taken
++        static uint64_t hits = 0, misses = 0;
++        ++(shown ? hits : misses);
++        if ((hits + misses) % 256 == 0)
++            std::fprintf(stderr, "[arrange-trace] logo fast path: %llu hits, %llu misses\n",
++                         (unsigned long long)hits, (unsigned long long)misses);
++    }
++    if (shown) return true;
++    Memory::Write32(desc + 0x00, 0x53505244);  // "SPRD"
++    Memory::Write32(desc + 0x04, 0x1C);
++    Memory::Write32(desc + 0x08, ref.texture);
++    Memory::Write32(desc + 0x0C, ref.palette);
++    const uint16_t rect[6] = {uint16_t(kLogoWidth / 2), uint16_t(kLogoHeight / 2), 0, 0, uint16_t(kLogoWidth),
++                              uint16_t(kLogoHeight)};
++    for (uint32_t i = 0; i < 6; ++i) Memory::Write16(desc + 0x10 + i * 2, rect[i]);
++    Call(ctx, 0x8001D25C, sprite, desc);
++    CallF(ctx, 0x8001A7B0, sprite, F(box + 0x40) + kLogoCentreX, F(box + 0x44) + kLogoCentreY);
++    CallF(ctx, 0x8001ABA0, sprite, kLogoScale, kLogoScale);
++    SetVisible(ctx, sprite, true);
++    SetVisible(ctx, box, false);
++    return true;
++}
++
++void HideLogo(CpuContext* ctx, uint32_t letters) {
++    const uint32_t sprite = letters ? LogoSprite(letters) : 0;
++    if (!sprite) return;
++    SetVisible(ctx, sprite, false);
++    SetVisible(ctx, letters + 0x210, true);
++}
++
++// The MARK legend (class 0x8059A9D0: the list-name picture of a game mark, 0x8059AB98): with a custom
++// mark, no picture and the mark's list name (as in the Team Mark list) in the game's font, centred
++// where the picture was. Its nodes go with the label (destructor 0x8059AA90).
++struct Legend {
++    uint32_t holder = 0, text = 0;
++};
++std::map<uint32_t, Legend> g_legends;  // label -> our name
++
++Legend* LegendOf(uint32_t label) {
++    const auto found = g_legends.find(label);
++    if (found == g_legends.end()) return nullptr;
++    if (GuestObject(found->second.holder, 0x100) && Memory::Read32(found->second.holder + 0x14) == label)
++        return &found->second;
++    g_legends.erase(found);
++    return nullptr;
++}
++
++// The name a mark file has in the Team Mark list (shownLabels over the folder), else its own label.
++// Kept from the last list built (BuildCustomCells); a file it did not have scans the folder once.
++std::string MarkLabel(const std::string& file) {
++    if (const auto found = g_markLabels.find(file); found != g_markLabels.end()) return found->second;
++    if (!g_markLabelsScanned) {
++        g_markLabelsScanned = true;
++        const std::vector<Entry> entries = Catalog(Kind::Mark);
++        RememberMarkLabels(entries, shownLabels(entries));
++        if (const auto found = g_markLabels.find(file); found != g_markLabels.end()) return found->second;
++    }
++    std::string stem = file;
++    if (stem.size() > 4 && (stem.compare(stem.size() - 4, 4, ".png") == 0 || stem.compare(stem.size() - 4, 4, ".PNG") == 0))
++        stem.resize(stem.size() - 4);
++    std::string shown = label(stem);
++    if (shown.empty()) shown = "IMG";
++    return g_markLabels[file] = shownLabels({Entry{file, shown}})[0];
++}
++}  // namespace
++
++// Team Mark list: build (0x805BD300, called by vt +0x30), refresh, cursor down, input (vt +0x38).
++extern "C" void MLB_ArrangeMarkList_805BD300(CpuContext* ctx) {
++    const uint32_t screen = ctx->gpr[3];
++    if (!Enabled()) { func_805BD300(ctx); return; }
++    if (g_list.screen) g_list = {};  // a screen torn down without our hooks: forget its cells
++    func_805BD300(ctx);
++    const uint32_t lr = ctx->lr;
++    BuildCustomCells(ctx, screen);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BD300, MLB_ArrangeMarkList_805BD300, "MLB_ArrangeMarkList_805BD300");
++
++extern "C" void MLB_ArrangeMarkRefresh_805BDCE0(CpuContext* ctx) {
++    const uint32_t screen = ctx->gpr[3];
++    if (!Active(screen)) { func_805BDCE0(ctx); return; }
++    const uint32_t lr = ctx->lr;
++    Refresh(ctx, screen);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BDCE0, MLB_ArrangeMarkRefresh_805BDCE0, "MLB_ArrangeMarkRefresh_805BDCE0");
++
++// 0x805BD28C: one row down, scrolling at the 11th visible row; the game's limits are 19 rows.
++extern "C" void MLB_ArrangeMarkDown_805BD28C(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    if (!Active(s)) { func_805BD28C(ctx); return; }
++    const uint32_t row = Memory::Read32(s + kRow), scroll = Memory::Read32(s + kScroll), rows = Rows();
++    uint32_t moved = 0;
++    if (scroll + row + 1 < rows) {
++        if (row == kVisibleRows - 2 && scroll + kVisibleRows < rows) Memory::Write32(s + kScroll, scroll + 1);
++        else if (row < kVisibleRows - 1) Memory::Write32(s + kRow, row + 1);
++        moved = 1;
++    }
++    ctx->gpr[3] = moved;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BD28C, MLB_ArrangeMarkDown_805BD28C, "MLB_ArrangeMarkDown_805BD28C");
++
++extern "C" void MLB_ArrangeMarkInput_805BCEE8(CpuContext* ctx) {
++    const uint32_t screen = ctx->gpr[3];
++    if (!Active(screen)) { func_805BCEE8(ctx); return; }
++    const uint32_t lr = ctx->lr;
++    Input(ctx, screen);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BCEE8, MLB_ArrangeMarkInput_805BCEE8, "MLB_ArrangeMarkInput_805BCEE8");
++
++// 0x805BE158: the mark under the cursor; a custom entry answers its virtual index.
++extern "C" void MLB_ArrangeMarkSelected_805BE158(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    if (Active(s)) {
++        const uint32_t position = Position(s);
++        if (position >= kGameMarks && position < Total()) { ctx->gpr[3] = g_list.marks[position - kGameMarks]; return; }
++    }
++    func_805BE158(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BE158, MLB_ArrangeMarkSelected_805BE158, "MLB_ArrangeMarkSelected_805BE158");
++
++// 0x805BE15C: the colour (A-D); a custom mark has none.
++extern "C" void MLB_ArrangeMarkColour_805BE15C(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    if (Active(s) && Position(s) >= kGameMarks && Position(s) < Total()) { ctx->gpr[3] = 0; return; }
++    func_805BE15C(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BE15C, MLB_ArrangeMarkColour_805BE15C, "MLB_ArrangeMarkColour_805BE15C");
++
++// 0x805BD1E4 (vt +0xDC), confirm: a game mark as the game does (and the slot's custom mark is
++// cleared); a custom mark sets only the 0x02 flag and the choice, +0x17/+0x18 keep the game mark.
++extern "C" void MLB_ArrangeMarkConfirm_805BD1E4(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    if (!Enabled()) { func_805BD1E4(ctx); return; }
++    const uint32_t lr = ctx->lr;
++    const uint32_t mark = Call(ctx, 0x805BE158, s);
++    ctx->lr = lr;
++    const int slot = EditingSlot();
++    const std::string* file = markFileFor(mark);
++    const uint32_t record = EditingRecord();
++    if (mark < kGameMarks) {
++        ctx->gpr[3] = s;
++        func_805BD1E4(ctx);
++        if (slot >= 0) liveChoices()[size_t(slot)].mark.clear();
++        return;
++    }
++    // A custom mark never reaches the original, which would store the virtual index in +0x17
++    // (through the hooked 0x805BE158). Unusable (no file or slot, damaged PNG): the team keeps its mark.
++    TextureRef ref;
++    if (!file || !record || slot < 0 || !markTexture(Choice{*file, {}}, ref)) return;
++    Memory::Write8(record + 0x1B, Memory::Read8(record + 0x1B) | 0x02);
++    Memory::Write8(record + 0x17, GameMarkOf(record));
++    liveChoices()[size_t(slot)].mark = *file;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BD1E4, MLB_ArrangeMarkConfirm_805BD1E4, "MLB_ArrangeMarkConfirm_805BD1E4");
++
++// Team Mark screen release (vt +0x18) and destructor (vt +0x08): the custom cells and names go first.
++extern "C" void MLB_ArrangeMarkRelease_805BCBF8(CpuContext* ctx) {
++    const uint32_t screen = ctx->gpr[3];
++    if (Enabled() && g_list.screen == screen) {
++        const uint32_t lr = ctx->lr;
++        Teardown(ctx, screen);
++        ctx->lr = lr;
++        ctx->gpr[3] = screen;
++    }
++    func_805BCBF8(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BCBF8, MLB_ArrangeMarkRelease_805BCBF8, "MLB_ArrangeMarkRelease_805BCBF8");
++
++extern "C" void MLB_ArrangeMarkDestroy_805BCAC0(CpuContext* ctx) {
++    const uint32_t screen = ctx->gpr[3], flags = ctx->gpr[4];
++    if (Enabled() && screen && g_list.screen == screen) {
++        const uint32_t lr = ctx->lr;
++        Teardown(ctx, screen);
++        ctx->lr = lr;
++        ctx->gpr[3] = screen;
++        ctx->gpr[4] = flags;
++    }
++    func_805BCAC0(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BCAC0, MLB_ArrangeMarkDestroy_805BCAC0, "MLB_ArrangeMarkDestroy_805BCAC0");
++
++// Mark widget: create (0x805BE408(parent, mark)) and change (0x805BE664(widget, mark)). A virtual
++// index is set up with a fallback game mark (the widget's previous one, else the edited team's),
++// then gets the custom texture; when the file is unusable the fallback stays.
++extern "C" void MLB_ArrangeMarkWidgetNew_805BE408(CpuContext* ctx) {
++    const uint32_t mark = ctx->gpr[4];
++    if (!Enabled() || mark < kGameMarks) { func_805BE408(ctx); return; }
++    ctx->gpr[4] = GameMarkOf(EditingRecord());
++    func_805BE408(ctx);
++    const uint32_t widget = ctx->gpr[3], lr = ctx->lr;
++    ApplyCustomMark(ctx, widget, mark);
++    ctx->lr = lr;
++    ctx->gpr[3] = widget;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BE408, MLB_ArrangeMarkWidgetNew_805BE408, "MLB_ArrangeMarkWidgetNew_805BE408");
++
++extern "C" void MLB_ArrangeMarkWidgetSet_805BE664(CpuContext* ctx) {
++    const uint32_t widget = ctx->gpr[3], mark = ctx->gpr[4];
++    if (!Enabled() || mark < kGameMarks) { func_805BE664(ctx); return; }
++    const uint32_t previous = widget ? Memory::Read32(widget + 0xDC) : 0;
++    ctx->gpr[4] = previous < kGameMarks ? previous : GameMarkOf(EditingRecord());
++    func_805BE664(ctx);
++    const uint32_t lr = ctx->lr;
++    ApplyCustomMark(ctx, widget, mark);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BE664, MLB_ArrangeMarkWidgetSet_805BE664, "MLB_ArrangeMarkWidgetSet_805BE664");
++
++// Team-flag mark icon 0x805BEFB8(flag, mark): the game ignores marks over 37 (it left the last game
++// mark under the cursor on the list's TEAM FLAG). A custom mark (the Team Mark list's preview) is set
++// up as the edited team's game mark, then shows its own icon without the initial (FlagIcon).
++extern "C" void MLB_ArrangeFlagMark_805BEFB8(CpuContext* ctx) {
++    const uint32_t flag = ctx->gpr[3], mark = ctx->gpr[4];
++    if (!Enabled() || mark < kGameMarks) { func_805BEFB8(ctx); return; }
++    ctx->gpr[4] = GameMarkOf(EditingRecord());
++    func_805BEFB8(ctx);
++    const std::string* file = markFileFor(mark);
++    TextureRef ref;
++    if (!flag || !file || !markTexture(Choice{*file, {}}, ref)) return;
++    const uint32_t lr = ctx->lr;
++    FlagIcon(ctx, flag, ref);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BEFB8, MLB_ArrangeFlagMark_805BEFB8, "MLB_ArrangeFlagMark_805BEFB8");
++
++// Team Name/Mark: its build (0x805C1840) lays out the MARK box with the "COLOR" header when the mark
++// has colours (+0x17 <= 0x17, there and in 0x805C1F8C). With a usable custom mark the build sees a
++// mark without colours (0x18) instead; the real +0x17 is back for the refresh (0x805C2340), the
++// "changed?" test (0x8059EF94) and after the build.
++namespace {
++struct LayoutSwap {
++    uint32_t record = 0;
++    uint8_t mark = 0;
++} g_swap;
++bool UsableCustomMark(uint32_t record) {
++    TextureRef ref;
++    return record && (Memory::Read8(record + 0x1B) & 0x02) && markTexture(choiceFor(record), ref);
++}
++}  // namespace
++
++extern "C" void MLB_ArrangeTeamNameMarkBuild_805C1840(CpuContext* ctx) {
++    const uint32_t record = Enabled() ? EditingRecord() : 0;
++    if (!UsableCustomMark(record)) { func_805C1840(ctx); return; }
++    // The window with +0x17 = 0x18 covers all of 0x805C1840 (checked in its call tree): 0x805C1F8C and
++    // its own test read the swapped value on purpose; 0x805C2340, near the end, restores the real one
++    // first (above); 0x8059EF94 (via 0x805C1C54 -> 0x805C25FC) sees the real one (below); 0x8059EE10
++    // is only called from 0x805A61DC and 0x805BB278, both outside this window, so no copy keeps 0x18.
++    g_swap = {record, Memory::Read8(record + 0x17)};
++    Memory::Write8(record + 0x17, 0x18);
++    func_805C1840(ctx);
++    if (g_swap.record) Memory::Write8(record + 0x17, g_swap.mark);
++    g_swap = {};
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805C1840, MLB_ArrangeTeamNameMarkBuild_805C1840, "MLB_ArrangeTeamNameMarkBuild_805C1840");
++
++// Team Name/Mark refresh (0x805C2340): with a custom mark, the "COLOR" A-D label and its "no colour"
++// counterpart are hidden, as the game does for its marks without colours (> 0x17).
++extern "C" void MLB_ArrangeTeamNameMark_805C2340(CpuContext* ctx) {
++    const uint32_t screen = ctx->gpr[3];
++    if (g_swap.record) {  // the rest of the build reads no mark: keep the real one from here on
++        Memory::Write8(g_swap.record + 0x17, g_swap.mark);
++        g_swap = {};
++    }
++    func_805C2340(ctx);
++    if (!Enabled()) return;
++    if (!UsableCustomMark(EditingRecord())) return;
++    const uint32_t lr = ctx->lr;
++    SetVisible(ctx, screen + 0x3940, false);
++    SetVisible(ctx, Memory::Read32(screen + 0x3DC4), false);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805C2340, MLB_ArrangeTeamNameMark_805C2340, "MLB_ArrangeTeamNameMark_805C2340");
++
++// "Cancel" copies of the edited record (0x8102FB78 + i * 0x38): save, restore and "changed?" also
++// cover the slot's choice, which the record alone does not show.
++extern "C" void MLB_ArrangeRecordKeep_8059EE10(CpuContext* ctx) {
++    const uint32_t which = ctx->gpr[3];
++    func_8059EE10(ctx);
++    if (!Enabled()) return;
++    const int slot = EditingSlot();
++    if (which < g_snapshots.size() && slot >= 0)
++        g_snapshots[which] = {slot, liveChoices()[size_t(slot)]};
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8059EE10, MLB_ArrangeRecordKeep_8059EE10, "MLB_ArrangeRecordKeep_8059EE10");
++
++extern "C" void MLB_ArrangeRecordRestore_8059EFE0(CpuContext* ctx) {
++    const uint32_t which = ctx->gpr[3];
++    func_8059EFE0(ctx);
++    if (!Enabled()) return;
++    const int slot = EditingSlot();
++    if (which < g_snapshots.size() && slot >= 0 && g_snapshots[which].slot == slot)
++        liveChoices()[size_t(slot)] = g_snapshots[which].choice;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8059EFE0, MLB_ArrangeRecordRestore_8059EFE0, "MLB_ArrangeRecordRestore_8059EFE0");
++
++extern "C" void MLB_ArrangeRecordChanged_8059EF94(CpuContext* ctx) {
++    if (!Enabled()) { func_8059EF94(ctx); return; }
++    const uint32_t which = ctx->gpr[3];
++    const LayoutSwap swap = g_swap;
++    if (swap.record) Memory::Write8(swap.record + 0x17, swap.mark);
++    func_8059EF94(ctx);
++    if (swap.record) Memory::Write8(swap.record + 0x17, 0x18);
++    const int slot = EditingSlot();
++    if (ctx->gpr[3] == 0 && which < g_snapshots.size() && slot >= 0 && g_snapshots[which].slot == slot &&
++        !SameChoice(g_snapshots[which].choice, liveChoices()[size_t(slot)]))
++        ctx->gpr[3] = 1;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8059EF94, MLB_ArrangeRecordChanged_8059EF94, "MLB_ArrangeRecordChanged_8059EF94");
++
++// Slots unpack 0x805A263C(buffer): the game fills the 32 slots of the main block from the save it
++// has just read (each record, then +0x01 = its index; called through the main data's section table,
++// 0x805A3EB0, and by 0x80839700 / 0x80C89A9C). The choices loaded with that save (nand_isfs.cpp, on
++// the read's last chunk, before this) are checked here, once, against the teams: a slot whose team
++// was deleted or replaced while the option was off (another run, Dolphin, a Wii) loses its choice,
++// before anything draws it. Renames and edits made with the option on are saved with the block's new
++// fingerprints, so they keep theirs.
++namespace {
++void CheckLoadedChoices(uint32_t lr) {
++    SaveState& state = saveState();
++    if (g_trace) {
++        std::fprintf(stderr, "[arrange-trace] slots unpacked lr=%08x block=%08x unchecked=%d\n", lr,
++                     Memory::Read32(kSlotBlock), state.unchecked ? 1 : 0);
++        for (uint32_t i = 0; i < kSlots; ++i) {
++            if (state.loaded[i].empty()) continue;
++            const SlotNow now = SlotState(i);
++            std::fprintf(stderr, "[arrange-trace]   slot %u used=%d print=%08x saved=%08x '%s' '%s'\n", i,
++                         now.used ? 1 : 0, now.fingerprint, state.fingerprints[i], state.loaded[i].mark.c_str(),
++                         state.loaded[i].logo.c_str());
++        }
++    }
++    if (!state.unchecked) return;
++    state.unchecked = false;
++    std::array<SlotNow, kSlots> now;
++    for (uint32_t i = 0; i < kSlots; ++i) now[i] = SlotState(i);
++    for (const int slot : dropChangedTeams(liveChoices(), state.fingerprints, now))
++        std::fprintf(stderr, "[arrange] slot %d: another team (changed with the option off): its custom mark and logo are dropped\n",
++                     slot);
++}
++}  // namespace
++
++extern "C" void MLB_ArrangeSlotsUnpack_805A263C(CpuContext* ctx) {
++    const uint32_t lr = ctx->lr;
++    if (g_trace && Enabled())  // the slots before the game fills them (WIICOMPILED_ARRANGE_TRACE)
++        for (uint32_t i = 0; i < kSlots; ++i)
++            if (!saveState().loaded[i].empty())
++                std::fprintf(stderr, "[arrange-trace] before unpack: slot %u used=%d print=%08x\n", i,
++                             SlotState(i).used ? 1 : 0, SlotState(i).fingerprint);
++    func_805A263C(ctx);
++    if (Enabled()) CheckLoadedChoices(lr);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805A263C, MLB_ArrangeSlotsUnpack_805A263C, "MLB_ArrangeSlotsUnpack_805A263C");
++
++// H7: every path that rewrites a slot. COPY 0x8059E2E8(from id, to id); DELETE 0x8059EC78(slot);
++// create from a base team 0x8059ECC4(id, base); Season "Save as Arrange Team" 0x8059CE4C(id, team);
++// new game 0x8059CD60() (all 32); "Reset to Base Team" 0x805BC394 (the edited slot).
++extern "C" void MLB_ArrangeSlotCopy_8059E2E8(CpuContext* ctx) {
++    const int from = int(ctx->gpr[3]) - 0x21, to = int(ctx->gpr[4]) - 0x21;
++    func_8059E2E8(ctx);
++    onSlotCopied(from, to);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8059E2E8, MLB_ArrangeSlotCopy_8059E2E8, "MLB_ArrangeSlotCopy_8059E2E8");
++
++extern "C" void MLB_ArrangeSlotDelete_8059EC78(CpuContext* ctx) {
++    if (!Enabled()) { func_8059EC78(ctx); return; }
++    const int slot = ctx->gpr[3] ? SlotOf(ctx->gpr[3]) : -1;
++    func_8059EC78(ctx);
++    onSlotDeleted(slot);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8059EC78, MLB_ArrangeSlotDelete_8059EC78, "MLB_ArrangeSlotDelete_8059EC78");
++
++extern "C" void MLB_ArrangeSlotCreate_8059ECC4(CpuContext* ctx) {
++    const int slot = int(ctx->gpr[3]) - 0x21;
++    func_8059ECC4(ctx);
++    onSlotDeleted(slot);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8059ECC4, MLB_ArrangeSlotCreate_8059ECC4, "MLB_ArrangeSlotCreate_8059ECC4");
++
++extern "C" void MLB_ArrangeSlotSaveAs_8059CE4C(CpuContext* ctx) {
++    const int slot = int(ctx->gpr[3]) - 0x21;
++    const bool writes = ctx->gpr[4] != 0;
++    func_8059CE4C(ctx);
++    if (writes) onSlotDeleted(slot);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8059CE4C, MLB_ArrangeSlotSaveAs_8059CE4C, "MLB_ArrangeSlotSaveAs_8059CE4C");
++
++extern "C" void MLB_ArrangeSlotsClear_8059CD60(CpuContext* ctx) {
++    func_8059CD60(ctx);
++    for (int slot = 0; slot < int(kSlots); ++slot) onSlotDeleted(slot);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8059CD60, MLB_ArrangeSlotsClear_8059CD60, "MLB_ArrangeSlotsClear_8059CD60");
++
++extern "C" void MLB_ArrangeResetToBase_805BC394(CpuContext* ctx) {
++    func_805BC394(ctx);
++    if (!Enabled()) return;
++    onSlotDeleted(EditingSlot());
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BC394, MLB_ArrangeResetToBase_805BC394, "MLB_ArrangeResetToBase_805BC394");
++
++// --- Logo Text ("Please set your logo", vtable 0x80D3CEC8) -----------------------------------------
++// The side column (LETTERS, DELETE, CANCEL, OK: the selector at +0x2B5C, buttons in +0x2BD0) gets one
++// more row between LETTERS and DELETE: a list cell of the Team Mark list (pack 0x929, added to the
++// screen's pack set) with the logo's name in the game's font, or "- - -" for the letter logo. The
++// side cursor reaches it with up/down; left/right go through the folder's logos and the letter logo,
++// and the TEAM LOGO box previews the choice. OK keeps it in liveChoices()[slot].logo; the record
++// (letters +0x30, flags +0x1B) is not touched, so the letters stay as the game's fallback. Typing or
++// deleting letters goes back to the letter logo; the screen's CANCEL (undo) restores both.
++namespace {
++constexpr uint32_t kLtCursor = 0x2B50, kLtSelector = 0x2B5C, kLtMode = 0x2BC8, kLtPreview = 0x2BCC,
++                   kLtButtons = 0x2BD0, kLtUndoShade = 0x2BF0, kLtOriginal = 0x2CF0, kLtKeyboard = 0x2938,
++                   kLtText = 0x2944;
++constexpr uint32_t kLtPreloadList = 0x80CEDBB0, kListPack = 0x929, kListCell = 0x40073EB0;
++constexpr uint32_t kLtSideLayer = 0xC70 + 0xB * 0xE0;  // 0x805862FC(screen, 0xB): the side buttons' layer
++// Guest memory of the head page: the pack list, the sprite descriptor, the label text.
++constexpr uint32_t kLtList = 0x900, kLtSprite = 0x940, kLtLabel = 0x960;
++// After the list names; the pack list (at most 14 game ids, 0x929 and the end), the 0x1C-byte
++// descriptor and the label (10 font codes and the end) do not overlap and stay in the head page.
++static_assert(kNames + kMaxEntries * kNameStride <= kLtList && kLtList + 16 * 4 <= kLtSprite &&
++              kLtSprite + 0x1C <= kLtLabel && kLtLabel + 11 * 2 <= kHeadBytes);
++// Layout, measured in game (docs/ingenieria-inversa.md, Logo Text). The screen's units are not square on a 16:9
++// screen (as for every 2D picture of the game, Task 6 marks included): in the side layer about
++// 3.2 px across and 2.3 px down at 1920 x 1080. A side button is about 103 x 29 units from its node
++// (top left); the row node sits halfway between LETTERS and DELETE, and the list cell (157 x 18 at
++// scale 1) is stretched to the button's size inside it. The name is the team-name text at 0.38
++// (34-unit glyphs), centred on the button area.
++constexpr float kButtonWidth = 103, kButtonHeight = 29;
++constexpr float kCellScaleX = 0.88f, kCellScaleY = 1.25f, kCellX = 0, kCellY = -1;
++constexpr float kRowNameScale = 0.38f;
++// The preview sprite in the letters widget's units (about 3.5 px across, 2.3 px down at 1920 x 1080,
++// measured with a 2:1 frame PNG): centred on the TEAM LOGO box (interior about 560 x 199 px, centre
++// 0.6 right of and 0.5 above the widget's origin), the 256 x 128 texture at 0.6 (about 540 x 175 px;
++// the game's seven letters with their underline span about 545 x 130). The sprite's UVs assume
++// power-of-two texture sides (fn_8001D25C).
++constexpr float kSpriteX = 0.6f, kSpriteY = -0.5f, kSpriteScale = 0.6f;
++
++struct LogoScreen {
++    uint32_t screen = 0, preloaded = 0;
++    std::vector<Entry> entries;
++    std::vector<std::string> labels;
++    uint32_t row = 0, cell = 0, holder = 0, text = 0, sprite = 0;
++    std::string original, pending;
++    bool onRow = false;
++} g_logo;
++
++bool LogoActive(uint32_t screen) { return Enabled() && screen && g_logo.screen == screen; }
++
++std::vector<uint16_t> KeyboardText(CpuContext* ctx, uint32_t s) {
++    std::vector<uint16_t> out;
++    const uint32_t text = Memory::Read32(s + kLtText);
++    if (!text) return out;
++    const uint32_t chars = Call(ctx, 0x8065965C, text);
++    for (uint32_t i = 0; chars && i < 8 && Memory::Contains(chars + i * 2, 2); ++i) {
++        const uint16_t c = Memory::Read16(chars + i * 2);
++        if (c == 0xFFFF) break;
++        out.push_back(c);
++    }
++    return out;
++}
++
++std::string LogoLabel(const std::string& file) {
++    if (file.empty()) return "- - -";
++    for (size_t i = 0; i < g_logo.entries.size(); ++i)
++        if (g_logo.entries[i].file == file) return g_logo.labels[i];
++    std::string stem = file;
++    if (stem.size() > 4 && (stem.compare(stem.size() - 4, 4, ".png") == 0 || stem.compare(stem.size() - 4, 4, ".PNG") == 0))
++        stem.resize(stem.size() - 4);
++    std::string shown = label(stem);
++    if (shown.empty()) shown = "IMG";
++    return shownLabels({Entry{file, shown}})[0];
++}
++
++int PendingIndex() {
++    for (size_t i = 0; i < g_logo.entries.size(); ++i)
++        if (g_logo.entries[i].file == g_logo.pending) return int(i);
++    return g_logo.pending.empty() ? -1 : int(g_logo.entries.size());  // a file no longer listed
++}
++
++// Positions of the row, its name and the preview sprite (cheap; also on each refresh).
++void PlaceLogoRow(CpuContext* ctx, uint32_t s) {
++    const uint32_t letters = VCall(ctx, s + kLtButtons, 0x14, 0), del = VCall(ctx, s + kLtButtons, 0x14, 1);
++    if (!letters || !del || !g_logo.row) return;
++    const float x = F(letters + 0x40), y = (F(letters + 0x44) + F(del + 0x44)) / 2;
++    CallF(ctx, 0x8001A7B0, g_logo.row, x, y);
++    CallF(ctx, 0x8001ABA0, g_logo.row, kCellScaleX, kCellScaleY);
++    if (g_logo.cell) CallF(ctx, 0x8001A7B0, g_logo.cell, kCellX, kCellY);
++    float width = 0;
++    if (g_logo.text) {
++        const uint32_t glyphs = Memory::Read32(g_logo.text + 0x130), count = Memory::Read16(g_logo.text + 0x10A);
++        if (count && Memory::Contains(glyphs + (count - 1) * 0x1C, 0x1C))
++            width = float(Memory::Read16(glyphs + (count - 1) * 0x1C + 8));
++    }
++    if (g_logo.holder)
++        CallF(ctx, 0x8001A7B0, g_logo.holder, x + (kButtonWidth - width * kRowNameScale) / 2,
++              y + (kButtonHeight - kGlyphHeight * kRowNameScale) / 2);
++    if (g_logo.sprite) {
++        CallF(ctx, 0x8001A7B0, g_logo.sprite, kSpriteX, kSpriteY);
++        CallF(ctx, 0x8001ABA0, g_logo.sprite, kSpriteScale, kSpriteScale);
++    }
++}
++
++// The preview (custom logo sprite or the game's letters), the row's name and the undo shade.
++void SyncLogo(CpuContext* ctx, uint32_t s) {
++    const uint32_t preview = Memory::Read32(s + kLtPreview);
++    TextureRef ref;
++    const bool custom = g_logo.sprite && !g_logo.pending.empty() && logoTexture(Choice{{}, g_logo.pending}, ref);
++    if (custom) {
++        const uint32_t desc = g_arena + kLtSprite;
++        Memory::Write32(desc + 0x00, 0x53505244);  // "SPRD", the game's sprite descriptor
++        Memory::Write32(desc + 0x04, 0x1C);
++        Memory::Write32(desc + 0x08, ref.texture);
++        Memory::Write32(desc + 0x0C, ref.palette);
++        // Pivot (the centre), texel origin and size: the whole texture.
++        const uint16_t rect[6] = {uint16_t(kLogoWidth / 2), uint16_t(kLogoHeight / 2), 0, 0, uint16_t(kLogoWidth),
++                                  uint16_t(kLogoHeight)};
++        for (uint32_t i = 0; i < 6; ++i) Memory::Write16(desc + 0x10 + i * 2, rect[i]);
++        Call(ctx, 0x8001D25C, g_logo.sprite, desc);
++    }
++    SetVisible(ctx, g_logo.sprite, custom);
++    if (preview) SetVisible(ctx, preview + 0x210, !custom);  // the letters and their underline
++    if (g_logo.text) {
++        Call(ctx, 0x807B4090, g_logo.text, kNameColour);
++        VCall(ctx, g_logo.text, 0x40, WriteName(g_arena + kLtLabel, LogoLabel(g_logo.pending)));
++        Call(ctx, 0x807B4090, g_logo.text, kNameColour);
++    }
++    // The CANCEL (undo) shade as the game sets it (0x805B8474), for the letters and the logo together.
++    const uint32_t text = Memory::Read32(s + kLtText);
++    const uint32_t chars = text ? Call(ctx, 0x8065965C, text) : 0;
++    const bool sameText = chars && Call(ctx, 0x805B6FFC, s + kLtOriginal, chars, 7) == 0;
++    VCall(ctx, s + kLtUndoShade, 0x10, sameText && g_logo.pending == g_logo.original ? 1 : 0);
++    PlaceLogoRow(ctx, s);
++}
++
++uint32_t NewNode(CpuContext* ctx, uint32_t parent) {
++    const uint32_t node = Call(ctx, 0x8005B060, 0x100);
++    if (!node) return 0;
++    Call(ctx, 0x8001E9BC, node);
++    Call(ctx, 0x8057A180, node, parent);
++    Call(ctx, 0x8001AC60, node, 0);
++    return node;
++}
++
++void BuildLogoRow(CpuContext* ctx, uint32_t s) {
++    const uint32_t layer = s + kLtSideLayer, preview = Memory::Read32(s + kLtPreview);
++    g_logo.screen = s;
++    g_logo.labels = shownLabels(g_logo.entries);
++    g_logo.row = NewNode(ctx, layer);
++    if (g_logo.row) {
++        g_logo.cell = NewNode(ctx, g_logo.row);
++        if (g_logo.cell) Call(ctx, 0x8001DFB8, g_logo.cell, kListPack, kListCell);
++    }
++    g_logo.holder = NewNode(ctx, layer);
++    if (g_logo.holder) {
++        CallF(ctx, 0x8001ABA0, g_logo.holder, kRowNameScale, kRowNameScale);
++        g_logo.text = Call(ctx, 0x805C28D4, g_logo.holder, 0, Memory::Read32(kStyle) & 0xFFFF);
++        if (g_logo.text) {
++            Call(ctx, 0x8001AC60, g_logo.text, 0);
++            CallF(ctx, 0x8001A7B0, g_logo.text, 0, 0);
++        }
++    }
++    // The preview sprite (the game's sprite class, as the letters' underline at +0xE0), hidden until
++    // a custom logo is shown.
++    if (preview) {
++        const uint32_t sprite = Call(ctx, 0x8005B060, 0x110);
++        if (sprite) {
++            Call(ctx, 0x8001D098, sprite);
++            Call(ctx, 0x8057A180, sprite, preview);
++            Call(ctx, 0x8001AC60, sprite, 0);
++            SetVisible(ctx, sprite, false);
++            g_logo.sprite = sprite;
++        }
++    }
++}
++
++void TeardownLogo(CpuContext* ctx, uint32_t s) {
++    if (!s || g_logo.screen != s) return;
++    for (uint32_t node : {g_logo.text, g_logo.holder, g_logo.cell, g_logo.row, g_logo.sprite})
++        if (node) VCall(ctx, node, 0x08, 1);
++    g_logo = {};
++}
++
++// The cursor on the logo row: where the game puts it on a button (fn_8001A8B8 of the node).
++void CursorOnRow(CpuContext* ctx, uint32_t s) {
++    const uint32_t vec = g_arena + kScratch;
++    Call(ctx, 0x8001A8B8, vec, g_logo.row);
++    CallF(ctx, 0x8001A7B0, Memory::Read32(s + kLtCursor), F(vec), F(vec + 4));
++    Call(ctx, 0x80641A80, Memory::Read32(s + kLtKeyboard), 0);  // the keyboard is not the target
++}
++
++// What 0x805B7FEC does first (0x8063FA1C, an empty base-class step: blr), kept when the row's
++// handling replaces the rest of the original, so the sequence mirrors the original.
++void InputPrologue(CpuContext* ctx, uint32_t s) { Call(ctx, 0x8063FA1C, s); }
++
++void SelectButton(CpuContext* ctx, uint32_t s, uint32_t button) {
++    g_logo.onRow = false;
++    Call(ctx, 0x805F77E8, s + kLtSelector, button);
++    VCall(ctx, s, 0xF0);
++}
++
++// 0x805B7FEC (vt +0x38) with the logo row: the row's own moves and keys first, the rest is the game's.
++void LogoInput(CpuContext* ctx, uint32_t s) {
++    const auto pressed = [&](uint32_t query) { return Call(ctx, query, 0) != 0; };
++    bool cancel = false;
++    if (Memory::Read32(s + kLtMode) == 0) {
++        const uint32_t selected = Memory::Read32(s + kLtSelector + 0x28);
++        const bool a = pressed(0x805EF2F8), b = pressed(0x805EF300), up = pressed(0x805EF2D8),
++                   down = pressed(0x805EF2E0), left = pressed(0x805EF2F0), right = pressed(0x805EF2E8);
++        if (g_logo.onRow && (a || b || up || down || left || right)) {
++            InputPrologue(ctx, s);
++            if (up || down) {
++                SelectButton(ctx, s, up ? 0 : 1);
++                Sound(ctx, 0x1004);
++            } else if (left || right) {
++                const int next = cycleChoice(int(g_logo.entries.size()), PendingIndex(), left ? -1 : +1);
++                g_logo.pending = next < 0 ? std::string() : g_logo.entries[size_t(next)].file;
++                SyncLogo(ctx, s);
++                Sound(ctx, 0x1000);
++            } else {  // A or B: on to OK, as B does from any button
++                SelectButton(ctx, s, 3);
++                Sound(ctx, a ? 0x1004 : 0x1002);
++            }
++            return;
++        }
++        if (!g_logo.onRow && ((selected == 0 && down) || (selected == 1 && up))) {
++            InputPrologue(ctx, s);
++            g_logo.onRow = true;
++            VCall(ctx, s, 0xF0);
++            Sound(ctx, 0x1004);
++            return;
++        }
++        if (!g_logo.onRow && a && selected == 3 && !g_logo.pending.empty()) {
++            // OK with a custom logo: the game's OK (vt +0xB8, confirm vt +0xF4, close) without its
++            // letters check; a new choice whose file cannot be used is refused as the game refuses.
++            InputPrologue(ctx, s);
++            TextureRef ref;
++            if (g_logo.pending != g_logo.original && !logoTexture(Choice{{}, g_logo.pending}, ref)) {
++                Sound(ctx, 0x1003);
++                return;
++            }
++            if (VCall(ctx, s, 0xB8, 3)) {
++                VCall(ctx, s, 0xF4);
++                Call(ctx, 0x80588710, s, 7);
++                Sound(ctx, 0x1001);
++            }
++            return;
++        }
++        // CANCEL (undo) brings back the letters (the game's, below) and the logo the screen opened
++        // with, whatever the logo is now: the restored letters are not "typed" letters.
++        cancel = !g_logo.onRow && a && selected == 2;
++        if (cancel && g_logo.pending != g_logo.original) {
++            const uint32_t text = Memory::Read32(s + kLtText);
++            const uint32_t chars = text ? Call(ctx, 0x8065965C, text) : 0;
++            if (chars && Call(ctx, 0x805B6FFC, s + kLtOriginal, chars, 7) == 0) {
++                // Only the logo changed: the game would buzz (nothing to undo), so this is ours.
++                InputPrologue(ctx, s);
++                g_logo.pending = g_logo.original;
++                SyncLogo(ctx, s);
++                Sound(ctx, 0x1002);
++                return;
++            }
++        }
++    }
++    const std::vector<uint16_t> before = KeyboardText(ctx, s);
++    ctx->gpr[3] = s;
++    func_805B7FEC(ctx);
++    if (!LogoActive(s)) return;  // the input closed the screen
++    if (cancel) {
++        g_logo.pending = g_logo.original;
++        SyncLogo(ctx, s);
++    } else if (!g_logo.pending.empty() && KeyboardText(ctx, s) != before) {
++        g_logo.pending.clear();  // typed or deleted letters: the letter logo
++        SyncLogo(ctx, s);
++    }
++}
++}  // namespace
++
++// Logo Text pack set (vt +0x24): the game's packs and the list cell's (0x929), when there is a row
++// (logos in the folder, or a logo chosen before).
++extern "C" void MLB_ArrangeLogoPreload_805B7ED0(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    if (!Enabled()) { func_805B7ED0(ctx); return; }
++    g_logo = {};
++    const int slot = EditingSlot();
++    std::vector<Entry> entries = Catalog(Kind::Logo);
++    // No row without a slot to keep the choice in, or with nothing to offer or to take back.
++    if (slot < 0 || (entries.empty() && liveChoices()[size_t(slot)].logo.empty())) { func_805B7ED0(ctx); return; }
++    const uint32_t list = g_arena + kLtList;
++    uint32_t n = 0;
++    for (; n < 14 && Memory::Read32(kLtPreloadList + n * 4); ++n)
++        Memory::Write32(list + n * 4, Memory::Read32(kLtPreloadList + n * 4));
++    Memory::Write32(list + n++ * 4, kListPack);
++    Memory::Write32(list + n * 4, 0);
++    const uint32_t lr = ctx->lr;
++    Call(ctx, 0x8064FEB0, Call(ctx, 0x8064ED54, s), list, 1);
++    Call(ctx, 0x80588710, s, 2);
++    ctx->lr = lr;
++    g_logo.preloaded = s;
++    g_logo.entries = std::move(entries);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805B7ED0, MLB_ArrangeLogoPreload_805B7ED0, "MLB_ArrangeLogoPreload_805B7ED0");
++
++// Logo Text build (vt +0xE8): the game's screen, then the logo row and the preview sprite.
++extern "C" void MLB_ArrangeLogoBuild_805B8838(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    func_805B8838(ctx);
++    if (!Enabled() || !s || g_logo.preloaded != s || g_logo.screen) return;
++    const uint32_t lr = ctx->lr;
++    BuildLogoRow(ctx, s);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805B8838, MLB_ArrangeLogoBuild_805B8838, "MLB_ArrangeLogoBuild_805B8838");
++
++// Logo Text start (vt +0xEC: the preview from the record, the keyboard from the letters): the row
++// starts on the slot's logo choice.
++extern "C" void MLB_ArrangeLogoStart_805B8CE4(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    func_805B8CE4(ctx);
++    if (!LogoActive(s)) return;
++    const uint32_t lr = ctx->lr;
++    const int slot = EditingSlot();
++    g_logo.original = g_logo.pending = slot >= 0 ? liveChoices()[size_t(slot)].logo : std::string();
++    g_logo.onRow = false;
++    SyncLogo(ctx, s);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805B8CE4, MLB_ArrangeLogoStart_805B8CE4, "MLB_ArrangeLogoStart_805B8CE4");
++
++extern "C" void MLB_ArrangeLogoInput_805B7FEC(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    if (!LogoActive(s)) { func_805B7FEC(ctx); return; }
++    const uint32_t lr = ctx->lr;
++    LogoInput(ctx, s);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805B7FEC, MLB_ArrangeLogoInput_805B7FEC, "MLB_ArrangeLogoInput_805B7FEC");
++
++// Logo Text side cursor (vt +0xF0): on the logo row it frames the row.
++extern "C" void MLB_ArrangeLogoCursor_805B8E98(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    func_805B8E98(ctx);
++    if (!LogoActive(s)) return;
++    const uint32_t lr = ctx->lr;
++    PlaceLogoRow(ctx, s);
++    if (g_logo.onRow) CursorOnRow(ctx, s);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805B8E98, MLB_ArrangeLogoCursor_805B8E98, "MLB_ArrangeLogoCursor_805B8E98");
++
++// Logo Text confirm (vt +0xF4): a custom logo goes to the slot's choice and the record keeps its
++// letters and flags; the letter logo is the game's confirm and clears the choice.
++extern "C" void MLB_ArrangeLogoConfirm_805B87CC(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    if (!Enabled()) { func_805B87CC(ctx); return; }
++    const int slot = EditingSlot();
++    if (LogoActive(s) && !g_logo.pending.empty()) {
++        if (slot >= 0) liveChoices()[size_t(slot)].logo = g_logo.pending;
++        return;
++    }
++    func_805B87CC(ctx);
++    if (slot >= 0) liveChoices()[size_t(slot)].logo.clear();
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805B87CC, MLB_ArrangeLogoConfirm_805B87CC, "MLB_ArrangeLogoConfirm_805B87CC");
++
++// Logo Text release (vt +0x18) and destructor (vt +0x08): the row and the sprite go first.
++extern "C" void MLB_ArrangeLogoRelease_805B7D68(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3];
++    if (LogoActive(s)) {
++        const uint32_t lr = ctx->lr;
++        TeardownLogo(ctx, s);
++        ctx->lr = lr;
++        ctx->gpr[3] = s;
++    }
++    func_805B7D68(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805B7D68, MLB_ArrangeLogoRelease_805B7D68, "MLB_ArrangeLogoRelease_805B7D68");
++
++extern "C" void MLB_ArrangeLogoDestroy_805B7CB4(CpuContext* ctx) {
++    const uint32_t s = ctx->gpr[3], flags = ctx->gpr[4];
++    if (LogoActive(s)) {
++        const uint32_t lr = ctx->lr;
++        TeardownLogo(ctx, s);
++        ctx->lr = lr;
++        ctx->gpr[3] = s;
++        ctx->gpr[4] = flags;
++    }
++    if (Enabled() && s && g_logo.preloaded == s) g_logo = {};
++    func_805B7CB4(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805B7CB4, MLB_ArrangeLogoDestroy_805B7CB4, "MLB_ArrangeLogoDestroy_805B7CB4");
++
++// --- Task 8 hooks: the team's custom mark, logo and no initial wherever the game draws the team ----
++// Each one runs the game's own code first (the fallback: game mark, initial, letters) and then, for
++// an Arrange record with a usable custom choice, swaps in the custom picture (helpers above).
++
++// Team flag by slot (0x805BFA58(flag, slot)) and by record (0x805BFB74(flag, record)): the slot
++// list, the Exhibition grid, the lineups, Team Name/Mark (icons 0x807B34FC / 0x807B336C modes 1 and 4).
++extern "C" void MLB_ArrangeFlagSlot_805BFA58(CpuContext* ctx) {
++    const uint32_t flag = ctx->gpr[3], slot = ctx->gpr[4], lr = ctx->lr;
++    func_805BFA58(ctx);
++    if (!Enabled() || !flag || !slot || !Memory::Contains(slot, 0x80) || !Memory::Read8(slot)) {
++        Trace("flag-slot", lr, flag, slot, 0, false);
++        return;
++    }
++    TextureRef ref;
++    const bool custom = TeamMark(slot + kRecord, ref) && FlagIcon(ctx, flag, ref);
++    ctx->lr = lr;
++    Trace("flag-slot", lr, flag, slot, slot + kRecord, custom);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BFA58, MLB_ArrangeFlagSlot_805BFA58, "MLB_ArrangeFlagSlot_805BFA58");
++
++extern "C" void MLB_ArrangeFlagRecord_805BFB74(CpuContext* ctx) {
++    const uint32_t flag = ctx->gpr[3], record = ctx->gpr[4], lr = ctx->lr;
++    func_805BFB74(ctx);
++    if (!Enabled() || !flag) return;
++    TextureRef ref;
++    const bool custom = TeamMark(record, ref) && FlagIcon(ctx, flag, ref);
++    ctx->lr = lr;
++    Trace("flag-record", lr, flag, record, record, custom);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BFB74, MLB_ArrangeFlagRecord_805BFB74, "MLB_ArrangeFlagRecord_805BFB74");
++
++// Flag palette 0x805BF048(flag, colour): a custom icon has its own palette and no colours (the game
++// would point the icon back at its palette list +0x4E0).
++extern "C" void MLB_ArrangeFlagColour_805BF048(CpuContext* ctx) {
++    const uint32_t flag = ctx->gpr[3];
++    if (Enabled() && flag && IsFlagBlock(flag, Memory::Read32(flag + 0x3E0 + 0xDC))) return;
++    func_805BF048(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BF048, MLB_ArrangeFlagColour_805BF048, "MLB_ArrangeFlagColour_805BF048");
++
++// TEAM FLAG field by record (0x805C6BCC(field, record); 0x805C6B58(field, slot) calls it for a team
++// with its own flag): the icon instead of the initial. 0x805C6A98(field, letter, colour) sets a letter:
++// the sprite gets its own scale back first.
++extern "C" void MLB_ArrangeFieldLetter_805C6A98(CpuContext* ctx) {
++    const uint32_t field = ctx->gpr[3];
++    if (Enabled() && field && Memory::Contains(field + 0x300, 4) && !g_fieldPoses.empty()) {
++        const uint32_t lr = ctx->lr, r4 = ctx->gpr[4], r5 = ctx->gpr[5];
++        FieldRestore(ctx, Memory::Read32(field + 0x300));
++        ctx->lr = lr;
++        ctx->gpr[3] = field;
++        ctx->gpr[4] = r4;
++        ctx->gpr[5] = r5;
++    }
++    func_805C6A98(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805C6A98, MLB_ArrangeFieldLetter_805C6A98, "MLB_ArrangeFieldLetter_805C6A98");
++
++extern "C" void MLB_ArrangeFieldRecord_805C6BCC(CpuContext* ctx) {
++    const uint32_t field = ctx->gpr[3], record = ctx->gpr[4], lr = ctx->lr;
++    func_805C6BCC(ctx);
++    if (!Enabled() || !field) return;
++    TextureRef ref;
++    const bool custom = TeamMark(record, ref) && FieldIcon(ctx, field, ref);
++    ctx->lr = lr;
++    Trace("field", lr, field, record, record, custom);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805C6BCC, MLB_ArrangeFieldRecord_805C6BCC, "MLB_ArrangeFieldRecord_805C6BCC");
++
++// Team icons by slot (0x807B34FC(icon, slot)) and by record (0x807B336C(icon, record)), mode +0x1F0:
++// mode 2 is the big mark (+0x208, 0x805BE664 with the record's game mark): HOME/ROAD, "X AT Y", Team
++// Name/Mark's MARK. Modes 0/1/3/4 go through the flag and field hooks above.
++namespace {
++void IconMark(CpuContext* ctx, uint32_t icon, const char* what, uint32_t lr) {
++    if (!Enabled() || !icon || !Memory::Contains(icon, 0x20C)) return;
++    const uint32_t mode = Memory::Read32(icon + 0x1F0), record = Memory::Read32(icon + 0x1FC);
++    TextureRef ref;
++    bool custom = false;
++    if (mode == 2 && TeamMark(record, ref)) {
++        const Choice& choice = choiceFor(record);
++        custom = ApplyCustomMark(ctx, Memory::Read32(icon + 0x208), markIndexFor(choice.mark));
++    }
++    Trace(what, lr, icon, mode, record, custom);
++}
++}  // namespace
++
++extern "C" void MLB_ArrangeIconSlot_807B34FC(CpuContext* ctx) {
++    const uint32_t icon = ctx->gpr[3], lr = ctx->lr;
++    func_807B34FC(ctx);
++    IconMark(ctx, icon, "icon-slot", lr);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x807B34FC, MLB_ArrangeIconSlot_807B34FC, "MLB_ArrangeIconSlot_807B34FC");
++
++extern "C" void MLB_ArrangeIconRecord_807B336C(CpuContext* ctx) {
++    const uint32_t icon = ctx->gpr[3], lr = ctx->lr;
++    func_807B336C(ctx);
++    IconMark(ctx, icon, "icon-record", lr);
++    ctx->lr = lr;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x807B336C, MLB_ArrangeIconRecord_807B336C, "MLB_ArrangeIconRecord_807B336C");
++
++// Team logo by slot: 0x807B5118(widget, slot, a, b) and 0x807B5184(widget, slot) (a, b from the
++// widget +0xE8/+0xEC). They call 0x807B4740(widget, id, a, b, record) with the letters (0x92 and the
++// record) or the base team's logo. A custom logo always takes the letters path, whose widget (+0x7D0)
++// then shows the PNG; otherwise the game's call, and our sprite (if any) gives the letters back.
++namespace {
++void SlotLogo(CpuContext* ctx, bool fromWidget, const char* what) {
++    if (!Enabled()) {
++        if (fromWidget) func_807B5184(ctx);
++        else func_807B5118(ctx);
++        return;
++    }
++    const uint32_t widget = ctx->gpr[3], slot = ctx->gpr[4], lr = ctx->lr;
++    const uint32_t a = fromWidget ? Memory::Read32(widget + 0xE8) : ctx->gpr[5];
++    const uint32_t b = fromWidget ? Memory::Read32(widget + 0xEC) : ctx->gpr[6];
++    TextureRef ref;
++    // Only the logo widget's modes that draw letters (0x807B4740: +0xDC 0, 1 or 3) can show a logo.
++    const uint32_t mode = widget ? Memory::Read32(widget + 0xDC) : ~0u;
++    const bool custom = widget && (mode == 0 || mode == 1 || mode == 3) && slot &&
++                        Memory::Contains(slot, 0x80) && Memory::Read8(slot) && TeamLogo(slot + kRecord, ref);
++    if (custom) {
++        Call(ctx, 0x807B4740, widget, 0x92, a, b, slot + kRecord);
++        ShowLogo(ctx, Memory::Read32(widget + 0x7D0), ref);
++    } else {
++        if (fromWidget) func_807B5184(ctx);
++        else func_807B5118(ctx);
++        if (widget) HideLogo(ctx, Memory::Read32(widget + 0x7D0));
++    }
++    ctx->lr = lr;
++    Trace(what, lr, widget, mode, slot ? slot + kRecord : 0, custom);
++}
++}  // namespace
++
++extern "C" void MLB_ArrangeLogoSlot_807B5118(CpuContext* ctx) { SlotLogo(ctx, false, "logo-slot"); }
++REGISTER_NATIVE_FUNCTION_AS(0x807B5118, MLB_ArrangeLogoSlot_807B5118, "MLB_ArrangeLogoSlot_807B5118");
++
++extern "C" void MLB_ArrangeLogoSlotWidget_807B5184(CpuContext* ctx) { SlotLogo(ctx, true, "logo-slot-widget"); }
++REGISTER_NATIVE_FUNCTION_AS(0x807B5184, MLB_ArrangeLogoSlotWidget_807B5184, "MLB_ArrangeLogoSlotWidget_807B5184");
++
++// Letters widget destructor (vt +0x08, 0x805B9F14): our logo sprite goes first.
++extern "C" void MLB_ArrangeLettersDestroy_805B9F14(CpuContext* ctx) {
++    const uint32_t letters = ctx->gpr[3], flags = ctx->gpr[4];
++    if (Enabled() && letters) {
++        if (const uint32_t sprite = LogoSprite(letters)) {
++            const uint32_t lr = ctx->lr;
++            VCall(ctx, sprite, 0x08, 1);
++            g_logoSprites.erase(letters);
++            ctx->lr = lr;
++            ctx->gpr[3] = letters;
++            ctx->gpr[4] = flags;
++        }
++    }
++    func_805B9F14(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805B9F14, MLB_ArrangeLettersDestroy_805B9F14, "MLB_ArrangeLettersDestroy_805B9F14");
++
++// Team Name/Mark legend 0x8059AB98(label, record): the custom mark's list name instead of the game
++// mark's name picture.
++extern "C" void MLB_ArrangeMarkLegend_8059AB98(CpuContext* ctx) {
++    const uint32_t label = ctx->gpr[3], record = ctx->gpr[4], lr = ctx->lr;
++    func_8059AB98(ctx);
++    if (!Enabled() || !label) return;
++    TextureRef ref;
++    const bool custom = TeamMark(record, ref);
++    Legend* legend = LegendOf(label);
++    if (!custom) {
++        if (legend) SetVisible(ctx, legend->holder, false);
++        ctx->lr = lr;
++        Trace("legend", lr, label, record, record, false);
++        return;
++    }
++    // The picture's box (fn_8001E6BC: min x, min y, max x, max y) before it goes.
++    const uint32_t box = g_arena + kScratch;
++    Call(ctx, 0x8001E6BC, box, label);
++    const float x0 = F(box), y0 = F(box + 4), x1 = F(box + 8), y1 = F(box + 12);
++    Call(ctx, 0x8001E254, label, 0);
++    if (!legend) {
++        Legend made;
++        made.holder = NewNode(ctx, label);
++        if (made.holder) {
++            CallF(ctx, 0x8001ABA0, made.holder, kNameScale, kNameScale);
++            made.text = Call(ctx, 0x805C28D4, made.holder, 0, Memory::Read32(kStyle) & 0xFFFF);
++            if (made.text) {
++                Call(ctx, 0x8001AC60, made.text, 0);
++                CallF(ctx, 0x8001A7B0, made.text, 0, 0);
++            }
++            g_legends[label] = made;
++            legend = &g_legends[label];
++        }
++    }
++    if (legend && legend->text) {
++        Call(ctx, 0x807B4090, legend->text, kNameColour);
++        VCall(ctx, legend->text, 0x40, WriteName(g_arena + kLtLabel, MarkLabel(choiceFor(record).mark)));
++        Call(ctx, 0x807B4090, legend->text, kNameColour);
++        float width = 0;
++        const uint32_t glyphs = Memory::Read32(legend->text + 0x130), count = Memory::Read16(legend->text + 0x10A);
++        if (count && Memory::Contains(glyphs + (count - 1) * 0x1C, 0x1C))
++            width = float(Memory::Read16(glyphs + (count - 1) * 0x1C + 8));
++        const float cx = x1 > x0 ? (x0 + x1) / 2 : 0, cy = y1 > y0 ? (y0 + y1) / 2 : 0;
++        CallF(ctx, 0x8001A7B0, legend->holder, cx - width * kNameScale / 2, cy - kGlyphHeight * kNameScale / 2);
++        SetVisible(ctx, legend->holder, true);
++    }
++    ctx->lr = lr;
++    Trace("legend", lr, label, record, record, true);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8059AB98, MLB_ArrangeMarkLegend_8059AB98, "MLB_ArrangeMarkLegend_8059AB98");
++
++// Mark legend destructor (vt +0x08 of 0x80D3BDF4, 0x8059AA90): our name goes first.
++extern "C" void MLB_ArrangeLegendDestroy_8059AA90(CpuContext* ctx) {
++    const uint32_t label = ctx->gpr[3], flags = ctx->gpr[4];
++    if (Enabled() && label) {
++        if (Legend* legend = LegendOf(label)) {
++            const uint32_t lr = ctx->lr, holder = legend->holder, text = legend->text;
++            g_legends.erase(label);
++            if (text) VCall(ctx, text, 0x08, 1);
++            VCall(ctx, holder, 0x08, 1);
++            ctx->lr = lr;
++            ctx->gpr[3] = label;
++            ctx->gpr[4] = flags;
++        }
++    }
++    func_8059AA90(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8059AA90, MLB_ArrangeLegendDestroy_8059AA90, "MLB_ArrangeLegendDestroy_8059AA90");
++
++// Team flag destructor (vt +0x08 of 0x80D3D960, 0x805BE7FC): the flag's custom icon block goes after
++// it (the flag's image node points at the block until the flag is gone).
++extern "C" void MLB_ArrangeFlagDestroy_805BE7FC(CpuContext* ctx) {
++    const uint32_t flag = ctx->gpr[3];
++    const uint32_t block = Enabled() && flag ? TakeFlagBlock(flag) : 0;
++    func_805BE7FC(ctx);
++    if (!block) return;
++    const uint32_t lr = ctx->lr, result = ctx->gpr[3];
++    Call(ctx, 0x8005B088, block);
++    ctx->lr = lr;
++    ctx->gpr[3] = result;
++}
++REGISTER_NATIVE_FUNCTION_AS(0x805BE7FC, MLB_ArrangeFlagDestroy_805BE7FC, "MLB_ArrangeFlagDestroy_805BE7FC");
+diff --git a/runtime/src/hle/mlb/game_heaps.cpp b/runtime/src/hle/mlb/game_heaps.cpp
+--- a/runtime/src/hle/mlb/game_heaps.cpp
++++ b/runtime/src/hle/mlb/game_heaps.cpp
+@@ -14,6 +14,7 @@
+ #include <cstdio>
+ 
+ #include "abi_bridge.h"
++#include "arrange_marks_native.h"
+ #include "hle_stubs.h"
+ #include "memory.h"
+ 
+@@ -47,6 +48,8 @@
+     set(kMem1Lo, lo1 + size1);
+ 
+     const uint32_t lo2 = (get(kMem2Lo) + 31) & ~31u;
++    // Custom Arrange marks ([arrange] custom_marks): their textures live above the heap.
++    set(kMem2Hi, arrange_marks::ReserveGuestMemory(lo2, get(kMem2Hi)));
+     const uint32_t arena2 = (get(kMem2Hi) - lo2) & ~31u;
+     const uint32_t size2 = std::max(arena2, kRetailMem2HeapSize);
+     set(kMem2Lo, (lo2 + size2 + 31) & ~31u);
+diff --git a/runtime/src/hle/storage/nand_isfs.cpp b/runtime/src/hle/storage/nand_isfs.cpp
+--- a/runtime/src/hle/storage/nand_isfs.cpp
++++ b/runtime/src/hle/storage/nand_isfs.cpp
+@@ -3,6 +3,7 @@
+ // Shared state and helpers live in nand_internal.h.
+ 
+ #include "season_cap.h"
++#include "arrange_marks_native.h"
+ #include <vector>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -490,6 +491,18 @@
+     const std::filesystem::path& real = handle.safeCommitPath.empty() ? handle.path : handle.safeCommitPath;
+     return season_cap::IsLifeSaveName(real.filename().string().c_str());
+ }
++static bool IsMainSaveHandle(const FileHandle& handle) {
++    const std::filesystem::path& real = handle.safeCommitPath.empty() ? handle.path : handle.safeCommitPath;
++    return arrange_marks::IsMainSaveName(real.filename().string().c_str());
++}
++// A main save open for writing: the SDK's NANDSafeOpen is copying the old file before a save
++// (arrange_marks::ShouldLoadOnRead). Callers must not hold g_fdMutex.
++static bool MainSaveWriteOpen() {
++    std::lock_guard<std::mutex> lock(g_fdMutex);
++    for (const auto& [fd, handle] : g_fileHandles)
++        if (handle.mode >= 2 && IsMainSaveHandle(handle)) return true;
++    return false;
++}
+ 
+ extern "C" int32_t NAND_IOS_Read_HLE(uint32_t fd, uint32_t bufferPtr, uint32_t length) {
+     auto* handle = GetHandle(fd);
+@@ -511,6 +524,9 @@
+     const uint32_t readAt = handle->position;
+     size_t bytesRead = std::fread(buffer, 1, length, handle->file);
+     handle->position += static_cast<uint32_t>(bytesRead);
++    if (NandTraceEnabled() && IsMainSaveHandle(*handle))
++        std::fprintf(stderr, "[nandtrace] read fd=%d mode=%d at=0x%X len=0x%X -> 0x%zX\n", fd, handle->mode, readAt,
++                     length, bytesRead);
+     if (IsSeasonSaveHandle(*handle)) {
+         // A load stops at the 16 KB chunk past the game's data, short of our tail: the chunk that
+         // reaches the end of the data brings the tail, read here from the file.
+@@ -551,6 +567,21 @@
+             }
+         }
+         season_cap::OnLifeSaveRead(readAt, buffer, bytesRead, tailBytes);
++    } else if (arrange_marks::LoadChunkReachesLoadEnd(readAt, bytesRead) && IsMainSaveHandle(*handle) &&
++               arrange_marks::SaveHooksEnabled() &&
++               arrange_marks::ShouldLoadOnRead(readAt, bytesRead, MainSaveWriteOpen())) {
++        // Main save: the load's last chunk (it reads up to 0xD0000) brings the custom Arrange marks,
++        // read here from the file's free tail (an earlier read from 0 must not drop unsaved picks, and
++        // neither may the copy NANDSafeOpen makes before a save). They are checked against the teams
++        // when the game unpacks the slots (arrange_marks.cpp, 0x805A263C).
++        const auto status = arrange_marks::OnMainSaveLoad(handle->file, true);
++        if (status == arrange_marks::ReadStatus::Invalid)
++            LogNandError("IOS_Read", "invalid Arrange custom marks save extension (ignored, kept on disk until a choice changes)");
++        if (NandTraceEnabled()) {
++            int marks = 0;
++            for (const auto& choice : arrange_marks::liveChoices()) marks += !choice.mark.empty();
++            std::fprintf(stderr, "[nandtrace] arrange marks loaded: status=%d, %d custom marks\n", int(status), marks);
++        }
+     }
+     
+     return static_cast<int32_t>(bytesRead);
+@@ -586,6 +617,21 @@
+         bytesWritten = std::fwrite(copy.data(), 1, copy.size(), handle->file);
+     } else {
+         bytesWritten = std::fwrite(buffer, 1, length, handle->file);
++        if (IsMainSaveHandle(*handle) && arrange_marks::SaveHooksEnabled()) {
++            // Main save: our block goes in the free tail after each game write (only if the file spans it),
++            // with the fingerprints of the teams as they are now. A failure is logged once per save.
++            static bool storeFailureLogged = false;
++            if (handle->position == 0) storeFailureLogged = false;
++            std::fflush(handle->file);
++            const auto stored =
++                arrange_marks::OnMainSaveStore(handle->file, true, arrange_marks::CurrentFingerprints());
++            if (stored == arrange_marks::StoreResult::Failed && !storeFailureLogged) {
++                storeFailureLogged = true;
++                LogNandError("IOS_Write", "could not write the Arrange custom marks save extension");
++            }
++            if (NandTraceEnabled() && handle->position == 0)
++                std::fprintf(stderr, "[nandtrace] arrange marks store: result=%d\n", int(stored));
++        }
+     }
+     std::fflush(handle->file);
+     handle->position += static_cast<uint32_t>(bytesWritten);
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -791,6 +791,15 @@
+                                "saved and loaded. A mod can choose modern or original."),
+                             YesNo(), RuntimeConfigFile::ModernPostseason(false) ? 1 : 0};
+     modernPostseason.experimental = true;
++    Option arrangeMarks{Tr("MARCAS Y LOGOTIPOS PROPIOS (ARRANGE)", "CUSTOM MARKS AND LOGOS (ARRANGE)"),
++                        Tr("Añade a las listas de Team Mark y Logo Text de Arrange las imágenes PNG de "
++                           "UserData/arrange/marks y UserData/arrange/logos. Un equipo con marca propia la muestra en "
++                           "lugar de su inicial.",
++                           "Adds the PNG images in UserData/arrange/marks and UserData/arrange/logos to "
++                           "Arrange's Team Mark and Logo Text lists. A team with its own mark shows it instead of its "
++                           "initial."),
++                        YesNo(), RuntimeConfigFile::ArrangeCustomMarks(false) ? 1 : 0};
++    arrangeMarks.experimental = true;
+ 
+     const std::string savedLanguage = RuntimeConfigFile::UiLanguage("auto");
+     Option language{"IDIOMA / LANGUAGE",
+@@ -937,7 +946,7 @@
+         {"AUDIO", {volume, mute}},
+         {Tr("CONTROLES", "CONTROLS"), {wiimote}},
+         {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
+-        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh, modernLeagues, modernPostseason, twoWay}},
++        {Tr("MEJORAS", "ENHANCEMENTS"), {seasons, universalDh, modernLeagues, modernPostseason, arrangeMarks, twoWay}},
+     };
+     tabs.push_back(std::move(modsTab));
+     tabs.push_back(std::move(toolsTab));
+@@ -1067,4 +1076,13 @@
+         if (label == universalDh.label) RuntimeConfigFile::SetUniversalDh(o.value != 0);
+         if (label == modernLeagues.label) RuntimeConfigFile::SetModernLeagues(o.value != 0);
+         if (label == modernPostseason.label) RuntimeConfigFile::SetModernPostseason(o.value != 0);
++        if (label == arrangeMarks.label) {
++            RuntimeConfigFile::SetArrangeCustomMarks(o.value != 0);
++            if (o.value != 0) {
++                std::error_code ec;
++                const std::filesystem::path root = RuntimeConfigFile::ApplicationDataDirectory() / "arrange";
++                std::filesystem::create_directories(root / "marks", ec);
++                std::filesystem::create_directories(root / "logos", ec);
++            }
++        }
+         if (label == twoWay.label) RuntimeConfigFile::SetTwoWayPlayer(o.value != 0);
+diff --git a/runtime/tests/arrange_marks_save_test.cpp b/runtime/tests/arrange_marks_save_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/tests/arrange_marks_save_test.cpp
+@@ -0,0 +1,393 @@
++#include "arrange_marks_save.h"
++#include <cassert>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <iterator>
++#include <vector>
++
++using namespace arrange_marks;
++// The game's data end in pm3usma.dat (save descriptor 0xD0000 + 0x50 header): past the load end.
++constexpr uint32_t kDataEnd = 0xD0050;
++
++static std::vector<uint8_t> slurp(const std::filesystem::path& p) {
++    std::ifstream in(p, std::ios::binary);
++    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
++}
++static void spit(const std::filesystem::path& p, const std::vector<uint8_t>& data) {
++    std::ofstream o(p, std::ios::binary);
++    o.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
++}
++
++// A team record as guest memory holds it (big endian): name in font codes (ASCII + 0x9B), 0xFFFF end.
++static std::array<uint8_t, 0x37> record(const char* name, uint8_t initial, uint8_t base) {
++    std::array<uint8_t, 0x37> r{};
++    size_t i = 0;
++    for (; name[i] && i < 10; ++i) {
++        const uint16_t code = uint16_t(uint8_t(name[i]) + 0x9B);
++        r[2 * i] = uint8_t(code >> 8);
++        r[2 * i + 1] = uint8_t(code);
++    }
++    for (; i < 10; ++i) r[2 * i] = r[2 * i + 1] = 0xFF;
++    r[0x15] = initial;
++    r[0x1A] = base;
++    r[0x17] = 2;     // LION
++    r[0x1B] = 0x43;  // name, mark, initial
++    for (size_t k = 0; k < 6; ++k) r[0x30 + k] = uint8_t(k + 1);
++    r[0x36] = 0xFF;
++    return r;
++}
++
++// A version 1 block (no fingerprints, 2064 bytes, its own valid checksum), as the unpublished first
++// format wrote it: "leones.png" as slot 2's mark.
++static std::vector<uint8_t> versionOneBlock() {
++    std::vector<uint8_t> v1(2064, 0);
++    const char magic[] = "MLBARRMK";
++    std::copy(magic, magic + 8, v1.begin());
++    v1[11] = 1;
++    const char mark[] = "leones.png";
++    std::copy(mark, mark + 10, v1.begin() + 16 + 2 * 64);
++    uint32_t h = 2166136261u;
++    for (size_t i = 16; i < v1.size(); ++i) h = (h ^ v1[i]) * 16777619u;
++    for (int i = 0; i < 4; ++i) v1[12 + i] = uint8_t(h >> (24 - 8 * i));
++    return v1;
++}
++
++int main() {
++    // round trip, Lions in slot 2, with the team's fingerprint
++    Choices c;
++    c[2] = {"leones.png", "leones_logo.png"};
++    Fingerprints prints{};
++    prints[2] = 0x12345678;
++    prints[5] = 0x9ABCDEF0;  // slot 5 has no choice: its row stores 0
++    auto bytes = writeChoices(c, prints);
++    assert(bytes.size() == 2192 && kSaveFileOffset + bytes.size() == 0xD3890);
++    assert(bytes[8] == 0 && bytes[11] == 2);
++    // isChosen: by kind, any slot, never for an empty name
++    assert(isChosen(c, false, "leones.png") && isChosen(c, true, "leones_logo.png"));
++    assert(!isChosen(c, true, "leones.png") && !isChosen(c, false, "leones_logo.png"));
++    assert(!isChosen(c, false, "") && !isChosen(c, true, "") && !isChosen(Choices{}, false, "x.png"));
++    Choices back;
++    Fingerprints backPrints{};
++    assert(readChoices(bytes.data(), bytes.size(), back, backPrints) == ReadStatus::Valid);
++    assert(back[2].mark == "leones.png" && back[2].logo == "leones_logo.png");
++    assert(back[0].mark.empty() && back[3].logo.empty());
++    assert(backPrints[2] == 0x12345678 && backPrints[5] == 0 && backPrints[0] == 0);
++
++    // all zeros
++    std::array<uint8_t, kSaveBytes> zeros{};
++    assert(readChoices(zeros.data(), zeros.size(), back, backPrints) == ReadStatus::Missing);
++    assert(back[2].mark.empty() && backPrints[2] == 0);
++
++    // altered checksum, payload, fingerprint, version, short block
++    auto bad = bytes; bad[12] ^= 1;
++    assert(readChoices(bad.data(), bad.size(), back, backPrints) == ReadStatus::Invalid);
++    bad = bytes; bad[100] ^= 1;
++    assert(readChoices(bad.data(), bad.size(), back, backPrints) == ReadStatus::Invalid);
++    bad = bytes; bad[16 + 2 * kRowBytes + 64] ^= 1;  // slot 2's fingerprint
++    assert(readChoices(bad.data(), bad.size(), back, backPrints) == ReadStatus::Invalid);
++    bad = bytes; bad[11] = 3;
++    assert(readChoices(bad.data(), bad.size(), back, backPrints) == ReadStatus::Invalid);
++    assert(back[2].mark.empty() && backPrints[2] == 0);  // nothing out of an Invalid block
++    assert(readChoices(bytes.data(), 100, back, backPrints) == ReadStatus::Invalid);
++
++    // version 1 (2064 bytes, no fingerprints, its own valid checksum) is not read: Invalid
++    {
++        auto v1 = versionOneBlock();
++        assert(readChoices(v1.data(), v1.size(), back, backPrints) == ReadStatus::Invalid);
++        v1.resize(kSaveBytes, 0);  // as it sits in the file: followed by zeros
++        assert(readChoices(v1.data(), v1.size(), back, backPrints) == ReadStatus::Invalid);
++        assert(back[2].mark.empty());
++    }
++
++    // 31-byte name kept; 40-byte rejected
++    Choices n;
++    n[0].mark = std::string(31, 'a');
++    n[0].logo = std::string(31, 'b');
++    bytes = writeChoices(n, Fingerprints{});
++    assert(readChoices(bytes.data(), bytes.size(), back, backPrints) == ReadStatus::Valid);
++    assert(back[0].mark == n[0].mark && back[0].logo == n[0].logo);
++    n[1].mark = std::string(40, 'x');
++    bool threw = false;
++    try { writeChoices(n, Fingerprints{}); } catch (const std::invalid_argument&) { threw = true; }
++    assert(threw);
++
++    // the record fingerprint: the team's identity as the save keeps it
++    {
++        const auto leones = record("LEONES", 0x0B, 7);
++        const uint32_t print = recordFingerprint(leones.data());
++        auto same = leones;
++        same[0x36] = 0x1F;               // letters are 5 bits in the file (0xFF reads back 0x1F)
++        same[0x1B] = 0x03;               // flags 0x40 and 0x20 are lost (5 bits)
++        same[0x17] = 5; same[0x18] = 1;  // another game mark and colour: an edit, same team
++        same[0x14] = 2; same[0x21] = 9;  // underline, cap colour
++        assert(recordFingerprint(same.data()) == print);
++        auto stored = leones;            // a name code of 0x1FFF or more reads back 0xFFFF
++        stored[2 * 7] = 0x3F; stored[2 * 7 + 1] = 0xFF;
++        assert(recordFingerprint(stored.data()) == print);
++        stored = leones;                 // fields wider in memory than in the file: their low bits
++        stored[0x15] = uint8_t(0x0B | 0x20); stored[0x1A] = uint8_t(7 | 0x40);
++        assert(recordFingerprint(stored.data()) == print);
++        assert(recordFingerprint(record("LEONEZ", 0x0B, 7).data()) != print);  // renamed
++        assert(recordFingerprint(record("LEONES", 0x0C, 7).data()) != print);  // another initial
++        assert(recordFingerprint(record("LEONES", 0x0B, 8).data()) != print);  // another base team
++        assert(recordFingerprint(record("TIGRES", 0x13, 7).data()) != print);
++        std::array<uint8_t, 0x37> empty{};  // a deleted slot (zeros)
++        assert(recordFingerprint(empty.data()) != print);
++    }
++
++    // loaded choices against the slots' teams now
++    {
++        Choices loaded;
++        loaded[1] = {"a.png", ""};
++        loaded[2] = {"leones.png", "leones_logo.png"};
++        loaded[3] = {"", "logo.png"};
++        loaded[4] = {"b.png", "b.png"};
++        Fingerprints saved{};
++        saved[1] = 11; saved[2] = 22; saved[3] = 33; saved[4] = 44;
++        std::array<SlotNow, kSlots> now{};
++        now[1] = {true, 11};  // same team
++        now[2] = {true, 99};  // replaced while the option was off
++        now[3] = {false, 0};  // deleted
++        now[4] = {true, 44};
++        now[6] = {true, 66};  // no choice: untouched
++        const auto dropped = dropChangedTeams(loaded, saved, now);
++        assert((dropped == std::vector<int>{2, 3}));
++        assert(loaded[1].mark == "a.png" && loaded[4].logo == "b.png");
++        assert(loaded[2].empty() && loaded[3].empty() && loaded[6].empty());
++    }
++
++    // copy / clear (COPY copies the whole slot but its index: the copy's record has the same
++    // fingerprint, and the store gives both rows the same one)
++    Choices k;
++    k[2] = {"a.png", "b.png"};
++    copySlot(k, 2, 5);
++    assert(k[5].mark == "a.png" && k[5].logo == "b.png" && k[2].mark == "a.png");
++    {
++        const auto from = record("LEONES", 0x0B, 7);
++        const auto to = from;  // 0x8059E2E8 copies 0x2448 bytes but +0x01: the record is identical
++        Fingerprints current{};
++        current[2] = recordFingerprint(from.data());
++        current[5] = recordFingerprint(to.data());
++        const auto block = writeChoices(k, current);
++        Choices r;
++        Fingerprints rp{};
++        assert(readChoices(block.data(), block.size(), r, rp) == ReadStatus::Valid);
++        assert(r[5] == k[5] && rp[5] == rp[2] && rp[2] == recordFingerprint(from.data()));
++    }
++    clearSlot(k, 2);
++    assert(k[2].mark.empty() && k[2].logo.empty() && k[5].mark == "a.png");
++
++    assert(IsMainSaveName("pm3usma.dat") && !IsMainSaveName("pm3usse0.dat") && !IsMainSaveName("pm3usmy0.dat"));
++
++    // nand hook functions end to end on a copy of a real save (ARRANGE_SAVE_FIXTURE), else synthetic
++    const char* src = std::getenv("ARRANGE_SAVE_FIXTURE");
++    std::filesystem::path dir = std::filesystem::temp_directory_path() / "arrange_marks_save_test";
++    std::filesystem::create_directories(dir);
++    auto file = dir / "pm3usma.dat";
++    if (src && std::filesystem::exists(src)) {
++        std::filesystem::copy_file(src, file, std::filesystem::copy_options::overwrite_existing);
++        auto data = slurp(file);  // a fixture saved by an earlier version may carry a block: start without
++        std::fill(data.begin() + kSaveFileOffset, data.begin() + kSaveFileOffset + kSaveBytes, 0);
++        spit(file, data);
++    } else {
++        std::ofstream o(file, std::ios::binary);
++        std::vector<char> z(kSaveFileSize, 0x5A);
++        o.write(z.data(), z.size());
++    }
++    const auto original = slurp(file);
++    assert(original.size() == kSaveFileSize);
++
++    // option off: nothing read, nothing written
++    Fingerprints current{};
++    current[4] = 0x44444444;
++    liveChoices() = Choices{};
++    liveChoices()[4] = {"x.png", "y.png"};
++    {
++        FILE* f = std::fopen(file.string().c_str(), "r+b");
++        std::fseek(f, 1234, SEEK_SET);
++        assert(OnMainSaveStore(f, false, current) == StoreResult::Disabled);
++        assert(OnMainSaveLoad(f, false) == ReadStatus::Missing);
++        assert(std::ftell(f) == 1234);
++        std::fclose(f);
++    }
++    assert(slurp(file) == original);
++    assert(liveChoices()[4].mark == "x.png");
++
++    // option on: the block lands at 0xD3000, everything else is unchanged
++    {
++        FILE* f = std::fopen(file.string().c_str(), "r+b");
++        std::fseek(f, 777, SEEK_SET);
++        assert(OnMainSaveStore(f, true, current) == StoreResult::Written);
++        assert(std::ftell(f) == 777);
++        std::fclose(f);
++    }
++    const auto after = slurp(file);
++    const auto block = writeChoices(liveChoices(), current);
++    assert(after.size() == original.size());
++    assert(std::equal(original.begin(), original.begin() + kSaveFileOffset, after.begin()));
++    assert(std::equal(original.begin() + kSaveFileOffset + kSaveBytes, original.end(),
++                      after.begin() + kSaveFileOffset + kSaveBytes));
++    assert(std::equal(block.begin(), block.end(), after.begin() + kSaveFileOffset));
++
++    // load trigger: a read from 0 that stops short of 0xD0000 must not reload; the load's last chunk does
++    assert(!LoadChunkReachesLoadEnd(0, 0x4000) && !LoadChunkReachesLoadEnd(0, kMainSaveLoadEnd - 1));
++    assert(LoadChunkReachesLoadEnd(0, kMainSaveLoadEnd) && LoadChunkReachesLoadEnd(0xCC000, 0x4000));  // the game's last chunk
++    assert(LoadChunkReachesLoadEnd(0xD0000 - 0x4000, 0x4000) && !LoadChunkReachesLoadEnd(0xC8000, 0x4000));
++    assert(!LoadChunkReachesLoadEnd(kMainSaveLoadEnd, 0x4000));
++    assert(ShouldLoadOnRead(0xCC000, 0x4000, false) && ShouldLoadOnRead(0, kDataEnd, false));
++    assert(!ShouldLoadOnRead(0xCC000, 0x4000, true) && !ShouldLoadOnRead(0, kDataEnd, true));
++    assert(!ShouldLoadOnRead(0, 0x4000, false) && !ShouldLoadOnRead(kMainSaveLoadEnd, 0x4000, false));
++    {
++        liveChoices() = Choices{};
++        liveChoices()[9] = {"unsaved.png", "unsaved_logo.png"};
++        const Choices picks = liveChoices();
++        FILE* f = std::fopen(file.string().c_str(), "rb");
++        if (LoadChunkReachesLoadEnd(0, 0x4000)) OnMainSaveLoad(f, true);  // not taken
++        std::fclose(f);
++        assert(liveChoices()[9].mark == picks[9].mark && liveChoices()[4].mark.empty());
++        f = std::fopen(file.string().c_str(), "rb");
++        if (LoadChunkReachesLoadEnd(0, 0xD4000)) assert(OnMainSaveLoad(f, true) == ReadStatus::Valid);
++        std::fclose(f);
++        assert(liveChoices()[9].mark.empty() && liveChoices()[4].mark == "x.png");
++        // loaded, still to be checked against the teams once the game has unpacked them
++        assert(saveState().unchecked && saveState().fingerprints[4] == 0x44444444);
++    }
++
++    // a file that does not span the block is never grown or written
++    {
++        auto shortFile = dir / "short.dat";
++        { std::ofstream o(shortFile, std::ios::binary); std::vector<char> z(kDataEnd + 0x400, 1); o.write(z.data(), z.size()); }
++        const auto before = slurp(shortFile);
++        FILE* f = std::fopen(shortFile.string().c_str(), "r+b");
++        assert(OnMainSaveStore(f, true, current) == StoreResult::NotSpanned);
++        std::fclose(f);
++        assert(slurp(shortFile) == before);
++    }
++
++    // a name over 32 bytes makes the store fail without touching the file
++    {
++        const auto beforeBad = slurp(file);
++        const Choices keep = liveChoices();
++        liveChoices()[1].mark = std::string(40, 'z');
++        FILE* f = std::fopen(file.string().c_str(), "r+b");
++        assert(OnMainSaveStore(f, true, current) == StoreResult::Failed);
++        std::fclose(f);
++        liveChoices() = keep;
++        assert(slurp(file) == beforeBad);
++    }
++
++    // read back
++    liveChoices() = Choices{};
++    {
++        FILE* f = std::fopen(file.string().c_str(), "rb");
++        assert(OnMainSaveLoad(f, true) == ReadStatus::Valid);
++        std::fclose(f);
++    }
++    assert(liveChoices()[4].mark == "x.png" && liveChoices()[4].logo == "y.png");
++
++    // renamed while the option is on: the next store saves the new fingerprint, so after a reload the
++    // check finds the same team and the choice stays
++    {
++        Fingerprints renamed = current;
++        renamed[4] = 0x55555555;
++        FILE* f = std::fopen(file.string().c_str(), "r+b");
++        assert(OnMainSaveStore(f, true, renamed) == StoreResult::Written);
++        std::fclose(f);
++        liveChoices() = Choices{};
++        f = std::fopen(file.string().c_str(), "rb");
++        assert(OnMainSaveLoad(f, true) == ReadStatus::Valid);
++        std::fclose(f);
++        std::array<SlotNow, kSlots> now{};
++        now[4] = {true, 0x55555555};
++        assert(dropChangedTeams(liveChoices(), saveState().fingerprints, now).empty());
++        assert(liveChoices()[4].mark == "x.png");
++        // ... while the same block against a team changed with the option off loses it
++        Choices other = liveChoices();
++        now[4] = {true, 0x44444444};
++        assert((dropChangedTeams(other, saveState().fingerprints, now) == std::vector<int>{4}) && other[4].empty());
++        f = std::fopen(file.string().c_str(), "r+b");  // back to the first fingerprint for what follows
++        assert(OnMainSaveStore(f, true, current) == StoreResult::Written);
++        std::fclose(f);
++    }
++
++    // the game rewrites below the tail (option off, so no hook runs): the block survives
++    {
++        FILE* f = std::fopen(file.string().c_str(), "r+b");
++        uint8_t b = 7;
++        std::fseek(f, 0x100, SEEK_SET);
++        std::fwrite(&b, 1, 1, f);
++        std::fclose(f);
++    }
++    assert(std::equal(block.begin(), block.end(), slurp(file).begin() + kSaveFileOffset));
++
++    // corrupted block: Invalid and live choices empty
++    {
++        FILE* f = std::fopen(file.string().c_str(), "r+b");
++        uint8_t b = 0xEE;
++        std::fseek(f, long(kSaveFileOffset + 500), SEEK_SET);
++        std::fwrite(&b, 1, 1, f);
++        std::fclose(f);
++        liveChoices()[4] = {"stale", "stale"};
++        f = std::fopen(file.string().c_str(), "rb");
++        assert(OnMainSaveLoad(f, true) == ReadStatus::Invalid);
++        std::fclose(f);
++        assert(liveChoices()[4].mark.empty() && !saveState().unchecked);
++    }
++
++    // after an Invalid load the block on disk is kept by every save until a choice changes
++    {
++        const auto invalid = slurp(file);
++        for (int save = 0; save < 3; ++save) {
++            FILE* f = std::fopen(file.string().c_str(), "r+b");
++            assert(OnMainSaveStore(f, true, current) == StoreResult::KeptInvalid);
++            std::fclose(f);
++        }
++        assert(slurp(file) == invalid);
++        liveChoices()[7] = {"new.png", ""};  // the user picks a mark in this run
++        FILE* f = std::fopen(file.string().c_str(), "r+b");
++        assert(OnMainSaveStore(f, true, current) == StoreResult::Written);
++        std::fclose(f);
++        liveChoices()[7] = Choice{};  // and takes it back: from now on the block follows the run
++        f = std::fopen(file.string().c_str(), "r+b");
++        assert(OnMainSaveStore(f, true, current) == StoreResult::Written);
++        std::fclose(f);
++        f = std::fopen(file.string().c_str(), "rb");
++        assert(OnMainSaveLoad(f, true) == ReadStatus::Valid);
++        std::fclose(f);
++        assert(liveChoices()[7].empty() && !saveState().unchecked);
++    }
++
++    // a version 1 block in the file: Invalid, and kept until a choice changes
++    {
++        auto data = slurp(file);
++        const auto v1 = versionOneBlock();
++        std::fill(data.begin() + kSaveFileOffset, data.begin() + kSaveFileOffset + kSaveBytes, 0);
++        std::copy(v1.begin(), v1.end(), data.begin() + kSaveFileOffset);
++        spit(file, data);
++        FILE* f = std::fopen(file.string().c_str(), "r+b");
++        assert(OnMainSaveLoad(f, true) == ReadStatus::Invalid);
++        assert(liveChoices()[2].empty());
++        assert(OnMainSaveStore(f, true, current) == StoreResult::KeptInvalid);
++        std::fclose(f);
++        assert(slurp(file) == data);
++    }
++
++    // a missing block (zeros) is written by the first save
++    {
++        auto data = slurp(file);
++        std::fill(data.begin() + kSaveFileOffset, data.begin() + kSaveFileOffset + kSaveBytes, 0);
++        spit(file, data);
++        FILE* f = std::fopen(file.string().c_str(), "r+b");
++        assert(OnMainSaveLoad(f, true) == ReadStatus::Missing);
++        assert(OnMainSaveStore(f, true, current) == StoreResult::Written);
++        std::fclose(f);
++        f = std::fopen(file.string().c_str(), "rb");
++        assert(OnMainSaveLoad(f, true) == ReadStatus::Valid);
++        std::fclose(f);
++    }
++    std::filesystem::remove_all(dir);
++    std::cout << "arrange_marks_save ok" << (src ? " (real save fixture)" : " (synthetic file)") << "\n";
++}
+diff --git a/runtime/tests/arrange_marks_test.cpp b/runtime/tests/arrange_marks_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/tests/arrange_marks_test.cpp
+@@ -0,0 +1,97 @@
++#include "arrange_marks.h"
++#include <cassert>
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <string>
++#include <vector>
++
++using namespace arrange_marks;
++namespace fs = std::filesystem;
++
++static void touch(const fs::path& p, const std::string& content = "png") {
++    std::ofstream(p, std::ios::binary) << content;
++}
++
++static int alpha(const Rgba& i, uint32_t x, uint32_t y) { return i.pixels[(y * i.width + x) * 4 + 3]; }
++
++int main() {
++    assert(label("Leones") == "LEONES");
++    assert(label("\xC3\x81guila \xC3\x91") == "AGUILA N");  // Águila Ñ
++    assert(label("los leones del caracas") == "LOS LEONES D");
++    assert(label("  a!!  b__c ") == "A BC");
++    assert(label("ni\xC3\xB1o-\xC3\xBC\xC3\xA7") == "NINO-UC");
++    assert(label("\xE2\x98\x85\xE2\x98\x85").empty());
++
++    fs::path tmp = fs::temp_directory_path() /
++                   ("mlb_arrange_marks_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++    fs::remove_all(tmp);
++    fs::create_directories(tmp / "sub");
++    touch(tmp / "b.png");
++    touch(tmp / "A.PNG");
++    touch(tmp / "x.txt");
++    touch(tmp / "big.png");
++    fs::resize_file(tmp / "big.png", kMaxFileBytes + 1);
++    touch(tmp / "dup.png");
++    touch(tmp / "DUP!.png");
++    auto e = scan(tmp);
++    assert(e.size() == 4);
++    assert(e[0].label == "A" && e[1].label == "B");
++    assert(e[2].label == "DUP" && e[3].label == "DUP 2");
++    assert(e[0].file == "A.PNG" && e[1].file == "b.png");
++    assert(scan(tmp / "no-existe").empty());
++    fs::remove_all(tmp);
++
++    // non-ASCII file name really on disk (UTF-8 end to end)
++    fs::create_directories(tmp);
++    {
++        fs::path real(u8"Águila niño.png");
++        touch(tmp / real);
++        auto u = scan(tmp);
++        assert(u.size() == 1 && u[0].label == "AGUILA NINO");
++        assert(fs::exists(pathOf(tmp, u[0])));
++    }
++    fs::remove_all(tmp);
++
++    // entry cap
++    fs::create_directories(tmp);
++    for (size_t i = 0; i < kMaxEntries + 5; i++) {
++        char name[32];
++        std::snprintf(name, sizeof name, "t%03zu.png", i);
++        touch(tmp / name);
++    }
++    assert(scan(tmp).size() == kMaxEntries);
++    fs::remove_all(tmp);
++
++    // fit
++    Rgba wide{4, 2, std::vector<uint8_t>(4 * 2 * 4, 255)};
++    auto f = fit(wide, 8, 8);
++    assert(f.width == 8 && f.height == 8);
++    assert(alpha(f, 0, 0) == 0 && alpha(f, 4, 4) == 255);
++    assert(alpha(f, 4, 1) == 0 && alpha(f, 4, 6) == 0);
++    assert(alpha(f, 0, 2) == 255 && alpha(f, 7, 5) == 255);
++    assert(fit(Rgba{}, 8, 8).pixels == std::vector<uint8_t>(8 * 8 * 4, 0));
++    Rgba bad{4, 4, std::vector<uint8_t>(3, 255)};
++    assert(fit(bad, 2, 2).pixels == std::vector<uint8_t>(2 * 2 * 4, 0));
++    // downscale keeps colour
++    Rgba red{16, 16, std::vector<uint8_t>(16 * 16 * 4)};
++    for (size_t i = 0; i < 256; i++) { red.pixels[i * 4] = 200; red.pixels[i * 4 + 3] = 255; }
++    auto d = fit(red, 4, 4);
++    assert(d.pixels[0] == 200 && d.pixels[3] == 255 && d.pixels[1] == 0);
++    // shownLabels: 10 characters, trailing spaces trimmed, unique
++    {
++        std::vector<Entry> in{{"a.png", "LOS LEONES D"}, {"b.png", "LOS LEONES X"}, {"c.png", "ESCUDO"},
++                              {"d.png", "ABCDEFGHI J"}};
++        auto s = shownLabels(in);
++        assert(s.size() == 4 && s[0] == "LOS LEONES" && s[1] == "LOS LEON 2" && s[2] == "ESCUDO");
++        assert(s[3] == "ABCDEFGHI");
++        assert(shownLabels({}).empty());
++    }
++    // cycleChoice: none (-1) and 0..count-1, both directions, wrapping
++    assert(cycleChoice(3, -1, +1) == 0 && cycleChoice(3, 0, +1) == 1 && cycleChoice(3, 2, +1) == -1);
++    assert(cycleChoice(3, -1, -1) == 2 && cycleChoice(3, 0, -1) == -1 && cycleChoice(3, 1, -1) == 0);
++    assert(cycleChoice(0, -1, +1) == -1 && cycleChoice(0, 5, -1) == -1);
++    assert(cycleChoice(2, 7, +1) == -1 && cycleChoice(2, -4, -1) == -1);  // a choice that left the list
++    std::puts("arrange_marks ok");
++}
+diff --git a/runtime/tests/arrange_marks_texture_test.cpp b/runtime/tests/arrange_marks_texture_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/tests/arrange_marks_texture_test.cpp
+@@ -0,0 +1,134 @@
++#include "arrange_marks_texture.h"
++#include <cassert>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <set>
++#include <vector>
++
++using namespace arrange_marks;
++
++static std::vector<uint8_t> header(uint32_t width, uint32_t height) {
++    std::vector<uint8_t> h = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 'I', 'H', 'D', 'R'};
++    for (uint32_t v : {width, height})
++        for (int s = 24; s >= 0; s -= 8) h.push_back(uint8_t(v >> s));
++    for (uint8_t b : {8, 6, 0, 0, 0}) h.push_back(b);
++    const uint32_t crc = texture_detail::crc32(h.data() + 12, 17);
++    for (int s = 24; s >= 0; s -= 8) h.push_back(uint8_t(crc >> s));
++    return h;
++}
++
++int main() {
++    // The well-known 1 x 1 RGBA PNG starts with this IHDR (CRC 0x1F15C489).
++    const std::vector<uint8_t> one = header(1, 1);
++    assert(one[29] == 0x1F && one[30] == 0x15 && one[31] == 0xC4 && one[32] == 0x89);
++    PngInfo info;
++    assert(pngHeader(one.data(), one.size(), info) && info.width == 1 && info.height == 1);
++    std::vector<uint8_t> big = header(4096, 300);
++    assert(pngHeader(big.data(), big.size(), info) && info.width == 4096 && info.height == 300);
++    big = header(4097, 10);
++    assert(!pngHeader(big.data(), big.size(), info));
++    std::vector<uint8_t> broken = header(64, 64);
++    broken[20] ^= 1;  // damaged size: the CRC no longer matches
++    assert(!pngHeader(broken.data(), broken.size(), info));
++    const std::vector<uint8_t> text = {'n', 'o', 't', ' ', 'a', ' ', 'p', 'n', 'g'};
++    assert(!pngHeader(text.data(), text.size(), info));
++    assert(!pngHeader(one.data(), 20, info));
++
++    // Chunk walk: IHDR, IDAT (5 bytes), IEND; cut short, padded, or without IEND it fails.
++    std::vector<uint8_t> file = header(1, 1);
++    for (uint8_t b : std::initializer_list<uint8_t>{0, 0, 0, 5, 'I', 'D', 'A', 'T', 1, 2, 3, 4, 5, 0, 0, 0, 0}) file.push_back(b);
++    for (uint8_t b : std::initializer_list<uint8_t>{0, 0, 0, 0, 'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82}) file.push_back(b);
++    const auto walk = [](const std::vector<uint8_t>& f, uint64_t size) {
++        return pngChunksComplete(size, [&](uint64_t at, uint8_t* out) {
++            if (at + 8 > f.size()) return false;
++            std::copy(f.begin() + long(at), f.begin() + long(at) + 8, out);
++            return true;
++        });
++    };
++    assert(walk(file, file.size()));
++    std::vector<uint8_t> cut(file.begin(), file.end() - 20);
++    assert(!walk(cut, cut.size()));
++    std::vector<uint8_t> padded = file;
++    padded.push_back(0);
++    assert(!walk(padded, padded.size()));
++    std::vector<uint8_t> noEnd(file.begin(), file.end() - 12);
++    assert(!walk(noEnd, noEnd.size()));
++
++    assert(toRgb5a3(255, 0, 0, 255) == 0xFC00);
++    assert(toRgb5a3(0, 0, 0, 0) == 0 && toRgb5a3(200, 10, 10, 0x1F) == 0);
++    assert(toRgb5a3(255, 255, 255, 0x80) == 0x4FFF);
++    const auto red = fromRgb5a3(0xFC00);
++    assert(red[0] == 255 && red[1] == 0 && red[2] == 0 && red[3] == 255);
++
++    // Few colours: kept exactly, transparent pixels on entry 0.
++    Rgba small;
++    small.width = 8;
++    small.height = 4;
++    small.pixels.assign(8 * 4 * 4, 0);
++    for (uint32_t i = 0; i < 16; ++i) {
++        small.pixels[i * 4] = 255;
++        small.pixels[i * 4 + 3] = 255;
++    }
++    Indexed q = quantize(small);
++    assert(q.indices.size() == 32 && q.indices[0] != 0 && q.indices[31] == 0);
++    assert(q.palette[q.indices[0]] == 0xFC00 && q.palette[0] == 0);
++
++    // Many colours (a 256 x 256 gradient with a transparent border): at most 256 entries, close colours.
++    Rgba grad;
++    grad.width = grad.height = 256;
++    grad.pixels.resize(256 * 256 * 4);
++    for (uint32_t y = 0; y < 256; ++y)
++        for (uint32_t x = 0; x < 256; ++x) {
++            uint8_t* p = &grad.pixels[(y * 256 + x) * 4];
++            p[0] = uint8_t(x);
++            p[1] = uint8_t(y);
++            p[2] = uint8_t((x * 7 + y * 3) & 255);
++            p[3] = (x < 8 || y < 8) ? 0 : 255;
++        }
++    q = quantize(grad);
++    std::set<uint16_t> used;
++    long worst = 0;
++    for (uint32_t y = 0; y < 256; ++y)
++        for (uint32_t x = 0; x < 256; ++x) {
++            const uint8_t index = q.indices[y * 256 + x];
++            used.insert(q.palette[index]);
++            if (x < 8 || y < 8) {
++                assert(index == 0);
++                continue;
++            }
++            assert(index != 0);
++            const auto c = fromRgb5a3(q.palette[index]);
++            const uint8_t* p = &grad.pixels[(y * 256 + x) * 4];
++            for (int ch = 0; ch < 3; ++ch) worst = std::max(worst, std::labs(long(c[ch]) - p[ch]));
++        }
++    assert(used.size() <= 256 && used.size() > 200);
++    assert(worst < 96);
++
++    // C8 tiles of 8 x 4: texel (9, 5) of a 16-wide picture is in tile (1, 1), row 1, column 1.
++    assert(c8Offset(0, 0, 16) == 0 && c8Offset(7, 0, 16) == 7 && c8Offset(0, 1, 16) == 8);
++    assert(c8Offset(8, 0, 16) == 32 && c8Offset(9, 5, 16) == 3 * 32 + 8 + 1);
++    Indexed tiles;
++    tiles.width = 16;
++    tiles.height = 8;
++    for (uint32_t i = 0; i < 128; ++i) tiles.indices.push_back(uint8_t(i));
++    const auto c8 = toC8(tiles);
++    assert(c8.size() == 128 && c8[c8Offset(9, 5, 16)] == 5 * 16 + 9);
++
++    // An icon in a letter's cell: as tall as the longer side, centred on the cell whatever the pivot.
++    {
++        const IconInCell top = iconInCell(26, 34, 0, 0);  // pivot at the cell's top left
++        assert(std::fabs(top.scale - 34.0f / 64) < 1e-6f && top.dx == 13 && top.dy == 17);
++        const IconInCell centred = iconInCell(26, 34, 13, 17);  // pivot already at the centre
++        assert(centred.dx == 0 && centred.dy == 0);
++        // The icon's box (pivot 32, 32, size 64) scaled and moved covers the cell's height, centred.
++        const float y0 = top.dy - 32 * top.scale, y1 = top.dy + 32 * top.scale;
++        assert(std::fabs(y0) < 1e-4f && std::fabs(y1 - 34) < 1e-4f);
++        const IconInCell wide = iconInCell(64, 32, 32, 16);
++        assert(wide.scale == 1.0f && wide.dx == 0 && wide.dy == 0);
++        assert(iconInCell(0, 10, 0, 0).scale == 0 && iconInCell(10, -1, 0, 0).scale == 0);
++    }
++
++    std::puts("arrange_marks_texture_test: ok");
++    return 0;
++}
+diff --git a/runtime/tests/runtime_config_tests.cpp b/runtime/tests/runtime_config_tests.cpp
+--- a/runtime/tests/runtime_config_tests.cpp
++++ b/runtime/tests/runtime_config_tests.cpp
+@@ -27,6 +27,19 @@
+         if (!Require(!RuntimeConfigFile::ParseConfig(empty, "empty.toml").modernPostseason.value_or(false),
+                      "postseason must default to original")) return 1;
+     }
++    {
++        for (const char* value : {"true", "false", "\"x\"", "1"}) {
++            std::istringstream input(std::string("[arrange]\ncustom_marks = ") + value + "\n");
++            const auto config = RuntimeConfigFile::ParseConfig(input, "arrange.toml");
++            const std::optional<bool> expected = std::string(value) == "true" ? std::optional<bool>{true}
++                                                : std::string(value) == "false" ? std::optional<bool>{false}
++                                                                               : std::nullopt;
++            if (!Require(config.arrangeCustomMarks == expected, "invalid arrange custom_marks parsing")) return 1;
++        }
++        std::istringstream empty("");
++        if (!Require(!RuntimeConfigFile::ParseConfig(empty, "empty.toml").arrangeCustomMarks.value_or(false),
++                     "arrange custom marks must default to off")) return 1;
++    }
+     {
+         std::istringstream input("[video]\nmetalfx_spatial_upscaling = true\n");
+         const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "enabled.toml");

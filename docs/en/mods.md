@@ -204,6 +204,55 @@ An MLB Life career, a season or a league started with a modified roster only mak
   - with only uniforms and textures, in the normal NAND.
   - Creating a save inside that folder has not been tested yet.
 
+## Custom marks and logos (Arrange)
+
+Your own PNG images as the mark (emblem) and logo of Arrange teams. This is not a mod: it does not go in `mods\`.
+
+- **Turning it on:** the **CUSTOM MARKS AND LOGOS (ARRANGE)** option in the launcher's ENHANCEMENTS tab. It is off by default and tagged EXPERIMENTAL. In `Config.toml` it is `[arrange] custom_marks = true`.
+- **Folders** (the launcher creates them when you turn the option on):
+
+```
+UserData\arrange\
+  marks\   marks: listed after the game's marks in Team Mark
+  logos\   logos: listed in a new row of Logo Text
+```
+
+  On the Switch they are `sdmc:/switch/mlbpowerpros2008/UserData/arrange/marks` and `.../arrange/logos`.
+
+**How to use it**
+- Copy PNG files into `marks` or `logos`. Transparency is fine, and so is any size within the limits; the game fits them without distortion, padding with transparency.
+- **Mark:** Arrange › a team › Team Name/Mark › MARK. The PNGs come after the game's 38 marks, with the file name. Pick one and confirm. If the PNG can no longer be used (changed or damaged since the list opened), the error sound plays and the list stays open.
+- **Logo:** Arrange › a team › Logo Text. The new row sits between LETTERS and DELETE. Left/right cycles through "- - -" and the logos, TEAM LOGO shows the preview and OK keeps it. The row only appears when there are valid logos or the team already had one.
+- The choice is saved with the game (`pm3usma.dat`), in an extension the original game does not read. Each choice goes with a fingerprint of the team: its name, initial and base team.
+- It shows in the Arrange team list, the team screens, the Exhibition grid and VS screen, HOME/ROAD, "X AT Y", the starting lineup and the scoreboard.
+
+**Behaviour**
+- A PNG mark hides the initial, the letter the game draws on the mark.
+- A PNG logo replaces the letters. The game's letters stay as the fallback. Typing new letters in Logo Text and confirming them removes the PNG logo.
+- If the PNG is deleted, renamed or invalid, the team goes back to the game mark or letters it had.
+- COPY also copies the custom mark and logo to the target slot. DELETE removes them.
+- Renaming a team, or changing its initial, base team, colours or uniform, with the option on keeps its mark and logo: saving updates the fingerprint. "Reset to Base Team" and "Save as Arrange" do remove the custom mark and logo from the slot they change.
+- With the option off the game is the original and the extension is neither read nor written. Saving does not erase it: turn the option back on and the choices are still there.
+- Except those of teams changed while the option was off (in another session, in Dolphin or on a Wii): if the team was deleted, another team was created in its slot, or its name, initial or base team changed, the fingerprint no longer matches and that team loses its custom mark and logo. It goes back to the game's and they can be chosen again. Changing the game mark, colours, letters or uniform with the option off does not count as another team. Limit: the fingerprint only covers the name, initial and base team, so a new team created with the option off with those three equal (for example the default name and the same base team) is taken as the same team and keeps the choice.
+- An extension this version does not understand (from a later version, or damaged) is ignored and is not erased by saving, until a mark or logo is chosen in that session.
+
+**Limits**
+- Each folder lists its first 64 `.png` files by name (case-insensitive; files over 8 MiB do not count). Files dropped afterwards, for a long name or because they are not a valid PNG, still take a place: with more than 64 files, a valid one may be left out.
+- File names over 31 bytes in UTF-8 are not listed: shorten them.
+- Files of at most 8 MiB and 4096×4096 pixels.
+- Truncated files, non-PNG files and files with data after the end of the PNG (the IEND chunk) are ignored, with no message on screen.
+- The name shows in upper case, only with letters of the game's font, cut to 10 visible characters. When two names match, the second gets a number.
+
+**Pending**
+- Season and League copy the team into their own table: there the game's mark and initial show.
+- Home Run has not been tested.
+- The Z key (underline) in Logo Text changes nothing visible with a PNG logo.
+- The first preview of a large PNG may pause while it is decoded, especially on the Switch. Later ones come from the cache.
+- In 16:9 the game's 2D units are not square. A mark or logo looks about 1.5 times wider than the file, just like the game's own marks.
+- Not tested on a Switch yet.
+
+Patch `wiicompiled-arrange-marks`. Technical details in `docs/en/reverse-engineering.md` ("Custom marks and logos").
+
 ## Rules
 
 A mod must only bring its own files or differences, **never copies of the game** (no unmodified original textures, no `project.bin`, no executable).

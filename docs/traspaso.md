@@ -2,6 +2,52 @@
 
 Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de trabajo; el historial está en `git log -p docs/traspaso.md`. Las secciones de abajo son notas por fase de sesiones anteriores.
 
+## Marcas y logotipos propios en Arrange (6–7 de noviembre de 2026; Claude, plan por tareas)
+
+- **Parche** `tools/patches/wiicompiled-arrange-marks.patch`, último de `tools/wiicompiled-translate.ps1` (después de `wiicompiled-modern-postseason`). Diseño/plan en `docs/superpowers/{specs,plans}/2026-11-06-arrange-custom-marks*`; uso y límites en `docs/mods.md` («Marcas y logotipos propios (Arrange)», EN `docs/en/mods.md`); RE en `docs/ingenieria-inversa.md` (final de «Equipos Arrange»). Evidencia privada: `local/analysis/arrange/` (`hooks.md`, `task8/`, `task9/`) y `.superpowers/sdd/2026-11-06-arrange-custom-marks/`.
+- **Qué hace:** PNG de `UserData/arrange/marks` y `UserData/arrange/logos` como marca y logotipo de los equipos de Arrange, elegidos en Team Mark y Logo Text con texturas, fuente y sonidos del juego, guardados en un bloque `MLBARRMK` en `0xD3000` de `pm3usma.dat`. Opción MEJORAS en PC y Switch (`[arrange] custom_marks`), apagada por defecto, EXPERIMENTAL; apagada, el juego es el original y la extensión no se toca.
+- **Formato del bloque (versión 2, 7/11, ronda final):** `MLBARRMK`, versión u32 = 2, FNV-1a 32 de los datos, 32 × {marca 32 B, logotipo 32 B, huella u32}: 2192 bytes, `0xD3000`–`0xD3890` (`arrange_marks_save.h`). La huella (`recordFingerprint`) es la FNV-1a del nombre, la inicial y el equipo base del registro, recortados a los bits que guarda la partida (tabla `0x80CEB828`). Se recalcula de los registros vivos en cada guardado y se comprueba una vez tras cada carga en el gancho del desempaquetado de huecos `0x805A263C` (llamado por la carga del arranque `0x80C89A9C`, después del último trozo leído): una elección cuyo hueco está vacío o tiene otra huella se descarta (equipo borrado/sustituido/renombrado con la opción apagada); renombrar con la opción encendida la conserva. El hueco temporal del partido `0x8102D730` solo usa la elección si su registro tiene la huella del hueco. La versión 1 no se publicó y se lee como no válida; un bloque no válido no se reescribe hasta que cambia alguna elección en esa sesión (`StoreResult::KeptInvalid`). Los ganchos NAND usan `SaveHooksEnabled()` (opción y arena reservada).
+- **Comprobado en PC** (NAND aislada `local/analysis/arrange/task9/nand`): lista de huecos, pantallas del equipo, cuadrícula y VS, HOME/ROAD, alineación y marcador con la marca propia; COPY/DELETE, PNG ausente, guardar con la opción apagada.
+- **Ronda final (huellas), comprobado en PC** (NAND `local/analysis/arrange/final/nand`, capturas `final/shots/`): elegir marca y logotipo, guardar y reiniciar los conserva; renombrar con la opción encendida y guardar los conserva tras reiniciar; con la opción apagada, borrar el equipo y crear otro en su hueco, y al encender: el hueco muestra la marca y la inicial del juego y el log dice `[arrange] slot 2: another team …`; el guardado siguiente deja la fila vacía; un partido de Exhibición Arrange contra Rockies muestra la marca en «X AT Y» y el marcador (registro temporal comprobado) y los Rockies sin cambios; un bloque v1 sobrevive a un guardado sin cambios. Informe: `.superpowers/sdd/2026-11-06-arrange-custom-marks/final-fix-report.md`.
+- **Coste en el partido (PC), con sus límites.** Lo que hay:
+  - la traza no muestra ninguna llamada por cuadro de los ganchos en 92 s de partido con dos equipos de Arrange: solo al montar widgets;
+  - el juego fue a 60 fps.
+
+  Lo que no hay:
+  - ni p99 ni medida de tiempo de cuadro: el atajo del benchmark no carga equipos de Arrange;
+  - una comparación fina de CPU. La CPU del proceso dio 38,9 % de un núcleo con la opción encendida y 38,4 % apagada, pero esos 0,5 puntos son menos que la variación entre ventanas de 60 s de una misma ejecución (4,6–7,6 puntos), y un partido CPU contra CPU no repite la jugada de forma determinista desde el mismo estado.
+
+  El VS de Exhibición sí llama al gancho del logotipo en cada cuadro, por el camino rápido.
+- **Cadena de Switch rota desde e6cab51 y arreglada (7/11):** `wiicompiled-modern-postseason` no aplicaba sin los `wiicompiled-pc-*`: el contexto de tres hunks (`runtime_config.h` ×2 y `launcher.cpp`) eran líneas que añade `pc-gfx-options`, que la cadena de Switch salta. `build-nro.sh` y `mkswitch.sh` fallaban ahí desde ese commit. Arreglo: esos hunks, y los tres equivalentes de `arrange-marks`, llevan ahora solo contexto común a las dos cadenas (3 líneas antes, 1 después; el cambio es el mismo y el árbol de PC sale idéntico byte a byte). Después se regeneraron `wiicompiled-switch*` con `local/tmp/mkswitch.sh`; `switch_edit.py` (copia previa `local/tmp/switch_edit.pre-ARRANGE.py`) cambia un ancla (`modernLeagues.experimental = true;` ya no va seguido de una línea en blanco) y pone MARCAS Y LOGOTIPOS PROPIOS en la pestaña MEJORAS de Switch (`restart = false`). La postemporada de 12 sigue sin opción en el launcher de Switch (en Switch solo con `[season] modern_postseason` o un mod), como antes.
+- **El NRO de esta tanda** (`build-nro.sh` desde la cadena reparada) lleva por primera vez en Switch la postemporada de 12 y las marcas de Arrange; la consola no ha ejecutado ninguna de las dos.
+- **Pendiente:** la prueba única en consola (pasos abajo); Temporada y Liga muestran la marca del juego (copian el equipo); Home Run sin probar; Z sin efecto visible con logotipo PNG; posible pausa la primera vez que se previsualiza un PNG grande.
+- **Trampas del entorno:** [trampas.md](trampas.md) (EN [en/pitfalls.md](en/pitfalls.md)); la de esta tanda es el `local/wiicompiled-mlb/build/UserData/Cache/pipeline_cache.db` envenenado tras un arranque fallido.
+
+### Prueba única en consola (Arrange y un partido de Exhibición)
+
+Nada de esto se ha ejecutado en la consola. El NRO (`local/switch/build/MLBPowerPros2008.nro`) sale de la cadena reparada y lleva **también la postemporada de 12 equipos**, que la Switch no ha ejecutado nunca. En Switch esa postemporada no tiene opción en el launcher y viene apagada; si algo falla en Temporada o MLB Life, apúntalo.
+
+1. **NRO:** en la Switch, menú homebrew (mantén R sobre un juego) y pulsa Y. En el PC: `python tools/switch/nxlink.py 192.168.0.105 local/switch/build/MLBPowerPros2008.nro --wait 300`. Queda en `sdmc:/switch/mlbpowerpros2008/MLBPowerPros2008.nro`. Lo demás de la SD (`Data/` o la ISO, `UserData/`, `dsp_coef.bin`, `cacert.pem`, `initial_pipeline_cache.db`, `wii_bootstrap/`) no se toca.
+2. **Opción:** launcher, pestaña MEJORAS, **MARCAS Y LOGOTIPOS PROPIOS (ARRANGE)** = SÍ (EXPERIMENTAL, apagada por defecto). Comprobar que se crean `sdmc:/switch/mlbpowerpros2008/UserData/arrange/marks` y `.../arrange/logos`. En VIDEO, **MOSTRAR FPS**. Cerrar el juego.
+3. **PNG:**
+   - en `marks`, una o dos marcas y un PNG grande (unos 4000×4000, menos de 8 MiB y 4096×4096 como mucho);
+   - en `logos`, un logotipo;
+   - nombres de 31 bytes como mucho.
+
+   Volver a lanzar con nxlink.
+4. **En el juego:**
+   1. Arrange → un equipo → Team Name/Mark → MARK: los PNG van al final de la lista. Anotar cuánto tarda la vista previa del PNG grande la primera vez.
+   2. Elegir una marca normal y confirmarla.
+   3. Logo Text: la fila entre LETTERS y DELETE; elegir el logotipo y OK.
+   4. Guardar el equipo y la partida («overwrite? YES»). Si se puede, lo mismo con un segundo equipo.
+   5. Exhibición (WATCH o 1 PLAYER) con el equipo de Arrange. Comprobar que el VS, HOME/ROAD, la alineación y el marcador muestran la marca.
+   6. Ver 2–3 entradas: ¿se mantiene a 60 fps?
+   7. Cerrar y volver a abrir el juego: la marca y el logotipo deben seguir.
+5. **Qué mandar:**
+   - el registro de nxlink (`local/switch/logs/nxlink-MLBPowerPros2008-<fecha>.log`). Si es solo un extracto: `[mlb] MEM2 heap …`, `[arrange] custom marks on|off …`, `[arrange] mark/logo '…' loaded (AxB)`, cualquier `[arrange] … skipped|not used|not found|no PNG decoder` y cualquier línea `[nand]` con «Arrange custom marks save extension»;
+   - si se cuelga, ESR/FAR/PC y la pila;
+   - a ojo: si se crearon las carpetas, los segundos de la primera vista previa, si hubo tirones en la lista y el FPS mínimo del partido.
+
 ## Postemporada de 12 equipos (4–5 de noviembre de 2026; Codex y luego Claude)
 
 - **Parche** `tools/patches/wiicompiled-modern-postseason.patch`, último de `tools/wiicompiled-translate.ps1`. Diseño/plan en `docs/superpowers/{specs,plans}/2026-11-04-modern-postseason*`; detalle y resultados en `docs/postemporada-investigacion.md` (EN `docs/en/postseason-research.md`); RE en `docs/ingenieria-inversa.md` (antes de «Datos por año»).
@@ -11,7 +57,7 @@ Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de tra
 - **Cuadro de 12 equipos** (pedido del usuario: un solo cuadro con imágenes del juego): pares Wild Card en los márgenes de pantalla ancha, dibujados con las texturas del cuadro leídas de MEM2; casillas Divisionales invertidas contra el sembrado 2 y sembrados 1-2 visibles con descanso; título POSTSEASON en la ronda Wild Card. Comprobado al inicio, a media ronda y con la postemporada terminada (ranura 2). Sondas: `probe_wc.sh bracket`, `probe_bracket.sh` (ranura 2). Algo externo minimiza la ventana del juego y entonces va a ~1 fps: `probe_wc.sh` la restaura. `0x80B899B8`/`0x80B897F0`/`0x80B88880` son hojas integradas: tras tocarlas, `translate-recursive` + `emit-build-shards`.
 - **4:3, calendario y clasificación** (pedido del usuario): en 4:3 el cuadro del juego se encoge al 75 % y los pares Wild Card van a los lados; el calendario muestra WILD CARD el 2–4 de octubre (letras del propio atlas); la clasificación marca 3 DIVISION WINNER y 3 WILD CARD WINNER por liga. Comprobado en el juego en 4:3 y 16:9 y con un partido Wild Card. Para probar 4:3 hacen falta `widescreen = false` **y** `force_16_9 = false` en `[video]`, con el juego cerrado (live.py restaura su copia del Config al salir).
 - **MLB Life comprobado** (5/11): de la clasificación a la Serie Mundial, tercer partido Wild Card, calendario, clasificación, cuadro y guardado/carga (ranura 2 de Life). Sonda: `probe_wc.sh life` (`SLOT2=1` carga la ranura 2) y `STOP=<día> probe_wc.sh lifewc`; `mark_sept.py` pone las marcas de septiembre que el día 277 necesita (sin ellas todos los equipos quedan sin MLB). Partidos pendientes: se reponen el 29/9–1/10 si deciden algo, si no se cancelan (`makeups()`); huecos vaciados como `0x80BA0DAC`. Si el juego aborta al arrancar en la inicialización gráfica, el `pipeline_cache.db` estaba corrupto: apartado en `local/analysis/postseason/cache-backup/`.
-- **Pendiente:** paso a 2009 dentro de MLB Life; vista de simulación sin ronda Wild Card; temporada simulada real (no inyectada; con resultados inyectados la clasificación sigue en 0–0); empates de 5+ equipos piden decisión.
+- **Pendiente:** paso a 2009 dentro de MLB Life; vista de simulación sin ronda Wild Card; temporada simulada real (no inyectada; con resultados inyectados la clasificación sigue en 0–0). Empates de 5+ equipos: pasos de la regla de 4 y sorteo fijo por resultados si se agotan los partidos (6/11, 18/18 ctest; sin build del juego ni prueba en el juego).
 
 ## Callnames en Switch (rama `switch-callnames`, 1 de noviembre de 2026)
 
