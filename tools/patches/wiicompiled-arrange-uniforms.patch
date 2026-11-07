@@ -302,3 +302,386 @@ new file mode 100644
 +    std::puts("arrange_uniforms OK");
 +    return 0;
 +}
+diff --git a/runtime/include/arrange_marks_save.h b/runtime/include/arrange_marks_save.h
+--- a/runtime/include/arrange_marks_save.h
++++ b/runtime/include/arrange_marks_save.h
+@@ -7,10 +7,13 @@
+ // foreign bytes at 0xD3F00 loads (proven in game, docs/ingenieria-inversa.md, Arrange save). The block
+ // sits at 0xD3000, beyond anything the save descriptor (0xD0400) may verify, and the record stays
+ // valid for the original game.
+-// Block (version 2): "MLBARRMK" (8), version u32 BE (4), FNV-1a 32 of the slot bytes u32 BE (4), then
++// Block (version 3): "MLBARRMK" (8), version u32 BE (4), FNV-1a 32 of the slot bytes u32 BE (4), then
+ // 32 x (mark 32 bytes + logo 32 bytes, UTF-8, zero padded + fingerprint u32 BE of the slot's team
+-// record when the choice was saved, recordFingerprint). Version 1 (no fingerprints) was never
+-// published: it reads as Invalid.
++// record when the choice was saved, recordFingerprint + imported uniform folder name for the home
++// side 32 bytes + for the road side 32 bytes, empty = no choice). Version 2 (the first 68 bytes of
++// each row, 2192 bytes in all, at 0xD3000) still reads, with empty uniforms. Version 1 (no
++// fingerprints) was never published: it reads as Invalid. Version 3 is 4240 bytes, which no longer
++// fit at 0xD3000 (the file ends at 0xD4000), so it starts at 0xD2E00 and ends at 0xD3E90.
+ #include <algorithm>
+ #include <array>
+ #include <cstddef>
+@@ -26,24 +29,36 @@ namespace arrange_marks {
+ constexpr size_t kSlots = 32;
+ constexpr size_t kNameBytes = 32;
+ constexpr size_t kFingerprintBytes = 4;
+-constexpr size_t kRowBytes = 2 * kNameBytes + kFingerprintBytes;
++constexpr size_t kRowBytesV2 = 2 * kNameBytes + kFingerprintBytes;  // mark, logo, fingerprint
++constexpr size_t kRowBytes = kRowBytesV2 + 2 * kNameBytes;          // + uniform home, uniform road
+ constexpr size_t kHeaderBytes = 16;
+-constexpr size_t kSaveBytes = 2192;
++constexpr size_t kSaveBytesV2 = 2192;
++constexpr size_t kSaveBytes = 4240;
++static_assert(kSaveBytesV2 == kHeaderBytes + kSlots * kRowBytesV2);
+ static_assert(kSaveBytes == kHeaderBytes + kSlots * kRowBytes);
+-constexpr uint32_t kVersion = 2;
++constexpr uint32_t kVersionV2 = 2;
++constexpr uint32_t kVersion = 3;
+ // File offset of the block in pm3usma.dat (ends 0xD3890); the game's data end at 0xD0050 (save
+ // descriptor 0xD0000 + 0x50 header), the file at 0xD4000.
+ // The game's load reads the file from 0 in 16 KB chunks and stops at 0xD0000 (NAND trace, Task 6):
+ // it never reaches the data end. The load hook keys on this offset.
+ constexpr uint32_t kMainSaveLoadEnd = 0xD0000;
+-constexpr uint32_t kSaveFileOffset = 0xD3000;
++// Version 3 starts earlier than version 2 did (0xD3000, kLegacyFileOffset: the old block only reads
++// there) and stays clear of the 0xD3F00 marker spot.
++constexpr uint32_t kSaveFileOffset = 0xD2E00;
++constexpr uint32_t kLegacyFileOffset = 0xD3000;
+ constexpr uint32_t kSaveFileSize = 0xD4000;
+-static_assert(kSaveFileOffset >= 0xD0400 && kSaveFileOffset + kSaveBytes <= kSaveFileSize);
++static_assert(kSaveFileOffset >= 0xD0400 && kSaveFileOffset + kSaveBytes <= 0xD3F00);
++static_assert(kLegacyFileOffset + kSaveBytesV2 <= kSaveFileSize);
+ 
+ struct Choice {
+     std::string mark, logo;
+-    bool empty() const { return mark.empty() && logo.empty(); }
+-    bool operator==(const Choice& other) const { return mark == other.mark && logo == other.logo; }
++    std::string uniformHome, uniformRoad;  // imported uniform folder names (UserData/arrange/uniforms)
++    bool empty() const { return mark.empty() && logo.empty() && uniformHome.empty() && uniformRoad.empty(); }
++    bool operator==(const Choice& other) const {
++        return mark == other.mark && logo == other.logo && uniformHome == other.uniformHome &&
++               uniformRoad == other.uniformRoad;
++    }
+     bool operator!=(const Choice& other) const { return !(*this == other); }
+ };
+ using Choices = std::array<Choice, kSlots>;
+@@ -108,8 +123,9 @@ inline uint32_t recordFingerprint(const uint8_t* record) {
+ inline std::array<uint8_t, kSaveBytes> writeChoices(const Choices& choices, const Fingerprints& fingerprints) {
+     std::array<uint8_t, kSaveBytes> out{};
+     for (const auto& choice : choices)
+-        if (choice.mark.size() > kNameBytes || choice.logo.size() > kNameBytes)
+-            throw std::invalid_argument("arrange marks: file name longer than 32 bytes");
++        if (choice.mark.size() > kNameBytes || choice.logo.size() > kNameBytes ||
++            choice.uniformHome.size() > kNameBytes || choice.uniformRoad.size() > kNameBytes)
++            throw std::invalid_argument("arrange marks: file or folder name longer than 32 bytes");
+     std::copy(detail::magic.begin(), detail::magic.end(), out.begin());
+     detail::put32(out.data() + 8, kVersion);
+     for (size_t i = 0; i < kSlots; ++i) {
+@@ -117,34 +133,48 @@ inline std::array<uint8_t, kSaveBytes> writeChoices(const Choices& choices, cons
+         std::copy(choices[i].mark.begin(), choices[i].mark.end(), row);
+         std::copy(choices[i].logo.begin(), choices[i].logo.end(), row + kNameBytes);
+         detail::put32(row + 2 * kNameBytes, choices[i].empty() ? 0 : fingerprints[i]);
++        std::copy(choices[i].uniformHome.begin(), choices[i].uniformHome.end(), row + kRowBytesV2);
++        std::copy(choices[i].uniformRoad.begin(), choices[i].uniformRoad.end(), row + kRowBytesV2 + kNameBytes);
+     }
+     detail::put32(out.data() + 12, detail::fnv1a(out.data() + kHeaderBytes, kSaveBytes - kHeaderBytes));
+     return out;
+ }
+ 
+-// out and fingerprints are left empty unless the result is Valid. Any other version (version 1 had
+-// no fingerprints) is Invalid.
++// out and fingerprints are left empty unless the result is Valid. Version 3 (kSaveBytes) and version 2
++// (kSaveBytesV2, read with empty uniforms) are read; any other version (version 1 had no
++// fingerprints) is Invalid.
+ inline ReadStatus readChoices(const uint8_t* data, size_t size, Choices& out, Fingerprints& fingerprints) {
+     out = Choices{};
+     fingerprints = Fingerprints{};
+     if (!data) return ReadStatus::Missing;
+     if (std::all_of(data, data + std::min(size, kSaveBytes), [](uint8_t b) { return b == 0; }))
+         return ReadStatus::Missing;
+-    if (size < kSaveBytes || !std::equal(detail::magic.begin(), detail::magic.end(), data) ||
+-        detail::get32(data + 8) != kVersion ||
+-        detail::get32(data + 12) != detail::fnv1a(data + kHeaderBytes, kSaveBytes - kHeaderBytes))
++    if (size < kSaveBytesV2 || !std::equal(detail::magic.begin(), detail::magic.end(), data))
++        return ReadStatus::Invalid;
++    const uint32_t version = detail::get32(data + 8);
++    size_t rowBytes = 0, total = 0;
++    if (version == kVersion) { rowBytes = kRowBytes; total = kSaveBytes; }
++    else if (version == kVersionV2) { rowBytes = kRowBytesV2; total = kSaveBytesV2; }
++    else return ReadStatus::Invalid;
++    if (size < total || detail::get32(data + 12) != detail::fnv1a(data + kHeaderBytes, total - kHeaderBytes))
+         return ReadStatus::Invalid;
+     Choices read;
+     Fingerprints prints{};
++    auto field = [](const uint8_t* at) {
++        const char* text = reinterpret_cast<const char*>(at);
++        size_t len = 0;
++        while (len < kNameBytes && text[len]) ++len;
++        return std::string(text, len);
++    };
+     for (size_t i = 0; i < kSlots; ++i) {
+-        const uint8_t* row = data + kHeaderBytes + i * kRowBytes;
+-        const char* text = reinterpret_cast<const char*>(row);
+-        size_t markLen = 0, logoLen = 0;
+-        while (markLen < kNameBytes && text[markLen]) ++markLen;
+-        while (logoLen < kNameBytes && text[kNameBytes + logoLen]) ++logoLen;
+-        read[i].mark.assign(text, markLen);
+-        read[i].logo.assign(text + kNameBytes, logoLen);
++        const uint8_t* row = data + kHeaderBytes + i * rowBytes;
++        read[i].mark = field(row);
++        read[i].logo = field(row + kNameBytes);
+         prints[i] = detail::get32(row + 2 * kNameBytes);
++        if (version == kVersion) {
++            read[i].uniformHome = field(row + kRowBytesV2);
++            read[i].uniformRoad = field(row + kRowBytesV2 + kNameBytes);
++        }
+     }
+     out = std::move(read);
+     fingerprints = prints;
+@@ -180,7 +210,7 @@ inline bool isChosen(const Choices& choices, bool logo, const std::string& file)
+ 
+ inline void copySlot(Choices& choices, int from, int to) {
+     if (from < 0 || to < 0 || from >= int(kSlots) || to >= int(kSlots)) return;
+-    choices[to] = choices[from];
++    choices[to] = choices[from];  // mark, logo and both uniforms
+ }
+ inline void clearSlot(Choices& choices, int slot) {
+     if (slot < 0 || slot >= int(kSlots)) return;
+@@ -219,9 +249,18 @@ inline ReadStatus OnMainSaveLoad(FILE* file, bool enabled) {
+     size_t got = 0;
+     if (std::fseek(file, long(kSaveFileOffset), SEEK_SET) == 0)
+         got = std::fread(block.data(), 1, block.size(), file);
+-    std::fseek(file, at, SEEK_SET);
+     SaveState& state = saveState();
+-    state.status = readChoices(block.data(), got, state.loaded, state.fingerprints);
++    if (got >= detail::magic.size() && std::equal(detail::magic.begin(), detail::magic.end(), block.data())) {
++        state.status = readChoices(block.data(), got, state.loaded, state.fingerprints);
++    } else {
++        // No version 3 block here: the version 2 one (0xD3000) or nothing.
++        std::array<uint8_t, kSaveBytesV2> legacy{};
++        size_t gotLegacy = 0;
++        if (std::fseek(file, long(kLegacyFileOffset), SEEK_SET) == 0)
++            gotLegacy = std::fread(legacy.data(), 1, legacy.size(), file);
++        state.status = readChoices(legacy.data(), gotLegacy, state.loaded, state.fingerprints);
++    }
++    std::fseek(file, at, SEEK_SET);
+     state.unchecked = state.status == ReadStatus::Valid &&
+                       std::any_of(state.loaded.begin(), state.loaded.end(), [](const Choice& c) { return !c.empty(); });
+     state.changed = false;
+diff --git a/runtime/src/hle/storage/nand_isfs.cpp b/runtime/src/hle/storage/nand_isfs.cpp
+--- a/runtime/src/hle/storage/nand_isfs.cpp
++++ b/runtime/src/hle/storage/nand_isfs.cpp
+@@ -570,7 +570,7 @@ extern "C" int32_t NAND_IOS_Read_HLE(uint32_t fd, uint32_t bufferPtr, uint32_t l
+     } else if (arrange_marks::LoadChunkReachesLoadEnd(readAt, bytesRead) && IsMainSaveHandle(*handle) &&
+                arrange_marks::SaveHooksEnabled() &&
+                arrange_marks::ShouldLoadOnRead(readAt, bytesRead, MainSaveWriteOpen())) {
+-        // Main save: the load's last chunk (it reads up to 0xD0000) brings the custom Arrange marks,
++        // Main save: the load's last chunk (it reads up to 0xD0000) brings the custom Arrange marks and imported uniforms,
+         // read here from the file's free tail (an earlier read from 0 must not drop unsaved picks, and
+         // neither may the copy NANDSafeOpen makes before a save). They are checked against the teams
+         // when the game unpacks the slots (arrange_marks.cpp, 0x805A263C).
+@@ -578,9 +578,13 @@ extern "C" int32_t NAND_IOS_Read_HLE(uint32_t fd, uint32_t bufferPtr, uint32_t l
+         if (status == arrange_marks::ReadStatus::Invalid)
+             LogNandError("IOS_Read", "invalid Arrange custom marks save extension (ignored, kept on disk until a choice changes)");
+         if (NandTraceEnabled()) {
+-            int marks = 0;
+-            for (const auto& choice : arrange_marks::liveChoices()) marks += !choice.mark.empty();
+-            std::fprintf(stderr, "[nandtrace] arrange marks loaded: status=%d, %d custom marks\n", int(status), marks);
++            int marks = 0, uniforms = 0;
++            for (const auto& choice : arrange_marks::liveChoices()) {
++                marks += !choice.mark.empty();
++                uniforms += !choice.uniformHome.empty() + !choice.uniformRoad.empty();
++            }
++            std::fprintf(stderr, "[nandtrace] arrange marks loaded: status=%d, %d custom marks, %d uniforms\n",
++                         int(status), marks, uniforms);
+         }
+     }
+     
+diff --git a/runtime/tests/arrange_marks_save_test.cpp b/runtime/tests/arrange_marks_save_test.cpp
+--- a/runtime/tests/arrange_marks_save_test.cpp
++++ b/runtime/tests/arrange_marks_save_test.cpp
+@@ -55,6 +55,26 @@ static std::vector<uint8_t> versionOneBlock() {
+     return v1;
+ }
+ 
++// A version 2 block (2192 bytes, no uniforms, its own valid checksum), as the published marks
++// format wrote it: Lions in slot 2 and a fingerprint.
++static std::vector<uint8_t> versionTwoBlock() {
++    std::vector<uint8_t> v2(2192, 0);
++    const char magic[] = "MLBARRMK";
++    std::copy(magic, magic + 8, v2.begin());
++    v2[11] = 2;
++    const char mark[] = "leones.png", logo[] = "leones_logo.png";
++    std::copy(mark, mark + 10, v2.begin() + 16 + 2 * 68);
++    std::copy(logo, logo + 15, v2.begin() + 16 + 2 * 68 + 32);
++    v2[16 + 2 * 68 + 64 + 3] = 0x78;  // fingerprint 0x12345678 (big endian)
++    v2[16 + 2 * 68 + 64 + 2] = 0x56;
++    v2[16 + 2 * 68 + 64 + 1] = 0x34;
++    v2[16 + 2 * 68 + 64] = 0x12;
++    uint32_t h = 2166136261u;
++    for (size_t i = 16; i < v2.size(); ++i) h = (h ^ v2[i]) * 16777619u;
++    for (int i = 0; i < 4; ++i) v2[12 + i] = uint8_t(h >> (24 - 8 * i));
++    return v2;
++}
++
+ int main() {
+     // round trip, Lions in slot 2, with the team's fingerprint
+     Choices c;
+@@ -63,8 +83,8 @@ int main() {
+     prints[2] = 0x12345678;
+     prints[5] = 0x9ABCDEF0;  // slot 5 has no choice: its row stores 0
+     auto bytes = writeChoices(c, prints);
+-    assert(bytes.size() == 2192 && kSaveFileOffset + bytes.size() == 0xD3890);
+-    assert(bytes[8] == 0 && bytes[11] == 2);
++    assert(bytes.size() == 4240 && kSaveFileOffset + bytes.size() == 0xD3E90);
++    assert(bytes[8] == 0 && bytes[11] == 3);
+     // isChosen: by kind, any slot, never for an empty name
+     assert(isChosen(c, false, "leones.png") && isChosen(c, true, "leones_logo.png"));
+     assert(!isChosen(c, true, "leones.png") && !isChosen(c, false, "leones_logo.png"));
+@@ -88,7 +108,7 @@ int main() {
+     assert(readChoices(bad.data(), bad.size(), back, backPrints) == ReadStatus::Invalid);
+     bad = bytes; bad[16 + 2 * kRowBytes + 64] ^= 1;  // slot 2's fingerprint
+     assert(readChoices(bad.data(), bad.size(), back, backPrints) == ReadStatus::Invalid);
+-    bad = bytes; bad[11] = 3;
++    bad = bytes; bad[11] = 4;
+     assert(readChoices(bad.data(), bad.size(), back, backPrints) == ReadStatus::Invalid);
+     assert(back[2].mark.empty() && backPrints[2] == 0);  // nothing out of an Invalid block
+     assert(readChoices(bytes.data(), 100, back, backPrints) == ReadStatus::Invalid);
+@@ -114,6 +134,65 @@ int main() {
+     try { writeChoices(n, Fingerprints{}); } catch (const std::invalid_argument&) { threw = true; }
+     assert(threw);
+ 
++    // version 3: home and road uniform per slot (slot 2: different ones), fingerprints unchanged
++    {
++        Choices u;
++        u[2] = {"leones.png", "leones_logo.png", "casa_leones", "visita_leones"};
++        u[7].uniformRoad = "solo_visita";  // a slot with only a uniform choice
++        Fingerprints up{};
++        up[2] = 0x12345678;
++        up[7] = 0xCAFEBABE;
++        const auto block = writeChoices(u, up);
++        Choices r;
++        Fingerprints rp{};
++        assert(readChoices(block.data(), block.size(), r, rp) == ReadStatus::Valid);
++        assert(r[2].uniformHome == "casa_leones" && r[2].uniformRoad == "visita_leones");
++        assert(r[2].mark == "leones.png" && r[2].logo == "leones_logo.png");
++        assert(r[7].uniformHome.empty() && r[7].uniformRoad == "solo_visita" && r[7].mark.empty());
++        assert(rp[2] == 0x12345678 && rp[7] == 0xCAFEBABE && rp[0] == 0);
++        assert(r[0].empty() && r[3].empty());
++        // altered uniform bytes or checksum: Invalid
++        auto bu = block; bu[16 + 2 * kRowBytes + 68] ^= 1;  // slot 2's uniform home
++        assert(readChoices(bu.data(), bu.size(), r, rp) == ReadStatus::Invalid);
++        assert(r[2].empty() && rp[2] == 0);
++        bu = block; bu[16 + 2 * kRowBytes + 100] ^= 1;  // slot 2's uniform road
++        assert(readChoices(bu.data(), bu.size(), r, rp) == ReadStatus::Invalid);
++        bu = block; bu[13] ^= 1;
++        assert(readChoices(bu.data(), bu.size(), r, rp) == ReadStatus::Invalid);
++        // a v3 header on a v2-sized buffer is cut short: Invalid
++        assert(readChoices(block.data(), 2192, r, rp) == ReadStatus::Invalid);
++        // 32-byte uniform names fit, 40-byte ones are rejected for either side
++        Choices w;
++        w[1].uniformHome = std::string(32, 'h');
++        w[1].uniformRoad = std::string(32, 'r');
++        const auto wb = writeChoices(w, Fingerprints{});
++        assert(readChoices(wb.data(), wb.size(), r, rp) == ReadStatus::Valid);
++        assert(r[1].uniformHome == w[1].uniformHome && r[1].uniformRoad == w[1].uniformRoad);
++        for (int side = 0; side < 2; ++side) {
++            Choices longName;
++            (side ? longName[3].uniformRoad : longName[3].uniformHome) = std::string(40, 'u');
++            bool rejected = false;
++            try { writeChoices(longName, Fingerprints{}); } catch (const std::invalid_argument&) { rejected = true; }
++            assert(rejected);
++        }
++    }
++
++    // migration: a version 2 buffer reads Valid with empty uniforms and the same marks and fingerprints
++    {
++        const auto v2 = versionTwoBlock();
++        Choices r;
++        Fingerprints rp{};
++        assert(readChoices(v2.data(), v2.size(), r, rp) == ReadStatus::Valid);
++        assert(r[2].mark == "leones.png" && r[2].logo == "leones_logo.png" && rp[2] == 0x12345678);
++        assert(r[2].uniformHome.empty() && r[2].uniformRoad.empty());
++        for (const auto& choice : r) assert(choice.uniformHome.empty() && choice.uniformRoad.empty());
++        auto bv2 = v2; bv2[100] ^= 1;  // altered sum
++        assert(readChoices(bv2.data(), bv2.size(), r, rp) == ReadStatus::Invalid);
++        auto padded = v2;  // as it sits in a file: followed by other bytes
++        padded.resize(kSaveBytes, 0x5A);
++        assert(readChoices(padded.data(), padded.size(), r, rp) == ReadStatus::Valid && r[2].mark == "leones.png");
++    }
++
+     // the record fingerprint: the team's identity as the save keeps it
+     {
+         const auto leones = record("LEONES", 0x0B, 7);
+@@ -179,6 +258,21 @@ int main() {
+     }
+     clearSlot(k, 2);
+     assert(k[2].mark.empty() && k[2].logo.empty() && k[5].mark == "a.png");
++    // copy / clear carry both uniforms
++    {
++        Choices cu;
++        cu[2] = {"", "", "casa", "visita"};
++        copySlot(cu, 2, 9);
++        assert(cu[9].uniformHome == "casa" && cu[9].uniformRoad == "visita" && cu[2].uniformHome == "casa");
++        assert(cu[9] == cu[2] && !cu[9].empty());
++        cu[9].uniformRoad = "otra";  // the copy is independent
++        assert(cu[2].uniformRoad == "visita");
++        clearSlot(cu, 2);
++        assert(cu[2].uniformHome.empty() && cu[2].uniformRoad.empty() && cu[2].empty());
++        assert(cu[9].uniformHome == "casa" && cu[9].uniformRoad == "otra");
++        copySlot(cu, 2, 9);  // copying an empty slot clears the target, uniforms included
++        assert(cu[9].empty());
++    }
+ 
+     assert(IsMainSaveName("pm3usma.dat") && !IsMainSaveName("pm3usse0.dat") && !IsMainSaveName("pm3usmy0.dat"));
+ 
+@@ -216,7 +310,7 @@ int main() {
+     assert(slurp(file) == original);
+     assert(liveChoices()[4].mark == "x.png");
+ 
+-    // option on: the block lands at 0xD3000, everything else is unchanged
++    // option on: the block lands at 0xD2E00, everything else is unchanged
+     {
+         FILE* f = std::fopen(file.string().c_str(), "r+b");
+         std::fseek(f, 777, SEEK_SET);
+@@ -375,6 +469,39 @@ int main() {
+         assert(slurp(file) == data);
+     }
+ 
++    // a version 2 block at 0xD3000 (an earlier runtime's save): read with empty uniforms, and the first
++    // save writes version 3 at 0xD2E00, which wins from then on
++    {
++        auto data = slurp(file);
++        std::fill(data.begin() + kSaveFileOffset, data.begin() + kSaveFileOffset + kSaveBytes, 0);
++        const auto v2 = versionTwoBlock();
++        std::copy(v2.begin(), v2.end(), data.begin() + kLegacyFileOffset);
++        spit(file, data);
++        FILE* f = std::fopen(file.string().c_str(), "r+b");
++        assert(OnMainSaveLoad(f, true) == ReadStatus::Valid);
++        assert(liveChoices()[2].mark == "leones.png" && liveChoices()[2].uniformHome.empty());
++        assert(saveState().fingerprints[2] == 0x12345678);
++        liveChoices()[2].uniformHome = "casa_leones";
++        liveChoices()[2].uniformRoad = "visita_leones";
++        Fingerprints keep{};
++        keep[2] = 0x12345678;
++        assert(OnMainSaveStore(f, true, keep) == StoreResult::Written);
++        std::fclose(f);
++        f = std::fopen(file.string().c_str(), "rb");
++        assert(OnMainSaveLoad(f, true) == ReadStatus::Valid);
++        std::fclose(f);
++        assert(liveChoices()[2].uniformHome == "casa_leones" && liveChoices()[2].uniformRoad == "visita_leones");
++        assert(liveChoices()[2].mark == "leones.png" && saveState().fingerprints[2] == 0x12345678);
++        // option off: a v3 block with uniforms stays as it is
++        const auto onDisk = slurp(file);
++        f = std::fopen(file.string().c_str(), "r+b");
++        liveChoices()[2].uniformHome = "cambiado";
++        assert(OnMainSaveStore(f, false, keep) == StoreResult::Disabled);
++        assert(OnMainSaveLoad(f, false) == ReadStatus::Missing);
++        std::fclose(f);
++        assert(slurp(file) == onDisk);
++    }
++
+     // a missing block (zeros) is written by the first save
+     {
+         auto data = slurp(file);
