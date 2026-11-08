@@ -368,26 +368,82 @@ index 2ae8e46..32c99c8 100644
      return Get().twoWayPlayer.value_or(fallback);
  }
 diff --git a/runtime/src/hle/mlb/arrange_marks.cpp b/runtime/src/hle/mlb/arrange_marks.cpp
-index fcc3345..6150355 100644
+index fcc3345..0409245 100644
 --- a/runtime/src/hle/mlb/arrange_marks.cpp
 +++ b/runtime/src/hle/mlb/arrange_marks.cpp
-@@ -651,7 +651,9 @@ const Choice& choiceFor(uint32_t teamRecordAddress) {
+@@ -63,6 +63,12 @@ ORIGINAL(807B34FC); ORIGINAL(807B336C); ORIGINAL(807B5118); ORIGINAL(807B5184);
+ ORIGINAL(8059AB98); ORIGINAL(8059AA90); ORIGINAL(805BE7FC); ORIGINAL(805A263C);
+ #undef ORIGINAL
+ 
++// Custom uniforms reserve their own MEM2 arena (src/hle/mlb/arrange_uniforms.cpp); the shared
++// choice/save system is on when either feature is.
++namespace arrange_uniforms {
++bool Reserved();
++}
++
+ namespace arrange_marks {
+ namespace {
+ namespace fs = std::filesystem;
+@@ -90,7 +96,17 @@ static_assert(kNames + kMaxEntries * kNameStride <= kHeadBytes);
+ 
+ uint32_t g_arena = 0;
+ 
++// Enabled(): the marks texture arena is reserved (custom_marks). The choice/save system (which only
++// reads liveChoices and the team records, no arena) is on when marks OR uniforms is active, and its
++// guest memory is any arena that reserved: ChoicesSystemOn / ChoiceMemoryReserved.
+ bool Enabled() { return g_arena != 0; }
++bool ChoicesSystemOn() {
++    return RuntimeConfigFile::ArrangeCustomMarks(false) || RuntimeConfigFile::ArrangeCustomUniforms(false);
++}
++bool ChoiceMemoryReserved() {
++    return (RuntimeConfigFile::ArrangeCustomMarks(false) && Enabled()) ||
++           (RuntimeConfigFile::ArrangeCustomUniforms(false) && arrange_uniforms::Reserved());
++}
+ 
+ // --- Game data ----------------------------------------------------------------------------------
+ constexpr uint32_t kSlotBlock = 0x8104E1D8, kSlotsOffset = 0x3AC, kSlotStride = 0x2448, kRecord = 0x42;
+@@ -638,7 +654,7 @@ uint32_t ReserveGuestMemory(uint32_t low, uint32_t high) {
+ 
+ const Choice& choiceFor(uint32_t teamRecordAddress) {
+     static const Choice kNone;
+-    if (!Enabled() || teamRecordAddress < kRecord) return kNone;
++    if (!ChoicesSystemOn() || teamRecordAddress < kRecord) return kNone;
+     int slot = SlotOf(teamRecordAddress - kRecord);
+     if (slot < 0 && teamRecordAddress == kMatchSlot + kRecord) {
+         // The match's copy of a slot: only while it is that slot's team (a stale copy, or another
+@@ -651,7 +667,9 @@ const Choice& choiceFor(uint32_t teamRecordAddress) {
      return slot >= 0 && slot < int(kSlots) ? liveChoices()[size_t(slot)] : kNone;
  }
  
 -bool SaveHooksEnabled() { return RuntimeConfigFile::ArrangeCustomMarks(false) && Enabled(); }
 +bool SaveHooksEnabled() {
-+    return (RuntimeConfigFile::ArrangeCustomMarks(false) || RuntimeConfigFile::ArrangeCustomUniforms(false)) && Enabled();
++    return ChoiceMemoryReserved();
 +}
  
  Fingerprints CurrentFingerprints() {
      Fingerprints out{};
+@@ -1365,13 +1383,13 @@ void CheckLoadedChoices(uint32_t lr) {
+ 
+ extern "C" void MLB_ArrangeSlotsUnpack_805A263C(CpuContext* ctx) {
+     const uint32_t lr = ctx->lr;
+-    if (g_trace && Enabled())  // the slots before the game fills them (WIICOMPILED_ARRANGE_TRACE)
++    if (g_trace && ChoicesSystemOn())  // the slots before the game fills them (WIICOMPILED_ARRANGE_TRACE)
+         for (uint32_t i = 0; i < kSlots; ++i)
+             if (!saveState().loaded[i].empty())
+                 std::fprintf(stderr, "[arrange-trace] before unpack: slot %u used=%d print=%08x\n", i,
+                              SlotState(i).used ? 1 : 0, SlotState(i).fingerprint);
+     func_805A263C(ctx);
+-    if (Enabled()) CheckLoadedChoices(lr);
++    if (ChoicesSystemOn()) CheckLoadedChoices(lr);
+ }
+ REGISTER_NATIVE_FUNCTION_AS(0x805A263C, MLB_ArrangeSlotsUnpack_805A263C, "MLB_ArrangeSlotsUnpack_805A263C");
+ 
 diff --git a/runtime/src/hle/mlb/arrange_uniforms.cpp b/runtime/src/hle/mlb/arrange_uniforms.cpp
 new file mode 100644
-index 0000000..b3dff84
+index 0000000..f5c48da
 --- /dev/null
 +++ b/runtime/src/hle/mlb/arrange_uniforms.cpp
-@@ -0,0 +1,375 @@
+@@ -0,0 +1,408 @@
 +// Imported uniforms for Arrange teams ([arrange] custom_uniforms): a team that chose an imported
 +// uniform (a .ppu baked by Uniform Studio, in UserData/arrange/uniforms/<folder>) wears it natively
 +// wherever the game draws that team. Addresses and evidence: docs/ingenieria-inversa.md ("Uniforme
@@ -419,11 +475,14 @@ index 0000000..b3dff84
 +//   original unchanged.
 +#include <algorithm>
 +#include <array>
++#include <chrono>
 +#include <cstdint>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
 +#include <filesystem>
++#include <fstream>
++#include <iterator>
 +#include <map>
 +#include <string>
 +#include <vector>
@@ -465,11 +524,14 @@ index 0000000..b3dff84
 +// (+0xC), palettes through the whole palette-object pointer (+0xC).
 +constexpr uint32_t kChBodyTex = 0x8C, kChBodyPal = 0x9C, kChCapTex = 0x11C, kChCapPal = 0x14C,
 +                   kChHelmetTex = 0x12C, kChHelmetPal = 0x15C, kChChestTex = 0x10C, kChChestPal = 0x13C;
++// Back number: two digit textures and their palettes. Left intact (G4) unless the .ppu has a number.
++constexpr uint32_t kChNumTex0 = 0xAC, kChNumTex1 = 0xBC, kChNumPal0 = 0xCC, kChNumPal1 = 0xDC;
 +constexpr uint32_t kSlotResolved = 0xC;
 +
 +// --- Cache arena --------------------------------------------------------------------------------
-+// One entry: body (128x128) then cap, helmet, chest (64x32 each); each part is texels + palette
-+// (256 x RGB5A3) + a texture descriptor (0x40) + a palette object (0x20), written as the game's own.
++// A head with one transparent 64x32 decal (shared, to blank the chest initial), then kCacheSlots
++// entries. Each entry: body (128x128) then cap, helmet, number (64x32 each); each part is texels +
++// palette (256 x RGB5A3) + a texture descriptor (0x40) + a palette object (0x20), the game's own.
 +constexpr uint32_t kBodyPixels = 128 * 128, kDecalPixels = 64 * 32, kPaletteBytes = 512;
 +constexpr uint32_t kTexDescBytes = 0x40, kPalObjBytes = 0x20;
 +constexpr uint32_t kBodyTexels = 0;
@@ -478,21 +540,29 @@ index 0000000..b3dff84
 +constexpr uint32_t kBodyPalObj = kBodyTexDesc + kTexDescBytes;          // 0x4240
 +constexpr uint32_t kDecal0 = kBodyPalObj + kPalObjBytes;                // 0x4260
 +constexpr uint32_t kDecalStride = kDecalPixels + kPaletteBytes + kTexDescBytes + kPalObjBytes;  // 0xA60
-+constexpr uint32_t kEntryBytes = (kDecal0 + 3 * kDecalStride + 0x1Fu) & ~0x1Fu;  // body + cap/helmet/chest
++constexpr uint32_t kEntryBytes = (kDecal0 + 3 * kDecalStride + 0x1Fu) & ~0x1Fu;  // body + cap/helmet/number
++constexpr uint32_t kHeadBytes = (kDecalStride + 0x1Fu) & ~0x1Fu;        // the transparent decal
 +constexpr uint32_t kCacheSlots = 8;
-+constexpr uint32_t kArenaBytes = kCacheSlots * kEntryBytes;
++constexpr uint32_t kArenaBytes = kHeadBytes + kCacheSlots * kEntryBytes;
 +
 +uint32_t g_arena = 0;
 +bool Enabled() { return g_arena != 0; }
-+uint32_t EntryAddress(int slot) { return g_arena + uint32_t(slot) * kEntryBytes; }
++uint32_t EntryAddress(int slot) { return g_arena + kHeadBytes + uint32_t(slot) * kEntryBytes; }
 +
 +struct Part {
 +    uint32_t texels, palette, texDesc, palObj, pixels;
 +};
-+// kind: 0 body, 1 cap, 2 helmet, 3 chest.
++// kind: 0 body, 1 cap, 2 helmet, 3 number.
 +Part PartOf(uint32_t base, int kind) {
 +    if (kind == 0) return {base + kBodyTexels, base + kBodyPalette, base + kBodyTexDesc, base + kBodyPalObj, kBodyPixels};
 +    const uint32_t d = base + kDecal0 + uint32_t(kind - 1) * kDecalStride;
++    return {d, d + kDecalPixels, d + kDecalPixels + kPaletteBytes,
++            d + kDecalPixels + kPaletteBytes + kTexDescBytes, kDecalPixels};
++}
++// The shared transparent decal (head of the arena): a 64x32 all-index-0 texture with an all-zero
++// palette (entry 0 = 0x0000, fully transparent). Its descriptors stay fixed; built once at boot.
++Part TransparentDecal() {
++    const uint32_t d = g_arena;
 +    return {d, d + kDecalPixels, d + kDecalPixels + kPaletteBytes,
 +            d + kDecalPixels + kPaletteBytes + kTexDescBytes, kDecalPixels};
 +}
@@ -583,7 +653,7 @@ index 0000000..b3dff84
 +
 +    const int slot = (c.slot >= 0 && g_owner[size_t(c.slot)] == folder) ? c.slot : FreeSlot();
 +    const uint32_t base = EntryAddress(slot);
-+    static constexpr const char* kKinds[4] = {"body", "cap", "helmet", "chest"};
++    static constexpr const char* kKinds[4] = {"body", "cap", "helmet", "number"};
 +    Built built;
 +    for (int kind = 0; kind < 4; ++kind) {
 +        const auto it = u.atlases.find(kKinds[kind]);
@@ -664,16 +734,24 @@ index 0000000..b3dff84
 +}
 +
 +void ApplyUniform(uint32_t ch, const Built& b) {
-+    // Body (G1), cap/helmet/chest (G2). Number slots (char+0xAC/+0xBC/+0xCC/+0xDC) are left intact (G4).
-+    // The cap letter shows through the cap (char+0x11C) and the helmet (char+0x12C) slots (both resolve
-+    // to the game's shared letter struct, Task 1); the .ppu's cap atlas covers both, so the red initial
-+    // is gone from either (a .ppu with its own helmet atlas overrides that one).
++    // Body (G1). Cap/helmet (G2): the .ppu's cap atlas covers the cap (char+0x11C) and the helmet
++    // (char+0x12C, falling back to the cap); both resolve to the game's shared letter struct (Task 1),
++    // so the red initial is gone from the cap. A .ppu with its own helmet atlas overrides that one.
 +    const uint32_t helmetTex = b.texDesc[2] ? b.texDesc[2] : b.texDesc[1];
 +    const uint32_t helmetPal = b.texDesc[2] ? b.palObj[2] : b.palObj[1];
 +    WriteSlot(ch, kChBodyTex, kChBodyPal, b.texDesc[0], b.palObj[0]);
 +    WriteSlot(ch, kChCapTex, kChCapPal, b.texDesc[1], b.palObj[1]);
 +    WriteSlot(ch, kChHelmetTex, kChHelmetPal, helmetTex, helmetPal);
-+    WriteSlot(ch, kChChestTex, kChChestPal, b.texDesc[3], b.palObj[3]);
++    // Chest (G2): the chest wordmark/art is baked into the body atlas, so the chest letter slot
++    // (char+0x10C, the small initial seen from the front, 0x974B3C20) is set transparent to remove it.
++    const Part t = TransparentDecal();
++    WriteSlot(ch, kChChestTex, kChChestPal, t.texDesc, t.palObj);
++    // Back number (G4): kept as the game set it, unless the .ppu brings a "number" atlas (kind 3),
++    // which then drives both digit textures and their palettes.
++    if (b.texDesc[3]) {
++        WriteSlot(ch, kChNumTex0, kChNumPal0, b.texDesc[3], b.palObj[3]);
++        WriteSlot(ch, kChNumTex1, kChNumPal1, b.texDesc[3], b.palObj[3]);
++    }
 +}
 +
 +}  // namespace
@@ -689,9 +767,20 @@ index 0000000..b3dff84
 +    }
 +    std::memset(Memory::GetPointer(arena, kArenaBytes), 0, kArenaBytes);
 +    g_arena = arena;
++    // The shared transparent 64x32 decal: all-index-0 texels (already zeroed) with its two descriptors
++    // (its palette is all zero, so index 0 reads as RGB5A3 0x0000 = fully transparent).
++    const Part t = TransparentDecal();
++    const uint32_t tex[16] = {uint32_t(32) << 16 | 64, 9, t.texels, 0, 0, 1, 1};
++    for (uint32_t i = 0; i < 16; ++i) Memory::Write32(t.texDesc + i * 4, tex[i]);
++    const uint32_t pal[8] = {256u << 16, 2, t.palette};
++    for (uint32_t i = 0; i < 8; ++i) Memory::Write32(t.palObj + i * 4, pal[i]);
++    GxGuestWrite::NotifyWrite(arena, kHeadBytes);
 +    std::fprintf(stderr, "[arrange] custom uniforms on: %u KB of MEM2 at 0x%08x\n", kArenaBytes / 1024, arena);
 +    return arena;
 +}
++
++// For arrange_marks.cpp: the save/choice system is on when marks OR uniforms reserved their arena.
++bool Reserved() { return g_arena != 0; }
 +
 +}  // namespace arrange_uniforms
 +
