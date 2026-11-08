@@ -443,7 +443,7 @@ new file mode 100644
 index 0000000..8b15eb9
 --- /dev/null
 +++ b/runtime/src/hle/mlb/arrange_uniforms.cpp
-@@ -0,0 +1,872 @@
+@@ -0,0 +1,868 @@
 +// Imported uniforms for Arrange teams ([arrange] custom_uniforms): a team that chose an imported
 +// uniform (a .ppu baked by Uniform Studio, in UserData/arrange/uniforms/<folder>) wears it natively
 +// wherever the game draws that team. Addresses and evidence: docs/ingenieria-inversa.md ("Uniforme
@@ -905,8 +905,7 @@ index 0000000..8b15eb9
 +// Uniform screen itself does this for A(4) and B(5). 0x8055F810 picks the glyph for the current
 +// controller. kGlyphButtonId is the id for our free button (Z / trigger); its exact value is a tunable
 +// (the enum is 0-3 dpad, 4 A, 5 B, then X/Y/Z/L/R/... — 8 is the best guess for Z/trigger).
-+constexpr uint32_t kGlyphPack = 515, kGlyphButtonId = 8;
-+constexpr float kHintX = 330.0f, kHintY = 385.0f, kHintScale = 0.55f, kGlyphW = 20.0f;
++constexpr float kHintX = 330.0f, kHintY = 385.0f, kHintScale = 0.55f;
 +// The selection list replaces the (hidden) left column: same left X, top to bottom.
 +constexpr float kListX = 14.0f, kListY = 42.0f, kListStep = 23.0f;
 +constexpr float kCellScale = 1.25f, kTextScale = 0.46f, kTextSelScale = 0.54f;  // cell / label sizes
@@ -969,18 +968,15 @@ index 0000000..8b15eb9
 +    if (!g_uni.text) return;
 +    // The real button glyph (pack 515) for the current controller; refreshed each frame so it tracks
 +    // the controller type. If the id has no glyph (returns 0) we just show the text.
-+    if (g_uni.hintCell) {
-+        const uint32_t glyph = Call(ctx, 0x8055F810, kGlyphButtonId, 0);
-+        if (glyph) Call(ctx, 0x8001DFB8, g_uni.hintCell, kGlyphPack, glyph);
-+        SetVisible(ctx, g_uni.hintCell, glyph != 0);
-+        CallF(ctx, 0x8001ABA0, g_uni.hintCell, kHintScale, kHintScale);
-+        CallF(ctx, 0x8001A7B0, g_uni.hintCell, kHintX, kHintY);
-+    }
++    // The real controller glyph needs 0x8055F810, which is inlined in the game and NOT a callable
++    // native — calling it crashes ("Missing translated function: 0x8055f810"). Hint is text-only for
++    // now ("Z IMPORT"); keep the glyph cell hidden until a callable glyph path is found.
++    if (g_uni.hintCell) SetVisible(ctx, g_uni.hintCell, false);
 +    Call(ctx, 0x807B4090, g_uni.text, kColNormal);
-+    VCall(ctx, g_uni.text, 0x40, WriteName(g_arena + kUniLabelScratch, "IMPORT"));
++    VCall(ctx, g_uni.text, 0x40, WriteName(g_arena + kUniLabelScratch, "Z IMPORT"));
 +    Call(ctx, 0x807B4090, g_uni.text, kColNormal);
 +    CallF(ctx, 0x8001ABA0, g_uni.holder, kHintScale, kHintScale);
-+    CallF(ctx, 0x8001A7B0, g_uni.holder, kHintX + kGlyphW, kHintY);
++    CallF(ctx, 0x8001A7B0, g_uni.holder, kHintX, kHintY);
 +    (void)s;
 +}
 +
