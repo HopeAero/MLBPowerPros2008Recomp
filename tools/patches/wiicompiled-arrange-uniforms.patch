@@ -440,10 +440,10 @@ index fcc3345..0409245 100644
  
 diff --git a/runtime/src/hle/mlb/arrange_uniforms.cpp b/runtime/src/hle/mlb/arrange_uniforms.cpp
 new file mode 100644
-index 0000000..28cfddf
+index 0000000..127c104
 --- /dev/null
 +++ b/runtime/src/hle/mlb/arrange_uniforms.cpp
-@@ -0,0 +1,799 @@
+@@ -0,0 +1,838 @@
 +// Imported uniforms for Arrange teams ([arrange] custom_uniforms): a team that chose an imported
 +// uniform (a .ppu baked by Uniform Studio, in UserData/arrange/uniforms/<folder>) wears it natively
 +// wherever the game draws that team. Addresses and evidence: docs/ingenieria-inversa.md ("Uniforme
@@ -875,13 +875,15 @@ index 0000000..28cfddf
 +    return int((slot - first) / kSlotStride);
 +}
 +
-+// --- The IMPORTED button + uniform list ---------------------------------------------------------
-+// The Uniform editor gets a bottom-bar hint "Z IMPORT" in the game font. A free button the screen
-+// ignores (GC Z-trigger / Wii Remote 1-2 / Classic Minus, read device-agnostically from pad.cpp via
-+// MLB_UniCycleButtonHeld) opens a selection list of the imported uniforms (scan() folders by name,
-+// plus "NONE"): up/down move, A chooses, B cancels. Choosing sets the current side's (HOME/ROAD)
-+// uniform in the working copy and refreshes the preview (the editor-map hook 0x805A83F0 feeds the
-+// working copy to the preview recompose); OK flushes to v3, cancel/reload restores.
++// --- The IMPORT button + uniform selection screen -----------------------------------------------
++// The Uniform editor gets a bottom-bar button (a game list-cell panel + "IMPORT" in the game font;
++// the real button glyph is a tunable, see the report). A free button the screen ignores (GC Z-trigger
++// / Wii Remote 1-2 / Classic Minus, read device-agnostically from pad.cpp via MLB_UniCycleButtonHeld)
++// opens a Team-Mark-style selection panel of the imported uniforms (scan() folders by name, plus
++// "NONE"), each on the game's list-cell image (pack 0x929 cell 0x40073EB0, reused from the marks
++// screen), with a title and a cursor. up/down move, A chooses, B cancels. Choosing sets the current
++// side's (HOME/ROAD) uniform in the working copy and previews live (the editor-map hook 0x805A83F0
++// feeds the working copy to the preview recompose); OK flushes to v3, cancel/reload restores.
 +constexpr uint32_t kUniSide = 0x487C;          // 0 HOME, 1 ROAD (R switches it)
 +constexpr uint32_t kUniChanged = 0x41C4;       // "there are changes" flag
 +constexpr uint32_t kUniStyle = 0x80CFFBB8;     // team-name text style (as the marks rows)
@@ -889,22 +891,25 @@ index 0000000..28cfddf
 +static_assert(kDecalStride + 25 * 2 <= kHeadBytes, "no room for the font string in the arena head");
 +constexpr uint32_t kUniButtons = 0x29C0, kNodeParent = 0x14;  // a column node, to parent in its layer
 +constexpr uint32_t kColNormal = 1, kColSelected = 4;  // text colour indices (kColSelected: tune in-game)
++constexpr uint32_t kListPack = 0x929, kListCell = 0x40073EB0;  // the game's list-cell image (marks)
 +// All positions are in the column layer's units (column row 0 is at y 33, 26 per row). Tunable from
 +// in-game screenshots.
-+constexpr float kPromptX = 14.0f, kPromptY = 338.0f, kPromptScale = 0.55f;  // bottom-bar hint
-+constexpr float kListX = 150.0f, kListY = 40.0f, kListStep = 28.0f, kListScale = 0.62f,
-+                kListSelScale = 0.82f;  // the pop-up list
++constexpr float kPromptX = 14.0f, kPromptY = 338.0f, kPromptScale = 0.55f;  // bottom-bar button
++constexpr float kListX = 150.0f, kListY = 56.0f, kListStep = 26.0f;  // the selection panel
++constexpr float kCellScale = 1.35f, kTextScale = 0.52f, kTextSelScale = 0.60f;  // cell / label sizes
++constexpr float kTitleX = 150.0f, kTitleY = 26.0f, kTitleScale = 0.70f;  // panel title
 +
 +enum { kClosed = 0, kListOpen = 1 };
 +
 +struct UniRow {
-+    uint32_t screen = 0, holder = 0, text = 0;  // the bottom-bar hint
++    uint32_t screen = 0, holder = 0, text = 0, hintCell = 0;  // the bottom-bar button
 +    std::vector<Entry> entries;
 +    int slot = -1;
 +    std::string home, road;  // the working copy, per side
 +    bool prevBtn = false, built = false;
-+    int mode = kClosed, cursor = 0;             // the list
-+    std::vector<uint32_t> itemHolders, itemTexts;
++    int mode = kClosed, cursor = 0;             // the selection panel
++    uint32_t titleHolder = 0, titleText = 0;
++    std::vector<uint32_t> itemCells, itemHolders, itemTexts;
 +} g_uni;
 +
 +bool UniActive(uint32_t s) { return Enabled() && s && g_uni.screen == s; }
@@ -934,12 +939,22 @@ index 0000000..28cfddf
 +    Call(ctx, 0x8001AC60, node, 0);
 +    return node;
 +}
++// A node showing the game's list-cell image (the Team Mark panel), placed and scaled.
++uint32_t UniNewCell(CpuContext* ctx, uint32_t parent, float x, float y, float scale) {
++    const uint32_t cell = UniNewNode(ctx, parent);
++    if (cell) {
++        Call(ctx, 0x8001DFB8, cell, kListPack, kListCell);
++        CallF(ctx, 0x8001ABA0, cell, scale, scale);
++        CallF(ctx, 0x8001A7B0, cell, x, y);
++    }
++    return cell;
++}
 +
-+// Keep the bottom-bar hint ("Z IMPORT") placed and visible.
++// Keep the bottom-bar button (cell panel + "IMPORT") placed and visible.
 +void UniSync(CpuContext* ctx, uint32_t s) {
 +    if (!g_uni.text) return;
 +    Call(ctx, 0x807B4090, g_uni.text, kColNormal);
-+    VCall(ctx, g_uni.text, 0x40, WriteName(g_arena + kUniLabelScratch, "Z IMPORT"));
++    VCall(ctx, g_uni.text, 0x40, WriteName(g_arena + kUniLabelScratch, "IMPORT"));
 +    Call(ctx, 0x807B4090, g_uni.text, kColNormal);
 +    CallF(ctx, 0x8001ABA0, g_uni.holder, kPromptScale, kPromptScale);
 +    CallF(ctx, 0x8001A7B0, g_uni.holder, kPromptX, kPromptY);
@@ -949,6 +964,9 @@ index 0000000..28cfddf
 +void UniBuildPrompt(CpuContext* ctx, uint32_t s) {
 +    g_uni.screen = s;
 +    const uint32_t parent = Memory::Read32(s + kUniButtons + kNodeParent);  // the column's layer
++    // A cell-image panel behind the button so it reads as a bar button (the real button glyph is a
++    // tunable; see the report).
++    g_uni.hintCell = UniNewCell(ctx, parent ? parent : s, kPromptX - 2.0f, kPromptY - 2.0f, kPromptScale);
 +    g_uni.holder = UniNewNode(ctx, parent ? parent : s);
 +    if (g_uni.holder) {
 +        g_uni.text = Call(ctx, 0x805C28D4, g_uni.holder, 0, Memory::Read32(kUniStyle) & 0xFFFF);
@@ -960,14 +978,14 @@ index 0000000..28cfddf
 +    g_uni.built = g_uni.holder != 0;
 +}
 +
-+// Highlight the cursor row (bigger + a different colour) and place every item.
++// Highlight the cursor row (bigger label + a different colour); cells stay put.
 +void UniRefreshList(CpuContext* ctx, uint32_t) {
 +    for (size_t i = 0; i < g_uni.itemHolders.size(); ++i) {
 +        const bool sel = int(i) == g_uni.cursor;
 +        if (g_uni.itemHolders[i]) {
-+            const float sc = sel ? kListSelScale : kListScale;
++            const float sc = sel ? kTextSelScale : kTextScale;
 +            CallF(ctx, 0x8001ABA0, g_uni.itemHolders[i], sc, sc);
-+            CallF(ctx, 0x8001A7B0, g_uni.itemHolders[i], kListX, kListY + float(i) * kListStep);
++            CallF(ctx, 0x8001A7B0, g_uni.itemHolders[i], kListX + 4.0f, kListY + float(i) * kListStep + 2.0f);
 +        }
 +        if (g_uni.itemTexts[i]) Call(ctx, 0x807B4090, g_uni.itemTexts[i], sel ? kColSelected : kColNormal);
 +    }
@@ -978,8 +996,23 @@ index 0000000..28cfddf
 +    const uint32_t parent = Memory::Read32(s + kUniButtons + kNodeParent);
 +    const uint32_t layer = parent ? parent : s;
 +    const uint32_t style = Memory::Read32(kUniStyle) & 0xFFFF;
++    // Title ("SELECT UNIFORM") in the game font above the list.
++    g_uni.titleHolder = UniNewNode(ctx, layer);
++    if (g_uni.titleHolder) {
++        CallF(ctx, 0x8001ABA0, g_uni.titleHolder, kTitleScale, kTitleScale);
++        CallF(ctx, 0x8001A7B0, g_uni.titleHolder, kTitleX, kTitleY);
++        g_uni.titleText = Call(ctx, 0x805C28D4, g_uni.titleHolder, 0, style);
++        if (g_uni.titleText) {
++            Call(ctx, 0x8001AC60, g_uni.titleText, 0);
++            CallF(ctx, 0x8001A7B0, g_uni.titleText, 0, 0);
++            Call(ctx, 0x807B4090, g_uni.titleText, kColNormal);
++            VCall(ctx, g_uni.titleText, 0x40, WriteName(g_arena + kUniLabelScratch, "SELECT UNIFORM"));
++        }
++    }
 +    const int n = int(g_uni.entries.size()) + 1;  // "NONE" + folders
 +    for (int i = 0; i < n; ++i) {
++        const float y = kListY + float(i) * kListStep;
++        g_uni.itemCells.push_back(UniNewCell(ctx, layer, kListX, y, kCellScale));  // the panel image
 +        const uint32_t h = UniNewNode(ctx, layer);
 +        uint32_t t = 0;
 +        if (h) {
@@ -1004,8 +1037,14 @@ index 0000000..28cfddf
 +        if (t) VCall(ctx, t, 0x08, 1);
 +    for (uint32_t h : g_uni.itemHolders)
 +        if (h) VCall(ctx, h, 0x08, 1);
++    for (uint32_t c : g_uni.itemCells)
++        if (c) VCall(ctx, c, 0x08, 1);
++    if (g_uni.titleText) VCall(ctx, g_uni.titleText, 0x08, 1);
++    if (g_uni.titleHolder) VCall(ctx, g_uni.titleHolder, 0x08, 1);
 +    g_uni.itemTexts.clear();
 +    g_uni.itemHolders.clear();
++    g_uni.itemCells.clear();
++    g_uni.titleText = g_uni.titleHolder = 0;
 +    g_uni.mode = kClosed;
 +}
 +
@@ -1044,7 +1083,7 @@ index 0000000..28cfddf
 +
 +void UniTeardown(CpuContext* ctx) {
 +    UniCloseList(ctx);
-+    for (uint32_t node : {g_uni.text, g_uni.holder})
++    for (uint32_t node : {g_uni.text, g_uni.holder, g_uni.hintCell})
 +        if (node) VCall(ctx, node, 0x08, 1);
 +    g_uni = {};
 +}
