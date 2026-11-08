@@ -1,8 +1,8 @@
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
-index fc9b090..4fe2791 100644
+index 86f6eca..b5e49bf 100644
 --- a/runtime/CMakeLists.txt
 +++ b/runtime/CMakeLists.txt
-@@ -460,7 +460,7 @@ target_compile_features(mkw_season_pack_tests PRIVATE cxx_std_20)
+@@ -478,7 +478,7 @@ target_compile_features(mkw_season_pack_tests PRIVATE cxx_std_20)
  target_include_directories(mkw_season_pack_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
  add_test(NAME mkw_season_pack_tests COMMAND mkw_season_pack_tests)
  
@@ -332,7 +332,7 @@ index 0000000..66ed077
 +
 +}  // namespace arrange_uniforms
 diff --git a/runtime/include/runtime_config.h b/runtime/include/runtime_config.h
-index 2ae8e46..32c99c8 100644
+index 5e6de9d..052decd 100644
 --- a/runtime/include/runtime_config.h
 +++ b/runtime/include/runtime_config.h
 @@ -47,6 +47,7 @@ struct RuntimeUserConfig {
@@ -440,10 +440,10 @@ index fcc3345..0409245 100644
  
 diff --git a/runtime/src/hle/mlb/arrange_uniforms.cpp b/runtime/src/hle/mlb/arrange_uniforms.cpp
 new file mode 100644
-index 0000000..7e50a8c
+index 0000000..28cfddf
 --- /dev/null
 +++ b/runtime/src/hle/mlb/arrange_uniforms.cpp
-@@ -0,0 +1,739 @@
+@@ -0,0 +1,799 @@
 +// Imported uniforms for Arrange teams ([arrange] custom_uniforms): a team that chose an imported
 +// uniform (a .ppu baked by Uniform Studio, in UserData/arrange/uniforms/<folder>) wears it natively
 +// wherever the game draws that team. Addresses and evidence: docs/ingenieria-inversa.md ("Uniforme
@@ -514,6 +514,9 @@ index 0000000..7e50a8c
 +ORIGINAL(805C9EF4);  // Uniform screen destructor (vt +0x08)
 +#undef ORIGINAL
 +
++// pad.cpp: held state of the Uniform editor's free "cycle" button this frame (device-agnostic).
++extern "C" bool MLB_UniCycleButtonHeld();
++
 +namespace arrange_uniforms {
 +namespace {
 +namespace fs = std::filesystem;
@@ -546,8 +549,8 @@ index 0000000..7e50a8c
 +constexpr uint32_t kDecal0 = kBodyPalObj + kPalObjBytes;                // 0x4260
 +constexpr uint32_t kDecalStride = kDecalPixels + kPaletteBytes + kTexDescBytes + kPalObjBytes;  // 0xA60
 +constexpr uint32_t kEntryBytes = (kDecal0 + 3 * kDecalStride + 0x1Fu) & ~0x1Fu;  // body + cap/helmet/number
-+// The transparent decal, then a small scratch for the IMPORTED row's font string (Task 9).
-+constexpr uint32_t kRowLabelBytes = 0x20;
++// The transparent decal, then a scratch for the IMPORTED prompt's font string (Task 9).
++constexpr uint32_t kRowLabelBytes = 0x40;
 +constexpr uint32_t kHeadBytes = (kDecalStride + kRowLabelBytes + 0x1Fu) & ~0x1Fu;
 +constexpr uint32_t kCacheSlots = 8;
 +constexpr uint32_t kArenaBytes = kHeadBytes + kCacheSlots * kEntryBytes;
@@ -841,7 +844,7 @@ index 0000000..7e50a8c
 +// lower case or accents never emits a garbage glyph.
 +uint32_t WriteName(uint32_t at, const std::string& name) {
 +    size_t written = 0;
-+    for (size_t i = 0; i < name.size() && written < 10; ++i) {
++    for (size_t i = 0; i < name.size() && written < 24; ++i) {
 +        char ch = name[i];
 +        if (ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
 +        const bool ok = (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == ' ' || ch == '-' ||
@@ -872,53 +875,55 @@ index 0000000..7e50a8c
 +    return int((slot - first) / kSlotStride);
 +}
 +
-+// --- The IMPORTED row ---------------------------------------------------------------------------
-+constexpr uint32_t kUniColListPtr = 0x2938;   // *(screen+0x2938) -> column cursor object
-+constexpr uint32_t kUniColIndex = 0xDC;       // selected row 0..11 (clamped in 0x805CBD04)
-+constexpr int kUniRows = 12;                   // the 12 colour / line-type rows
-+constexpr uint32_t kUniButtons = 0x29C0, kUniButtonStride = 0x100;  // embedded row-button nodes
-+constexpr uint32_t kUniSide = 0x487C;          // 0 HOME, 1 ROAD (L / R switch it)
++// --- The IMPORTED button + uniform list ---------------------------------------------------------
++// The Uniform editor gets a bottom-bar hint "Z IMPORT" in the game font. A free button the screen
++// ignores (GC Z-trigger / Wii Remote 1-2 / Classic Minus, read device-agnostically from pad.cpp via
++// MLB_UniCycleButtonHeld) opens a selection list of the imported uniforms (scan() folders by name,
++// plus "NONE"): up/down move, A chooses, B cancels. Choosing sets the current side's (HOME/ROAD)
++// uniform in the working copy and refreshes the preview (the editor-map hook 0x805A83F0 feeds the
++// working copy to the preview recompose); OK flushes to v3, cancel/reload restores.
++constexpr uint32_t kUniSide = 0x487C;          // 0 HOME, 1 ROAD (R switches it)
 +constexpr uint32_t kUniChanged = 0x41C4;       // "there are changes" flag
 +constexpr uint32_t kUniStyle = 0x80CFFBB8;     // team-name text style (as the marks rows)
-+constexpr uint32_t kUniLabelScratch = kDecalStride;  // spare bytes in the arena head
-+static_assert(kDecalStride + 16 * 2 <= kHeadBytes, "no room for the row label in the arena head");
-+constexpr uint32_t kNodeParent = 0x14, kNodePosX = 0x40, kNodePosY = 0x44;
-+constexpr float kUniRowScale = 0.40f, kUniGlyphHeight = 34.0f;  // kUniGlyphHeight: future centring
++constexpr uint32_t kUniLabelScratch = kDecalStride;  // scratch for one font string at a time
++static_assert(kDecalStride + 25 * 2 <= kHeadBytes, "no room for the font string in the arena head");
++constexpr uint32_t kUniButtons = 0x29C0, kNodeParent = 0x14;  // a column node, to parent in its layer
 +constexpr uint32_t kColNormal = 1, kColSelected = 4;  // text colour indices (kColSelected: tune in-game)
-+// This screen's input queries (take the input object): A, up, down, left, right, B.
-+constexpr uint32_t kQA = 0x80579D78, kQUp = 0x80579D70, kQDown = 0x80579D68, kQLeft = 0x80579D58,
-+                   kQRight = 0x80579D60, kQB = 0x80579D80;
++// All positions are in the column layer's units (column row 0 is at y 33, 26 per row). Tunable from
++// in-game screenshots.
++constexpr float kPromptX = 14.0f, kPromptY = 338.0f, kPromptScale = 0.55f;  // bottom-bar hint
++constexpr float kListX = 150.0f, kListY = 40.0f, kListStep = 28.0f, kListScale = 0.62f,
++                kListSelScale = 0.82f;  // the pop-up list
++
++enum { kClosed = 0, kListOpen = 1 };
 +
 +struct UniRow {
-+    uint32_t screen = 0, holder = 0, text = 0;
++    uint32_t screen = 0, holder = 0, text = 0;  // the bottom-bar hint
 +    std::vector<Entry> entries;
 +    int slot = -1;
 +    std::string home, road;  // the working copy, per side
-+    bool onRow = false, built = false;
++    bool prevBtn = false, built = false;
++    int mode = kClosed, cursor = 0;             // the list
++    std::vector<uint32_t> itemHolders, itemTexts;
 +} g_uni;
 +
 +bool UniActive(uint32_t s) { return Enabled() && s && g_uni.screen == s; }
++bool UniEditorOpen() { return Enabled() && g_uni.built && g_uni.screen != 0; }
 +uint8_t UniSide(uint32_t s) { return Memory::Read8(s + kUniSide) ? 1 : 0; }
 +std::string& UniPending(uint32_t s) { return UniSide(s) ? g_uni.road : g_uni.home; }
 +
-+int UniColIndex(uint32_t s) {
-+    const uint32_t list = Memory::Read32(s + kUniColListPtr);
-+    return list && Memory::Contains(list + kUniColIndex, 4) ? int(Memory::Read32(list + kUniColIndex)) : 0;
-+}
 +int UniPendingIndex(uint32_t s) {
 +    const std::string& p = UniPending(s);
 +    for (size_t i = 0; i < g_uni.entries.size(); ++i)
 +        if (g_uni.entries[i].folder == p) return int(i);
 +    return p.empty() ? -1 : int(g_uni.entries.size());  // chosen before but no longer listed
 +}
-+std::string UniLabel(uint32_t s) {
-+    const int i = UniPendingIndex(s);
-+    if (i < 0) return "NONE";
-+    if (i < int(g_uni.entries.size())) {
-+        const std::string& l = g_uni.entries[size_t(i)].label;
-+        return l.empty() ? std::string("IMPORTED") : l;
-+    }
-+    return UniPending(s);
++// List item name: index 0 is "NONE", then one per scan() folder.
++std::string UniItemName(int i) {
++    if (i <= 0) return "NONE";
++    const size_t e = size_t(i - 1);
++    if (e >= g_uni.entries.size()) return "IMPORTED";
++    return g_uni.entries[e].label.empty() ? g_uni.entries[e].folder : g_uni.entries[e].label;
 +}
 +
 +uint32_t UniNewNode(CpuContext* ctx, uint32_t parent) {
@@ -930,30 +935,20 @@ index 0000000..7e50a8c
 +    return node;
 +}
 +
-+// Position the row just below the last real row, in the rows' own layer (same units).
-+void UniPlaceRow(CpuContext* ctx, uint32_t s) {
-+    if (!g_uni.holder) return;
-+    const uint32_t row0 = s + kUniButtons, row1 = row0 + kUniButtonStride,
-+                   rowN = row0 + uint32_t(kUniRows - 1) * kUniButtonStride;
-+    const float x = F(row0 + kNodePosX);
-+    const float stride = F(row1 + kNodePosY) - F(row0 + kNodePosY);
-+    const float y = F(rowN + kNodePosY) + stride;
-+    CallF(ctx, 0x8001ABA0, g_uni.holder, kUniRowScale, kUniRowScale);
-+    CallF(ctx, 0x8001A7B0, g_uni.holder, x, y);
-+}
-+// The row's name (the side's pending uniform, or "NONE") and its selection colour.
++// Keep the bottom-bar hint ("Z IMPORT") placed and visible.
 +void UniSync(CpuContext* ctx, uint32_t s) {
 +    if (!g_uni.text) return;
-+    const uint32_t colour = g_uni.onRow ? kColSelected : kColNormal;
-+    Call(ctx, 0x807B4090, g_uni.text, colour);
-+    VCall(ctx, g_uni.text, 0x40, WriteName(g_arena + kUniLabelScratch, UniLabel(s)));
-+    Call(ctx, 0x807B4090, g_uni.text, colour);
-+    UniPlaceRow(ctx, s);
++    Call(ctx, 0x807B4090, g_uni.text, kColNormal);
++    VCall(ctx, g_uni.text, 0x40, WriteName(g_arena + kUniLabelScratch, "Z IMPORT"));
++    Call(ctx, 0x807B4090, g_uni.text, kColNormal);
++    CallF(ctx, 0x8001ABA0, g_uni.holder, kPromptScale, kPromptScale);
++    CallF(ctx, 0x8001A7B0, g_uni.holder, kPromptX, kPromptY);
++    (void)s;
 +}
 +
-+void UniBuildRow(CpuContext* ctx, uint32_t s) {
++void UniBuildPrompt(CpuContext* ctx, uint32_t s) {
 +    g_uni.screen = s;
-+    const uint32_t parent = Memory::Read32(s + kUniButtons + kNodeParent);  // the rows' layer
++    const uint32_t parent = Memory::Read32(s + kUniButtons + kNodeParent);  // the column's layer
 +    g_uni.holder = UniNewNode(ctx, parent ? parent : s);
 +    if (g_uni.holder) {
 +        g_uni.text = Call(ctx, 0x805C28D4, g_uni.holder, 0, Memory::Read32(kUniStyle) & 0xFFFF);
@@ -965,58 +960,107 @@ index 0000000..7e50a8c
 +    g_uni.built = g_uni.holder != 0;
 +}
 +
++// Highlight the cursor row (bigger + a different colour) and place every item.
++void UniRefreshList(CpuContext* ctx, uint32_t) {
++    for (size_t i = 0; i < g_uni.itemHolders.size(); ++i) {
++        const bool sel = int(i) == g_uni.cursor;
++        if (g_uni.itemHolders[i]) {
++            const float sc = sel ? kListSelScale : kListScale;
++            CallF(ctx, 0x8001ABA0, g_uni.itemHolders[i], sc, sc);
++            CallF(ctx, 0x8001A7B0, g_uni.itemHolders[i], kListX, kListY + float(i) * kListStep);
++        }
++        if (g_uni.itemTexts[i]) Call(ctx, 0x807B4090, g_uni.itemTexts[i], sel ? kColSelected : kColNormal);
++    }
++}
++
++void UniOpenList(CpuContext* ctx, uint32_t s) {
++    if (g_uni.mode == kListOpen) return;
++    const uint32_t parent = Memory::Read32(s + kUniButtons + kNodeParent);
++    const uint32_t layer = parent ? parent : s;
++    const uint32_t style = Memory::Read32(kUniStyle) & 0xFFFF;
++    const int n = int(g_uni.entries.size()) + 1;  // "NONE" + folders
++    for (int i = 0; i < n; ++i) {
++        const uint32_t h = UniNewNode(ctx, layer);
++        uint32_t t = 0;
++        if (h) {
++            t = Call(ctx, 0x805C28D4, h, 0, style);
++            if (t) {
++                Call(ctx, 0x8001AC60, t, 0);
++                CallF(ctx, 0x8001A7B0, t, 0, 0);
++                VCall(ctx, t, 0x40, WriteName(g_arena + kUniLabelScratch, UniItemName(i)));
++            }
++        }
++        g_uni.itemHolders.push_back(h);
++        g_uni.itemTexts.push_back(t);
++    }
++    const int pi = UniPendingIndex(s);
++    g_uni.cursor = (pi < 0 || pi + 1 >= n) ? 0 : pi + 1;
++    g_uni.mode = kListOpen;
++    UniRefreshList(ctx, s);
++}
++
++void UniCloseList(CpuContext* ctx) {
++    for (uint32_t t : g_uni.itemTexts)
++        if (t) VCall(ctx, t, 0x08, 1);
++    for (uint32_t h : g_uni.itemHolders)
++        if (h) VCall(ctx, h, 0x08, 1);
++    g_uni.itemTexts.clear();
++    g_uni.itemHolders.clear();
++    g_uni.mode = kClosed;
++}
++
++void UniPreviewRefresh(CpuContext* ctx, uint32_t s) { Call(ctx, 0x805CC73C, s, 1); }
++
++void UniChoose(CpuContext* ctx, uint32_t s) {
++    UniPending(s) = g_uni.cursor == 0 ? std::string() : g_uni.entries[size_t(g_uni.cursor - 1)].folder;
++    Memory::Write8(s + kUniChanged, 1);
++    Sound(ctx, 0x1001);
++    UniCloseList(ctx);
++    UniPreviewRefresh(ctx, s);
++    UniSync(ctx, s);
++}
++
++// List input (A/B/up/down) via the global edge queries; the game's column input is NOT run while open.
++void UniListInput(CpuContext* ctx, uint32_t s) {
++    const auto pressed = [&](uint32_t q) { return Call(ctx, q, 0) != 0; };
++    const int n = int(g_uni.itemHolders.size());
++    if (n <= 0) { UniCloseList(ctx); return; }
++    if (pressed(0x805EF2D8)) {  // up
++        g_uni.cursor = (g_uni.cursor + n - 1) % n;
++        Sound(ctx, 0x1004);
++        UniRefreshList(ctx, s);
++    } else if (pressed(0x805EF2E0)) {  // down
++        g_uni.cursor = (g_uni.cursor + 1) % n;
++        Sound(ctx, 0x1004);
++        UniRefreshList(ctx, s);
++    } else if (pressed(0x805EF2F8)) {  // A: choose
++        UniChoose(ctx, s);
++    } else if (pressed(0x805EF300)) {  // B: cancel
++        Sound(ctx, 0x1002);
++        UniCloseList(ctx);
++        UniSync(ctx, s);
++    }
++}
++
 +void UniTeardown(CpuContext* ctx) {
++    UniCloseList(ctx);
 +    for (uint32_t node : {g_uni.text, g_uni.holder})
 +        if (node) VCall(ctx, node, 0x08, 1);
 +    g_uni = {};
 +}
 +
-+// The column input (0x805CA548) with the row: our moves and keys first, the rest is the game's.
-+void UniInput(CpuContext* ctx, uint32_t s, uint32_t input) {
-+    const auto pressed = [&](uint32_t q) { return Call(ctx, q, input) != 0; };
-+    const bool a = pressed(kQA), up = pressed(kQUp), down = pressed(kQDown), left = pressed(kQLeft),
-+               right = pressed(kQRight);
-+    if (g_uni.onRow) {
-+        if (up) {  // leave the row, back to the last real row (the game's cursor is already there)
-+            g_uni.onRow = false;
-+            Sound(ctx, 0x1004);
-+            UniSync(ctx, s);
-+            ctx->gpr[3] = 1;  // M1: handled
-+            return;
-+        }
-+        if (a || left || right) {  // cycle the side's uniform (A / right = next, left = previous)
-+            const int next = CycleChoice(int(g_uni.entries.size()), UniPendingIndex(s), left ? -1 : +1);
-+            UniPending(s) = next < 0 ? std::string() : g_uni.entries[size_t(next)].folder;
-+            Memory::Write8(s + kUniChanged, 1);
-+            Sound(ctx, 0x1000);
-+            UniSync(ctx, s);
-+            ctx->gpr[3] = 1;  // M1: handled
-+            return;
-+        }
-+        if (down) {  // already at the bottom
-+            Sound(ctx, 0x1002);
-+            ctx->gpr[3] = 1;  // M1: handled
-+            return;
-+        }
-+        if (!pressed(kQB)) {  // idle frame: stay on the row (do NOT drop off on no input)
-+            UniSync(ctx, s);
-+            ctx->gpr[3] = 0;  // M1: nothing happened
-+            return;
-+        }
-+        g_uni.onRow = false;  // B (back): leave the row and let the game handle it below
-+    } else if (down && UniColIndex(s) == kUniRows - 1) {
-+        g_uni.onRow = true;  // down on the last real row: step onto the virtual IMPORTED row
++// Once per frame while the Uniform column is up and the list is closed: the free button (rising edge)
++// opens the list; the bottom-bar hint is kept placed.
++void UniFrame(CpuContext* ctx, uint32_t s) {
++    const bool held = MLB_UniCycleButtonHeld();
++    const bool edge = held && !g_uni.prevBtn;
++    g_uni.prevBtn = held;
++    if (edge) {
 +        Sound(ctx, 0x1004);
-+        UniSync(ctx, s);
-+        ctx->gpr[3] = 1;  // M1: handled
++        UniOpenList(ctx, s);
 +        return;
 +    }
-+    ctx->gpr[3] = s;
-+    ctx->gpr[4] = input;
-+    func_805CA548(ctx);
-+    const uint32_t ret = ctx->gpr[3];  // M1: the original's return, preserved past our UniSync
-+    if (UniActive(s)) UniSync(ctx, s);
-+    ctx->gpr[3] = ret;
++    UniSync(ctx, s);
 +}
 +
 +}  // namespace row_ui
@@ -1059,6 +1103,12 @@ index 0000000..7e50a8c
 +        if (record) {
 +            SetIdxFromRecord(0, record, true);
 +            SetIdxFromRecord(1, record, false);
++            // While the Uniform editor is open, the preview must show the working copy (not the saved
++            // choice), so the list selection previews live before OK.
++            if (row_ui::UniEditorOpen()) {
++                g_idxFolder[0] = row_ui::g_uni.home;
++                g_idxFolder[1] = row_ui::g_uni.road;
++            }
 +            if (g_trace)
 +                std::fprintf(stderr, "[arrange-uniform] 805A83F0 rec=%08x home='%s' road='%s'\n", record,
 +                             g_idxFolder[0].c_str(), g_idxFolder[1].c_str());
@@ -1116,8 +1166,8 @@ index 0000000..7e50a8c
 +    // never flushes an empty choice over a saved one when build runs without a following open.
 +    row_ui::g_uni.home = live.uniformHome;
 +    row_ui::g_uni.road = live.uniformRoad;
-+    row_ui::g_uni.onRow = false;
-+    row_ui::UniBuildRow(ctx, s);
++    row_ui::g_uni.prevBtn = false;
++    row_ui::UniBuildPrompt(ctx, s);
 +    row_ui::UniSync(ctx, s);
 +    ctx->lr = lr;
 +    ctx->gpr[3] = ret;
@@ -1136,23 +1186,33 @@ index 0000000..7e50a8c
 +        row_ui::g_uni.slot >= 0 ? arrange_marks::liveChoices()[size_t(row_ui::g_uni.slot)] : Choice{};
 +    row_ui::g_uni.home = live.uniformHome;
 +    row_ui::g_uni.road = live.uniformRoad;
-+    row_ui::g_uni.onRow = false;
++    row_ui::g_uni.prevBtn = false;
 +    row_ui::UniSync(ctx, s);
 +    ctx->lr = lr;
 +    ctx->gpr[3] = ret;
 +}
 +REGISTER_NATIVE_FUNCTION_AS(0x805CC0F8, MLB_ArrangeUniformScreenOpen_805CC0F8, "MLB_ArrangeUniformScreenOpen_805CC0F8");
 +
-+// 0x805CA548: the column input (mode 0). On the IMPORTED row we cycle the side's uniform.
++// 0x805CA548: the Uniform column input (runs each frame in column mode). With the list open we take
++// all input (and do NOT run the game's column input); otherwise the game runs, then our per-frame
++// step watches the free button and keeps the hint placed.
 +extern "C" void MLB_ArrangeUniformColumnInput_805CA548(CpuContext* ctx) {
-+    const uint32_t s = ctx->gpr[3], input = ctx->gpr[4];
-+    if (!row_ui::UniActive(s) || !row_ui::g_uni.built) {
-+        func_805CA548(ctx);
++    const uint32_t s = ctx->gpr[3];
++    if (row_ui::UniActive(s) && row_ui::g_uni.built && row_ui::g_uni.mode == row_ui::kListOpen) {
++        const uint32_t lr = ctx->lr;
++        row_ui::UniListInput(ctx, s);
++        ctx->lr = lr;
++        ctx->gpr[3] = 1;  // handled
 +        return;
 +    }
-+    const uint32_t lr = ctx->lr;
-+    row_ui::UniInput(ctx, s, input);
-+    ctx->lr = lr;
++    func_805CA548(ctx);
++    const uint32_t ret = ctx->gpr[3];
++    if (row_ui::UniActive(s) && row_ui::g_uni.built) {
++        const uint32_t lr = ctx->lr;
++        row_ui::UniFrame(ctx, s);
++        ctx->lr = lr;
++    }
++    ctx->gpr[3] = ret;
 +}
 +REGISTER_NATIVE_FUNCTION_AS(0x805CA548, MLB_ArrangeUniformColumnInput_805CA548, "MLB_ArrangeUniformColumnInput_805CA548");
 +
@@ -1240,7 +1300,7 @@ index d8f0c80..83ea471 100644
      }
      
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index 5024e22..673c5f9 100644
+index 5024e22..e64c992 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
 @@ -299,6 +299,7 @@ constexpr int kOpenTextureStudio = -4;
@@ -1693,3 +1753,48 @@ index 84bb6e5..8ae4615 100644
      {
          std::istringstream input("[video]\nmetalfx_spatial_upscaling = true\n");
          const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "enabled.toml");
+diff --git a/runtime/src/hle/input/pad.cpp b/runtime/src/hle/input/pad.cpp
+index d1c95f1..85eabf7 100644
+--- a/runtime/src/hle/input/pad.cpp
++++ b/runtime/src/hle/input/pad.cpp
+@@ -20,6 +20,9 @@
+ namespace {
+ 
+ std::atomic<bool> g_rumbleEnabled{true};
++// Arrange imported-uniforms (arrange_uniforms.cpp): a free "cycle" button the Uniform editor ignores,
++// held state refreshed every PADRead. Read device-agnostically there via MLB_UniCycleButtonHeld().
++std::atomic<bool> g_uniCycleHeld{false};
+ 
+ bool NativeButtonHeld(SDL_Gamepad* gamepad, uint32_t nativeButton) {
+     if (gamepad == nullptr || nativeButton == PAD_NATIVE_BUTTON_INVALID ||
+@@ -154,6 +157,11 @@ extern "C" void PAD_HLE_SetRumbleEnabled(bool enabled)
+     g_rumbleEnabled.store(enabled, std::memory_order_relaxed);
+ }
+ 
++#if defined(WIICOMPILED_GAME_RL8E54)
++// arrange_uniforms.cpp: held state of the Arrange Uniform editor's free "cycle" button this frame.
++extern "C" bool MLB_UniCycleButtonHeld() { return g_uniCycleHeld.load(std::memory_order_relaxed); }
++#endif
++
+ extern "C" uint32_t PAD__Init_HLE()
+ {
+     return PADInit() ? 1u : 0u;
+@@ -185,6 +193,18 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
+ #endif
+     ScaleSticksToGameCubeRange(statuses);
+ 
++#if defined(WIICOMPILED_GAME_RL8E54)
++    {
++        // A free "cycle" button for the Arrange Uniform editor (it ignores these): GC Z-trigger (what
++        // the live probe injects, and GameCube / Classic-as-pad), Wii Remote 1 / 2, Classic Minus.
++        bool held = (statuses[0].button & 0x0010u) != 0;
++        WiiRemoteInput::KpadSample ks{};
++        if (!held && WiiRemoteInput::ReadKpadSample(0, ks))
++            held = (ks.hold & 0x0300u) != 0 || (ks.clHold & 0x1000u) != 0;
++        g_uniCycleHeld.store(held, std::memory_order_relaxed);
++    }
++#endif
++
+     try {
+         for (uint32_t i = 0; i < PAD_CHANMAX; ++i) {
+             WritePadStatus(statusPtr + static_cast<uint32_t>(i * PadStatusContract::kGuestStatusSize),
