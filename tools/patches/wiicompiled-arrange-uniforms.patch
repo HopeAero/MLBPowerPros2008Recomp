@@ -440,10 +440,10 @@ index fcc3345..0409245 100644
  
 diff --git a/runtime/src/hle/mlb/arrange_uniforms.cpp b/runtime/src/hle/mlb/arrange_uniforms.cpp
 new file mode 100644
-index 0000000..8b15eb9
+index 0000000..30580c0
 --- /dev/null
 +++ b/runtime/src/hle/mlb/arrange_uniforms.cpp
-@@ -0,0 +1,868 @@
+@@ -0,0 +1,947 @@
 +// Imported uniforms for Arrange teams ([arrange] custom_uniforms): a team that chose an imported
 +// uniform (a .ppu baked by Uniform Studio, in UserData/arrange/uniforms/<folder>) wears it natively
 +// wherever the game draws that team. Addresses and evidence: docs/ingenieria-inversa.md ("Uniforme
@@ -897,19 +897,28 @@ index 0000000..8b15eb9
 +constexpr int kUniRows = 12;
 +constexpr uint32_t kColNormal = 1, kColSelected = 4;  // text colour indices (kColSelected: tune in-game)
 +constexpr uint32_t kListPack = 0x929, kListCell = 0x40073EB0;  // the game's list-cell image (marks)
-+// All positions are in the column layer's units (column row 0 is at y 33, 26 per row). Tunable from
-+// in-game screenshots.
 +// The IMPORT hint sits in the bottom bar area, to the RIGHT of the game's "A ADVANCE / B BACK / MOVE
-+// CRS" (not in the left column): the real button glyph + "IMPORT".
-+// Button glyphs: the game draws them with 0x8001DFB8(node, kGlyphPack, 0x8055F810(buttonId, 0)); the
-+// Uniform screen itself does this for A(4) and B(5). 0x8055F810 picks the glyph for the current
-+// controller. kGlyphButtonId is the id for our free button (Z / trigger); its exact value is a tunable
-+// (the enum is 0-3 dpad, 4 A, 5 B, then X/Y/Z/L/R/... — 8 is the best guess for Z/trigger).
++// CRS" (not in the left column). Button glyphs: the game draws them with
++// 0x8001DFB8(node, kGlyphPack, 0x8055F810(buttonId, 0)) for A(4)/B(5), but 0x8055F810 is INLINED and
++// not a callable native (calling it crashes "Missing translated function"), so the hint is text-only
++// ("Z IMPORT") until a callable glyph path is found.
 +constexpr float kHintX = 330.0f, kHintY = 385.0f, kHintScale = 0.55f;
-+// The selection list replaces the (hidden) left column: same left X, top to bottom.
-+constexpr float kListX = 14.0f, kListY = 42.0f, kListStep = 23.0f;
-+constexpr float kCellScale = 1.25f, kTextScale = 0.46f, kTextSelScale = 0.54f;  // cell / label sizes
-+constexpr float kTitleX = 14.0f, kTitleY = 16.0f, kTitleScale = 0.55f;  // list title
++// --- The dedicated uniform-selection panel ------------------------------------------------------
++// It takes over the hidden left column (all positions are in the column layer's units: column row 0
++// sits at y 33, 26 per row). A list-cell image is stretched into a white rounded panel behind the
++// rows (like the Team Mark screen's white list panel), a title sits at the top, up to kVisibleRows
++// pill cells (the SAME pack 0x929 cell the Team Mark list uses) scroll through the uniforms, and the
++// HOME / ROAD chibi models on the right stay on screen as the live preview (the cursor previews the
++// hovered uniform through 0x805CC73C -> 0x805A83F0). Everything here is tunable from in-game shots.
++constexpr int kVisibleRows = 11;              // pill rows shown at once (the list scrolls past this)
++constexpr float kListX = 10.0f, kListY = 46.0f, kListStep = 24.0f;    // first cell / per-row step
++constexpr float kCellScale = 1.3f;            // normal pill scale (x = y)
++constexpr float kCellSelScaleX = 1.44f;       // selected pill: wider (the cursor), same height
++constexpr float kTextScale = 0.5f, kTextSelScale = 0.6f;              // label sizes (normal / cursor)
++constexpr float kTextX = 5.0f, kTextY = 2.0f; // label offset inside its pill
++constexpr float kTitleX = 8.0f, kTitleY = 14.0f, kTitleScale = 0.62f; // the title ("HOME/ROAD UNIFORM")
++// Background panel: one list-cell image stretched (independent x / y) into a tall white panel.
++constexpr float kBgX = 2.0f, kBgY = 6.0f, kBgScaleX = 1.95f, kBgScaleY = 15.5f;
 +
 +enum { kClosed = 0, kListOpen = 1 };
 +
@@ -919,9 +928,11 @@ index 0000000..8b15eb9
 +    int slot = -1;
 +    std::string home, road;  // the working copy, per side
 +    bool prevBtn = false, built = false;
-+    int mode = kClosed, cursor = 0;             // the selection panel
-+    uint32_t titleHolder = 0, titleText = 0;
-+    std::vector<uint32_t> itemCells, itemHolders, itemTexts;
++    int mode = kClosed, cursor = 0, firstVis = 0;  // the selection panel + its scroll window
++    uint32_t titleHolder = 0, titleText = 0, bg = 0;
++    std::vector<uint32_t> itemCells, itemHolders, itemTexts;  // kVisibleRows reused rows
++    std::string openHome, openRoad;  // working copy snapshot at open (B restores it)
++    uint8_t openChanged = 0;         // screen+0x41C4 snapshot at open
 +} g_uni;
 +
 +bool UniActive(uint32_t s) { return Enabled() && s && g_uni.screen == s; }
@@ -960,6 +971,17 @@ index 0000000..8b15eb9
 +        CallF(ctx, 0x8001A7B0, cell, x, y);
 +    }
 +    return cell;
++}
++// The same list-cell image stretched (independent x / y) into a flat white panel: the picker's
++// background, so the list reads as its own screen panel (like the Team Mark white list area).
++uint32_t UniNewPanel(CpuContext* ctx, uint32_t parent, float x, float y, float sx, float sy) {
++    const uint32_t node = UniNewNode(ctx, parent);
++    if (node) {
++        Call(ctx, 0x8001DFB8, node, kListPack, kListCell);
++        CallF(ctx, 0x8001ABA0, node, sx, sy);
++        CallF(ctx, 0x8001A7B0, node, x, y);
++    }
++    return node;
 +}
 +
 +// Keep the bottom-bar IMPORT hint (real button glyph + "IMPORT") placed and visible, to the right of
@@ -1005,17 +1027,52 @@ index 0000000..8b15eb9
 +    if (show) Call(ctx, 0x805CC1A4, s);  // restore the normal (un-dimmed) column state
 +}
 +
-+// Highlight the cursor row (bigger label + a different colour); cells stay put.
-+void UniRefreshList(CpuContext* ctx, uint32_t) {
-+    for (size_t i = 0; i < g_uni.itemHolders.size(); ++i) {
-+        const bool sel = int(i) == g_uni.cursor;
-+        if (g_uni.itemHolders[i]) {
-+            const float sc = sel ? kTextSelScale : kTextScale;
-+            CallF(ctx, 0x8001ABA0, g_uni.itemHolders[i], sc, sc);
-+            CallF(ctx, 0x8001A7B0, g_uni.itemHolders[i], kListX + 4.0f, kListY + float(i) * kListStep + 2.0f);
++// Bind the kVisibleRows reused rows to the scroll window around the cursor, highlight the cursor
++// (wider pill + bigger, brighter label), and hide the rows past the end of the list.
++void UniRefreshList(CpuContext* ctx, uint32_t s) {
++    const int n = int(g_uni.entries.size()) + 1;  // "NONE" + folders
++    int first = g_uni.firstVis;
++    if (g_uni.cursor < first) first = g_uni.cursor;
++    if (g_uni.cursor >= first + kVisibleRows) first = g_uni.cursor - kVisibleRows + 1;
++    if (first > n - kVisibleRows) first = n > kVisibleRows ? n - kVisibleRows : 0;
++    if (first < 0) first = 0;
++    g_uni.firstVis = first;
++    for (int i = 0; i < int(g_uni.itemCells.size()); ++i) {
++        const int item = first + i;
++        const uint32_t cell = g_uni.itemCells[size_t(i)], h = g_uni.itemHolders[size_t(i)],
++                       t = g_uni.itemTexts[size_t(i)];
++        const bool used = item < n;
++        if (cell) SetVisible(ctx, cell, used);
++        if (h) SetVisible(ctx, h, used);
++        if (!used) {
++            if (t) VCall(ctx, t, 0x40, WriteName(g_arena + kUniLabelScratch, ""));
++            continue;
 +        }
-+        if (g_uni.itemTexts[i]) Call(ctx, 0x807B4090, g_uni.itemTexts[i], sel ? kColSelected : kColNormal);
++        const bool sel = item == g_uni.cursor;
++        const float y = kListY + float(i) * kListStep;
++        if (cell) {
++            CallF(ctx, 0x8001ABA0, cell, sel ? kCellSelScaleX : kCellScale, kCellScale);
++            CallF(ctx, 0x8001A7B0, cell, kListX, y);
++        }
++        if (h) {
++            const float sc = sel ? kTextSelScale : kTextScale;
++            CallF(ctx, 0x8001ABA0, h, sc, sc);
++            CallF(ctx, 0x8001A7B0, h, kListX + kTextX, y + kTextY);
++        }
++        if (t) {
++            VCall(ctx, t, 0x40, WriteName(g_arena + kUniLabelScratch, UniItemName(item)));
++            Call(ctx, 0x807B4090, t, sel ? kColSelected : kColNormal);
++        }
 +    }
++    (void)s;
++}
++
++void UniLivePreview(CpuContext* ctx, uint32_t s) {
++    // Drive the HOME / ROAD models to the hovered uniform: the working copy feeds the preview
++    // recompose through 0x805CC73C -> (our hooked) 0x805A83F0. The "changed" flag is NOT touched here,
++    // so merely browsing never dirties the slot; only A (UniChoose) commits a change.
++    UniPending(s) = g_uni.cursor <= 0 ? std::string() : g_uni.entries[size_t(g_uni.cursor - 1)].folder;
++    Call(ctx, 0x805CC73C, s, 1);
 +}
 +
 +void UniOpenList(CpuContext* ctx, uint32_t s) {
@@ -1023,8 +1080,13 @@ index 0000000..8b15eb9
 +    const uint32_t parent = Memory::Read32(s + kUniButtons + kNodeParent);
 +    const uint32_t layer = parent ? parent : s;
 +    const uint32_t style = Memory::Read32(kUniStyle) & 0xFFFF;
-+    UniShowColumn(ctx, s, false);  // hide the 12 column rows; the list takes their place (no overlap)
-+    // Title ("SELECT UNIFORM") in the game font above the list.
++    UniShowColumn(ctx, s, false);  // hide the 12 column rows; the panel takes their place (no overlap)
++    // Snapshot the working copy and the changed flag so B restores exactly what was there on open.
++    g_uni.openHome = g_uni.home;
++    g_uni.openRoad = g_uni.road;
++    g_uni.openChanged = Memory::Read8(s + kUniChanged);
++    // The white background panel, then the title, then the reused scroll rows.
++    g_uni.bg = UniNewPanel(ctx, layer, kBgX, kBgY, kBgScaleX, kBgScaleY);
 +    g_uni.titleHolder = UniNewNode(ctx, layer);
 +    if (g_uni.titleHolder) {
 +        CallF(ctx, 0x8001ABA0, g_uni.titleHolder, kTitleScale, kTitleScale);
@@ -1033,14 +1095,14 @@ index 0000000..8b15eb9
 +        if (g_uni.titleText) {
 +            Call(ctx, 0x8001AC60, g_uni.titleText, 0);
 +            CallF(ctx, 0x8001A7B0, g_uni.titleText, 0, 0);
-+            Call(ctx, 0x807B4090, g_uni.titleText, kColNormal);
-+            VCall(ctx, g_uni.titleText, 0x40, WriteName(g_arena + kUniLabelScratch, "SELECT UNIFORM"));
++            Call(ctx, 0x807B4090, g_uni.titleText, kColSelected);
++            VCall(ctx, g_uni.titleText, 0x40,
++                  WriteName(g_arena + kUniLabelScratch, UniSide(s) ? "ROAD UNIFORM" : "HOME UNIFORM"));
 +        }
 +    }
-+    const int n = int(g_uni.entries.size()) + 1;  // "NONE" + folders
-+    for (int i = 0; i < n; ++i) {
++    for (int i = 0; i < kVisibleRows; ++i) {
 +        const float y = kListY + float(i) * kListStep;
-+        g_uni.itemCells.push_back(UniNewCell(ctx, layer, kListX, y, kCellScale));  // the panel image
++        g_uni.itemCells.push_back(UniNewCell(ctx, layer, kListX, y, kCellScale));  // the pill image
 +        const uint32_t h = UniNewNode(ctx, layer);
 +        uint32_t t = 0;
 +        if (h) {
@@ -1048,16 +1110,18 @@ index 0000000..8b15eb9
 +            if (t) {
 +                Call(ctx, 0x8001AC60, t, 0);
 +                CallF(ctx, 0x8001A7B0, t, 0, 0);
-+                VCall(ctx, t, 0x40, WriteName(g_arena + kUniLabelScratch, UniItemName(i)));
 +            }
 +        }
 +        g_uni.itemHolders.push_back(h);
 +        g_uni.itemTexts.push_back(t);
 +    }
++    const int n = int(g_uni.entries.size()) + 1;  // "NONE" + folders
 +    const int pi = UniPendingIndex(s);
-+    g_uni.cursor = (pi < 0 || pi + 1 >= n) ? 0 : pi + 1;
++    g_uni.cursor = (pi < 0 || pi + 1 >= n) ? 0 : pi + 1;  // start on the saved choice, else "NONE"
++    g_uni.firstVis = 0;
 +    g_uni.mode = kListOpen;
 +    UniRefreshList(ctx, s);
++    UniLivePreview(ctx, s);
 +}
 +
 +void UniCloseList(CpuContext* ctx) {
@@ -1070,18 +1134,21 @@ index 0000000..8b15eb9
 +        if (c) VCall(ctx, c, 0x08, 1);
 +    if (g_uni.titleText) VCall(ctx, g_uni.titleText, 0x08, 1);
 +    if (g_uni.titleHolder) VCall(ctx, g_uni.titleHolder, 0x08, 1);
++    if (g_uni.bg) VCall(ctx, g_uni.bg, 0x08, 1);
 +    g_uni.itemTexts.clear();
 +    g_uni.itemHolders.clear();
 +    g_uni.itemCells.clear();
-+    g_uni.titleText = g_uni.titleHolder = 0;
++    g_uni.titleText = g_uni.titleHolder = g_uni.bg = 0;
 +    g_uni.mode = kClosed;
++    g_uni.firstVis = 0;
 +    if (wasOpen && g_uni.screen) UniShowColumn(ctx, g_uni.screen, true);  // restore the column rows
 +}
 +
 +void UniPreviewRefresh(CpuContext* ctx, uint32_t s) { Call(ctx, 0x805CC73C, s, 1); }
 +
++// A: commit the hovered choice (the working copy already holds it from the live preview) and close.
 +void UniChoose(CpuContext* ctx, uint32_t s) {
-+    UniPending(s) = g_uni.cursor == 0 ? std::string() : g_uni.entries[size_t(g_uni.cursor - 1)].folder;
++    UniPending(s) = g_uni.cursor <= 0 ? std::string() : g_uni.entries[size_t(g_uni.cursor - 1)].folder;
 +    Memory::Write8(s + kUniChanged, 1);
 +    Sound(ctx, 0x1001);
 +    UniCloseList(ctx);
@@ -1089,25 +1156,37 @@ index 0000000..8b15eb9
 +    UniSync(ctx, s);
 +}
 +
++// B: drop the browsing and restore the working copy / changed flag as they were on open.
++void UniCancel(CpuContext* ctx, uint32_t s) {
++    g_uni.home = g_uni.openHome;
++    g_uni.road = g_uni.openRoad;
++    Memory::Write8(s + kUniChanged, g_uni.openChanged);
++    Sound(ctx, 0x1002);
++    UniCloseList(ctx);
++    UniPreviewRefresh(ctx, s);
++    UniSync(ctx, s);
++}
++
 +// List input (A/B/up/down) via the global edge queries; the game's column input is NOT run while open.
++// up/down scroll the cursor over all items (NONE + folders) and live-preview the hovered uniform.
 +void UniListInput(CpuContext* ctx, uint32_t s) {
 +    const auto pressed = [&](uint32_t q) { return Call(ctx, q, 0) != 0; };
-+    const int n = int(g_uni.itemHolders.size());
-+    if (n <= 0) { UniCloseList(ctx); return; }
++    const int n = int(g_uni.entries.size()) + 1;  // "NONE" + folders
++    if (n <= 0 || g_uni.itemHolders.empty()) { UniCancel(ctx, s); return; }
 +    if (pressed(0x805EF2D8)) {  // up
 +        g_uni.cursor = (g_uni.cursor + n - 1) % n;
 +        Sound(ctx, 0x1004);
 +        UniRefreshList(ctx, s);
++        UniLivePreview(ctx, s);
 +    } else if (pressed(0x805EF2E0)) {  // down
 +        g_uni.cursor = (g_uni.cursor + 1) % n;
 +        Sound(ctx, 0x1004);
 +        UniRefreshList(ctx, s);
++        UniLivePreview(ctx, s);
 +    } else if (pressed(0x805EF2F8)) {  // A: choose
 +        UniChoose(ctx, s);
 +    } else if (pressed(0x805EF300)) {  // B: cancel
-+        Sound(ctx, 0x1002);
-+        UniCloseList(ctx);
-+        UniSync(ctx, s);
++        UniCancel(ctx, s);
 +    }
 +}
 +
