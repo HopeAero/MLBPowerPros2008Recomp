@@ -2,6 +2,13 @@
 
 Estado para la próxima sesión o IA. Se sobrescribe al cerrar cada tanda de trabajo; el historial está en `git log -p docs/traspaso.md`. Las secciones de abajo son notas por fase de sesiones anteriores.
 
+## Uniformes importados en Arrange (7 de noviembre de 2026; Claude, plan por tareas)
+
+- **Parche** `tools/patches/wiicompiled-arrange-uniforms.patch`, registrado el último en `tools/wiicompiled-translate.ps1` (después de `wiicompiled-arrange-marks`). Diseño y plan en `docs/superpowers/{specs,plans}/2026-11-07-arrange-imported-uniforms*`; uso y límites en `docs/mods.md` («Uniformes importados (Arrange)»). Opción `[arrange] custom_uniforms`, EXPERIMENTAL, apagada por defecto; el bloque `MLBARRMK` pasa a la versión 3 (riesgo de downgrade en `docs/trampas.md`).
+- **Cadena de parches:** el parche se regeneró (solo contexto de `game_heaps.cpp` y `launcher.cpp`) para que aplique limpio sobre el árbol fijado más la cadena de `wiicompiled-translate.ps1`; antes llevaba contexto de `experimentos/animaciones`, que no está en la cadena. El `local/wiicompiled-mlb/src` de trabajo tiene ese parche de animaciones y otras diferencias, así que no coincide byte a byte con una cadena nueva. `ctest` (arrange_marks, arrange_uniforms, arrange_marks_save, arrange_marks_texture, runtime_config) pasa.
+- **Pendiente:** (1) build de Switch (`tools/switch/build-nro.sh`, `MLB_SWITCH_JOBS=2..3`) y regenerar los parches de Switch; (2) **una** prueba en consola: crear un uniforme en Uniform Studio, ponerlo en `sdmc:/switch/mlbpowerpros2008/UserData/arrange/uniforms/` para un equipo de Arrange, jugar una Exhibición y comprobar por nxlink que no hay errores y que la extensión se guardó; (3) Temporada y MLB Life.
+- **Por afinar en el primer build en el juego:** 4 constantes de UI de la fila IMPORTED (entre ellas el color de resaltado, el diseño de los nodos de la fila y el sentido IZQ/DER).
+
 ## Marcas y logotipos propios en Arrange (6–7 de noviembre de 2026; Claude, plan por tareas)
 
 - **Parche** `tools/patches/wiicompiled-arrange-marks.patch`, último de `tools/wiicompiled-translate.ps1` (después de `wiicompiled-modern-postseason`). Diseño/plan en `docs/superpowers/{specs,plans}/2026-11-06-arrange-custom-marks*`; uso y límites en `docs/mods.md` («Marcas y logotipos propios (Arrange)», EN `docs/en/mods.md`); RE en `docs/ingenieria-inversa.md` (final de «Equipos Arrange»). Evidencia privada: `local/analysis/arrange/` (`hooks.md`, `task8/`, `task9/`) y `.superpowers/sdd/2026-11-06-arrange-custom-marks/`.

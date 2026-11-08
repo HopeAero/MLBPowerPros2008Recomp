@@ -12,6 +12,7 @@ Modding is what keeps a game like this alive: rosters, textures, stadiums, seaso
 - **Season Editor:** real schedules 2002–2026, start year, DH, 15/15 leagues.
 - **Rosters:** PowerUp+ adapted to 2008, imported into every mode, MLB Life included.
 - **Stadiums:** Blender add-on that builds a stadium from scratch and previews it in the game.
+- **Imported uniforms in Arrange:** your own uniforms (logos, text, colors; 2K `.iff` and MVP `.fsh`) made in Uniform Studio and picked per side on the uniform screen (experimental ENHANCEMENTS option; [mods.md](../mods.md#imported-uniforms-arrange)). Tested on PC.
 - **Arrange marks and logos:** your own PNGs as the mark and logo of Arrange teams, picked in the game's screens and saved with the game (experimental ENHANCEMENTS option; [mods.md](../mods.md#custom-marks-and-logos-arrange)). Tested on PC; the Switch test is pending.
 
 ## Next
@@ -27,3 +28,5 @@ Modding is what keeps a game like this alive: rosters, textures, stadiums, seaso
 - [ ] Mod list with conflicts shown in the launcher
 - [x] Custom PNG marks and logos in Arrange (PC)
 - [ ] Arrange marks and logos: Switch test, Season and League
+- [x] Imported uniforms in Arrange (PC)
+- [ ] Imported uniforms in Arrange: Switch and Season test

@@ -253,6 +253,26 @@ UserData\arrange\
 
 Patch `wiicompiled-arrange-marks`. Technical details in `docs/en/reverse-engineering.md` ("Custom marks and logos").
 
+## Imported uniforms (Arrange)
+
+Your own uniforms for Arrange teams, made with the Uniform Studio editor. It is not a mod: it does not go in `mods\`.
+
+- **Enabling:** the **CUSTOM UNIFORMS (ARRANGE)** option on the launcher's ENHANCEMENTS tab. It is off by default and tagged EXPERIMENTAL. In `Config.toml` it is `[arrange] custom_uniforms = true`.
+- **Folder** (the launcher creates it when the option is turned on): `UserData\arrange\uniforms\<name>\uniform.ppu`. On Switch it is `sdmc:/switch/mlbpowerpros2008/UserData/arrange/uniforms/<name>/uniform.ppu`.
+- **Editor:** **Uniform Studio** (`UniformStudio.exe`, a PC tool; open it from the launcher's TOOLS > UNIFORM STUDIO). It is simple: pick the uniform, place logos and text, adjust the colors and save the `.ppu` in the folder above.
+- **What is imported:** logos, text and colors. MLB 2K `.iff` files and MVP Baseball `.fsh` files work as a starting point.
+
+**How to use it**
+- Arrange > a team > the game's uniform screen: each side (HOME and ROAD) has an **IMPORTED** entry that cycles through your uniforms. It is chosen per side.
+- The choice is saved with the game (`pm3usma.dat`), in the same extension as the marks, which becomes version 3.
+- With the option off, the game is the original.
+
+**Limits**
+- **128x128 resolution:** the game's uniform is a 128x128 pixel atlas. Long or small lettering loses sharpness and looks pixelated.
+- The Switch test is pending.
+
+Patch `wiicompiled-arrange-uniforms`. Design in `docs/superpowers/specs/2026-11-07-arrange-imported-uniforms-design.md` (Spanish).
+
 ## Rules
 
 A mod must only bring its own files or differences, **never copies of the game** (no unmodified original textures, no `project.bin`, no executable).

@@ -1184,10 +1184,10 @@ index 0000000..7e50a8c
 +}
 +REGISTER_NATIVE_FUNCTION_AS(0x805C9EF4, MLB_ArrangeUniformScreenDtor_805C9EF4, "MLB_ArrangeUniformScreenDtor_805C9EF4");
 diff --git a/runtime/src/hle/mlb/game_heaps.cpp b/runtime/src/hle/mlb/game_heaps.cpp
-index 5c22428..5f8e92f 100644
+index acf856e..683e74b 100644
 --- a/runtime/src/hle/mlb/game_heaps.cpp
 +++ b/runtime/src/hle/mlb/game_heaps.cpp
-@@ -19,6 +19,12 @@
+@@ -18,6 +18,12 @@
  #include "hle_stubs.h"
  #include "memory.h"
  
@@ -1200,8 +1200,8 @@ index 5c22428..5f8e92f 100644
  namespace mlb_heaps {
  
  constexpr uint32_t kMem1Heap = 0x802B57A8, kMem2Heap = 0x802B57C8;
-@@ -52,6 +58,8 @@ uint32_t Setup(CpuContext* cpu) {
-     set(kMem2Hi, animation_overrides::Reserve(lo2, get(kMem2Hi)));
+@@ -50,6 +56,8 @@ uint32_t Setup(CpuContext* cpu) {
+     const uint32_t lo2 = (get(kMem2Lo) + 31) & ~31u;
      // Custom Arrange marks ([arrange] custom_marks): their textures live above the heap.
      set(kMem2Hi, arrange_marks::ReserveGuestMemory(lo2, get(kMem2Hi)));
 +    // Custom Arrange uniforms ([arrange] custom_uniforms): their textures live below the marks arena.
@@ -1240,18 +1240,18 @@ index d8f0c80..83ea471 100644
      }
      
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index 1fa8ed1..18e5e19 100644
+index 5024e22..673c5f9 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
-@@ -300,6 +300,7 @@ constexpr int kOpenSavesFolder = -5;
+@@ -299,6 +299,7 @@ constexpr int kOpenTextureStudio = -4;
+ constexpr int kOpenSavesFolder = -5;
  constexpr int kOpenSeasonStudio = -6;
  constexpr int kOpenCallnameStudio = -7;
- constexpr int kOpenAnimationStudio = -8;
 +constexpr int kOpenUniformStudio = -9;
  constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, MEJORAS; HERRAMIENTAS follows it
  constexpr int kEnhancementsTab = 4;
  
-@@ -392,6 +393,10 @@ constexpr Phrase kCallnameStudioHelp{
+@@ -387,6 +388,10 @@ constexpr Phrase kCallnameStudioHelp{
      "Crea callnames con tu audio WAV o MP3 y asígnalos en PowerUp+ (MODS > EDITAR ROSTER). Activa el mod para usarlos.",
      "Create callnames with your WAV or MP3 audio and assign them in PowerUp+ (MODS > EDIT ROSTER). Enable the mod to use them."};
  
@@ -1262,15 +1262,15 @@ index 1fa8ed1..18e5e19 100644
  constexpr Phrase kSeasonStudioHelp{
      "Abre el Editor de temporada, en su propia ventana:\n\n"
      "- Qué tendrá una partida nueva del modo Temporada o de MLB Life (año, calendario, DH, ligas) y de qué mod "
-@@ -516,6 +521,7 @@ void OpenStudio(const wchar_t* exe) {
+@@ -526,6 +531,7 @@ void OpenStudio(const wchar_t* exe) {
  void OpenTextureStudio() { OpenStudio(L"TextureStudio.exe"); }
  void OpenSeasonStudio() { OpenStudio(L"SeasonStudio.exe"); }
  void OpenCallnameStudio() { OpenStudio(L"CallnameStudio.exe"); }
 +void OpenUniformStudio() { OpenStudio(L"UniformStudio.exe"); }
- void OpenAnimationStudio() {
- #if defined(_WIN32)
-     const auto directory = RuntimeConfigFile::ExecutableDirectory();
-@@ -806,6 +812,15 @@ Result Run(int argc, char** argv) {
+ 
+ // The folder whose saves the game uses with these mods: <user data>\ModSaves\<mods> for roster mods,
+ // else the NAND's own save folder.
+@@ -800,6 +806,15 @@ Result Run(int argc, char** argv) {
                             "initial."),
                          YesNo(), RuntimeConfigFile::ArrangeCustomMarks(false) ? 1 : 0};
      arrangeMarks.experimental = true;
@@ -1286,15 +1286,15 @@ index 1fa8ed1..18e5e19 100644
  
      const std::string savedLanguage = RuntimeConfigFile::UiLanguage("auto");
      Option language{"IDIOMA / LANGUAGE",
-@@ -847,6 +862,7 @@ Result Run(int argc, char** argv) {
+@@ -841,6 +856,7 @@ Result Run(int argc, char** argv) {
      toolsTab.options.push_back({Tr("EDITOR DE TEXTURAS", "TEXTURE EDITOR"), kTextureStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenTextureStudio});
      toolsTab.options.push_back({Tr("EDITOR DE TEMPORADA", "SEASON EDITOR"), kSeasonStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenSeasonStudio});
      toolsTab.options.push_back({Tr("EDITOR DE CALLNAMES", "CALLNAME EDITOR"), kCallnameStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenCallnameStudio});
 +    toolsTab.options.push_back({Tr("EDITOR DE UNIFORMES", "UNIFORM STUDIO"), kUniformStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenUniformStudio});
-     toolsTab.options.push_back({Tr("EDITOR DE ANIMACIONES", "ANIMATION EDITOR"), kAnimationStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenAnimationStudio});
      toolsTab.options.push_back({kRosterPlayersLabel, kRosterPlayersHelp, {Tr("Nativos", "Native"), Tr("Como en el editor", "As in the editor")},
                                  RuntimeConfigFile::NativeRoster(true) ? 0 : 1});
-@@ -953,7 +969,7 @@ Result Run(int argc, char** argv) {
+     for (size_t i = 0; i < installedMods.size(); ++i) {
+@@ -946,7 +962,7 @@ Result Run(int argc, char** argv) {
          {"AUDIO", {volume, mute}},
          {Tr("CONTROLES", "CONTROLS"), {wiimote}},
          {Tr("INTERFAZ", "INTERFACE"), {launcherOption, language}},
@@ -1303,8 +1303,8 @@ index 1fa8ed1..18e5e19 100644
      };
      tabs.push_back(std::move(modsTab));
      tabs.push_back(std::move(toolsTab));
-@@ -1030,6 +1046,10 @@ Result Run(int argc, char** argv) {
-             OpenAnimationStudio();
+@@ -1019,6 +1035,10 @@ Result Run(int argc, char** argv) {
+             OpenTextureStudio();
              return;
          }
 +        if (o.mod == kOpenUniformStudio) {
@@ -1314,7 +1314,7 @@ index 1fa8ed1..18e5e19 100644
          if (o.mod == kOpenCallnameStudio) {
              OpenCallnameStudio();
              return;
-@@ -1096,6 +1116,13 @@ Result Run(int argc, char** argv) {
+@@ -1085,6 +1105,13 @@ Result Run(int argc, char** argv) {
                  std::filesystem::create_directories(root / "logos", ec);
              }
          }
@@ -1328,9 +1328,9 @@ index 1fa8ed1..18e5e19 100644
          if (label == twoWay.label) RuntimeConfigFile::SetTwoWayPlayer(o.value != 0);
          if (label == shadows.label) RuntimeConfigFile::SetPlayerShadows(kShadowModes[static_cast<size_t>(o.value)]);
          if (label == crowd.label) RuntimeConfigFile::SetCrowdLevel(kCrowdLevels[static_cast<size_t>(o.value)]);
-@@ -1158,6 +1185,7 @@ Result Run(int argc, char** argv) {
+@@ -1146,6 +1173,7 @@ Result Run(int argc, char** argv) {
+     if (testAction != nullptr && std::strcmp(testAction, "texture-studio") == 0) OpenTextureStudio();
      if (testAction != nullptr && std::strcmp(testAction, "season-studio") == 0) OpenSeasonStudio();
-     if (testAction != nullptr && std::strcmp(testAction, "animation-studio") == 0) OpenAnimationStudio();
      if (testAction != nullptr && std::strcmp(testAction, "callname-studio") == 0) OpenCallnameStudio();
 +    if (testAction != nullptr && std::strcmp(testAction, "uniform-studio") == 0) OpenUniformStudio();
      // =language-es / =language-en: switch the language once, as if chosen in INTERFAZ (the launcher is

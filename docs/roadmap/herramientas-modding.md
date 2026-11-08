@@ -12,6 +12,7 @@ El modding es lo que mantiene vivo un juego así: rosters, texturas, estadios, t
 - **Editor de temporada:** calendarios reales 2002–2026, año de inicio, DH, ligas 15/15.
 - **Rosters:** PowerUp+ adaptado a 2008, importado en todos los modos, MLB Life incluido.
 - **Estadios:** add-on de Blender que arma un estadio desde cero y lo previsualiza en el juego.
+- **Uniformes importados en Arrange:** uniformes propios (logos, texto, colores; `.iff` de 2K y `.fsh` de MVP) hechos en Uniform Studio y elegidos por lado en la pantalla de uniformes (opción experimental de MEJORAS; [mods.md](../mods.md#uniformes-importados-arrange)). Probado en PC.
 - **Marcas y logotipos de Arrange:** PNG propios como marca y logotipo de los equipos de Arrange, elegidos en las pantallas del juego y guardados con la partida (opción experimental de MEJORAS; [mods.md](../mods.md#marcas-y-logotipos-propios-arrange)). Probado en PC; falta la prueba en Switch.
 
 ## Siguiente
@@ -27,3 +28,5 @@ El modding es lo que mantiene vivo un juego así: rosters, texturas, estadios, t
 - [ ] Lista de mods con conflictos en el launcher
 - [x] Marcas y logotipos PNG propios en Arrange (PC)
 - [ ] Marcas y logotipos de Arrange: prueba en Switch, Temporada y Liga
+- [x] Uniformes importados en Arrange (PC)
+- [ ] Uniformes importados en Arrange: prueba en Switch y Temporada
