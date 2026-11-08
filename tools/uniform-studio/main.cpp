@@ -10,6 +10,7 @@
 #include "lang.h"
 #include "layers.h"
 #include "preview.h"
+#include "render3d.h"
 #include "ui.h"
 
 #include <SDL3/SDL.h>
@@ -28,6 +29,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -77,8 +79,10 @@ struct App {
     std::array<Canvas, kKindCount> canvases;
     int activeKind = 0;
     std::array<Tex, kKindCount> canvasTex;
-    Tex bodyPreviewTex, guideTex;
+    Tex bodyPreviewTex, guideTex, render3dTex;
     bool hasGuide = false;
+    std::vector<Vtx> mesh;
+    float yaw = 0.6f, pitch = 0.08f, zoom = 1.0f;
     char name[64] = "nuevo";
     std::array<int, 10> backup{};
     bool advanced = false;
@@ -428,12 +432,15 @@ int Run(const std::vector<std::string>& args) {
         else if (args[i] == "--tooldir") a.toolDir = tstudio::PathFromUtf8(args[i + 1]);
         else if (args[i] == "--python") a.pyExe = tstudio::PathFromUtf8(args[i + 1]);
         else if (args[i] == "--name") std::snprintf(a.name, sizeof a.name, "%s", args[i + 1].c_str());
+        else if (args[i] == "--yaw") a.yaw = static_cast<float>(std::atof(args[i + 1].c_str()));
+        else if (args[i] == "--pitch") a.pitch = static_cast<float>(std::atof(args[i + 1].c_str()));
     }
     const fs::path pyenv = "C:/Users/david/.pyenv/pyenv-win/versions/3.12.0/python.exe";
     if (a.pyExe == "python" && fs::exists(pyenv)) a.pyExe = pyenv;  // dev default; Setup passes --python
     a.config = a.userData / "Config.toml";
     a.tempDir = a.userData / "Cache" / "uniform_studio";
     for (int i = 0; i < kKindCount; ++i) a.canvases[i].kind = static_cast<Kind>(i);
+    a.mesh = BuildMannequin();
 
     {
         const auto v = fs::exists(a.config) ? tstudio::ReadSetting(a.config, "ui", "language") : std::nullopt;
@@ -509,6 +516,7 @@ int Run(const std::vector<std::string>& args) {
         const Image bodyImg = Compose(a.canvases[0]);
         Upload(renderer, a.bodyPreviewTex, bodyImg);
         const int colors = CountColors(bodyImg);
+        if (a.dollView) Upload(renderer, a.render3dTex, RenderMesh(a.mesh, bodyImg, 440, 440, a.yaw, a.pitch, a.zoom));
 
         const ImVec2 vs = ImGui::GetMainViewport()->Size;
         ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -533,7 +541,8 @@ int Run(const std::vector<std::string>& args) {
         const float rightX = vs.x - rightW - 10;
         const float previewH = bodyH * 0.55f;
         ImGui::SetCursorPos(ImVec2(rightX, top));
-        DrawPreview(a.bodyPreviewTex.t, a.hasGuide ? a.guideTex.t : nullptr, ImVec2(rightW, previewH), colors, &a.dollView);
+        DrawPreview(a.render3dTex.t, a.bodyPreviewTex.t, a.hasGuide ? a.guideTex.t : nullptr,
+                    ImVec2(rightW, previewH), colors, &a.dollView, &a.yaw, &a.pitch, &a.zoom);
         DrawRightBottom(a, ImVec2(rightX, top + previewH + gap), ImVec2(rightW, bodyH - previewH - gap));
 
         if (!a.toast.empty())
@@ -571,6 +580,7 @@ int Run(const std::vector<std::string>& args) {
 
     for (auto& tx : a.canvasTex) if (tx.t) SDL_DestroyTexture(tx.t);
     if (a.bodyPreviewTex.t) SDL_DestroyTexture(a.bodyPreviewTex.t);
+    if (a.render3dTex.t) SDL_DestroyTexture(a.render3dTex.t);
     if (a.guideTex.t) SDL_DestroyTexture(a.guideTex.t);
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
