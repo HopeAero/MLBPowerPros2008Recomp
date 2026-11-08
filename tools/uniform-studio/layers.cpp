@@ -165,6 +165,35 @@ Image BuildMould(Kind k) {
     return out;
 }
 
+Image BuildTemplate(Kind k, Template t) {
+    if (t == Template::None) return {};
+    Image m = BuildMould(k);
+    if (m.Empty()) return {};
+    Image out{m.width, m.height, std::vector<uint8_t>(m.rgba.size(), 0)};
+    const uint8_t white[3] = {235, 235, 235}, navy[3] = {28, 38, 86}, accent[3] = {170, 30, 42};
+    for (uint32_t y = 0; y < m.height; ++y)
+        for (uint32_t x = 0; x < m.width; ++x) {
+            const size_t i = (static_cast<size_t>(y) * m.width + x) * 4;
+            if (m.rgba[i + 3] == 0) continue;  // outside the body regions
+            const int mr = m.rgba[i], mg = m.rgba[i + 1], mb = m.rgba[i + 2];
+            const bool chest = mr > 200 && mg > 200 && mb > 200;     // jersey
+            const bool trousers = mb > 180 && mr < 150;              // blue zone
+            const uint8_t* c = white;
+            switch (t) {
+            case Template::Plain: c = white; break;
+            case Template::Pinstripes: c = ((chest || trousers) && x % 6 == 0) ? navy : white; break;
+            case Template::TwoTone: c = trousers ? white : navy; break;
+            case Template::Placket: c = (chest && x >= 9 && x <= 13) ? accent : white; break;
+            case Template::None: break;
+            }
+            out.rgba[i] = c[0];
+            out.rgba[i + 1] = c[1];
+            out.rgba[i + 2] = c[2];
+            out.rgba[i + 3] = 255;
+        }
+    return out;
+}
+
 Image Compose(const Canvas& c) {
     const KindInfo& in = Info(c.kind);
     Image out{static_cast<uint32_t>(in.w), static_cast<uint32_t>(in.h),
@@ -267,6 +296,29 @@ BridgeResult ImportSource(const fs::path& pyExe, const fs::path& toolDir, const 
     if (loaded == 0)
         return {false, tstudio::Tr("El archivo no contiene capas reconocibles.",
                                    "The file has no recognisable layers.")};
+    return {true, ""};
+}
+
+BridgeResult LoadGamePack(const fs::path& pyExe, const fs::path& toolDir, const fs::path& tempDir,
+                          const fs::path& pack, const fs::path& common, Layer* out) {
+    std::error_code ec;
+    const fs::path dir = tempDir / "pack";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path job = tempDir / "job.json";
+    {
+        std::ofstream f(job, std::ios::binary);
+        f << "{\"op\":\"pack\",\"pack\":" << JsonString(pack) << ",\"common\":" << JsonString(common)
+          << ",\"outdir\":" << JsonString(dir) << "}";
+    }
+    std::string log;
+    const int code = RunPython(pyExe, toolDir / "studio_bridge.py", job, tempDir / "bridge.log", &log);
+    if (code != 0) return {false, (log.empty() ? tstudio::Tr("no se pudo leer el pack", "could not read the pack") : log)};
+    std::string err;
+    auto img = tstudio::LoadImage(dir / "uniform_from_pack.png", &err);
+    if (!img) return {false, err};
+    out->name = tstudio::Utf8(pack.stem());
+    out->src = std::move(*img);
     return {true, ""};
 }
 

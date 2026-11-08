@@ -25,6 +25,7 @@ struct Layer {
     std::string name;
     bool visible = true;
     bool isText = false;
+    bool isBase = false;  // a starter template or imported-pack body layer (kept at the bottom)
     Image src;                               // RGBA source for image layers (empty for text)
     std::string text = "TEXTO";              // text layers
     float fontPx = 20.0f;
@@ -56,6 +57,11 @@ void RasterText(Image& dst, ImFont* font, const Layer& layer);
 // Returns an empty image for atlases without a mould.
 Image BuildMould(Kind k);
 
+// Original (not game-derived) starter patterns painted inside the body regions, so the player can start
+// from a plain/striped jersey and add logos on top. Empty for atlases without a mould.
+enum class Template { None, Plain, Pinstripes, TwoTone, Placket };
+Image BuildTemplate(Kind k, Template t);
+
 // ---- Python bridge --------------------------------------------------------------------------------
 // We invoke the project's Python interpreter to reuse the tested tools/uniform-studio/bake.py and
 // import_sources.py instead of porting them to C++. See README.md for the rationale.
@@ -71,5 +77,12 @@ BridgeResult SaveUniform(const std::filesystem::path& pyExe, const std::filesyst
 BridgeResult ImportSource(const std::filesystem::path& pyExe, const std::filesystem::path& toolDir,
                           const std::filesystem::path& tempDir, const std::filesystem::path& file,
                           std::vector<Layer>* out);
+
+// Decodes a team uniform from the player's own game files as a base layer: the common body atlas
+// (<common> = PWM_mdl_main_Common.pack) recoloured with <pack>'s palette (a PWM_mdl_uniform_*.pack).
+// The .pack files are the player's game data and are never written to the repo.
+BridgeResult LoadGamePack(const std::filesystem::path& pyExe, const std::filesystem::path& toolDir,
+                          const std::filesystem::path& tempDir, const std::filesystem::path& pack,
+                          const std::filesystem::path& common, Layer* out);
 
 } // namespace ustudio

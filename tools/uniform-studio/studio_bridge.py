@@ -18,10 +18,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # -I drops it, so re-add for bake/import_sources
 
+import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 import bake  # noqa: E402
 import import_sources  # noqa: E402
+import packwii  # noqa: E402
 
 
 def do_bake(job):
@@ -51,6 +53,18 @@ def do_import(job):
     (outdir / "index.txt").write_text("\n".join(lines), encoding="utf-8")
 
 
+def do_pack(job):
+    # Decode a team uniform as a base layer: the body C8 atlas is common (PWM_mdl_main_Common.pack at
+    # 0xDA40, 128x128), each PWM_mdl_uniform_*.pack supplies only the 256 RGB5A3 palette at +0x20.
+    common = Path(job["common"]).read_bytes()
+    pal = np.frombuffer(Path(job["pack"]).read_bytes(), ">u2", 256, 0x20)
+    rgba = packwii.decode(common[0xDA40:], 128, 128, 9, pal)
+    outdir = Path(job["outdir"])
+    outdir.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rgba, "RGBA").save(outdir / "uniform_from_pack.png")
+    (outdir / "index.txt").write_text("uniform_from_pack.png\tbody/chest\n", encoding="utf-8")
+
+
 def main():
     if len(sys.argv) != 2:
         sys.stderr.write("usage: studio_bridge.py <job.json>\n")
@@ -61,6 +75,8 @@ def main():
         do_bake(job)
     elif op == "import":
         do_import(job)
+    elif op == "pack":
+        do_pack(job)
     else:
         sys.stderr.write("unknown op: %r\n" % op)
         return 2

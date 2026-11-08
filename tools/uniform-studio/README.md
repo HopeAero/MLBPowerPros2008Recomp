@@ -42,6 +42,23 @@ indices in `PWM_mdl_main_Common.pack`) and therefore must never be committed. A 
 generate a precise map from their own install and drop it at `UserData/arrange/uniform/body_regions.png`;
 the editor loads it in place of the schematic when present. No game content ships with this tool.
 
+## Starting a uniform
+
+- **Plantilla / Template** — an original (not game-derived) starter painted inside the body regions:
+  plain white, pinstripes, two-tone, placket stripe (`layers.cpp:BuildTemplate`). Pick one and add logos
+  and text on top.
+- **Cargar de mi juego… / Load from my game…** — decode a team uniform from the player's own files as a
+  base layer: pick a `PWM_mdl_uniform_MLB_*.pack`; the editor finds `PWM_mdl_main_Common.pack` nearby (the
+  body C8 atlas is common; the pack only supplies the 256-colour palette) and the bridge's `pack` op decodes
+  it. **The `.pack` files are the player's game data and are never written to the repo.** If no packs are
+  present, only the original templates are available.
+
+## Preview
+
+The preview panel toggles between a chibi **paper-doll** of the Power Pros character wearing the composed
+uniform (atlas regions mapped onto head/cap/torso/arms/legs — an approximation, not a 3D render) and the
+flat composed **atlas**.
+
 ## Build
 
 ```

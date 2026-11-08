@@ -105,6 +105,23 @@ class T(unittest.TestCase):
             # RasterText drew the "24" layer: some opaque pixels in its lower region.
             self.assertGreater(int((img[66:110, 35:100, 3] > 0).sum()), 0)
 
+    def test_bridge_pack_decodes_team_uniform(self):
+        # E1b: decode a team uniform (common body atlas + a pack's palette) through the bridge.
+        common = ROOT / "local" / "analysis" / "animations" / "character" / "PWM_mdl_main_Common.pack"
+        pack = ROOT / "local" / "analysis" / "arrange" / "uniform" / "packs" / "PWM_mdl_uniform_MLB_BOS_00.pack"
+        if not (common.exists() and pack.exists()):
+            self.skipTest("local game packs not present")
+        with tempfile.TemporaryDirectory() as t:
+            job = Path(t) / "job.json"
+            job.write_text(json.dumps({"op": "pack", "common": str(common), "pack": str(pack),
+                                       "outdir": t}), encoding="utf-8")
+            r = subprocess.run([sys.executable, "-I", str(HERE / "studio_bridge.py"), str(job)],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            img = np.array(Image.open(Path(t) / "uniform_from_pack.png").convert("RGBA"))
+            self.assertEqual(img.shape, (128, 128, 4))
+            self.assertGreater(int((img[..., 3] > 0).sum()), 1000)  # the body atlas decoded
+
     def test_bridge_import_png_is_handled_in_cpp(self):
         # PNG/DDS import needs no bridge (the editor loads them directly); the bridge only does .fsh/.iff.
         r = subprocess.run([sys.executable, "-I", str(HERE / "studio_bridge.py")],

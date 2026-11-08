@@ -83,7 +83,10 @@ struct App {
     std::array<int, 10> backup{};
     bool advanced = false;
     DialogResult dialog;
-    bool dialogOpen = false, pendingImport = false;
+    bool dialogOpen = false, pendingImport = false, pendingGamePack = false;
+    int dialogKind = 0;  // 0 = import art, 1 = load from game pack
+    int templateChoice = 0;
+    bool dollView = true;  // preview: chibi paper-doll vs flat atlas
     std::string toast;
     bool toastError = false;
 };
@@ -160,6 +163,62 @@ std::string SanitizeName(const std::string& raw) {
                                      "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"};
     for (const char* r : reserved) if (lower == r) return "";
     return s;
+}
+
+// Puts a base layer (template or imported pack) at the bottom, replacing any previous one.
+void SetBase(App& a, Layer base) {
+    Canvas& c = Active(a);
+    base.isBase = true;
+    std::erase_if(c.layers, [](const Layer& L) { return L.isBase; });
+    base.x = 0;
+    base.y = 0;
+    base.scale = static_cast<float>(Info(c.kind).w) / std::max(1u, base.src.width);  // fill the atlas
+    c.layers.insert(c.layers.begin(), std::move(base));
+    c.selected = 0;
+}
+
+void ApplyTemplate(App& a, Template t) {
+    if (t == Template::None) {
+        Canvas& c = Active(a);
+        std::erase_if(c.layers, [](const Layer& L) { return L.isBase; });
+        c.selected = -1;
+        return;
+    }
+    Image img = BuildTemplate(Active(a).kind, t);
+    if (img.Empty()) { Toast(a, Tr("Esta parte no tiene plantilla.", "This part has no template."), true); return; }
+    Layer L;
+    L.name = Tr("Plantilla", "Template");
+    L.src = std::move(img);
+    SetBase(a, std::move(L));
+}
+
+// Looks for PWM_mdl_main_Common.pack next to the chosen uniform pack (or up a couple of folders).
+fs::path FindCommon(const fs::path& pack) {
+    fs::path dir = pack.parent_path();
+    for (int up = 0; up < 3 && !dir.empty(); ++up, dir = dir.parent_path()) {
+        std::error_code ec;
+        for (const auto& e : fs::recursive_directory_iterator(dir, ec))
+            if (e.is_regular_file(ec) && tstudio::Utf8(e.path().filename()) == "PWM_mdl_main_Common.pack") return e.path();
+    }
+    return {};
+}
+
+void FinishGamePack(App& a, const std::string& path) {
+    if (path.empty()) return;
+    const fs::path pack = tstudio::PathFromUtf8(path);
+    const fs::path common = FindCommon(pack);
+    if (common.empty()) {
+        Toast(a, Tr("No se encontró PWM_mdl_main_Common.pack junto al pack elegido.",
+                    "PWM_mdl_main_Common.pack was not found next to the chosen pack."), true);
+        return;
+    }
+    Layer base;
+    const BridgeResult r = LoadGamePack(a.pyExe, a.toolDir, a.tempDir, pack, common, &base);
+    if (!r.ok) { Toast(a, r.message, true); return; }
+    a.activeKind = 0;  // a pack uniform is the body
+    SetBase(a, std::move(base));
+    Toast(a, Tr("Uniforme cargado de tu juego. Añade logos/texto encima.",
+                "Loaded from your game. Add logos/text on top."));
 }
 
 void Save(App& a) {
@@ -250,6 +309,24 @@ void DrawLeft(App& a, float h) {
             if (ImGui::Selectable(kinds[i].get(), i == a.activeKind)) a.activeKind = i;
         ImGui::EndCombo();
     }
+    ImGui::Dummy(ImVec2(0, 4));
+
+    // Starter template (original art) and "load from my game" base.
+    static const power_pros_ui::Phrase tpl[] = {{"Plantilla: ninguna", "Template: none"}, {"Blanco liso", "Plain white"},
+                                                {"Pinstripes", "Pinstripes"}, {"Dos tonos", "Two-tone"},
+                                                {"Franja/placket", "Placket stripe"}};
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##tpl", tpl[a.templateChoice].get())) {
+        for (int i = 0; i < 5; ++i)
+            if (ImGui::Selectable(tpl[i].get(), i == a.templateChoice)) {
+                a.templateChoice = i;
+                ApplyTemplate(a, static_cast<Template>(i));
+            }
+        ImGui::EndCombo();
+    }
+    ImGui::Dummy(ImVec2(0, 2));
+    if (ui::Pill(Tr("Cargar de mi juego...", "Load from my game..."), ui::kGreyTop, ui::kGreyBottom, true))
+        a.pendingGamePack = true;
     ImGui::Dummy(ImVec2(0, 4));
     if (ui::Pill(Tr("Importar", "Import"), ui::kBlueTop, ui::kBlueBottom, true)) a.pendingImport = true;
     ImGui::SameLine();
@@ -375,7 +452,7 @@ int Run(const std::vector<std::string>& args) {
         a.hasGuide = true;
     }
     for (const auto& arg : args)
-        if (arg == "--demo") LoadDemo(a);
+        if (arg == "--demo") { ApplyTemplate(a, Template::Pinstripes); LoadDemo(a); }
 
     // Headless dump of the composed body atlas, so test_roundtrip.py can verify Compose/RasterText.
     for (size_t i = 0; i + 1 < args.size(); ++i)
@@ -414,7 +491,12 @@ int Run(const std::vector<std::string>& args) {
         }
         {
             std::lock_guard lock(a.dialog.mutex);
-            if (a.dialog.ready) { a.dialog.ready = false; a.dialogOpen = false; FinishImport(a, a.dialog.path); }
+            if (a.dialog.ready) {
+                a.dialog.ready = false;
+                a.dialogOpen = false;
+                if (a.dialogKind == 1) FinishGamePack(a, a.dialog.path);
+                else FinishImport(a, a.dialog.path);
+            }
         }
 
         ImGui_ImplSDLRenderer3_NewFrame();
@@ -451,7 +533,7 @@ int Run(const std::vector<std::string>& args) {
         const float rightX = vs.x - rightW - 10;
         const float previewH = bodyH * 0.55f;
         ImGui::SetCursorPos(ImVec2(rightX, top));
-        DrawPreview(a.bodyPreviewTex.t, a.hasGuide ? a.guideTex.t : nullptr, ImVec2(rightW, previewH), colors);
+        DrawPreview(a.bodyPreviewTex.t, a.hasGuide ? a.guideTex.t : nullptr, ImVec2(rightW, previewH), colors, &a.dollView);
         DrawRightBottom(a, ImVec2(rightX, top + previewH + gap), ImVec2(rightW, bodyH - previewH - gap));
 
         if (!a.toast.empty())
@@ -460,11 +542,14 @@ int Run(const std::vector<std::string>& args) {
                                         a.toast.c_str());
         ImGui::End();
 
-        if (a.pendingImport && !a.dialogOpen) {
-            a.pendingImport = false;
+        if ((a.pendingImport || a.pendingGamePack) && !a.dialogOpen) {
+            const bool pack = a.pendingGamePack;
+            a.pendingImport = a.pendingGamePack = false;
             a.dialogOpen = true;
-            static const SDL_DialogFileFilter filt[] = {{"PNG / DDS / FSH / IFF", "png;dds;fsh;iff"}};
-            SDL_ShowOpenFileDialog(OnDialog, &a.dialog, window, filt, 1, nullptr, false);
+            a.dialogKind = pack ? 1 : 0;
+            static const SDL_DialogFileFilter art[] = {{"PNG / DDS / FSH / IFF", "png;dds;fsh;iff"}};
+            static const SDL_DialogFileFilter packs[] = {{"PWM_mdl_uniform_*.pack", "pack"}};
+            SDL_ShowOpenFileDialog(OnDialog, &a.dialog, window, pack ? packs : art, 1, nullptr, false);
         }
 
         ImGui::Render();
