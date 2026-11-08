@@ -1256,8 +1256,8 @@ index 5024e22..673c5f9 100644
      "Create callnames with your WAV or MP3 audio and assign them in PowerUp+ (MODS > EDIT ROSTER). Enable the mod to use them."};
  
 +constexpr Phrase kUniformStudioHelp{
-+    "Convierte uniformes de PowerUp Pros 2008 en archivos .ppu y los guarda en UserData/arrange/uniforms para que un equipo de Arrange los lleve. Activa MEJORAS > UNIFORMES PROPIOS (ARRANGE).",
-+    "Turns PowerUp Pros 2008 uniforms into .ppu files and saves them in UserData/arrange/uniforms so an Arrange team can wear them. Enable ENHANCEMENTS > CUSTOM UNIFORMS (ARRANGE)."};
++    "Crea uniformes propios para equipos de Arrange: importa PNG, .iff (MLB 2K) o .fsh (MVP Baseball 2005) y coloca logos y texto. Se guardan como .ppu en UserData/arrange/uniforms. Activa MEJORAS > UNIFORMES PROPIOS (ARRANGE).",
++    "Create custom uniforms for Arrange teams: import PNG, .iff (MLB 2K) or .fsh (MVP Baseball 2005) files and place logos and text. They are saved as .ppu in UserData/arrange/uniforms. Enable ENHANCEMENTS > CUSTOM UNIFORMS (ARRANGE)."};
 +
  constexpr Phrase kSeasonStudioHelp{
      "Abre el Editor de temporada, en su propia ventana:\n\n"
