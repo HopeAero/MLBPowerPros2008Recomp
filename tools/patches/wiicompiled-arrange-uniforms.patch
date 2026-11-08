@@ -440,10 +440,10 @@ index fcc3345..0409245 100644
  
 diff --git a/runtime/src/hle/mlb/arrange_uniforms.cpp b/runtime/src/hle/mlb/arrange_uniforms.cpp
 new file mode 100644
-index 0000000..f72135f
+index 0000000..8b15eb9
 --- /dev/null
 +++ b/runtime/src/hle/mlb/arrange_uniforms.cpp
-@@ -0,0 +1,858 @@
+@@ -0,0 +1,872 @@
 +// Imported uniforms for Arrange teams ([arrange] custom_uniforms): a team that chose an imported
 +// uniform (a .ppu baked by Uniform Studio, in UserData/arrange/uniforms/<folder>) wears it natively
 +// wherever the game draws that team. Addresses and evidence: docs/ingenieria-inversa.md ("Uniforme
@@ -900,8 +900,13 @@ index 0000000..f72135f
 +// All positions are in the column layer's units (column row 0 is at y 33, 26 per row). Tunable from
 +// in-game screenshots.
 +// The IMPORT hint sits in the bottom bar area, to the RIGHT of the game's "A ADVANCE / B BACK / MOVE
-+// CRS" (not in the left column). The real button glyph icon is a tunable (see report).
-+constexpr float kHintX = 330.0f, kHintY = 385.0f, kHintScale = 0.55f;
++// CRS" (not in the left column): the real button glyph + "IMPORT".
++// Button glyphs: the game draws them with 0x8001DFB8(node, kGlyphPack, 0x8055F810(buttonId, 0)); the
++// Uniform screen itself does this for A(4) and B(5). 0x8055F810 picks the glyph for the current
++// controller. kGlyphButtonId is the id for our free button (Z / trigger); its exact value is a tunable
++// (the enum is 0-3 dpad, 4 A, 5 B, then X/Y/Z/L/R/... — 8 is the best guess for Z/trigger).
++constexpr uint32_t kGlyphPack = 515, kGlyphButtonId = 8;
++constexpr float kHintX = 330.0f, kHintY = 385.0f, kHintScale = 0.55f, kGlyphW = 20.0f;
 +// The selection list replaces the (hidden) left column: same left X, top to bottom.
 +constexpr float kListX = 14.0f, kListY = 42.0f, kListStep = 23.0f;
 +constexpr float kCellScale = 1.25f, kTextScale = 0.46f, kTextSelScale = 0.54f;  // cell / label sizes
@@ -958,24 +963,31 @@ index 0000000..f72135f
 +    return cell;
 +}
 +
-+// Keep the bottom-bar IMPORT hint (cell panel + "Z IMPORT") placed and visible, to the right of the
-+// game's button bar (not in the left column).
++// Keep the bottom-bar IMPORT hint (real button glyph + "IMPORT") placed and visible, to the right of
++// the game's button bar (not in the left column).
 +void UniSync(CpuContext* ctx, uint32_t s) {
 +    if (!g_uni.text) return;
++    // The real button glyph (pack 515) for the current controller; refreshed each frame so it tracks
++    // the controller type. If the id has no glyph (returns 0) we just show the text.
++    if (g_uni.hintCell) {
++        const uint32_t glyph = Call(ctx, 0x8055F810, kGlyphButtonId, 0);
++        if (glyph) Call(ctx, 0x8001DFB8, g_uni.hintCell, kGlyphPack, glyph);
++        SetVisible(ctx, g_uni.hintCell, glyph != 0);
++        CallF(ctx, 0x8001ABA0, g_uni.hintCell, kHintScale, kHintScale);
++        CallF(ctx, 0x8001A7B0, g_uni.hintCell, kHintX, kHintY);
++    }
 +    Call(ctx, 0x807B4090, g_uni.text, kColNormal);
-+    VCall(ctx, g_uni.text, 0x40, WriteName(g_arena + kUniLabelScratch, "Z IMPORT"));
++    VCall(ctx, g_uni.text, 0x40, WriteName(g_arena + kUniLabelScratch, "IMPORT"));
 +    Call(ctx, 0x807B4090, g_uni.text, kColNormal);
 +    CallF(ctx, 0x8001ABA0, g_uni.holder, kHintScale, kHintScale);
-+    CallF(ctx, 0x8001A7B0, g_uni.holder, kHintX, kHintY);
++    CallF(ctx, 0x8001A7B0, g_uni.holder, kHintX + kGlyphW, kHintY);
 +    (void)s;
 +}
 +
 +void UniBuildPrompt(CpuContext* ctx, uint32_t s) {
 +    g_uni.screen = s;
 +    const uint32_t parent = Memory::Read32(s + kUniButtons + kNodeParent);  // the column's layer
-+    // A cell-image panel behind the hint so it reads as a bar button (the real button glyph is a
-+    // tunable; see the report).
-+    g_uni.hintCell = UniNewCell(ctx, parent ? parent : s, kHintX - 2.0f, kHintY - 2.0f, kHintScale);
++    g_uni.hintCell = UniNewNode(ctx, parent ? parent : s);  // holds the button glyph (set in UniSync)
 +    g_uni.holder = UniNewNode(ctx, parent ? parent : s);
 +    if (g_uni.holder) {
 +        g_uni.text = Call(ctx, 0x805C28D4, g_uni.holder, 0, Memory::Read32(kUniStyle) & 0xFFFF);
@@ -987,12 +999,14 @@ index 0000000..f72135f
 +    g_uni.built = g_uni.holder != 0;
 +}
 +
-+// Hide / show the 12 embedded column rows (buttons + dim overlays) so the list can take their place.
++// Hide / show the 12 embedded column rows so the list can take their place. We touch ONLY the button
++// nodes (+0x29C0), never the dim overlays (+0x35C0): those are the "window open" shade, normally off,
++// and forcing them visible is what left the column dark. On restore we also re-run the game's own dim
++// pass (0x805CC1A4, per screen+0x41C0 / 0x80CEE534) so the column goes back to its normal brightness.
 +void UniShowColumn(CpuContext* ctx, uint32_t s, bool show) {
-+    for (int i = 0; i < kUniRows; ++i) {
++    for (int i = 0; i < kUniRows; ++i)
 +        SetVisible(ctx, s + kUniButtons + uint32_t(i) * kUniButtonStride, show);
-+        SetVisible(ctx, s + kUniDim + uint32_t(i) * kUniButtonStride, show);
-+    }
++    if (show) Call(ctx, 0x805CC1A4, s);  // restore the normal (un-dimmed) column state
 +}
 +
 +// Highlight the cursor row (bigger label + a different colour); cells stay put.
