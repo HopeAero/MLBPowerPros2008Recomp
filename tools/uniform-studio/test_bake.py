@@ -29,6 +29,33 @@ class T(unittest.TestCase):
         self.assertEqual(len(c8), 128 * 128)
         self.assertEqual(pal[0:2], b"\x00\x00")
 
+    def test_version2_flags(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t) / "u.ppu"
+            write_ppu(p, {"body": checker_rgba(128, 128)}, [0, 0, 0, 0, 0, 0, 0, 0, 4, 21], flags=1)
+            r = read_ppu(p)
+            self.assertEqual((r["version"], r["flags"], r["backup"][8:]), (2, 1, [4, 21]))
+            write_ppu(p, {"body": checker_rgba(128, 128)}, [1] * 10)
+            self.assertEqual((read_ppu(p)["version"], read_ppu(p)["flags"]), (1, 0))
+
+    def test_number_layout(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t) / "u.ppu"
+            write_ppu(p, {"body": checker_rgba(128, 128)}, [0] * 10, flags=1, layout=(5, -3, 4, 0, -10, 120))
+            r = read_ppu(p)
+            self.assertEqual((r["flags"], r["layout"]), (3, (5, -3, 4, 0, -10, 120)))
+            with self.assertRaises(ValueError):
+                write_ppu(p, {"body": checker_rgba(128, 128)}, [0] * 10, layout=(10, 0, 0, 0, 0, 100))
+
+    def test_thumb_kind(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t) / "u.ppu"
+            write_ppu(p, {"body": checker_rgba(128, 128), "thumb": checker_rgba(64, 64)}, [1] * 10)
+            r = read_ppu(p)
+            self.assertEqual(set(r["atlases"]), {"body", "thumb"})
+            self.assertEqual(r["atlases"]["thumb"][0:2], (64, 64))
+            self.assertEqual(p.read_bytes()[16 + 10 + 5 + 512 + 128 * 128], 4)  # thumb kind id after body
+
     def test_roundtrip_and_corrupt(self):
         with tempfile.TemporaryDirectory() as t:
             p = Path(t) / "u.ppu"
@@ -98,7 +125,7 @@ class T(unittest.TestCase):
                     read_ppu(self._w(t, mk(b=b)))
 
             with self.assertRaisesRegex(ValueError, "version"):
-                read_ppu(self._w(t, mk(version=2)))
+                read_ppu(self._w(t, mk(version=3)))
             bad_body(body[:11] + b"\x7f\x00" + body[13:], "atlas header")       # body w=127
             bad_body(body[:13] + b"\x40\x00" + body[15:], "atlas header")       # body h=64
             bad_body(body[:10] + b"\x09" + body[11:], "atlas header")           # kind-id 9

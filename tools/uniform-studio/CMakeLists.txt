@@ -19,7 +19,7 @@ endforeach()
 add_subdirectory("${SDL_SOURCE_DIR}" sdl EXCLUDE_FROM_ALL)
 
 add_executable(UniformStudio
-    main.cpp canvas.cpp layers.cpp preview.cpp render3d.cpp
+    main.cpp canvas.cpp layers.cpp paint.cpp pieces.cpp preview.cpp project.cpp render3d.cpp zones.cpp
     "${TEXTURE_STUDIO}/gx.cpp" "${TEXTURE_STUDIO}/images.cpp" "${TEXTURE_STUDIO}/config.cpp"
     "${IMGUI_SOURCE_DIR}/imgui.cpp"
     "${IMGUI_SOURCE_DIR}/imgui_draw.cpp"

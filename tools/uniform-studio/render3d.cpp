@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iterator>
 
 namespace ustudio {
 using tstudio::Image;
@@ -72,11 +75,12 @@ std::vector<Vtx> BuildMannequin() {
 }
 
 tstudio::Image RenderMesh(const std::vector<Vtx>& mesh, const Image& tex, int w, int h,
-                          float yaw, float pitch, float zoom) {
+                          float yaw, float pitch, float zoom, float centerY,
+                          const std::vector<const Image*>* extras, float panX) {
     Image img{static_cast<uint32_t>(w), static_cast<uint32_t>(h),
               std::vector<uint8_t>(static_cast<size_t>(w) * h * 4, 0)};
     std::vector<float> zbuf(static_cast<size_t>(w) * h, 1e30f);
-    const float cy = 3.7f;                        // model centre for rotation
+    const float cy = centerY;                     // model centre for rotation (whole figure: 3.7)
     const float dist = 12.0f / std::max(0.2f, zoom);
     const float f = h * 0.95f;                    // focal length in pixels
     const float cyaw = std::cos(yaw), syaw = std::sin(yaw);
@@ -89,7 +93,7 @@ tstudio::Image RenderMesh(const std::vector<Vtx>& mesh, const Image& tex, int w,
         float y2 = cpit * y - spit * z1, z2 = spit * y + cpit * z1;          // pitch about X
         depth = dist - z2;                                                   // camera looks down +z at origin
         if (depth < 0.1f) depth = 0.1f;
-        out[0] = w * 0.5f + f * x1 / depth;
+        out[0] = w * 0.5f + f * (x1 - panX) / depth;
         out[1] = h * 0.5f - f * y2 / depth;
         out[2] = depth;
     };
@@ -119,6 +123,7 @@ tstudio::Image RenderMesh(const std::vector<Vtx>& mesh, const Image& tex, int w,
         const int y0 = std::max(0, static_cast<int>(miny)), y1 = std::min(h - 1, static_cast<int>(maxy));
         const float area = (sb[0] - sa[0]) * (sc[1] - sa[1]) - (sb[1] - sa[1]) * (sc[0] - sa[0]);
         if (std::fabs(area) < 1e-4f) continue;
+        if (A.mat == 3 && area < 0) continue;  // a hull's front faces would cover the figure (GX winding, seen)
         for (int y = y0; y <= y1; ++y) {
             for (int x = x0; x <= x1; ++x) {
                 const float px = x + 0.5f, py = y + 0.5f;
@@ -130,7 +135,22 @@ tstudio::Image RenderMesh(const std::vector<Vtx>& mesh, const Image& tex, int w,
                 const size_t zi = static_cast<size_t>(y) * w + x;
                 if (depth >= zbuf[zi]) continue;
                 uint8_t cr, cg, cb;
-                if (A.mat == 1) {            // skin
+                bool lit = true;
+                if (A.mat == 3) {            // outline hull: the game draws it black
+                    cr = cg = cb = 0;
+                    lit = false;
+                } else if (A.mat >= 4) {     // the figure's own textures / the cap letter, alpha-tested
+                    const size_t k = static_cast<size_t>(A.mat - 4);
+                    const Image* e = extras && k < extras->size() ? (*extras)[k] : nullptr;
+                    if (!e || e->Empty()) continue;
+                    float u = wa * A.u + wb * B.u + wc * C.u, vv = wa * A.v + wb * B.v + wc * C.v;
+                    const int ew = static_cast<int>(e->width), eh = static_cast<int>(e->height);
+                    int sx = std::clamp(static_cast<int>(u * ew), 0, ew - 1);
+                    int sy = std::clamp(static_cast<int>(vv * eh), 0, eh - 1);
+                    const uint8_t* t = &e->rgba[(static_cast<size_t>(sy) * ew + sx) * 4];
+                    if (t[3] < 128) continue;
+                    cr = t[0]; cg = t[1]; cb = t[2];
+                } else if (A.mat == 1) {            // skin
                     cr = 236; cg = 198; cb = 166;
                 } else if (A.mat == 2) {     // accent (cap bill): a dark neutral
                     cr = 40; cg = 46; cb = 64;
@@ -144,14 +164,64 @@ tstudio::Image RenderMesh(const std::vector<Vtx>& mesh, const Image& tex, int w,
                 }
                 zbuf[zi] = depth;
                 uint8_t* o = &img.rgba[zi * 4];
-                o[0] = static_cast<uint8_t>(cr * shade);
-                o[1] = static_cast<uint8_t>(cg * shade);
-                o[2] = static_cast<uint8_t>(cb * shade);
+                const float sh = lit ? shade : 1.0f;
+                o[0] = static_cast<uint8_t>(cr * sh);
+                o[1] = static_cast<uint8_t>(cg * sh);
+                o[2] = static_cast<uint8_t>(cb * sh);
                 o[3] = 255;
             }
         }
     }
     return img;
+}
+
+bool LoadGameDoll(const std::filesystem::path& file, GameDoll* out) {
+    std::ifstream f(file, std::ios::binary);
+    if (!f) return false;
+    const std::vector<uint8_t> d{std::istreambuf_iterator<char>(f), {}};
+    size_t o = 0;
+    auto take = [&](void* dst, size_t n) {
+        if (o + n > d.size()) return false;
+        std::memcpy(dst, d.data() + o, n);
+        o += n;
+        return true;
+    };
+    char magic[4];
+    uint32_t version = 0, count = 0;
+    if (!take(magic, 4) || std::memcmp(magic, "PPDL", 4) || !take(&version, 4) || version != 1 || !take(&count, 4) ||
+        count > 64)
+        return false;
+    GameDoll doll;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint16_t w = 0, h = 0;
+        if (!take(&w, 2) || !take(&h, 2) || w > 1024 || h > 1024) return false;
+        Image img{w, h, std::vector<uint8_t>(static_cast<size_t>(w) * h * 4)};
+        if (!take(img.rgba.data(), img.rgba.size())) return false;
+        doll.textures.push_back(std::move(img));
+    }
+    uint32_t tris = 0;
+    if (!take(&tris, 4) || tris > 200000) return false;
+    float lo = 1e30f, hi = -1e30f;
+    for (uint32_t t = 0; t < tris; ++t) {
+        float v[15];
+        uint8_t mat = 0;
+        if (!take(v, sizeof v) || !take(&mat, 1)) return false;
+        for (int k = 0; k < 3; ++k) {
+            doll.mesh.push_back({v[k * 5], v[k * 5 + 1], v[k * 5 + 2], v[k * 5 + 3], v[k * 5 + 4], mat});
+            lo = std::min(lo, v[k * 5 + 1]);
+            hi = std::max(hi, v[k * 5 + 1]);
+        }
+    }
+    // Same frame as the mannequin: feet at 0, 8 units tall, so the camera settings fit both.
+    const float scale = hi > lo ? 8.0f / (hi - lo) : 1.0f;
+    for (Vtx& p : doll.mesh) {
+        p.x *= scale;
+        p.y = (p.y - lo) * scale;
+        p.z *= scale;
+    }
+    doll.ok = !doll.mesh.empty();
+    *out = std::move(doll);
+    return out->ok;
 }
 
 } // namespace ustudio

@@ -25,7 +25,9 @@ if ($LASTEXITCODE -ne 0) { throw "uniform studio configure failed ($LASTEXITCODE
 cmake --build $Output --parallel | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "uniform studio build failed ($LASTEXITCODE)" }
 # Python bridge beside the exe so it runs from the build folder.
-foreach ($f in 'studio_bridge.py', 'bake.py', 'import_sources.py') {
+foreach ($f in 'studio_bridge.py', 'bake.py', 'import_sources.py', 'game_doll.py') {
     Copy-Item (Join-Path $PSScriptRoot $f) $Output -Force
 }
 Copy-Item (Join-Path $root 'tools\packwii.py') $Output -Force
+Copy-Item (Join-Path $root 'tools\projectbin.py') $Output -Force  # the "gamebase" op reads the player's project.bin
+Copy-Item (Join-Path $root 'tools\blender\powerpros_stadium\pj7m.py') $Output -Force  # game_doll.py reads the figure

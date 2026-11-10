@@ -42,6 +42,18 @@ indices in `PWM_mdl_main_Common.pack`) and therefore must never be committed. A 
 generate a precise map from their own install and drop it at `UserData/arrange/uniform/body_regions.png`;
 the editor loads it in place of the schematic when present. No game content ships with this tool.
 
+## Layout
+
+Header: New, Open, name, Save (`*` = unsaved), Undo / Redo. Left: tabs Colours (pieces, line type, other
+bases), Logos & text (import, add text, the active part's layers), Number and Drawing. Centre: zone buttons
+(`zones.cpp`), the layer toolbar and the mould (`canvas.cpp`, no panel of its own). Right: the figure and
+the selected layer's properties. Undo / redo (`main.cpp` `TrackHistory`): a snapshot of the editable state
+is recorded whenever it changed and the player is idle (no item active, no button down), 40 steps; checked
+by `--undo-selftest`. Save also writes the editable project (`project.cpp`:
+`UserData/arrange/uniforms/<name>/studio/project.txt`, one PNG per image layer, `thumb.png`), which Open
+lists as cards and loads back. Uniforms saved before projects existed are listed too ("older", thumbnail
+read from the .ppu in `project.cpp`) and open through the bridge's `readppu` op, each atlas as its part's base.
+
 ## Starting a uniform
 
 - **Plantilla / Template** — an original (not game-derived) starter painted inside the body regions:
@@ -55,9 +67,37 @@ the editor loads it in place of the schematic when present. No game content ship
 
 ## Preview
 
-The preview panel toggles between a chibi **paper-doll** of the Power Pros character wearing the composed
-uniform (atlas regions mapped onto head/cap/torso/arms/legs — an approximation, not a 3D render) and the
-flat composed **atlas**.
+The preview panel toggles between a software-rendered 3D figure wearing the composed uniform and the flat
+composed **atlas**. With the game installed, the figure is the **game's own chibi** (`game_doll.py`: the
+body, head-with-cap and hands PJ7M models of `PWM_mdl_main_Up.pack`, skinned with the body's 19-joint
+skeleton in a standing pose), read from the player's `project.bin` by the bridge's `gamedoll` op into
+`UserData/arrange/uniform/game_doll.bin`. Without the game it falls back to the editor's own mannequin
+(`render3d.cpp:BuildMannequin`). The saved thumbnail (`.ppu` kind `thumb`, 64×64) is the same figure from
+the front.
+
+## Colour by piece
+
+"Start from scratch: colour by piece" paints the body atlas as the game's Arrange editor does: CAP, BRIM,
+SLEEVES/ETC, UPPER, LOWER, LINE and LINE TYPE, each one of the game's 32 colours. `pieces.cpp` composes the
+256-entry palette exactly as the game (`0x806BDE24`, checked entry by entry against the running game) over
+the body atlas indices; the indices, the Arrange template palette and the 32 colours come from the player's
+own game through the bridge's `gamebase` op (`UserData/arrange/uniform/game_base.bin`). The result is the
+base layer; logos and text go on top. The backup colours follow the pieces. `--pieces` starts in this mode
+and `--pieces-selftest` checks the port on synthetic colours.
+
+None of the caches is ever committed or shipped; `build.ps1` copies `projectbin.py`, `game_doll.py` and
+`pj7m.py` beside the exe so the bridge can read the player's disc.
+
+## Drawing and free colours
+
+The Drawing tab (tools above the mould, colour and layer on the left, patterns with a preview in the
+right panel) paints into the part's drawing layer (`Layer::isPaint`: an atlas-sized image at (0, 0), scale 1,
+found or made by `canvas.cpp:PaintLayer`) with `paint.cpp`: brush, line, rectangle, fill (over the composed
+image's colour patch), eraser, picker and line patterns (stripes, diagonals, checks), optionally kept inside
+the zone's mask. A piece can take any RGB (`Pieces::rgb`, -1 = the game colour): mid / dark shades use the
+game colours' average brightness ratios (`pieces.cpp:PieceRgb`), the backup bytes the nearest game colour
+(`NearestColor`). The number keeps the 32 game colours (the game paints it). `--paint-selftest` checks it all
+on synthetic data; `--paint-demo`, `--free-rgb piece,RRGGBB` and `--tab 3` are for screenshots.
 
 ## Build
 

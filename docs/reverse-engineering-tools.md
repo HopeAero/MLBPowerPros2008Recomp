@@ -30,6 +30,8 @@ local\tools\ghidra_12.1.4_PUBLIC\support\analyzeHeadless.bat <proyecto> <nombre>
   -scriptPath tools\ghidra -postScript PowerProsFunctionProbe.java <direccion> <nombre> <bytes.bin> <salida> -deleteProject
 ```
 
+- `tools/ghidra/PowerProsBatchDecompile.java` saca el pseudo-C de muchas funciones a la vez desde un volcado de MEM1 (el REL ya está reubicado, así que valen las direcciones del juego en marcha). Recibe una lista de `0xDIRECCIÓN nombre` y líneas `#range 0xDESDE 0xHASTA`: sigue las llamadas que caen en esos rangos y descompila también esas funciones (dtk fusiona algunas). Pone `r13`/`r2` del área de datos pequeños. Importar el volcado con `-loader BinaryLoader -loader-baseAddr 0x80000000 -processor PowerPC:BE:32:default -noanalysis` y pasar `<lista> <salida.c>`. Se usó para el framework de pantallas y Arrange (`docs/ingenieria-inversa.md`, «Framework de pantallas y menús de Arrange»); unas 175 de 4.250 funciones quedan a medias por las paired-single: para esas, `local/wiicompiled-mlb/generated/functions/func_X.cpp`.
+
 Límite conocido: Ghidra 12.1.4 no trae una variante Gekko/Broadway (`ppc.ldefs` solo tiene `PowerPC:BE:32:default` y otras), así que las instrucciones paired-single (`psq_l`, `ps_*`) no se decodifican. El pseudocódigo es una inferencia del decompilador, no el código fuente original.
 
 La prueba inicial (`memcpy` a `0x8000626C`, 668 bytes, 167 instrucciones) y su script de lanzamiento están en el tag de git `moderngekko-era`; la evidencia privada, en `local/analysis/ghidra-ppc-memcpy/`.

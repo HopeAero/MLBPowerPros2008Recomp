@@ -17,7 +17,7 @@ ImTextureID Tex(SDL_Texture* t) { return static_cast<ImTextureID>(reinterpret_ca
 } // namespace
 
 void DrawPreview(SDL_Texture* render3d, SDL_Texture* body, SDL_Texture* guide, ImVec2 size, int colors,
-                 bool* figure, float* yaw, float* pitch, float* zoom) {
+                 bool* figure, float* yaw, float* pitch, float* zoom, bool* inspect) {
     if (!ui::BeginPanel("##preview", Tr("Vista previa", "Preview"), size)) {
         ui::EndPanel();
         return;
@@ -30,6 +30,10 @@ void DrawPreview(SDL_Texture* render3d, SDL_Texture* body, SDL_Texture* guide, I
     if (ui::Pill(Tr("Atlas", "Atlas"), !*figure ? ui::kBlueTop : ui::kGreyTop,
                  !*figure ? ui::kBlueBottom : ui::kGreyBottom, true))
         *figure = false;
+    if (*figure) {
+        ImGui::SameLine();
+        if (ui::Pill(Tr("Ampliar", "Enlarge"), ui::kGreenTop, ui::kGreenBottom, true)) *inspect = true;
+    }
 
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const ImVec2 a = ImGui::GetCursorScreenPos();
@@ -43,6 +47,9 @@ void DrawPreview(SDL_Texture* render3d, SDL_Texture* body, SDL_Texture* guide, I
         dl->AddRect(p0, p1, ui::kPanelBorder, 6, 0, 2);
         ImGui::SetCursorScreenPos(p0);
         ImGui::InvisibleButton("##orbit", ImVec2(p1.x - p0.x, p1.y - p0.y));
+        if (ImGui::IsItemDeactivated() && ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0.0f).x == 0.0f &&
+            ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0.0f).y == 0.0f)
+            *inspect = true;  // a plain click opens the big viewer
         if (ImGui::IsItemActive()) {
             const ImVec2 d = ImGui::GetIO().MouseDelta;
             *yaw += d.x * 0.012f;
@@ -51,7 +58,8 @@ void DrawPreview(SDL_Texture* render3d, SDL_Texture* body, SDL_Texture* guide, I
         if (ImGui::IsItemHovered() && ImGui::GetIO().MouseWheel != 0.0f)
             *zoom = std::clamp(*zoom * (1.0f + ImGui::GetIO().MouseWheel * 0.1f), 0.4f, 3.0f);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", Tr("Arrastra para girar · rueda para acercar", "Drag to rotate · wheel to zoom"));
+            ImGui::SetTooltip("%s", Tr("Arrastra para girar · rueda para acercar · clic para ampliar",
+                                       "Drag to rotate · wheel to zoom · click to enlarge"));
     } else {
         const auto [p0, p1] = ui::Fit(a, b, 128.0f, 128.0f);
         ui::Checker(dl, p0, p1);

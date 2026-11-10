@@ -2,6 +2,7 @@
 #include "layers.h"
 
 #include "images.h"  // tstudio::LoadImage / SavePng
+#include "render3d.h"  // the thumbnail: the preview mannequin, front view
 #include "lang.h"
 
 #include <imgui.h>
@@ -43,15 +44,25 @@ void Over(Image& d, int x, int y, int r, int g, int b, int a) {
 
 void BlitScaled(Image& out, const Layer& L) {
     if (L.src.Empty()) return;
-    const int dw = std::max(1, static_cast<int>(std::lround(L.src.width * L.scale)));
-    const int dh = std::max(1, static_cast<int>(std::lround(L.src.height * L.scale)));
+    const int dw = std::max(1, static_cast<int>(std::lround(L.DrawnW())));
+    const int dh = std::max(1, static_cast<int>(std::lround(L.DrawnH())));
+    const int sw = static_cast<int>(L.src.width), shh = static_cast<int>(L.src.height);
     for (int dy = 0; dy < dh; ++dy) {
-        const int sy = std::min(static_cast<int>(L.src.height) - 1, dy * static_cast<int>(L.src.height) / dh);
+        // Each output pixel averages the source pixels it covers (shrinking a big logo stays smooth;
+        // enlarging stays crisp, nearest).
+        const int y0 = dy * shh / dh, y1 = std::max(y0 + 1, (dy + 1) * shh / dh);
         for (int dx = 0; dx < dw; ++dx) {
-            const int sx = std::min(static_cast<int>(L.src.width) - 1, dx * static_cast<int>(L.src.width) / dw);
-            const uint8_t* p = &L.src.rgba[(static_cast<size_t>(sy) * L.src.width + sx) * 4];
+            const int x0 = dx * sw / dw, x1 = std::max(x0 + 1, (dx + 1) * sw / dw);
+            uint32_t r = 0, g = 0, b = 0, a = 0, n = 0;
+            for (int yy = y0; yy < std::min(y1, shh); ++yy)
+                for (int xx = x0; xx < std::min(x1, sw); ++xx) {
+                    const uint8_t* p = &L.src.rgba[(static_cast<size_t>(yy) * sw + xx) * 4];
+                    r += p[0] * p[3]; g += p[1] * p[3]; b += p[2] * p[3]; a += p[3]; ++n;
+                }
+            if (!n || !a) continue;
             Over(out, static_cast<int>(std::lround(L.x)) + dx, static_cast<int>(std::lround(L.y)) + dy,
-                 p[0], p[1], p[2], p[3]);
+                 static_cast<uint8_t>(r / a), static_cast<uint8_t>(g / a), static_cast<uint8_t>(b / a),
+                 static_cast<uint8_t>(a / n));
         }
     }
 }
@@ -106,8 +117,16 @@ std::string JsonString(const fs::path& p) {
 
 const KindInfo& Info(Kind k) { return kInfo[static_cast<int>(k)]; }
 
-float Layer::DrawnW() const { return isText ? 0.0f : src.width * scale; }
-float Layer::DrawnH() const { return isText ? 0.0f : src.height * scale; }
+void FillBehind(Image& img, const std::array<uint8_t, 3>& rgb) {
+    for (size_t i = 0; i + 3 < img.rgba.size(); i += 4) {
+        const float a = img.rgba[i + 3] / 255.0f;
+        for (int k = 0; k < 3; ++k) img.rgba[i + k] = static_cast<uint8_t>(img.rgba[i + k] * a + rgb[k] * (1 - a));
+        img.rgba[i + 3] = 255;
+    }
+}
+
+float Layer::DrawnW() const { return isText ? 0.0f : src.width * scale * sx; }
+float Layer::DrawnH() const { return isText ? 0.0f : src.height * scale * sy; }
 
 void RasterText(Image& dst, ImFont* font, const Layer& L) {
     if (!font || L.text.empty()) return;
@@ -217,17 +236,20 @@ int CountColors(const Image& img) {
 }
 
 BridgeResult SaveUniform(const fs::path& pyExe, const fs::path& toolDir, const fs::path& tempDir, const fs::path& out,
-                         const std::array<Canvas, kKindCount>& canvases, const std::array<int, 10>& backup) {
+                         const std::array<Canvas, kKindCount>& canvases, const std::array<int, 10>& backup,
+                         const GameDoll* doll, const std::array<uint8_t, 3>* capFill, int flags,
+                         const std::array<int, 6>* numberLayout) {
     std::error_code ec;
     fs::create_directories(tempDir, ec);
     fs::create_directories(out.parent_path(), ec);
     std::string atlasJson;
     for (int i = 0; i < kKindCount; ++i) {
-        const Image img = Compose(canvases[i]);
+        Image img = Compose(canvases[i]);
         bool any = false;
         for (size_t p = 3; p < img.rgba.size(); p += 4)
             if (img.rgba[p] >= 0x80) { any = true; break; }
         if (!any) continue;  // skip empty atlases
+        if (capFill && (canvases[i].kind == Kind::Cap || canvases[i].kind == Kind::Helmet)) FillBehind(img, *capFill);
         const fs::path png = tempDir / (std::string(Info(canvases[i].kind).id) + ".png");
         std::string err;
         if (!tstudio::SavePng(png, img, &err)) return {false, err};
@@ -236,12 +258,50 @@ BridgeResult SaveUniform(const fs::path& pyExe, const fs::path& toolDir, const f
     if (atlasJson.empty())
         return {false, tstudio::Tr("No hay nada que guardar: todas las capas están vacías.",
                                    "Nothing to save: every atlas is empty.")};
+    // The thumbnail the game's LINE TYPE window shows for this uniform (as the game's own pictures show
+    // the jersey): the preview mannequin's torso and arms wearing the body atlas, front view, framed on
+    // the torso (centre y 4.6, zoom 2.3: torso, arms and shoulders), rendered at 4x and box-filtered down to 64 x 64.
+    if (atlasJson.find("\"body\"") != std::string::npos) {
+        constexpr int kThumb = 64, kScale = 4;
+        // With the game's own figure (read from the player's disc): the whole chibi, as the game shows it.
+        const Image body = Compose(canvases[0]), cap = Compose(canvases[1]);
+        std::vector<const Image*> extras{&cap};
+        if (doll && doll->ok)
+            for (const Image& t : doll->textures) extras.push_back(&t);
+        const Image big = doll && doll->ok
+                              ? RenderMesh(doll->mesh, body, kThumb * kScale, kThumb * kScale, 0.0f, 0.08f, 1.2f, 3.9f, &extras)
+                              : RenderMesh(BuildMannequin(), body, kThumb * kScale, kThumb * kScale, 0.0f, 0.08f, 2.3f, 4.6f);
+        Image thumb{kThumb, kThumb, std::vector<uint8_t>(size_t(kThumb) * kThumb * 4, 0)};
+        for (int y = 0; y < kThumb; ++y)
+            for (int x = 0; x < kThumb; ++x) {
+                int sum[4] = {}, n = 0;
+                for (int dy = 0; dy < kScale; ++dy)
+                    for (int dx = 0; dx < kScale; ++dx) {
+                        const uint8_t* q = &big.rgba[(size_t(y * kScale + dy) * big.width + x * kScale + dx) * 4];
+                        if (q[3] < 0x80) continue;
+                        for (int c = 0; c < 4; ++c) sum[c] += q[c];
+                        ++n;
+                    }
+                if (n * 2 < kScale * kScale) continue;  // mostly background: stays transparent
+                uint8_t* o = &thumb.rgba[(size_t(y) * kThumb + x) * 4];
+                for (int c = 0; c < 3; ++c) o[c] = uint8_t(sum[c] / n);
+                o[3] = 255;
+            }
+        const fs::path png = tempDir / "thumb.png";
+        std::string err;
+        if (!tstudio::SavePng(png, thumb, &err)) return {false, err};
+        atlasJson += ",\"thumb\":" + JsonString(png);
+    }
     std::string backupJson;
     for (int v : backup) backupJson += (backupJson.empty() ? "" : ",") + std::to_string(std::clamp(v, 0, 31));
     const fs::path job = tempDir / "job.json";
     {
         std::ofstream f(job, std::ios::binary);
-        f << "{\"op\":\"bake\",\"out\":" << JsonString(out) << ",\"backup\":[" << backupJson
+        std::string layoutJson;
+        if (numberLayout)
+            for (int v : *numberLayout) layoutJson += (layoutJson.empty() ? "" : ",") + std::to_string(v);
+        f << "{\"op\":\"bake\",\"flags\":" << flags << (layoutJson.empty() ? "" : ",\"layout\":[" + layoutJson + "]")
+          << ",\"out\":" << JsonString(out) << ",\"backup\":[" << backupJson
           << "],\"atlases\":{" << atlasJson << "}}";
     }
     std::string log;
@@ -319,6 +379,37 @@ BridgeResult LoadGamePack(const fs::path& pyExe, const fs::path& toolDir, const 
     if (!img) return {false, err};
     out->name = tstudio::Utf8(pack.stem());
     out->src = std::move(*img);
+    return {true, ""};
+}
+
+BridgeResult ExtractFromGame(const fs::path& pyExe, const fs::path& toolDir, const fs::path& tempDir, const char* op,
+                            const fs::path& projectBin, const fs::path& out) {
+    std::error_code ec;
+    fs::create_directories(tempDir, ec);
+    const fs::path job = tempDir / "job.json";
+    {
+        std::ofstream f(job, std::ios::binary);
+        f << "{\"op\":\"" << op << "\",\"project\":" << JsonString(projectBin) << ",\"out\":" << JsonString(out) << "}";
+    }
+    std::string log;
+    const int code = RunPython(pyExe, toolDir / "studio_bridge.py", job, tempDir / "bridge.log", &log);
+    if (code != 0) return {false, log.empty() ? tstudio::Tr("no se pudo leer el juego", "could not read the game") : log};
+    return {true, ""};
+}
+
+BridgeResult ReadPpu(const fs::path& pyExe, const fs::path& toolDir, const fs::path& tempDir, const fs::path& ppu,
+                     const fs::path& outdir) {
+    std::error_code ec;
+    fs::remove_all(outdir, ec);
+    fs::create_directories(outdir, ec);
+    const fs::path job = tempDir / "job.json";
+    {
+        std::ofstream f(job, std::ios::binary);
+        f << "{\"op\":\"readppu\",\"ppu\":" << JsonString(ppu) << ",\"outdir\":" << JsonString(outdir) << "}";
+    }
+    std::string log;
+    const int code = RunPython(pyExe, toolDir / "studio_bridge.py", job, tempDir / "bridge.log", &log);
+    if (code != 0) return {false, log.empty() ? tstudio::Tr("no se pudo leer el uniforme", "could not read the uniform") : log};
     return {true, ""};
 }
 
