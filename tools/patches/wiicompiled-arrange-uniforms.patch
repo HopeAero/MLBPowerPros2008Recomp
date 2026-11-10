@@ -387,7 +387,7 @@ index 5e6de9d..1e078f3 100644
      return Get().twoWayPlayer.value_or(fallback);
  }
 diff --git a/runtime/src/hle/mlb/arrange_marks.cpp b/runtime/src/hle/mlb/arrange_marks.cpp
-index fcc3345..0409245 100644
+index fcc3345..0d4e54f 100644
 --- a/runtime/src/hle/mlb/arrange_marks.cpp
 +++ b/runtime/src/hle/mlb/arrange_marks.cpp
 @@ -63,6 +63,12 @@ ORIGINAL(807B34FC); ORIGINAL(807B336C); ORIGINAL(807B5118); ORIGINAL(807B5184);
@@ -441,7 +441,46 @@ index fcc3345..0409245 100644
  
  Fingerprints CurrentFingerprints() {
      Fingerprints out{};
-@@ -1365,13 +1383,13 @@ void CheckLoadedChoices(uint32_t lr) {
+@@ -1209,7 +1227,11 @@ REGISTER_NATIVE_FUNCTION_AS(0x805BCAC0, MLB_ArrangeMarkDestroy_805BCAC0, "MLB_Ar
+ // then gets the custom texture; when the file is unusable the fallback stays.
+ extern "C" void MLB_ArrangeMarkWidgetNew_805BE408(CpuContext* ctx) {
+     const uint32_t mark = ctx->gpr[4];
+-    if (!Enabled() || mark < kGameMarks) { func_805BE408(ctx); return; }
++    if (!Enabled() || mark < kGameMarks) {
++        Trace("mark-widget-new", ctx->lr, ctx->gpr[3], mark, 0, false);  // who shows a game mark (trace only)
++        func_805BE408(ctx);
++        return;
++    }
+     ctx->gpr[4] = GameMarkOf(EditingRecord());
+     func_805BE408(ctx);
+     const uint32_t widget = ctx->gpr[3], lr = ctx->lr;
+@@ -1221,7 +1243,11 @@ REGISTER_NATIVE_FUNCTION_AS(0x805BE408, MLB_ArrangeMarkWidgetNew_805BE408, "MLB_
+ 
+ extern "C" void MLB_ArrangeMarkWidgetSet_805BE664(CpuContext* ctx) {
+     const uint32_t widget = ctx->gpr[3], mark = ctx->gpr[4];
+-    if (!Enabled() || mark < kGameMarks) { func_805BE664(ctx); return; }
++    if (!Enabled() || mark < kGameMarks) {
++        Trace("mark-widget-set", ctx->lr, widget, mark, 0, false);
++        func_805BE664(ctx);
++        return;
++    }
+     const uint32_t previous = widget ? Memory::Read32(widget + 0xDC) : 0;
+     ctx->gpr[4] = previous < kGameMarks ? previous : GameMarkOf(EditingRecord());
+     func_805BE664(ctx);
+@@ -1236,7 +1262,11 @@ REGISTER_NATIVE_FUNCTION_AS(0x805BE664, MLB_ArrangeMarkWidgetSet_805BE664, "MLB_
+ // up as the edited team's game mark, then shows its own icon without the initial (FlagIcon).
+ extern "C" void MLB_ArrangeFlagMark_805BEFB8(CpuContext* ctx) {
+     const uint32_t flag = ctx->gpr[3], mark = ctx->gpr[4];
+-    if (!Enabled() || mark < kGameMarks) { func_805BEFB8(ctx); return; }
++    if (!Enabled() || mark < kGameMarks) {
++        Trace("flag-mark", ctx->lr, flag, mark, 0, false);
++        func_805BEFB8(ctx);
++        return;
++    }
+     ctx->gpr[4] = GameMarkOf(EditingRecord());
+     func_805BEFB8(ctx);
+     const std::string* file = markFileFor(mark);
+@@ -1365,13 +1395,13 @@ void CheckLoadedChoices(uint32_t lr) {
  
  extern "C" void MLB_ArrangeSlotsUnpack_805A263C(CpuContext* ctx) {
      const uint32_t lr = ctx->lr;
@@ -459,7 +498,7 @@ index fcc3345..0409245 100644
  
 diff --git a/runtime/src/hle/mlb/arrange_uniforms.cpp b/runtime/src/hle/mlb/arrange_uniforms.cpp
 new file mode 100644
-index 0000000..66413fa
+index 0000000..b0c91de
 --- /dev/null
 +++ b/runtime/src/hle/mlb/arrange_uniforms.cpp
 @@ -0,0 +1,1070 @@
@@ -898,7 +937,7 @@ index 0000000..66413fa
 +
 +// --- Game data ----------------------------------------------------------------------------------
 +// Uniform screen.
-+constexpr uint32_t kSide = 0x487C;          // 0 HOME, 1 ROAD
++constexpr uint32_t kSide = 0x487C;          // int (stw/lwz in 0x805EF5F4 / 0x805EF564): 0 HOME, 1 ROAD
 +constexpr uint32_t kLineTypeWin = 0x4860;   // the LINE TYPE window object
 +constexpr uint32_t kOpenItf = 0x4868;       // interface (window + 0xDC) of the open window, or 0
 +constexpr uint32_t kItf = 0xDC;             // window -> its interface
@@ -938,7 +977,7 @@ index 0000000..66413fa
 +
 +bool Active(uint32_t screen) { return Enabled() && screen && g.screen == screen; }
 +bool OnWindow(uint32_t window) { return Enabled() && window && g.window == window && !g.entries.empty(); }
-+uint8_t Side(uint32_t s) { return Memory::Read8(s + kSide) ? 1 : 0; }
++uint8_t Side(uint32_t s) { return Memory::Read32(s + kSide) ? 1 : 0; }
 +std::string& Pending(uint32_t s) { return Side(s) ? g.road : g.home; }
 +uint32_t ListOf(uint32_t window) { return window + kList; }
 +uint32_t Index(uint32_t window) { return Memory::Read32(ListOf(window) + 0x28); }
@@ -1559,6 +1598,47 @@ index acf856e..683e74b 100644
      const uint32_t arena2 = (get(kMem2Hi) - lo2) & ~31u;
      const uint32_t size2 = std::max(arena2, kRetailMem2HeapSize);
      set(kMem2Lo, (lo2 + size2 + 31) & ~31u);
+diff --git a/runtime/src/hle/mlb/player_password.cpp b/runtime/src/hle/mlb/player_password.cpp
+index 09a6582..bfa8210 100644
+--- a/runtime/src/hle/mlb/player_password.cpp
++++ b/runtime/src/hle/mlb/player_password.cpp
+@@ -287,7 +287,9 @@ void OnHostFrame() {
+     if (g_copyRequested.exchange(false)) {
+         const std::vector<int> shown = ShownPassword();
+         if (shown.empty()) {
+-            Notice("To copy a password, open it in My Data > View or Delete Custom Players > Password Display.", true);
++            // Only on Password Display does Ctrl+C mean "copy the password"; elsewhere it stays silent.
++            if (DisplayOpen())
++                Notice("To copy a password, open it in My Data > View or Delete Custom Players > Password Display.", true);
+         } else {
+             const std::string text = Format(shown);
+             SDL_SetClipboardText(text.c_str());
+@@ -451,14 +453,23 @@ void DrawNotice() {
+     if (g_notice.empty() || std::chrono::steady_clock::now() > g_noticeUntil) return;
+     // Above the footer while Password Display's buttons are on it.
+     const float noticeY = display ? game.y + game.w * 0.92f : io.DisplaySize.y - 24.0f;
+-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, noticeY), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
++    const float maxW = game.z * 0.8f;
++    ImGui::SetNextWindowPos(ImVec2(game.x + game.z * 0.5f, noticeY), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
++    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, io.DisplaySize.y));
+     ImGui::SetNextWindowBgAlpha(0.85f);
+     if (ImGui::Begin("Password notice", nullptr,
+                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                          ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                          ImGuiWindowFlags_NoSavedSettings)) {
+         ImGui::SetWindowFontScale(std::max(1.0f, io.DisplaySize.y / 720.0f) * 1.3f);
+-        ImGui::TextColored(g_noticeError ? ImVec4(1, 0.55f, 0.4f, 1) : ImVec4(1, 1, 1, 1), "%s", g_notice.c_str());
++        // Wrapped inside the window's width (at most 80 % of the game picture); the box is centred.
++        const float wrap = maxW - ImGui::GetStyle().WindowPadding.x * 2;
++        const float textW = std::min(ImGui::CalcTextSize(g_notice.c_str()).x, wrap);
++        ImGui::PushStyleColor(ImGuiCol_Text, g_noticeError ? ImVec4(1, 0.55f, 0.4f, 1) : ImVec4(1, 1, 1, 1));
++        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + textW);
++        ImGui::TextUnformatted(g_notice.c_str());
++        ImGui::PopTextWrapPos();
++        ImGui::PopStyleColor();
+     }
+     ImGui::End();
+ }
 diff --git a/runtime/src/hle/storage/nand_isfs.cpp b/runtime/src/hle/storage/nand_isfs.cpp
 index d8f0c80..83ea471 100644
 --- a/runtime/src/hle/storage/nand_isfs.cpp
