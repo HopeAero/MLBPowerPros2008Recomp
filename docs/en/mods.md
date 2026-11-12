@@ -260,7 +260,7 @@ Your own uniforms for Arrange teams, made with the Uniform Studio editor. It is 
 - **Always on:** it is part of the game, not an optional enhancement (no ENHANCEMENTS switch; `[arrange] custom_uniforms` is no longer read). The editor opens from the launcher: TOOLS > UNIFORM STUDIO.
 - **Folder** (the launcher creates it when the option is turned on): `UserData\arrange\uniforms\<name>\uniform.ppu`. On Switch it is `sdmc:/switch/mlbpowerpros2008/UserData/arrange/uniforms/<name>/uniform.ppu`.
 - **Editor:** **Uniform Studio** (`UniformStudio.exe`, a PC tool; open it from the launcher's TOOLS > UNIFORM STUDIO). It is simple: pick the uniform, place logos and text, adjust the colors and save the `.ppu` in the folder above. The Setup installs it next to the game with everything it needs (its own Python too, in `uniform-studio\`): nothing else to install.
-- **What is imported:** logos, text and colors. MLB 2K `.iff` files and MVP Baseball `.fsh` files work as a starting point.
+- **What is imported:** logos, text and colors. From MLB 2K `.iff` files and MVP Baseball `.fsh` files you can take logos and other elements to place on your uniform, but not the whole uniform: their clothing does not fit the game's mould as it is.
 
 **How to use it**
 - Arrange > a team > ORIGINAL TEAM > UNIFORM > **LINE TYPE** row: the game's window with the three line types continues to the right in pages of three with your uniforms. Each shows its thumbnail (or its name if the `.ppu` has none) and the bar at the top names the one under the cursor; the HOME and ROAD figures show it while you move. A picks it, B undoes and the screen's OK keeps it. Picking one of the game's three types goes back to the game uniform. It is chosen per side (R switches HOME/ROAD).
