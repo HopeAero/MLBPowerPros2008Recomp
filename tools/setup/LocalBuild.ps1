@@ -163,6 +163,14 @@ $seasonStudio = Join-Path $workspace 'SeasonStudio.exe'  # season settings and s
 if (Test-Path $seasonStudio) { Copy-Item $seasonStudio $game -Force }
 $callnameStudio = Join-Path $workspace 'CallnameStudio.exe'  # launcher > HERRAMIENTAS > EDITOR DE CALLNAMES
 if (Test-Path $callnameStudio) { Copy-Item $callnameStudio $game -Force }
+$uniformStudio = Join-Path $workspace 'UniformStudio.exe'  # launcher > HERRAMIENTAS > EDITOR DE UNIFORMES
+if (Test-Path $uniformStudio) { Copy-Item $uniformStudio $game -Force }
+$uniformBundle = Join-Path $workspace 'uniform-studio'  # its bridge scripts + embedded Python (numpy, Pillow)
+if (Test-Path $uniformBundle) {
+    $installedBundle = Join-Path $game 'uniform-studio'
+    if (Test-Path $installedBundle) { Remove-Item -Recurse -Force $installedBundle }
+    Copy-Item $uniformBundle $game -Recurse -Force
+}
 foreach ($name in 'config', 'wii_bootstrap') {
     $dir = Join-Path $build $name
     if (Test-Path $dir) { Copy-Item $dir $game -Recurse -Force }

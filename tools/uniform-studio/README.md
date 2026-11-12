@@ -30,6 +30,12 @@ It reuses the Texture Studio's shell: `core.h`, `ui.h`, `power_pros_ui.h`, and t
   This was the simplest, lowest-risk option (the spec flagged the C++↔Python seam as a risk): no duplicated
   baking logic, and the `.ppu` format lives in exactly one place (`bake.py`).
 
+  **Installed copy:** the Setup puts the scripts and an embedded CPython 3.12 with numpy and Pillow in
+  `uniform-studio\` next to `UniformStudio.exe` (`Get-EmbeddedPython.ps1`, called by
+  `tools/setup/Make-Payload.ps1`; pinned SHA-256, cached in `local\tools\uniform-python`). When that folder
+  exists the editor uses it for `--tooldir` and `--python` unless the flags say otherwise, so players need
+  no Python of their own. A dev build (scripts next to the exe) keeps using the system Python.
+
 ### Interpreter path
 
 The editor uses `--python <exe>` when given; otherwise it falls back to the dev interpreter

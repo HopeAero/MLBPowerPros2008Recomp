@@ -1538,8 +1538,14 @@ int Run(const std::vector<std::string>& args) {
         else if (args[i] == "--yaw") a.yaw = static_cast<float>(std::atof(args[i + 1].c_str()));
         else if (args[i] == "--pitch") a.pitch = static_cast<float>(std::atof(args[i + 1].c_str()));
     }
+    // Installed by the Setup: the bridge scripts and an embedded Python (numpy, Pillow) in uniform-studio\
+    // next to the exe. Flags still win; a dev build (scripts next to the exe) keeps the system Python.
+    const fs::path bundled = base / "uniform-studio";
+    const bool toolDirFlag = std::find(args.begin(), args.end(), "--tooldir") != args.end();
+    if (!toolDirFlag && fs::exists(bundled / "studio_bridge.py")) a.toolDir = bundled;
+    if (a.pyExe == "python" && fs::exists(bundled / "python" / "python.exe")) a.pyExe = bundled / "python" / "python.exe";
     const fs::path pyenv = "C:/Users/david/.pyenv/pyenv-win/versions/3.12.0/python.exe";
-    if (a.pyExe == "python" && fs::exists(pyenv)) a.pyExe = pyenv;  // dev default; Setup passes --python
+    if (a.pyExe == "python" && fs::exists(pyenv)) a.pyExe = pyenv;  // dev default
     a.config = a.userData / "Config.toml";
     for (size_t i = 0; i + 1 < args.size(); ++i)  // the launcher passes its own Config.toml
         if (args[i] == "--config") a.config = tstudio::PathFromUtf8(args[i + 1]);

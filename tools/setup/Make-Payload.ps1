@@ -114,6 +114,20 @@ $callnameBuild = Join-Path $root 'local\build\callname-studio'
 & "$root\tools\callname-studio\build.ps1" -Source $Source -Output $callnameBuild
 Copy-Item "$callnameBuild\CallnameStudio.exe" $workspace
 
+Write-Host 'Uniform Studio...'
+# Uniform Studio (tools/uniform-studio): imported uniforms for Arrange teams. Its bridge (studio_bridge.py
+# and friends) and an embedded Python with numpy + Pillow go in uniform-studio\, which the editor finds
+# next to its exe. Players need no Python of their own.
+$uniformBuild = Join-Path $root 'local\build\uniform-studio'
+& "$root\tools\uniform-studio\build.ps1" -Source $Source -Output $uniformBuild
+Copy-Item "$uniformBuild\UniformStudio.exe" $workspace
+$uniformBundle = Join-Path $workspace 'uniform-studio'
+New-Item -ItemType Directory -Force $uniformBundle | Out-Null
+foreach ($f in 'studio_bridge.py', 'bake.py', 'import_sources.py', 'game_doll.py', 'packwii.py', 'projectbin.py', 'pj7m.py') {
+    Copy-Item (Join-Path $uniformBuild $f) $uniformBundle
+}
+& "$root\tools\uniform-studio\Get-EmbeddedPython.ps1" -Output (Join-Path $uniformBundle 'python')
+
 Write-Host 'Licenses...'
 New-Item -ItemType Directory -Force "$Output\licenses" | Out-Null
 Copy-Item "$root\LICENSE" "$Output\licenses\MLBPowerPros2008Recomp-LICENSE.txt"
@@ -126,6 +140,11 @@ Copy-Item "$root\tools\patches\powerupplus-2008.patch" "$Output\licenses\PowerUp
 Set-Content -Encoding utf8 "$Output\licenses\PowerUpPlus-SOURCE.txt" (
     "PowerUp+ (https://github.com/ogura-connection/PowerUpPlus, commit eb1a2c2, GPLv3) with PowerUpPlus-2008.patch " +
     "from the MLB Power Pros 2008 recomp project (tools/patches), built by tools/powerupplus.ps1 -Publish.")
+# Uniform Studio's embedded Python: CPython (PSF), numpy (BSD-3-Clause + bundled OpenBLAS etc.), Pillow (MIT-CMU).
+$py = Join-Path $uniformBundle 'python'
+Copy-Item (Join-Path $py 'LICENSE.txt') "$Output\licenses\Python-LICENSE.txt"
+Copy-Item (Get-ChildItem $py -Directory -Filter 'numpy-*.dist-info' | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'LICENSE.txt' }) "$Output\licenses\numpy-LICENSE.txt"
+Copy-Item (Get-ChildItem $py -Directory -Filter 'pillow-*.dist-info' | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'LICENSE' }) "$Output\licenses\Pillow-LICENSE.txt"
 foreach ($license in 'LICENSE-MIT', 'LICENSE-APACHE') {  # nodtool is MIT OR Apache-2.0
     Invoke-WebRequest -UseBasicParsing -OutFile "$Output\licenses\nodtool-$license.txt" `
         "https://raw.githubusercontent.com/encounter/nod/v2.0.0-alpha.10/$license"

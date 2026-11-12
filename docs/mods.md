@@ -259,7 +259,7 @@ Uniformes propios para los equipos de Arrange, hechos con el editor Uniform Stud
 
 - **Siempre activo:** forma parte del juego, no es una mejora opcional (no hay interruptor en MEJORAS; `[arrange] custom_uniforms` ya no se lee). El editor se abre desde el launcher: HERRAMIENTAS > EDITOR DE UNIFORMES.
 - **Carpeta** (el launcher la crea al encender la opción): `UserData\arrange\uniforms\<nombre>\uniform.ppu`. En Switch es `sdmc:/switch/mlbpowerpros2008/UserData/arrange/uniforms/<nombre>/uniform.ppu`.
-- **Editor:** **Uniform Studio** (`UniformStudio.exe`, herramienta de PC; se abre desde HERRAMIENTAS > EDITOR DE UNIFORMES del launcher). Es sencillo: eliges el uniforme, colocas logos y texto, ajustas los colores y guardas el `.ppu` en la carpeta anterior.
+- **Editor:** **Uniform Studio** (`UniformStudio.exe`, herramienta de PC; se abre desde HERRAMIENTAS > EDITOR DE UNIFORMES del launcher). Es sencillo: eliges el uniforme, colocas logos y texto, ajustas los colores y guardas el `.ppu` en la carpeta anterior. El Setup lo instala junto al juego con todo lo que necesita (también su propio Python, en `uniform-studio\`): no hay que instalar nada más.
 - **Qué se importa:** logos, texto y colores. Como punto de partida valen los `.iff` de MLB 2K y los `.fsh` de MVP Baseball.
 
 **Cómo se usa**
