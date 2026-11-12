@@ -3,7 +3,7 @@
 # llvm-mingw, statically against SDL3 and Dear ImGui from the runtime's own dependency sources.
 cmake_minimum_required(VERSION 3.24)
 # Bump with each release: it is the Setup's file version (setup.rc).
-project(MLBPowerProsSetup VERSION 0.1.6 LANGUAGES C CXX RC)
+project(MLBPowerProsSetup VERSION 0.1.7 LANGUAGES C CXX RC)
 
 set(SDL_SOURCE_DIR "" CACHE PATH "SDL3 source tree")
 set(IMGUI_SOURCE_DIR "" CACHE PATH "Dear ImGui source tree")
