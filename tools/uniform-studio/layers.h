@@ -34,6 +34,7 @@ struct Layer {
     float x = 0.0f, y = 0.0f;                // top-left in atlas pixels
     float scale = 1.0f;                      // image layers only (uniform size)
     float sx = 1.0f, sy = 1.0f;              // image layers only: horizontal / vertical stretch
+    float rot = 0.0f;                        // image layers only: degrees clockwise about the box centre
     // Drawn size in atlas pixels (image layers).
     float DrawnW() const;
     float DrawnH() const;

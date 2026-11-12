@@ -84,6 +84,8 @@ bool SaveProject(const fs::path& dir, const Project& p, std::string* error) {
     o << "rgb";
     for (int c : p.pieces.rgb) o << "\t" << c;
     o << "\n";
+    o << "stripes\t" << p.pieces.stripes << "\t" << p.pieces.stripeGap << "\t" << p.pieces.stripe2 << "\t"
+      << (p.pieces.stripeTrousers ? 1 : 0) << "\t" << p.pieces.stripe1 << "\n";
     o << "backup";
     for (int b : p.backup) o << "\t" << b;
     o << "\n";
@@ -99,7 +101,7 @@ bool SaveProject(const fs::path& dir, const Project& p, std::string* error) {
             o << "layer\t" << k << "\t" << L.visible << "\t" << L.isText << "\t" << L.isBase << "\t" << L.x << "\t" << L.y
               << "\t" << L.scale << "\t" << L.sx << "\t" << L.sy << "\t" << L.fontPx << "\t" << int(L.color[0]) << "\t"
               << int(L.color[1]) << "\t" << int(L.color[2]) << "\t" << int(L.color[3]) << "\t" << png << "\t"
-              << Clean(L.name) << "\t" << Clean(L.text) << "\t" << L.isPaint << "\n";
+              << Clean(L.name) << "\t" << Clean(L.text) << "\t" << L.isPaint << "\t" << L.rot << "\n";
         }
     }
     std::ofstream f(dir / "project.txt", std::ios::binary);
@@ -142,6 +144,12 @@ bool LoadProject(const fs::path& dir, Project* out, std::string* error) {
         } else if (v[0] == "rgb") {  // free colours per piece (-1 = the game colour)
             for (size_t i = 0; i < p.pieces.rgb.size() && i + 1 < v.size(); ++i)
                 p.pieces.rgb[i] = std::clamp(static_cast<int>(num(1 + i)), -1, 0xFFFFFF);
+        } else if (v[0] == "stripes" && v.size() >= 5) {  // the Studio's own stripes (pieces.h)
+            p.pieces.stripes = std::clamp(static_cast<int>(num(1)), 0, 3);
+            p.pieces.stripeGap = std::clamp(static_cast<int>(num(2)), 3, 32);
+            p.pieces.stripe2 = std::clamp(static_cast<int>(num(3)), 0, 0xFFFFFF);
+            p.pieces.stripeTrousers = num(4) != 0;
+            if (v.size() > 5) p.pieces.stripe1 = std::clamp(static_cast<int>(num(5)), 0, 0xFFFFFF);
         } else if (v[0] == "backup" && v.size() >= 11) {
             for (size_t i = 0; i < 10; ++i) p.backup[i] = std::clamp(static_cast<int>(num(1 + i)), 0, 31);
         } else if (v[0] == "layer" && v.size() >= 18) {
@@ -166,6 +174,7 @@ bool LoadProject(const fs::path& dir, Project* out, std::string* error) {
             L.name = v[16];
             L.text = v[17];
             L.isPaint = num(18) != 0;  // older projects: no column, not a drawing
+            L.rot = static_cast<float>(num(19));  // older projects: not turned
             p.canvases[static_cast<size_t>(k)].layers.push_back(std::move(L));
         }
     }

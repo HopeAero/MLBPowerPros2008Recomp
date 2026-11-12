@@ -17,7 +17,7 @@ ImTextureID Tex(SDL_Texture* t) { return static_cast<ImTextureID>(reinterpret_ca
 } // namespace
 
 void DrawPreview(SDL_Texture* render3d, SDL_Texture* body, SDL_Texture* guide, ImVec2 size, int colors,
-                 bool* figure, float* yaw, float* pitch, float* zoom, bool* inspect) {
+                 bool* figure, bool* bands, float* yaw, float* pitch, float* zoom, bool* inspect) {
     if (!ui::BeginPanel("##preview", Tr("Vista previa", "Preview"), size)) {
         ui::EndPanel();
         return;
@@ -33,6 +33,10 @@ void DrawPreview(SDL_Texture* render3d, SDL_Texture* body, SDL_Texture* guide, I
     if (*figure) {
         ImGui::SameLine();
         if (ui::Pill(Tr("Ampliar", "Enlarge"), ui::kGreenTop, ui::kGreenBottom, true)) *inspect = true;
+        ImGui::Checkbox(Tr("Muñequeras", "Wristbands"), bands);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", Tr("Solo la vista previa: en el juego cada jugador lleva las suyas (no son del uniforme).",
+                                       "Preview only: in the game each player wears their own (they are not part of the uniform)."));
     }
 
     const ImVec2 avail = ImGui::GetContentRegionAvail();

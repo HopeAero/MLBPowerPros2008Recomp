@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "pieces.h"
 
+#include "paint.h"
+
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -284,6 +286,22 @@ tstudio::Image BuildPiecesBase(const GameBase& base, const Pieces& pieces) {
     for (size_t i = 0; i < base.index.size(); ++i) {
         const Rgba c = DecodeRgb5a3(pal[base.index[i]]);
         std::memcpy(&img.rgba[i * 4], c.data(), 4);
+    }
+    if (pieces.stripes > 0) {
+        // Where: the jersey's entries (not the piping's when the line type is piping, so the trim stays)
+        // and, if asked, the trousers'.
+        std::array<uint8_t, 256> on{};
+        for (int e : {0x80, 0x81, 0x82, 0x88, 0x89, 0x8A, 0xA4}) on[e] = 1;
+        if (pieces.lineType != 1)
+            for (int e : {0x92, 0x93, 0xA2, 0xA3, 0xA5, 0xA6, 0xA7}) on[e] = 1;
+        if (pieces.stripeTrousers)
+            for (int e : {0x70, 0x71, 0x72, 0x73, 0x78}) on[e] = 1;
+        std::vector<uint8_t> mask(base.index.size());
+        for (size_t i = 0; i < mask.size(); ++i) mask[i] = on[base.index[i]];
+        auto rgba = [](uint32_t c) { return Rgba8{static_cast<uint8_t>(c >> 16), static_cast<uint8_t>(c >> 8), static_cast<uint8_t>(c), 255}; };
+        const Pattern kind = pieces.stripes == 1 ? Pattern::Vertical : pieces.stripes == 2 ? Pattern::Double : Pattern::Braid;
+        PaintPattern(img, kind, 1, static_cast<float>(std::clamp(pieces.stripeGap, 3, 32)), 0,
+                     rgba(static_cast<uint32_t>(pieces.stripe1)), PaintMask{&mask}, rgba(static_cast<uint32_t>(pieces.stripe2)));
     }
     return img;
 }

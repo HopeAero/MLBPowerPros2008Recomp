@@ -31,9 +31,11 @@ void PaintRect(tstudio::Image& img, float x0, float y0, float x1, float y1, floa
 // that have the start pixel's colour, painting them into img.
 void PaintFill(tstudio::Image& img, const tstudio::Image* ref, int x, int y, Rgba8 c, const PaintMask& m);
 
-enum class Pattern { Vertical, Horizontal, Diagonal, DiagonalBack, Checks };
+enum class Pattern { Vertical, Horizontal, Diagonal, DiagonalBack, Checks, Double, Braid };
 // Stripes `width` px wide every `spacing` px (checks: squares of `spacing`), shifted by `offset`, over the
-// whole image (inside the mask).
-void PaintPattern(tstudio::Image& img, Pattern p, float width, float spacing, float offset, Rgba8 c, const PaintMask& m);
+// whole image (inside the mask). Double: vertical pairs, a `c` line and a `c2` line one width apart.
+// Braid: vertical pairs of `c` and `c2` strands that weave over each other (chain pinstripes).
+void PaintPattern(tstudio::Image& img, Pattern p, float width, float spacing, float offset, Rgba8 c, const PaintMask& m,
+                  Rgba8 c2 = {0, 0, 0, 255});
 
 }  // namespace ustudio

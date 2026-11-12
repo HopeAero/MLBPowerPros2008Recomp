@@ -14,6 +14,10 @@ It reuses the Texture Studio's shell: `core.h`, `ui.h`, `power_pros_ui.h`, and t
   Layers are composited on the CPU into an atlas-resolution RGBA image (`layers.cpp:Compose`). That image is
   both what the canvas shows and what gets baked, so the editor is WYSIWYG. The over-256-colours check
   (`CountColors`) runs on the same image.
+  An image layer is resampled from its untouched source each time (`layers.cpp:ResampleArea`: exact-area
+  average per axis when shrinking, nearest when enlarging), then turned about its box centre by `rot`
+  degrees with 4 × 4 supersampling. The canvas handles work in the turned box (`canvas.cpp:Frame`); the
+  knob above the top side turns it.
 - **Python bridge** (`studio_bridge.py`) — the baking (`bake.py`) and `.fsh`/`.iff` decoding
   (`import_sources.py`) already existed in Python (tasks 2 and 3) and are tested. Rather than port them to
   C++, the editor invokes the project's Python interpreter with a single JSON job file:
@@ -74,6 +78,12 @@ skeleton in a standing pose), read from the player's `project.bin` by the bridge
 `UserData/arrange/uniform/game_doll.bin`. Without the game it falls back to the editor's own mannequin
 (`render3d.cpp:BuildMannequin`). The saved thumbnail (`.ppu` kind `thumb`, 64×64) is the same figure from
 the front.
+
+The game's model maps the left and right halves of the body to the same atlas pixels (sleeves, trousers,
+cap sides: mirrored; only chest and back are unique), so the preview shows a sleeve logo on both arms, as
+the game does. "Wristbands" hides the figure's wristbands (the body model's two 32x16 textures and their outline hulls,
+`render3d.cpp:WithoutBands`): they are each player's equipment, not the uniform. Test flags: `--rotate <deg>`
+(the selected layer), `--no-bands`.
 
 ## Colour by piece
 

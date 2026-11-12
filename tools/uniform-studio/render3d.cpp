@@ -6,12 +6,69 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <array>
 #include <iterator>
+#include <map>
 
 namespace ustudio {
 using tstudio::Image;
 
 namespace {
+// The figure without its wristbands: their triangles (the body model's only 32x16 textures, materials
+// 5 + i) and their black outline hulls, the hull pieces (triangles joined by shared corners) that lie
+// wholly around a wristband. Measured on game_doll.bin: 2 x 96 hull triangles, as many as the bands.
+// Under them the forearm is the uniform's (one atlas pixel, the sleeves colour).
+std::vector<Vtx> WithoutBands(const GameDoll& d) {
+    struct Box { float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f}; };
+    auto grow = [](Box& b, const Vtx& v) {
+        const float p[3] = {v.x, v.y, v.z};
+        for (int k = 0; k < 3; ++k) { b.lo[k] = std::min(b.lo[k], p[k]); b.hi[k] = std::max(b.hi[k], p[k]); }
+    };
+    std::map<int, Box> bands;  // material -> its box
+    for (size_t i = 0; i < d.textures.size(); ++i)
+        if (d.textures[i].width == 32 && d.textures[i].height == 16) bands[5 + static_cast<int>(i)];
+    for (const Vtx& v : d.mesh)
+        if (bands.count(v.mat)) grow(bands[v.mat], v);
+    // Hull triangles joined into pieces by shared corners (union-find over rounded positions).
+    std::map<std::array<int, 3>, int> corner;
+    std::vector<int> parent;
+    auto find = [&](int x) { while (parent[x] != x) x = parent[x] = parent[parent[x]]; return x; };
+    auto id = [&](const Vtx& v) {
+        const std::array<int, 3> k{static_cast<int>(std::lround(v.x * 1000)), static_cast<int>(std::lround(v.y * 1000)),
+                                   static_cast<int>(std::lround(v.z * 1000))};
+        auto [it, fresh] = corner.try_emplace(k, static_cast<int>(parent.size()));
+        if (fresh) parent.push_back(it->second);
+        return it->second;
+    };
+    const size_t n = d.mesh.size() / 3;
+    for (size_t t = 0; t < n; ++t)
+        if (d.mesh[t * 3].mat == 3) {
+            const int a = find(id(d.mesh[t * 3]));
+            parent[find(id(d.mesh[t * 3 + 1]))] = a;
+            parent[find(id(d.mesh[t * 3 + 2]))] = find(a);
+        }
+    std::map<int, Box> piece;
+    for (size_t t = 0; t < n; ++t)
+        if (d.mesh[t * 3].mat == 3)
+            for (int k = 0; k < 3; ++k) grow(piece[find(id(d.mesh[t * 3]))], d.mesh[t * 3 + k]);
+    constexpr float kMargin = 0.25f;  // the hull stands ~0.12 off the band (figure 8 units tall)
+    auto aroundBand = [&](const Box& p) {
+        for (const auto& [mat, b] : bands) {
+            bool in = true;
+            for (int k = 0; k < 3; ++k) in &= p.lo[k] >= b.lo[k] - kMargin && p.hi[k] <= b.hi[k] + kMargin;
+            if (in) return true;
+        }
+        return false;
+    };
+    std::vector<Vtx> out;
+    for (size_t t = 0; t < n; ++t) {
+        const Vtx& v = d.mesh[t * 3];
+        if (bands.count(v.mat) || (v.mat == 3 && aroundBand(piece[find(id(v))]))) continue;
+        out.insert(out.end(), d.mesh.begin() + t * 3, d.mesh.begin() + t * 3 + 3);
+    }
+    return out;
+}
+
 struct UV { float u0, v0, u1, v1; };
 
 // A textured quad p0..p3 (counter-clockwise), UV corners TL,TR,BR,BL mapped to `r`.
@@ -219,6 +276,7 @@ bool LoadGameDoll(const std::filesystem::path& file, GameDoll* out) {
         p.y = (p.y - lo) * scale;
         p.z *= scale;
     }
+    doll.meshNoBands = WithoutBands(doll);
     doll.ok = !doll.mesh.empty();
     *out = std::move(doll);
     return out->ok;

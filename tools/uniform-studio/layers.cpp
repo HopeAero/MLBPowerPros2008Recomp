@@ -42,29 +42,87 @@ void Over(Image& d, int x, int y, int r, int g, int b, int a) {
     d.rgba[i + 3] = static_cast<uint8_t>(a + d.rgba[i + 3] * ia);
 }
 
+// Resample to dw x dh. Shrinking (per axis): exact area, each output pixel the coverage-weighted mean of
+// the source it spans (fractional edges count by how much of them it covers), so a logo shrunk by any
+// factor, or squeezed in x or y only, keeps its thin lines evenly instead of dropping some. Enlarging:
+// nearest, crisp. Alpha-weighted; premultiplied float RGBA out. The layer's source is never changed, so
+// resizing again always starts from the original picture.
+std::vector<float> ResampleArea(const Image& s, int dw, int dh) {
+    struct Tap { int i; float w; };
+    auto taps = [](int src, int dst) {
+        std::vector<std::vector<Tap>> t(static_cast<size_t>(dst));
+        const double f = static_cast<double>(src) / dst;
+        for (int o = 0; o < dst; ++o) {
+            if (dst >= src) { t[static_cast<size_t>(o)].push_back({std::min(src - 1, static_cast<int>((o + 0.5) * f)), 1.0f}); continue; }
+            const double a = o * f, b = (o + 1) * f;
+            for (int i = static_cast<int>(a); i < src && i < b; ++i) {
+                const double w = std::min(b, i + 1.0) - std::max(a, static_cast<double>(i));
+                if (w > 0) t[static_cast<size_t>(o)].push_back({i, static_cast<float>(w / (b - a))});
+            }
+        }
+        return t;
+    };
+    const int sw = static_cast<int>(s.width), sh = static_cast<int>(s.height);
+    const auto tx = taps(sw, dw), ty = taps(sh, dh);
+    std::vector<float> row(static_cast<size_t>(dw) * sh * 4, 0.0f), out(static_cast<size_t>(dw) * dh * 4, 0.0f);
+    for (int y = 0; y < sh; ++y)
+        for (int x = 0; x < dw; ++x) {
+            float* o = &row[(static_cast<size_t>(y) * dw + x) * 4];
+            for (const Tap& t : tx[static_cast<size_t>(x)]) {
+                const uint8_t* p = &s.rgba[(static_cast<size_t>(y) * sw + t.i) * 4];
+                const float a = p[3] * t.w;
+                o[0] += p[0] * a; o[1] += p[1] * a; o[2] += p[2] * a; o[3] += a;
+            }
+        }
+    for (int y = 0; y < dh; ++y)
+        for (const Tap& t : ty[static_cast<size_t>(y)])
+            for (int x = 0; x < dw; ++x) {
+                const float* r = &row[(static_cast<size_t>(t.i) * dw + x) * 4];
+                float* o = &out[(static_cast<size_t>(y) * dw + x) * 4];
+                for (int k = 0; k < 4; ++k) o[k] += r[k] * t.w;
+            }
+    return out;
+}
+
+void OverPremul(Image& d, int x, int y, const float* p) {
+    if (p[3] < 0.5f) return;
+    Over(d, x, y, static_cast<int>(p[0] / p[3] + 0.5f), static_cast<int>(p[1] / p[3] + 0.5f),
+         static_cast<int>(p[2] / p[3] + 0.5f), static_cast<int>(p[3] + 0.5f));
+}
+
 void BlitScaled(Image& out, const Layer& L) {
     if (L.src.Empty()) return;
     const int dw = std::max(1, static_cast<int>(std::lround(L.DrawnW())));
     const int dh = std::max(1, static_cast<int>(std::lround(L.DrawnH())));
-    const int sw = static_cast<int>(L.src.width), shh = static_cast<int>(L.src.height);
-    for (int dy = 0; dy < dh; ++dy) {
-        // Each output pixel averages the source pixels it covers (shrinking a big logo stays smooth;
-        // enlarging stays crisp, nearest).
-        const int y0 = dy * shh / dh, y1 = std::max(y0 + 1, (dy + 1) * shh / dh);
-        for (int dx = 0; dx < dw; ++dx) {
-            const int x0 = dx * sw / dw, x1 = std::max(x0 + 1, (dx + 1) * sw / dw);
-            uint32_t r = 0, g = 0, b = 0, a = 0, n = 0;
-            for (int yy = y0; yy < std::min(y1, shh); ++yy)
-                for (int xx = x0; xx < std::min(x1, sw); ++xx) {
-                    const uint8_t* p = &L.src.rgba[(static_cast<size_t>(yy) * sw + xx) * 4];
-                    r += p[0] * p[3]; g += p[1] * p[3]; b += p[2] * p[3]; a += p[3]; ++n;
-                }
-            if (!n || !a) continue;
-            Over(out, static_cast<int>(std::lround(L.x)) + dx, static_cast<int>(std::lround(L.y)) + dy,
-                 static_cast<uint8_t>(r / a), static_cast<uint8_t>(g / a), static_cast<uint8_t>(b / a),
-                 static_cast<uint8_t>(a / n));
-        }
+    const std::vector<float> img = ResampleArea(L.src, dw, dh);
+    const float turn = std::remainder(L.rot, 360.0f);
+    if (std::fabs(turn) < 0.01f) {
+        const int ox = static_cast<int>(std::lround(L.x)), oy = static_cast<int>(std::lround(L.y));
+        for (int y = 0; y < dh; ++y)
+            for (int x = 0; x < dw; ++x) OverPremul(out, ox + x, oy + y, &img[(static_cast<size_t>(y) * dw + x) * 4]);
+        return;
     }
+    // Turned about the box centre: each atlas pixel averages 4 x 4 points mapped back into the resized
+    // picture (smooth edges at any angle).
+    constexpr int kSub = 4;
+    const float r = turn * 3.14159265f / 180.0f, c = std::cos(r), s = std::sin(r);
+    const float cx = L.x + dw / 2.0f, cy = L.y + dh / 2.0f;
+    const float ex = (std::fabs(c) * dw + std::fabs(s) * dh) / 2, ey = (std::fabs(s) * dw + std::fabs(c) * dh) / 2;
+    for (int py = static_cast<int>(std::floor(cy - ey)); py <= static_cast<int>(std::ceil(cy + ey)); ++py)
+        for (int px = static_cast<int>(std::floor(cx - ex)); px <= static_cast<int>(std::ceil(cx + ex)); ++px) {
+            float acc[4] = {};
+            for (int j = 0; j < kSub; ++j)
+                for (int i = 0; i < kSub; ++i) {
+                    const float dx = px + (i + 0.5f) / kSub - cx, dy = py + (j + 0.5f) / kSub - cy;
+                    const int lx = static_cast<int>(std::floor(c * dx + s * dy + dw / 2.0f));
+                    const int ly = static_cast<int>(std::floor(-s * dx + c * dy + dh / 2.0f));
+                    if (lx < 0 || ly < 0 || lx >= dw || ly >= dh) continue;
+                    const float* p = &img[(static_cast<size_t>(ly) * dw + lx) * 4];
+                    for (int k = 0; k < 4; ++k) acc[k] += p[k];
+                }
+            for (float& v : acc) v /= kSub * kSub;
+            OverPremul(out, px, py, acc);
+        }
 }
 
 // Quote one argument for a Windows command line / keep it plain for posix_spawn (passed as argv).

@@ -105,6 +105,7 @@ struct App {
     int dialogKind = 0;  // 0 = import art, 1 = load from game pack
     int templateChoice = 0;
     bool dollView = true;  // preview: chibi paper-doll vs flat atlas
+    bool bands = true;     // preview: the figure wears its wristbands (equipment, not the uniform)
     GameBase gameBase;      // the pieces of an Arrange uniform, from the player's own game (pieces.h)
     Pieces pieces;
     bool piecesOn = false;  // the body base layer is the piece-coloured atlas
@@ -125,6 +126,7 @@ struct App {
     bool clipZone = true;   // drawing stays inside the zone being edited
     int pattern = 0;        // paint.h Pattern
     float patWidth = 2.0f, patSpacing = 8.0f, patOffset = 0.0f;
+    unsigned char patColor2[3] = {24, 34, 84};  // the second colour of the two-colour patterns (double, braid)
     bool patPreview = false;  // the pattern shown on the mould before it is applied
     Image activeImg;        // the active part composed this frame (the picker and the fill read it)
     std::vector<Snapshot> undo, redo;
@@ -282,6 +284,15 @@ void ApplyTemplate(App& a, Template t) {
 // UserData), found through Config.toml [paths] dvd_root like the Texture Studio. Nothing is shipped.
 fs::path GameBaseCache(const App& a) { return a.userData / "arrange" / "uniform" / "game_base.bin"; }
 fs::path GameDollCache(const App& a) { return a.userData / "arrange" / "uniform" / "game_doll.bin"; }
+
+// RenderMesh's extra textures: the composed cap letter, then the figure's own.
+std::vector<const Image*> DollExtras(const App& a, const Image* cap) {
+    std::vector<const Image*> e{cap};
+    for (const Image& t : a.doll.textures) e.push_back(&t);
+    return e;
+}
+// The figure to draw: with or without its wristbands (each player's equipment, not the uniform).
+const std::vector<Vtx>& DollMesh(const App& a) { return a.bands ? a.doll.mesh : a.doll.meshNoBands; }
 
 // The player's project.bin, from Config.toml [paths] dvd_root (as the Texture Studio), or empty.
 fs::path FindProjectBin(const App& a) {
@@ -470,6 +481,33 @@ void DrawPieces(App& a, int part) {
         if (a.pieces.lineType == 2)
             ImGui::TextDisabled("%s", Tr("Con rayas, el pantalón lleva el color de la camiseta (como en el juego).",
                                          "With pinstripes the trousers take the jersey colour (as in the game)."));
+        // The Studio's own stripes, on top of the game's line type (piping + stripes works).
+        ImGui::SeparatorText(Tr("Rayas del Studio", "Studio stripes"));
+        static const power_pros_ui::Phrase stripes[4] = {{"Ninguna", "None"}, {"Finas", "Fine"}, {"Dobles", "Double"},
+                                                         {"Trenzadas", "Braided"}};
+        for (int t = 0; t < 4; ++t) {
+            if (t % 2) ImGui::SameLine();
+            if (Tab(stripes[t].get(), a.pieces.stripes == t)) {
+                a.pieces.stripes = t;
+                if (t && a.pieces.lineType == 2) a.pieces.lineType = 0;  // not over the game's own pinstripes
+                changed = true;
+            }
+        }
+        if (a.pieces.stripes > 0) {
+            auto pick = [&](const char* label, int* rgb) {
+                float f[3] = {((*rgb >> 16) & 255) / 255.0f, ((*rgb >> 8) & 255) / 255.0f, (*rgb & 255) / 255.0f};
+                if (ImGui::ColorEdit3(label, f, ImGuiColorEditFlags_NoInputs)) {
+                    *rgb = (static_cast<int>(std::lround(f[0] * 255)) << 16) | (static_cast<int>(std::lround(f[1] * 255)) << 8) |
+                           static_cast<int>(std::lround(f[2] * 255));
+                    changed = true;
+                }
+            };
+            pick(Tr("Color de la raya", "Stripe colour"), &a.pieces.stripe1);
+            if (a.pieces.stripes >= 2) pick(Tr("Segundo color", "Second colour"), &a.pieces.stripe2);
+            ImGui::SetNextItemWidth(-1);
+            changed |= ImGui::SliderInt("##sgap", &a.pieces.stripeGap, 3, 32, Tr("una raya cada %d px", "a stripe every %d px"));
+            changed |= ImGui::Checkbox(Tr("También en el pantalón", "On the trousers too"), &a.pieces.stripeTrousers);
+        }
     }
     if (part == 1) {
         // The number, as the game's UNIFORM # / # OUTLINE: its colours go with the uniform (the game takes
@@ -641,7 +679,7 @@ uint64_t StateKey(const App& a) {
         mix(c.layers.size());
         for (const Layer& L : c.layers) {
             mix(L.visible); mix(L.isText); mix(L.isBase); mix(L.isPaint);
-            mixf(L.x); mixf(L.y); mixf(L.scale); mixf(L.sx); mixf(L.sy); mixf(L.fontPx);
+            mixf(L.x); mixf(L.y); mixf(L.scale); mixf(L.sx); mixf(L.sy); mixf(L.rot); mixf(L.fontPx);
             for (int k = 0; k < 4; ++k) mix(L.color[k]);
             for (char ch : L.text) mix(static_cast<uint8_t>(ch));
             for (char ch : L.name) mix(static_cast<uint8_t>(ch));
@@ -653,7 +691,8 @@ uint64_t StateKey(const App& a) {
     for (int v : a.pieces.color) mix(static_cast<uint32_t>(v));
     for (int v : a.pieces.rgb) mix(static_cast<uint32_t>(v));
     for (int v : {a.pieces.lineType, a.pieces.number, a.pieces.outline, a.pieces.previewNumber, a.pieces.chest,
-                  a.pieces.chestDx, a.pieces.chestDy, a.pieces.backDx, a.pieces.backDy, a.pieces.backSize})
+                  a.pieces.chestDx, a.pieces.chestDy, a.pieces.backDx, a.pieces.backDy, a.pieces.backSize,
+                  a.pieces.stripes, a.pieces.stripeGap, a.pieces.stripe1, a.pieces.stripe2, static_cast<int>(a.pieces.stripeTrousers)})
         mix(static_cast<uint32_t>(v));
     mix(a.piecesOn);
     for (int v : a.backup) mix(static_cast<uint32_t>(v));
@@ -1083,8 +1122,16 @@ void DrawPattern(App& a) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 8));
     static const power_pros_ui::Phrase pats[] = {{"Verticales", "Vertical"}, {"Horizontales", "Horizontal"},
                                                  {"Diagonal /", "Diagonal /"}, {"Diagonal \\", "Diagonal \\"},
-                                                 {"Cuadros", "Checks"}};
-    ButtonGrid("pats", pats, 5, 3, &a.pattern, 30);
+                                                 {"Cuadros", "Checks"}, {"Dobles", "Double"}, {"Trenzadas", "Braided"}};
+    ButtonGrid("pats", pats, 7, 3, &a.pattern, 30);
+    if (a.pattern >= 5) {  // two colours: the drawing colour and this one
+        float f[3] = {a.patColor2[0] / 255.0f, a.patColor2[1] / 255.0f, a.patColor2[2] / 255.0f};
+        if (ImGui::ColorEdit3(Tr("Segundo color", "Second colour"), f, ImGuiColorEditFlags_NoInputs))
+            for (int k = 0; k < 3; ++k) a.patColor2[k] = static_cast<unsigned char>(std::lround(f[k] * 255));
+        ImGui::SameLine();
+        if (ImGui::SmallButton(Tr("Igual al primero", "Same as the first")))
+            for (int k = 0; k < 3; ++k) a.patColor2[k] = a.paint.color[k];
+    }
     ImGui::SetNextItemWidth(-1);
     if (a.pattern != 4) ImGui::SliderFloat("##pw", &a.patWidth, 1.0f, 32.0f, Tr("grosor de la línea: %.0f px", "line width: %.0f px"));
     ImGui::SetNextItemWidth(-1);
@@ -1103,7 +1150,7 @@ void DrawPattern(App& a) {
     if (apply) {
         const Rgba8 c{a.paint.color[0], a.paint.color[1], a.paint.color[2], 255};
         PaintPattern(PaintLayer(Active(a), Tr("Dibujo", "Drawing")).src, static_cast<Pattern>(a.pattern), a.patWidth,
-                     a.patSpacing, a.patOffset, c, PaintMask{ZoneMask(a)});
+                     a.patSpacing, a.patOffset, c, PaintMask{ZoneMask(a)}, {a.patColor2[0], a.patColor2[1], a.patColor2[2], 255});
         a.patPreview = false;
         Toast(a, Tr("Patrón aplicado (Ctrl+Z lo deshace).", "Pattern applied (Ctrl+Z undoes it)."));
     }
@@ -1333,6 +1380,18 @@ void DrawProperties(App& a, ImVec2 pos, ImVec2 size) {
         ImGui::SetNextItemWidth(half);
         ImGui::SliderFloat("##sy", &L.sy, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
         if (ImGui::SmallButton(Tr("Forma original", "Original shape"))) L.sx = L.sy = 1.0f;
+        ImGui::TextUnformatted(Tr("Girar (o el círculo sobre la caja; Mayús: de 15 en 15)",
+                                  "Turn (or the knob above the box; Shift: steps of 15)"));
+        const float bw = ImGui::GetFrameHeight() * 1.6f;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 3 * (bw + 4));
+        ImGui::SliderFloat("##rot", &L.rot, -180.0f, 180.0f, "%.0f°");
+        auto turn = [&](float d) { L.rot = std::remainder(L.rot + d, 360.0f); };
+        ImGui::SameLine(0, 4);
+        if (ImGui::Button("-90", ImVec2(bw, 0))) turn(-90);
+        ImGui::SameLine(0, 4);
+        if (ImGui::Button("+90", ImVec2(bw, 0))) turn(90);
+        ImGui::SameLine(0, 4);
+        if (ImGui::Button("0°", ImVec2(bw, 0))) L.rot = 0;
     }
     ImGui::TextUnformatted(Tr("Posición", "Position"));
     const float half = (ImGui::GetContentRegionAvail().x - 8) / 2;
@@ -1594,12 +1653,37 @@ int Run(const std::vector<std::string>& args) {
             a.pattern = 2;
             a.patPreview = true;
         }
+    for (size_t i = 0; i + 1 < args.size(); ++i) {  // screenshots: a pattern previewed with its two colours; the line type
+        if (args[i] == "--pattern") {
+            std::sscanf(args[i + 1].c_str(), "%d,%f,%f", &a.pattern, &a.patWidth, &a.patSpacing);
+            a.pattern = std::clamp(a.pattern, 0, 6);
+            a.patPreview = true;
+        }
+        unsigned c1 = 0, c2 = 0;
+        if (args[i] == "--pattern-colors" && std::sscanf(args[i + 1].c_str(), "%x,%x", &c1, &c2) == 2)
+            for (int k = 0; k < 3; ++k) {
+                a.paint.color[k] = static_cast<unsigned char>(c1 >> (16 - 8 * k));
+                a.patColor2[k] = static_cast<unsigned char>(c2 >> (16 - 8 * k));
+            }
+        if (args[i] == "--stripes" && a.piecesOn) {
+            a.pieces.stripes = std::clamp(std::atoi(args[i + 1].c_str()), 0, 3);
+            ApplyPieces(a);
+        }
+        if (args[i] == "--line-type" && a.piecesOn) {
+            a.pieces.lineType = std::clamp(std::atoi(args[i + 1].c_str()), 0, 2);
+            ApplyPieces(a);
+        }
+    }
     for (size_t i = 0; i + 1 < args.size(); ++i)  // tests: chest,chestDx,chestDy,backDx,backDy,backSize
         if (args[i] == "--number-layout")
             std::sscanf(args[i + 1].c_str(), "%d,%d,%d,%d,%d,%d", &a.pieces.chest, &a.pieces.chestDx, &a.pieces.chestDy,
                         &a.pieces.backDx, &a.pieces.backDy, &a.pieces.backSize);
     for (const auto& arg : args)
         if (arg == "--inspect") { a.inspect = true; a.iyaw = a.yaw; }
+    for (const auto& arg : args)
+        if (arg == "--no-bands") a.bands = false;
+    for (size_t i = 0; i + 1 < args.size(); ++i)  // screenshots: the selected layer turned this many degrees
+        if (args[i] == "--rotate" && Active(a).selected >= 0) Active(a).layers[Active(a).selected].rot = std::strtof(args[i + 1].c_str(), nullptr);
     for (size_t i = 0; i + 1 < args.size(); ++i)  // tests: the body atlas with the sample number drawn
         if (args[i] == "--number-test" && a.piecesOn) {
             a.pieces.number = 4;
@@ -1693,7 +1777,7 @@ int Run(const std::vector<std::string>& args) {
             Canvas tmp = Active(a);
             const Rgba8 c{a.paint.color[0], a.paint.color[1], a.paint.color[2], 255};
             PaintPattern(PaintLayer(tmp, "preview").src, static_cast<Pattern>(a.pattern), a.patWidth, a.patSpacing,
-                         a.patOffset, c, PaintMask{ZoneMask(a)});
+                         a.patOffset, c, PaintMask{ZoneMask(a)}, {a.patColor2[0], a.patColor2[1], a.patColor2[2], 255});
             a.activeImg = Compose(tmp);
         } else {
             a.activeImg = Compose(Active(a));
@@ -1708,12 +1792,11 @@ int Run(const std::vector<std::string>& args) {
                 bool capUsed = false;
                 for (size_t i = 3; i < capImg.rgba.size(); i += 4) capUsed |= capImg.rgba[i] >= 128;
                 if (capUsed) FillBehind(capImg, CapFill(a, bodyImg));  // as the game shows it
-                std::vector<const Image*> extras{&capImg};
-                for (const Image& t : a.doll.textures) extras.push_back(&t);
+                const std::vector<const Image*> extras = DollExtras(a, &capImg);
                 Image withNumber = bodyImg;
                 if (a.piecesOn) DrawNumber(withNumber, a.gameBase, a.pieces);
                 Upload(renderer, a.render3dTex,
-                       RenderMesh(a.doll.mesh, withNumber, 440, 440, a.yaw, a.pitch, a.zoom, 4.0f, &extras));
+                       RenderMesh(DollMesh(a), withNumber, 440, 440, a.yaw, a.pitch, a.zoom, 4.0f, &extras));
             } else {
                 Upload(renderer, a.render3dTex, RenderMesh(a.mesh, bodyImg, 440, 440, a.yaw, a.pitch, a.zoom));
             }
@@ -1743,7 +1826,7 @@ int Run(const std::vector<std::string>& args) {
         const float previewH = std::min(bodyH * 0.6f, rightW + 90);
         ImGui::SetCursorPos(ImVec2(rightX, top));
         DrawPreview(a.render3dTex.t, a.bodyPreviewTex.t, a.hasGuide ? a.guideTex.t : nullptr,
-                    ImVec2(rightW, previewH), colors, &a.dollView, &a.yaw, &a.pitch, &a.zoom, &a.inspect);
+                    ImVec2(rightW, previewH), colors, &a.dollView, &a.bands, &a.yaw, &a.pitch, &a.zoom, &a.inspect);
         DrawProperties(a, ImVec2(rightX, top + previewH + gap), ImVec2(rightW, bodyH - previewH - gap));
         DrawDialogs(a, vs);
 
@@ -1767,6 +1850,8 @@ int Run(const std::vector<std::string>& args) {
             ImGui::SameLine();
             if (ImGui::SmallButton(Tr("Restablecer", "Reset"))) { a.iyaw = 0; a.ipitch = 0.08f; a.izoom = 1; a.ipanX = 0; a.icenterY = 4.0f; }
             ImGui::SameLine();
+            ImGui::Checkbox(Tr("Muñequeras", "Wristbands"), &a.bands);
+            ImGui::SameLine();
             if (ImGui::SmallButton(Tr("Cerrar", "Close")) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
                 a.inspect = false;
                 ImGui::CloseCurrentPopup();
@@ -1782,10 +1867,9 @@ int Run(const std::vector<std::string>& args) {
             bool capUsed = false;
             for (size_t i = 3; i < capImg.rgba.size(); i += 4) capUsed |= capImg.rgba[i] >= 128;
             if (capUsed) FillBehind(capImg, CapFill(a, body));
-            std::vector<const Image*> extras{&capImg};
-            for (const Image& t : a.doll.textures) extras.push_back(&t);
+            const std::vector<const Image*> extras = DollExtras(a, &capImg);
             Upload(renderer, a.inspectTex,
-                   a.doll.ok ? RenderMesh(a.doll.mesh, body, side, side, a.iyaw, a.ipitch, a.izoom, a.icenterY, &extras, a.ipanX)
+                   a.doll.ok ? RenderMesh(DollMesh(a), body, side, side, a.iyaw, a.ipitch, a.izoom, a.icenterY, &extras, a.ipanX)
                              : RenderMesh(a.mesh, body, side, side, a.iyaw, a.ipitch, a.izoom, a.icenterY, nullptr, a.ipanX));
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail.x - side) * 0.5f);
             const ImVec2 at = ImGui::GetCursorScreenPos();

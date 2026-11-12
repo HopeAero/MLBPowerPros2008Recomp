@@ -11,8 +11,8 @@ struct SDL_Texture;
 namespace ustudio {
 // `render3d` is the software-rendered mannequin texture; `body` the composed atlas (flat view); `colors`
 // its distinct-colour count. `*figure` picks the 3D view (true) or the flat atlas (false); dragging the
-// 3D view updates *yaw/*pitch and the wheel updates *zoom.
+// 3D view updates *yaw/*pitch and the wheel updates *zoom. *bands: the figure wears its wristbands.
 // A click (without dragging) on the figure, or its "Ampliar" button, sets *inspect (the big viewer).
 void DrawPreview(SDL_Texture* render3d, SDL_Texture* body, SDL_Texture* guide, ImVec2 size, int colors,
-                 bool* figure, float* yaw, float* pitch, float* zoom, bool* inspect);
+                 bool* figure, bool* bands, float* yaw, float* pitch, float* zoom, bool* inspect);
 } // namespace ustudio

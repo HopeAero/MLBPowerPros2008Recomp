@@ -77,7 +77,7 @@ void PaintFill(Image& img, const Image* ref, int x, int y, Rgba8 c, const PaintM
     }
 }
 
-void PaintPattern(Image& img, Pattern p, float width, float spacing, float offset, Rgba8 c, const PaintMask& m) {
+void PaintPattern(Image& img, Pattern p, float width, float spacing, float offset, Rgba8 c, const PaintMask& m, Rgba8 c2) {
     spacing = std::max(1.0f, spacing);
     width = std::clamp(width, 0.5f, spacing);
     for (int y = 0; y < static_cast<int>(img.height); ++y)
@@ -90,13 +90,31 @@ void PaintPattern(Image& img, Pattern p, float width, float spacing, float offse
             case Pattern::Horizontal: on = band(cy); break;
             case Pattern::Diagonal: on = band((cx + cy) * 0.7071f); break;
             case Pattern::DiagonalBack: on = band((cx - cy) * 0.7071f); break;
+            case Pattern::Double:
+            case Pattern::Braid: break;  // below: two colours
             case Pattern::Checks: {
                 const int i = static_cast<int>(std::floor((cx - offset) / spacing)), j = static_cast<int>(std::floor((cy - offset) / spacing));
                 on = ((i + j) & 1) == 0;
                 break;
             }
             }
-            if (on) Put(img, x, y, c, false, m);
+            Rgba8 col = c;
+            if (p == Pattern::Double || p == Pattern::Braid) {
+                const float lx = std::fmod(std::fmod(cx - offset, spacing) + spacing, spacing);  // 0..spacing
+                if (p == Pattern::Double) {
+                    on = lx < width || (lx >= 2 * width && lx < 3 * width);
+                    if (lx >= 2 * width) col = c2;
+                } else {
+                    // Two strands swinging `amp` either side of the pair's centre, half a turn apart; the
+                    // one coming forward (cos > 0 for the first) is drawn over the other.
+                    const float amp = std::max(1.0f, width), mid = amp + width / 2, turn = 4 * (amp + width) - 2;
+                    const float ph = cy * 6.2831853f / turn, sw = amp * std::sin(ph);
+                    const bool a = std::fabs(lx - (mid + sw)) <= width / 2, b = std::fabs(lx - (mid - sw)) <= width / 2;
+                    on = a || b;
+                    if (b && !(a && std::cos(ph) > 0)) col = c2;
+                }
+            }
+            if (on) Put(img, x, y, col, false, m);
         }
 }
 

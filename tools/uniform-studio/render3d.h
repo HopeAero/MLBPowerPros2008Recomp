@@ -21,6 +21,7 @@ struct Vtx {
 // and the figure's small textures (extras 1..; extras[0] is the cap letter the editor composes).
 struct GameDoll {
     std::vector<Vtx> mesh;
+    std::vector<Vtx> meshNoBands;  // the same figure without its wristbands (each player's equipment)
     std::vector<tstudio::Image> textures;
     bool ok = false;
 };

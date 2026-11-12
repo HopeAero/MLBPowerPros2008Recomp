@@ -34,6 +34,11 @@ struct Pieces {
     // image in the .ppu, so any colour reaches the game; the backup bytes keep the nearest game colour.
     std::array<int, kPieceCount> rgb{-1, -1, -1, -1, -1, -1};
     int lineType = 0;                                          // 0 none, 1 piping, 2 pinstripes
+    // Stripes the Studio paints itself on the jersey (and the trousers), on top of the game's line type
+    // (so piping in the LINE colour + stripes works): 0 none, 1 fine, 2 double, 3 braided, in `stripe1`
+    // (0xRRGGBB; the last two pair it with `stripe2`). One every `stripeGap` atlas pixels.
+    int stripes = 0, stripeGap = 7, stripe1 = 0x1B2A5B, stripe2 = 0xC8102E;
+    bool stripeTrousers = true;
     int number = 0, outline = 21;                              // UNIFORM # and # OUTLINE colours
     int previewNumber = 1;                                     // the shirt number shown in the preview only
     // Where the number goes (saved in the .ppu; the game applies it): chest 0 as the game (Arrange uses

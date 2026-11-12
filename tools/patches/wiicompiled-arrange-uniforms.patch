@@ -387,9 +387,18 @@ index 5e6de9d..1e078f3 100644
      return Get().twoWayPlayer.value_or(fallback);
  }
 diff --git a/runtime/src/hle/mlb/arrange_marks.cpp b/runtime/src/hle/mlb/arrange_marks.cpp
-index fcc3345..0d4e54f 100644
+index fcc3345..09b3587 100644
 --- a/runtime/src/hle/mlb/arrange_marks.cpp
 +++ b/runtime/src/hle/mlb/arrange_marks.cpp
+@@ -55,7 +55,7 @@ ORIGINAL(805BD300); ORIGINAL(805BCEE8); ORIGINAL(805BDCE0); ORIGINAL(805BD28C);
+ ORIGINAL(805BE15C); ORIGINAL(805BD1E4); ORIGINAL(805BE408); ORIGINAL(805BE664); ORIGINAL(805BCBF8);
+ ORIGINAL(805BCAC0); ORIGINAL(8059EE10); ORIGINAL(8059EFE0); ORIGINAL(8059EF94); ORIGINAL(805C2340);
+ ORIGINAL(8059E2E8); ORIGINAL(8059EC78); ORIGINAL(8059ECC4); ORIGINAL(8059CE4C); ORIGINAL(8059CD60);
+-ORIGINAL(805BC394); ORIGINAL(805BEFB8); ORIGINAL(805C1840);
++ORIGINAL(805BC394); ORIGINAL(805BEFB8); ORIGINAL(805C1840); ORIGINAL(8000C330); ORIGINAL(8000C3E0);
+ ORIGINAL(805B7ED0); ORIGINAL(805B8838); ORIGINAL(805B8CE4); ORIGINAL(805B7FEC); ORIGINAL(805B8E98);
+ ORIGINAL(805B87CC); ORIGINAL(805B7D68); ORIGINAL(805B7CB4);
+ ORIGINAL(805BFA58); ORIGINAL(805BFB74); ORIGINAL(805BF048); ORIGINAL(805C6A98); ORIGINAL(805C6BCC);
 @@ -63,6 +63,12 @@ ORIGINAL(807B34FC); ORIGINAL(807B336C); ORIGINAL(807B5118); ORIGINAL(807B5184);
  ORIGINAL(8059AB98); ORIGINAL(8059AA90); ORIGINAL(805BE7FC); ORIGINAL(805A263C);
  #undef ORIGINAL
@@ -496,12 +505,72 @@ index fcc3345..0d4e54f 100644
  }
  REGISTER_NATIVE_FUNCTION_AS(0x805A263C, MLB_ArrangeSlotsUnpack_805A263C, "MLB_ArrangeSlotsUnpack_805A263C");
  
+@@ -2049,3 +2079,59 @@ extern "C" void MLB_ArrangeFlagDestroy_805BE7FC(CpuContext* ctx) {
+     ctx->gpr[3] = result;
+ }
+ REGISTER_NATIVE_FUNCTION_AS(0x805BE7FC, MLB_ArrangeFlagDestroy_805BE7FC, "MLB_ArrangeFlagDestroy_805BE7FC");
++
++// --- In a match: the stadium's team flags and the replay wipe -----------------------------------
++// The match also reads a team's mark straight from its mark pack, not through the mark widgets: the
++// packs of both teams are loaded by 0x80612C64 (0x81032978 / 0x8103297C, from 0x80612434: the team's
++// record copy at [0x8103D118] + team * 0x89C + 0x6D8 -> 0x807B3250) and again for replays by 0x80877E18
++// (0x80E5B908 / 0x80E5B90C), and drawn with the texture and palette the generic getters
++// 0x8000C330(pack, id) / 0x8000C3E0(pack, id) return. While the match scene is up, a request for the
++// texture or a palette of the match team's fallback game mark (record +0x17: pack 0x80D3D590[m], texture
++// 0x80D3D628[m], palettes 0x80D3D6C0[m * 4 + 0..3], the same ids as the mark widget 0x805BE408) gets the
++// custom picture. Limit: another team in that match whose game mark is that same mark shows it too.
++namespace {
++constexpr uint32_t kMarkPacks = 0x80D3D590, kMarkTextures = 0x80D3D628, kMarkPalettes = 0x80D3D6C0;
++constexpr uint32_t kSceneManager = 0x81033268, kSceneManagerVtable = 0x80D4EB88, kSceneNow = 0x408,
++                   kMatchScene = 409;
++bool InMatchScene() {
++    const uint32_t manager = Memory::Read32(kSceneManager);
++    return manager && Memory::Contains(manager, kSceneNow + 4) && Memory::Read32(manager) == kSceneManagerVtable &&
++           Memory::Read32(manager + kSceneNow) == kMatchScene;
++}
++// The custom texture (palette = false) or palette for this getter call, or 0. Cheap checks first: the
++// getters run for every pack of the game.
++uint32_t MatchMark(uint32_t pack, uint32_t id, bool palette) {
++    if (!Enabled()) return 0;
++    const uint32_t record = kMatchSlot + kRecord, mark = Memory::Read8(record + 0x17);
++    if (mark >= kGameMarks || Memory::Read32(kMarkPacks + mark * 4) != pack) return 0;
++    bool same = false;
++    if (palette) {
++        for (uint32_t k = 0; k < 4; ++k) same |= Memory::Read32(kMarkPalettes + mark * 16 + k * 4) == id;
++    } else {
++        same = Memory::Read32(kMarkTextures + mark * 4) == id;
++    }
++    TextureRef ref;
++    if (!same || !InMatchScene() || !TeamMark(record, ref)) return 0;
++    return palette ? ref.palette : ref.texture;
++}
++}  // namespace
++
++extern "C" void MLB_ArrangeMatchMarkTexture_8000C330(CpuContext* ctx) {
++    if (const uint32_t custom = MatchMark(ctx->gpr[3], ctx->gpr[4], false)) {
++        Trace("match-texture", ctx->lr, ctx->gpr[3], ctx->gpr[4], kMatchSlot + kRecord, true);
++        ctx->gpr[3] = custom;
++        return;
++    }
++    func_8000C330(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8000C330, MLB_ArrangeMatchMarkTexture_8000C330, "MLB_ArrangeMatchMarkTexture_8000C330");
++
++extern "C" void MLB_ArrangeMatchMarkPalette_8000C3E0(CpuContext* ctx) {
++    if (const uint32_t custom = MatchMark(ctx->gpr[3], ctx->gpr[4], true)) {
++        Trace("match-palette", ctx->lr, ctx->gpr[3], ctx->gpr[4], kMatchSlot + kRecord, true);
++        ctx->gpr[3] = custom;
++        return;
++    }
++    func_8000C3E0(ctx);
++}
++REGISTER_NATIVE_FUNCTION_AS(0x8000C3E0, MLB_ArrangeMatchMarkPalette_8000C3E0, "MLB_ArrangeMatchMarkPalette_8000C3E0");
 diff --git a/runtime/src/hle/mlb/arrange_uniforms.cpp b/runtime/src/hle/mlb/arrange_uniforms.cpp
 new file mode 100644
-index 0000000..b0c91de
+index 0000000..de26d4c
 --- /dev/null
 +++ b/runtime/src/hle/mlb/arrange_uniforms.cpp
-@@ -0,0 +1,1070 @@
+@@ -0,0 +1,1074 @@
 +// Imported uniforms for Arrange teams ([arrange] custom_uniforms): a team that chose an imported
 +// uniform (a .ppu baked by Uniform Studio, in UserData/arrange/uniforms/<folder>) wears it natively
 +// wherever the game draws that team. Addresses and evidence: docs/ingenieria-inversa.md ("Uniforme
@@ -1239,13 +1308,17 @@ index 0000000..b0c91de
 +        SetVisible(ctx, g.label.holder, false);
 +        return;
 +    }
-+    // The label names the hovered uniform, as the game's names the hovered line type, at the type
-+    // label's own position (pack locator 0x400001D4, set by the game): the node is the picture's top
-+    // centre (seen in game), so the text hangs from it.
++    // The label names the hovered uniform, as the game's names the hovered line type. The bar reads
++    // "LINE" (quad 0 of +0x270) then the type (+0x370, pack locator 0x400001D4), so the type label sits
++    // right of the bar's centre (seen in game: a name centred on it was ~17 units right). The bar is
++    // centred in the window like the three cells, so the name is centred between the first cell's left
++    // edge and the last cell's right edge (the cells' origin is their top-left corner), at the type
++    // label's height (the node is the picture's top: the text hangs from it).
 +    const std::string name = FontSafe(NameOf(g.entries[size_t(index - kGameTypes)])).substr(0, kLineChars);
 +    const float w = SetString(ctx, g.label, name);
-+    Place(ctx, g.label, F(window + kTypeLabel + 0x40), F(window + kTypeLabel + 0x44) + kGlyphHeight * kMaxScale / 2,
-+          w, kMaxScale);
++    const uint32_t leftCell = Memory::Read32(window + kCells), rightCell = Memory::Read32(window + kCells + 8);
++    const float cx = leftCell && rightCell ? (F(leftCell + 0x40) + F(rightCell + 0x40) + F(kCellW)) / 2 : F(window + kTypeLabel + 0x40);
++    Place(ctx, g.label, cx, F(window + kTypeLabel + 0x44) + kGlyphHeight * kMaxScale / 2, w, kMaxScale);
 +    SetVisible(ctx, g.label.holder, true);
 +}
 +
