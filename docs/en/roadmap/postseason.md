@@ -2,7 +2,7 @@
 
 *Español: [../../roadmap/postemporada.md](../../roadmap/postemporada.md)*
 
-**Status:** research · [Roadmap](../../../ROADMAP.md)
+**Status:** done in v0.1.7 (opt-in, experimental; details in [postseason-research.md](../postseason-research.md)) · [Roadmap](../../../ROADMAP.md)
 
 ## Why
 The gameplay updates so far bring Season mode and MLB Life closer to today's baseball: real schedules, the DH in both leagues, 15 and 15 leagues, two-way players. The postseason is the piece still missing. The game plays the 2008 format (4 teams per league); since 2022 MLB has 12 teams.

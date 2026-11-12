@@ -6,7 +6,7 @@
 
 Talk about it: [roadmap discussion](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/7).
 
-Updated: November 1, 2026 · latest release [v0.1.6](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.6) (PC) and [Switch v0.1.1](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.1).
+Updated: November 11, 2026 · latest release [v0.1.7](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.7) (PC) and [Switch v0.1.1](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.1).
 
 Two rules hold for everything below: the game stays **faithful to the Wii original by default** (anything that changes gameplay is opt-in from the launcher), and **no game files are ever distributed**: on PC every player builds the game from their own disc; on Switch the NRO is published and players bring their own disc (see [decisions](docs/en/decisions.md)).
 
@@ -23,7 +23,6 @@ Two rules hold for everything below: the game stays **faithful to the Wii origin
 | Line of work | What | Status |
 |---|---|---|
 | [ABS: ball-strike challenges](docs/en/roadmap/abs.md) | MLB's 2026 challenge system (2 per team, automated umpire), opt-in in every mode | Planned: research done |
-| [Modern postseason](docs/en/roadmap/postseason.md) | The 12-team postseason (Wild Card Series) in Season mode and MLB Life, opt-in | Research |
 | [Modding tools](docs/en/roadmap/modding-tools.md) | Better Texture Studio, Season Studio, roster and stadium tools; custom stadiums in Season and MLB Life | Ongoing |
 
 ## Research
@@ -36,6 +35,7 @@ Two rules hold for everything below: the game stays **faithful to the Wii origin
 
 | Release | Highlights |
 |---|---|
+| [v0.1.7](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.7) | [12-team postseason](docs/en/roadmap/postseason.md) (Wild Card round) in Season and MLB Life; custom PNG marks and logos for Arrange teams; imported uniforms for Arrange teams with the new Uniform Studio |
 | [Switch v0.1.1](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.1) | Callname mods on the Switch; MLB Life two-way creation fix |
 | [Switch v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0) | [Nintendo Switch](docs/en/roadmap/switch.md): native homebrew at 60 fps handheld without overclock, launcher with graphics presets, mods, direct ISO ([releases repo](https://github.com/HopeAero/MLBPR2008-NX)) |
 | [v0.1.6](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.6) | New player names (callnames) for the commentators with mods and the Callname Editor; Switch optimizations ported to PC (13% less main-thread CPU); lighter graphics options in VIDEO; Setup no longer flagged by Defender heuristics |

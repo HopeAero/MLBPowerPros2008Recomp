@@ -6,7 +6,7 @@
 
 Para comentarlo: [discusión del roadmap](https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/7).
 
-Actualizado: 1 de noviembre de 2026 · última versión [v0.1.6](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.6) (PC) y [Switch v0.1.1](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.1).
+Actualizado: 11 de noviembre de 2026 · última versión [v0.1.7](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.7) (PC) y [Switch v0.1.1](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.1).
 
 Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto** (lo que cambie el juego se activa en el launcher), y **nunca se distribuyen archivos del juego**: en PC cada jugador lo compila desde su propio disco; en Switch se publica el NRO y el jugador pone su propio disco (ver [decisiones](docs/decisiones.md)).
 
@@ -23,7 +23,6 @@ Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto
 | Línea de trabajo | Qué | Estado |
 |---|---|---|
 | [ABS: desafíos de bola y strike](docs/roadmap/abs.md) | El sistema de desafíos de MLB 2026 (2 por equipo, umpire automático), opcional en todos los modos | Planificado: investigación hecha |
-| [Postemporada moderna](docs/roadmap/postemporada.md) | La postemporada de 12 equipos (Wild Card Series) en Temporada y MLB Life, opcional | Investigación |
 | [Herramientas de modding](docs/roadmap/herramientas-modding.md) | Mejoras al Texture Studio, al Editor de temporada, a los rosters y estadios; estadios propios en Temporada y MLB Life | Continuo |
 
 ## Investigación
@@ -38,6 +37,7 @@ Dos reglas valen para todo: el juego sigue **fiel al original de Wii por defecto
 |---|---|
 | [Switch v0.1.1](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.1) | Mods de callnames en la Switch; arreglo de la creación de dos vías en MLB Life |
 | [Switch v0.1.0](https://github.com/HopeAero/MLBPR2008-NX/releases/tag/v0.1.0) | [Nintendo Switch](docs/roadmap/switch.md): homebrew nativo a 60 fps en portátil sin overclock, launcher con perfiles gráficos, mods, ISO directa ([repo de releases](https://github.com/HopeAero/MLBPR2008-NX)) |
+| [v0.1.7](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.7) | [Postemporada de 12 equipos](docs/roadmap/postemporada.md) (ronda de Wild Card) en Temporada y MLB Life; marcas y logotipos PNG propios para los equipos de Arrange; uniformes importados para los equipos de Arrange con el nuevo Uniform Studio |
 | [v0.1.6](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.6) | Nombres de jugador nuevos (callnames) para los comentaristas con mods y el Editor de callnames; optimizaciones de Switch portadas a PC (13 % menos CPU en el hilo principal); opciones gráficas más ligeras en VIDEO; el Setup ya no lo marcan las heurísticas de Defender |
 | [v0.1.5](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.5) | Jugadores de dos vías (regla Ohtani) en todos los modos; charla de rol con el mánager en MLB Life; escalado con IA y packs de Dolphin en el Texture Studio |
 | [v0.1.4.1](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.4.1) | Corrección de los controles |

@@ -2,7 +2,7 @@
 
 *English: [../en/roadmap/postseason.md](../en/roadmap/postseason.md)*
 
-**Estado:** investigación · [Roadmap](../../ROADMAP.es.md)
+**Estado:** hecho en v0.1.7 (opcional, experimental; detalles en [postemporada-investigacion.md](../postemporada-investigacion.md)) · [Roadmap](../../ROADMAP.es.md)
 
 ## Por qué
 Las mejoras de juego hasta ahora acercan Temporada y MLB Life al béisbol actual: calendarios reales, DH en ambas ligas, ligas 15 y 15, jugadores de dos vías. La postemporada es la pieza que falta. El juego usa el formato de 2008 (4 equipos por liga); desde 2022 la MLB tiene 12.
