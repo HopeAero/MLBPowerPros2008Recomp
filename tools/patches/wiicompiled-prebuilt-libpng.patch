@@ -1,0 +1,100 @@
+diff --git a/Launcher/Prepare-NativePrebuilt.ps1 b/Launcher/Prepare-NativePrebuilt.ps1
+index 2757565..53a1e55 100644
+--- a/Launcher/Prepare-NativePrebuilt.ps1
++++ b/Launcher/Prepare-NativePrebuilt.ps1
+@@ -235,6 +235,26 @@ foreach ($name in ($targets.Keys | Sort-Object)) {
+ if ($sharedImports.Count -eq 0) { throw 'No shared libraries were harvested; the SDL/zlib/libpng DLLs would be missing.' }
+ if ($dawnLinkerFile) { $linkerFileToReference[$dawnLinkerFile] = 'dawn::webgpu_dawn' }
+ 
++# libpng's headers travel with its library: the runtime decodes custom Arrange marks with it
++# directly (PNG::PNG), and pnglibconf.h exists only in the staging build tree.
++$pngLines = @()
++if ($meta['png_target'] -and $targets.ContainsKey($meta['png_target'])) {
++    $pngTarget = $targets[$meta['png_target']]
++    if (-not $linkerFileToReference.ContainsKey($pngTarget.LinkerFile)) {
++        throw "libpng ($($pngTarget.Name)) is not part of the harvested closure."
++    }
++    $pngInclude = Join-Path (Join-Path $package 'include') 'png'
++    [IO.Directory]::CreateDirectory($pngInclude) | Out-Null
++    foreach ($header in @((Join-Path $meta['png_source_dir'] 'png.h'), (Join-Path $meta['png_source_dir'] 'pngconf.h'),
++                          (Join-Path $meta['png_binary_dir'] 'pnglibconf.h'))) {
++        Assert-File $header 'libpng header'
++        Copy-Item -LiteralPath $header -Destination $pngInclude
++        $copiedFiles.Add("include/png/$([IO.Path]::GetFileName($header))")
++    }
++    $pngLines = @('', "set(MKW_NP_PNG_INCLUDE_DIR `"`@PKG`@/include/png`")",
++        "set(MKW_NP_PNG_LIBRARY `"$($linkerFileToReference[$pngTarget.LinkerFile])`")")
++}
++
+ # ---------------------------------------------------------------------------
+ # Rewrite the compile/link interface into workspace-relative tokens.
+ # ---------------------------------------------------------------------------
+@@ -332,6 +352,7 @@ $generated.Add((Format-CMakeBlock 'MKW_NP_AURORA_TARGETS' @('aurora::gx','aurora
+ $generated.Add('')
+ $generated.Add("set(MKW_NP_DAWN_CONFIG_DIR `"$(ConvertTo-Token $meta['dawn_config_dir'] 'dawn')`")")
+ $generated.Add("set(MKW_NP_DAWN_VERSION `"$($meta['aurora_dawn_version'])`")")
++foreach ($line in $pngLines) { $generated.Add($line) }
+ $generated.Add('')
+ $generated.Add('# Shared third-party libraries keep imported SHARED targets so that')
+ $generated.Add('# $<TARGET_RUNTIME_DLLS> still copies them next to the game executable.')
+diff --git a/runtime/cmake/NativePrebuilt.cmake b/runtime/cmake/NativePrebuilt.cmake
+index 9cdce89..1dd1fc6 100644
+--- a/runtime/cmake/NativePrebuilt.cmake
++++ b/runtime/cmake/NativePrebuilt.cmake
+@@ -143,6 +143,20 @@ endif()
+ # linked it, so the probe-vs-control diff includes it). Repeating a static
+ # archive on the link line is harmless; the second pass resolves no members.
+ 
++# First-party code calls libpng directly (custom Arrange marks). A from-source build gets PNG::PNG
++# from aurora-main/extern; here the package ships libpng's headers next to its library.
++if(MKW_NP_PNG_INCLUDE_DIR AND MKW_NP_PNG_LIBRARY AND NOT TARGET PNG::PNG)
++    mkw_np_resolve(_mkw_np_png_include ${MKW_NP_PNG_INCLUDE_DIR})
++    mkw_np_resolve(_mkw_np_png_library ${MKW_NP_PNG_LIBRARY})
++    if(NOT EXISTS "${_mkw_np_png_include}/png.h" OR NOT EXISTS "${_mkw_np_png_include}/pnglibconf.h")
++        message(FATAL_ERROR "The precompiled package is missing libpng headers: ${_mkw_np_png_include}")
++    endif()
++    add_library(PNG::PNG INTERFACE IMPORTED GLOBAL)
++    set_target_properties(PNG::PNG PROPERTIES
++        INTERFACE_INCLUDE_DIRECTORIES "${_mkw_np_png_include}"
++        INTERFACE_LINK_LIBRARIES "${_mkw_np_png_library}")
++endif()
++
+ list(LENGTH _mkw_np_links _mkw_np_link_count)
+ message(STATUS
+     "Aurora and third-party libraries come from the precompiled package "
+diff --git a/runtime/cmake/NativePrebuiltExport.cmake b/runtime/cmake/NativePrebuiltExport.cmake
+index e81b3c4..1f7cf9b 100644
+--- a/runtime/cmake/NativePrebuiltExport.cmake
++++ b/runtime/cmake/NativePrebuiltExport.cmake
+@@ -154,6 +154,20 @@ if(Dawn_DIR AND EXISTS "${Dawn_DIR}/DawnConfig.cmake")
+     set(_mkw_np_dawn_config_dir "${Dawn_DIR}")
+ endif()
+ 
++# First-party code links libpng directly (custom Arrange marks), so its headers must ship with
++# the DLL: png.h/pngconf.h live in libpng's source tree, pnglibconf.h only in its build tree.
++set(_mkw_np_png_target "")
++set(_mkw_np_png_source_dir "")
++set(_mkw_np_png_binary_dir "")
++if(TARGET PNG::PNG)
++    get_target_property(_mkw_np_png_aliased PNG::PNG ALIASED_TARGET)
++    if(_mkw_np_png_aliased)
++        set(_mkw_np_png_target "${_mkw_np_png_aliased}")
++        get_target_property(_mkw_np_png_source_dir ${_mkw_np_png_target} SOURCE_DIR)
++        get_target_property(_mkw_np_png_binary_dir ${_mkw_np_png_target} BINARY_DIR)
++    endif()
++endif()
++
+ string(REPLACE ";" "," _mkw_np_lib_targets_csv "${_mkw_np_lib_targets}")
+ file(WRITE "${MKW_NATIVE_PREBUILT_EXPORT_DIR}/meta.txt"
+     "aurora_dir=${_mkw_np_aurora_dir}\n"
+@@ -167,6 +181,9 @@ file(WRITE "${MKW_NATIVE_PREBUILT_EXPORT_DIR}/meta.txt"
+     "aurora_dawn_linkage=${AURORA_DAWN_LINKAGE}\n"
+     "cxx_compiler=${CMAKE_CXX_COMPILER}\n"
+     "cxx_compiler_version=${CMAKE_CXX_COMPILER_VERSION}\n"
+-    "library_targets=${_mkw_np_lib_targets_csv}\n")
++    "library_targets=${_mkw_np_lib_targets_csv}\n"
++    "png_target=${_mkw_np_png_target}\n"
++    "png_source_dir=${_mkw_np_png_source_dir}\n"
++    "png_binary_dir=${_mkw_np_png_binary_dir}\n")
+ 
+ message(STATUS "Native prebuilt export: ${MKW_NATIVE_PREBUILT_EXPORT_DIR}")
