@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -56,7 +57,83 @@ struct Build {
     HANDLE job = nullptr;
     std::thread reader;
 
-    void Start(const fs::path& script, const std::string& iso, const fs::path& install, bool shortcut) {
+    std::thread preparer;
+    std::atomic<bool> cancel{false};
+
+    static bool SameBytes(const fs::path& a, const fs::path& b) {
+        std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+        if (!fa || !fb) return false;
+        std::vector<char> ba(1 << 16), bb(1 << 16);
+        while (fa) {
+            fa.read(ba.data(), static_cast<std::streamsize>(ba.size()));
+            fb.read(bb.data(), static_cast<std::streamsize>(bb.size()));
+            const auto got = fa.gcount();
+            if (got != fb.gcount() || std::memcmp(ba.data(), bb.data(), static_cast<size_t>(got)) != 0) return false;
+        }
+        return true;
+    }
+
+    // Copies src over dst, skipping files that already have the same bytes so a reinstall leaves Ninja's
+    // timestamps alone, and skipping the relative paths in `skip` (the previous build's objects and translated code).
+    static bool SyncTree(const fs::path& src, const fs::path& dst, const std::vector<std::string>& skip,
+                         const std::atomic<bool>& stopRequested) {
+        std::error_code ec;
+        fs::create_directories(dst, ec);
+        for (fs::recursive_directory_iterator it(src, ec), end; it != end; it.increment(ec)) {
+            if (ec) return false;
+            if (stopRequested) return false;
+            const fs::path rel = fs::relative(it->path(), src, ec);
+            const std::string key = rel.generic_string();
+            if (std::find(skip.begin(), skip.end(), key) != skip.end()) {
+                it.disable_recursion_pending();
+                continue;
+            }
+            const fs::path target = dst / rel;
+            if (it->is_directory(ec)) {
+                fs::create_directories(target, ec);
+                if (ec) return false;
+                continue;
+            }
+            const auto size = it->file_size(ec);
+            ec.clear();
+            if (fs::exists(target, ec) && fs::file_size(target, ec) == size && SameBytes(it->path(), target)) continue;
+            ec.clear();
+            fs::copy_file(it->path(), target, fs::copy_options::overwrite_existing, ec);
+            if (ec) return false;
+            // The copy gets the current time (CopyFile would keep the source's, which can be older than the
+            // objects built from the file it replaces, and Ninja would then not rebuild).
+            fs::last_write_time(target, fs::file_time_type::clock::now(), ec);
+        }
+        if (ec) return false;
+        // Prune: whatever is in dst but no longer in src (a file the new payload dropped) goes, except the
+        // skipped paths (build\, src\generated\ and files the build scripts write).
+        std::vector<fs::path> stale;
+        for (fs::recursive_directory_iterator it(dst, ec), end; it != end; it.increment(ec)) {
+            if (ec) return false;
+            if (stopRequested) return false;
+            const fs::path rel = fs::relative(it->path(), dst, ec);
+            if (std::find(skip.begin(), skip.end(), rel.generic_string()) != skip.end()) {
+                it.disable_recursion_pending();
+                continue;
+            }
+            std::error_code existsEc;
+            if (!fs::exists(src / rel, existsEc) && !existsEc) {
+                stale.push_back(it->path());
+                it.disable_recursion_pending();
+            }
+        }
+        if (ec) return false;
+        for (const fs::path& path : stale) {
+            fs::remove_all(path, ec);
+            if (ec) return false;
+        }
+        return true;
+    }
+
+    // Starts the install: first copies the payload into <install>\Build (the rebuildable workspace the
+    // launcher's updates use later; its build\ and src\generated\ are never touched), then runs that
+    // copy of LocalBuild.ps1 with -KeepWorkspace.
+    void Start(const fs::path& base, const std::string& iso, const fs::path& install, bool shortcut) {
         Stop();
         percent = 0;
         message = Tr("Preparando...", "Preparing...");
@@ -64,10 +141,64 @@ struct Build {
         tail.clear();
         finished = false;
         succeeded = false;
-        fs::create_directories(install);
+        cancel = false;
+        running = true;
+        preparer = std::thread([this, base, iso, install, shortcut] {
+            std::error_code ec;
+            const fs::path buildDir = install / "Build";
+            fs::create_directories(buildDir, ec);
+            auto fail = [&] {
+                std::lock_guard lock(mutex);
+                if (error.empty()) error = Tr("No se pudo copiar el espacio de trabajo.", "Could not copy the workspace.");
+                running = false;
+                finished = true;
+            };
+            if (ec) return fail();
+            {
+                std::lock_guard lock(mutex);
+                message = Tr("Copiando el espacio de trabajo...", "Copying the workspace...");
+            }
+            const std::vector<std::string> skip = {"build", "src/generated", "project.yml"};
+            if (!SyncTree(base / "toolkit", buildDir / "toolkit", {}, cancel) ||
+                !SyncTree(base / "workspace", buildDir / "workspace", skip, cancel) ||
+                !SyncTree(base / "licenses", buildDir / "licenses", {}, cancel)) {
+                if (cancel) return;
+                return fail();
+            }
+            fs::copy_file(base / "update-manifest.txt", buildDir / "update-manifest.txt",
+                          fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                std::lock_guard lock(mutex);
+                error = Tr("No se pudo guardar la lista de actualización (update-manifest.txt).",
+                           "Could not save the update list (update-manifest.txt).");
+                running = false;
+                finished = true;
+                return;
+            }
+            wchar_t self[MAX_PATH * 2];
+            const DWORD length = GetModuleFileNameW(nullptr, self, static_cast<DWORD>(std::size(self)));
+            if (length > 0 && length < std::size(self)) {
+                fs::copy_file(fs::path(self), buildDir / "MLBPowerPros2008-Setup.exe",
+                              fs::copy_options::overwrite_existing, ec);
+            }
+            if (cancel) return;
+            Launch(buildDir / "workspace" / "LocalBuild.ps1", iso, install, shortcut);
+        });
+    }
+
+    void Launch(const fs::path& script, const std::string& iso, const fs::path& install, bool shortcut) {
+        std::error_code dirEc;
+        fs::create_directories(install, dirEc);
+        if (dirEc) {
+            std::lock_guard lock(mutex);
+            error = Tr("No se pudo crear la carpeta de instalación.", "Could not create the install folder.");
+            running = false;
+            finished = true;
+            return;
+        }
         std::wstring command = L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" +
                                script.wstring() + L"\" -Iso \"" + Wide(iso) + L"\" -Install \"" + install.wstring() +
-                               L"\"" + (shortcut ? L" -Shortcut" : L"") +
+                               L"\" -KeepWorkspace" + (shortcut ? L" -Shortcut" : L"") +
                                // The script's progress messages come in the Setup's language.
                                (g_lang == Lang::En ? L" -Lang en" : L" -Lang es");
         SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
@@ -103,7 +234,9 @@ struct Build {
         CloseHandle(writePipe);
         if (!started) {
             CloseHandle(readPipe);
+            std::lock_guard lock(mutex);
             error = Tr("No se pudo iniciar PowerShell.", "Could not start PowerShell.");
+            running = false;
             finished = true;
             return;
         }
@@ -156,6 +289,8 @@ struct Build {
     }
 
     void Stop() {
+        cancel = true;
+        if (preparer.joinable()) preparer.join();
         if (job != nullptr) {
             TerminateJobObject(job, 1);
             CloseHandle(job);
@@ -370,8 +505,9 @@ int main(int, char**) {
     }
 
     const fs::path base = fs::path(SDL_GetBasePath());
-    const fs::path script = base / "workspace" / "LocalBuild.ps1";
     fs::path install = base / "MLB Power Pros 2008";
+    // MLBPP_SETUP_INSTALL=<folder> (scripted tests): install there instead of next to the Setup.
+    if (const wchar_t* forced = _wgetenv(L"MLBPP_SETUP_INSTALL"); forced != nullptr && *forced != L'\0') install = fs::path(forced);
     auto gameExe = [&] { return install / "Game" / "MLBPowerPros2008.exe"; };
     // A language picked in the Setup goes to the installed game's Config.toml once it is installed.
     bool wroteLanguage = false;
@@ -401,7 +537,7 @@ int main(int, char**) {
     Uint64 buildStart = 0;
     bool quit = false;
     if (autoStart) {
-        build.Start(script, iso, install, shortcut);
+        build.Start(base, iso, install, shortcut);
         buildStart = SDL_GetTicks();
         screen = Screen::Building;
     }
@@ -870,7 +1006,7 @@ int main(int, char**) {
                 if (iso.empty()) {
                     SDL_ShowOpenFileDialog(OnDialog, &isoDialog, window, filters, 2, nullptr, false);
                 } else {
-                    build.Start(script, iso, install, shortcut);
+                    build.Start(base, iso, install, shortcut);
                     buildStart = SDL_GetTicks();
                     screen = Screen::Building;
                     menu = 0;

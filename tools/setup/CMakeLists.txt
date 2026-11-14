@@ -2,8 +2,9 @@
 # MLB Power Pros 2008 Setup (setup.cpp). Built by tools/setup/Make-Payload.ps1 with the pinned
 # llvm-mingw, statically against SDL3 and Dear ImGui from the runtime's own dependency sources.
 cmake_minimum_required(VERSION 3.24)
-# Bump with each release: it is the Setup's file version (setup.rc).
-project(MLBPowerProsSetup VERSION 0.1.7 LANGUAGES C CXX RC)
+# The repo's VERSION file (two levels up) is the Setup's file version (setup.rc) and the launcher's.
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/../../VERSION" MLBPP_SETUP_VERSION LIMIT_COUNT 1)
+project(MLBPowerProsSetup VERSION ${MLBPP_SETUP_VERSION} LANGUAGES C CXX RC)
 
 set(SDL_SOURCE_DIR "" CACHE PATH "SDL3 source tree")
 set(IMGUI_SOURCE_DIR "" CACHE PATH "Dear ImGui source tree")

@@ -17,6 +17,9 @@ avise cuando hay una nueva y que la instale sin reinstalar nada ni tocar los dat
 - **Versión visible:** el launcher enseña su versión (por ejemplo «v0.1.7») en un sitio fijo.
 - **Aviso:** el launcher comprueba si hay una versión nueva y, si la hay, lo indica con su número.
   Además hay una opción para **buscar actualizaciones** a mano.
+- **Contenido del aviso (14 nov):** «Nueva versión vX.Y.Z», un **enlace a la Discussion** de esa
+  versión (vídeo, imágenes y detalles técnicos, como ya enlazan las notas de cada release) y la pregunta
+  de si quiere actualizar, **Sí / No**. «Sí» empieza la actualización; «No» cierra el aviso y deja jugar.
 - **Actualizar es preferible a solo avisar:** un botón que actualiza desde el propio launcher, sin
   Setup ni reinstalación, conservando partidas, mods, marcas, logotipos y uniformes.
 - **Progreso:** una barra que muestra cuántos MB pesa la actualización y cuánto lleva descargado, y
@@ -30,8 +33,28 @@ avise cuando hay una nueva y que la instale sin reinstalar nada ni tocar los dat
 - **Plataformas:** Windows, Linux y Steam Deck.
 - **Volver atrás:** si la versión nueva compila bien pero sale con un fallo (no arranca, un bug), el
   launcher conserva la versión anterior (~1,5 GB más en disco) y ofrece «Volver a vX.Y.Z». Solo se
-  guarda una versión anterior. Las partidas y los mods son los mismos para las dos; volver atrás no los
-  toca.
+  guarda una versión anterior. Las partidas y los mods son los mismos para las dos.
+- **Copia de partidas antes de actualizar (14 nov):** como una versión nueva puede guardar en un
+  formato que la anterior no lee (v0.1.7 cambió las partidas de temporada y MLB Life), antes del
+  primer arranque de la versión nueva el launcher copia `UserData\NAND`, `UserData\ModSaves`,
+  `UserData\arrange` y `Config.toml` (~35 MB en la PC de pruebas; el caché no). Al «Volver a vX.Y.Z»
+  pregunta si recuperar las partidas de antes de actualizar, avisando de que lo jugado después en la
+  versión nueva se pierde. Solo se guarda una copia, la de la última actualización. `mods` no se copia
+  (no lo escribe el juego).
+
+## Enfoques considerados (14 nov)
+
+Se compararon tres formas; el usuario eligió la **B**.
+
+- **A. Volver a pasar el Setup entero sin preguntas.** El launcher baja el Setup (346 MB: llvm-mingw
+  105, dependencias 63, PowerUp+ 50, CMake 34, traductor 29, Uniform Studio 24; fuentes ~3 MB) y lo
+  corre con la ISO y la carpeta conocidas. Simple, pero cada versión baja 346 MB y compila todo.
+- **B. Paquete pequeño + compilación incremental (elegida).** Se baja solo lo que cambió, se conserva
+  lo compilado en la instalación y se recompila lo afectado. Es lo que más se parece a cómo actualizan
+  otros ports (Skate 3 Recomp, Unleashed Recompiled, Dusklight: el trabajo pesado —extraer la ISO— se
+  hace una vez y la actualización solo cambia lo nuevo), con la diferencia de que ellos publican el
+  `.exe` ya compilado y aquí no se puede (ver «Restricciones»).
+- **C. Solo avisar y enlazar la descarga.** Casi gratis, pero no evita bajar y compilar desde cero.
 
 ## Objetivos
 
@@ -83,6 +106,12 @@ avise cuando hay una nueva y que la instale sin reinstalar nada ni tocar los dat
   (`HopeAero/MLBPowerPros2008Recomp`, título «vX.Y.Z beta — …», no prerelease, marcado Latest), con
   `MLB-Power-Pros-2008-Setup-vX.Y.Z.zip`, los dos kits, el complemento de Blender y `SHA256SUMS.txt`.
   El payload se arma con `tools/setup/Make-Release.ps1` desde un clon limpio.
+- **El traductor ya no reescribe lo que no cambió:** los builds recientes informan «0 archivos traducidos
+  actualizados, 48.223 sin cambios» (`docs/traspaso.md`), así que Ninja no recompila el código traducido
+  si el traductor y el `main.dol` no cambian. El plan lo comprueba en el camino de Windows
+  (`LocalBuild.ps1`).
+- **Enlace a la Discussion:** la API de GitHub devuelve `discussion_url: null` en los releases (la
+  Discussion se crea aparte, p. ej. #10 para v0.1.7); el enlace solo está en el texto de las notas.
 - **Ya existe una descarga en el launcher:** el calendario de temporadas usa el `curl` del sistema
   (Windows 10+ y Linux; `wiicompiled-season-schedule-download.patch`). No hace falta una librería HTTP.
 - **Windows PowerShell 5.1** ejecuta `LocalBuild.ps1`; sus trampas conocidas están en `docs/trampas.md`.
@@ -93,8 +122,24 @@ avise cuando hay una nueva y que la instale sin reinstalar nada ni tocar los dat
 
 - **Fuente de la versión nueva:** la API de releases de GitHub del repositorio (el último release no
   borrador y no prerelease). No hay servidor propio.
-- **Qué se descarga:** solo lo que cambió respecto a lo instalado, comparando por archivo (huella por
-  archivo del payload), no el zip entero. El primer salto desde una instalación v0.1.7 o anterior no
+- **De dónde sale el enlace a la Discussion:** lo publica el propio release en su manifiesto de
+  actualización (un campo con la URL, escrito por `Make-Release.ps1`), en ES/EN si hay dos. Si un
+  release no lo trae, el launcher usa el primer enlace `…/discussions/N` de las notas; si tampoco hay,
+  enlaza a la página del release.
+- **Aviso en ES/EN:** el texto sigue el idioma del launcher (`[ui] language`).
+- **Cuántas veces sale la ventana Sí/No:** una vez por versión nueva. Tras «No», no vuelve a saltar en
+  cada arranque; queda una marca fija «Nueva versión vX.Y.Z» junto a la versión instalada, que vuelve a
+  abrir el aviso al pulsarla. Si sale otra versión más nueva, la ventana salta otra vez. Se guarda la
+  última versión avisada en `Config.toml`.
+- **Solo cuenta el último release (decisión del usuario, 14 nov):** da igual cuántas versiones atrás
+  vaya el jugador; el launcher solo mira y baja del **último** release, que trae todo. No hay cadenas
+  de paquetes ni dependencia de releases viejos.
+- **Cómo trae «todo» sin bajar 346 MB:** el último release publica el payload partido en piezas, como
+  archivos del release (nada de repos, ramas ni Pages aparte): fuentes + parches + launcher (~3–15 MB),
+  traductor, dependencias, CMake, llvm-mingw, PowerUp+, estudios. Un manifiesto lista la huella de cada
+  pieza (y el enlace a la Discussion). El launcher compara con las huellas de lo instalado y baja solo
+  las piezas distintas. Normalmente cambia solo la de fuentes.
+- **Qué se descarga:** solo las piezas que difieren de lo instalado, no el zip entero. El primer salto desde una instalación v0.1.7 o anterior no
   tiene piezas compiladas guardadas, así que esa primera actualización hará la compilación completa
   (~4–5 min); desde ahí, las siguientes son incrementales.
 - **Qué se guarda en la instalación:** a partir de esta versión, el Setup conserva junto a la
@@ -104,8 +149,8 @@ avise cuando hay una nueva y que la instale sin reinstalar nada ni tocar los dat
 - **Instalación nueva al lado, cambio al final:** la versión nueva se compila aparte y solo sustituye
   a la vieja cuando ha terminado bien; si algo falla, la vieja no se ha tocado.
 - **Reinicio:** al terminar, el launcher se cierra y se abre ya en la versión nueva.
-- **Aviso discreto:** el aviso no bloquea JUGAR; si el jugador lo ignora, se le recuerda la próxima vez
-  que abra el launcher, no en cada pantalla.
+- **Aviso discreto:** el aviso no bloquea JUGAR; tras «No» solo queda la marca fija (ver «Cuántas veces
+  sale la ventana Sí/No»).
 - **Verificación:** lo descargado se comprueba contra las sumas SHA-256 publicadas con el release.
 - **Instalaciones v0.1.7 y anteriores:** no tienen código de actualización, así que pasan una vez por el
   Setup de la versión que traiga esto («REINSTALAR» en la misma carpeta, que ya conserva `UserData` y

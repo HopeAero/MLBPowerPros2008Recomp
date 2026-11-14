@@ -29,6 +29,20 @@ container=0
 in_container=0
 arch=x86_64
 pages16k=0
+stage_dir=""
+from_kit=""
+
+# The options an in-place update (tools/linux/update.sh) must repeat: all but where things go
+# (--disc, --install, --stage, --from-kit) and the one-shot ones (--fresh, --in-container).
+recorded=()
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[i]}" in
+        --disc|--install|--stage|--from-kit) i=$((i + 1)) ;;
+        --fresh|--in-container) ;;
+        *) recorded+=("${args[i]}") ;;
+    esac
+done
 
 usage() {
     sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -41,6 +55,10 @@ Options:
   --no-studio        skip Texture Studio
   --no-roster-editor skip PowerUp+ (the roster editor; needs the .NET 10 SDK, Node.js is downloaded)
   --desktop-entry    add "MLB Power Pros 2008" to the desktop's application menu
+  --stage DIR        install only the program (no Data, UserData, mods, Config.toml or desktop entry)
+                     into DIR; used by tools/linux/update.sh
+  --from-kit PLATFORM  (the kit installers pass it: linux or steamdeck) write <install>/kit.txt so the
+                     launcher can update this install in place from the next release's kit
   --container        build inside a glibc 2.35 container (podman or docker): a portable build for
                      the Steam Deck / SteamOS, and no compilers or -devel packages needed on the host
   --arch aarch64     experimental: cross-compile for Linux ARM64 against the sysroot from
@@ -55,6 +73,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --disc) disc=$(realpath "$2"); shift 2 ;;
         --install) install_dir=$(realpath -m "$2"); shift 2 ;;
+        --stage) stage_dir=$(realpath -m "$2"); shift 2 ;;
+        --from-kit) from_kit=$2; shift 2 ;;
         --jobs) jobs=$2; shift 2 ;;
         --fresh) fresh=1; shift ;;
         --no-studio) skip_studio=1; shift ;;
@@ -75,8 +95,17 @@ cd "$root"
 [[ $arch == x86_64 || $arch == aarch64 ]] || fail "--arch must be x86_64 or aarch64"
 [[ $arch == aarch64 ]] && (( container )) && fail "--arch aarch64 is not supported with --container"
 (( pages16k )) && [[ $arch != aarch64 ]] && fail "--16k-pages needs --arch aarch64"
+[[ -z $from_kit || $from_kit == linux || $from_kit == steamdeck ]] || fail "--from-kit must be linux or steamdeck"
+[[ -z $stage_dir || -z $from_kit ]] || fail "--stage and --from-kit do not go together"
 [[ -n $install_dir ]] || install_dir=$HOME/Games/MLBPowerPros2008
 [[ $arch == aarch64 && $install_dir == "$HOME/Games/MLBPowerPros2008" ]] && install_dir=$root/local/install-aarch64
+if [[ -n $from_kit ]]; then
+    # An update replaces the kit folder's files (tools/linux/update.sh): the install, with the saves, lives elsewhere.
+    case "$install_dir/" in
+        "$(realpath -m "$root")/local/"*) ;;
+        "$(realpath -m "$root")/"*) fail "--install cannot be inside the kit folder ($root): an update replaces its files" ;;
+    esac
+fi
 
 work=$root/local/wiicompiled-mlb
 data=$root/local/disc/DATA
@@ -304,6 +333,7 @@ sdl_flags=()
 (( in_container )) && sdl_flags+=(-DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc")
 configure+=("${sdl_flags[@]}")
 step "Configuring the native build"
+configure+=("-DMLBPP_VERSION=$(tr -d '[:space:]' < "$root/VERSION")")
 cmake "${configure[@]}" > local/analysis/linux${log_tag}-configure.log 2>&1 || {
     tail -n 30 local/analysis/linux${log_tag}-configure.log; fail "configure failed (see local/analysis/linux${log_tag}-configure.log)"; }
 step "Compiling the game (this takes the longest)"
@@ -390,22 +420,32 @@ fi  # steps 1-3
 (( in_container )) && exit 0
 
 # ---- 4. Install -----------------------------------------------------------------------------------
+[[ -n $stage_dir ]] && install_dir=$stage_dir
 step "Installing into $install_dir"
 mkdir -p "$install_dir"
 cp -f "$build/WiiCompiled" "$install_dir/MLBPowerPros2008"
+tr -d '[:space:]' < "$root/VERSION" > "$install_dir/version.txt"   # travels with the program in update swaps
 for name in dsp_coef.bin initial_pipeline_cache.db cacert.pem; do
     [[ -f $build/$name ]] && cp -f "$build/$name" "$install_dir/"
 done
 for dir in config wii_bootstrap; do
     [[ -d $build/$dir ]] && cp -rf "$build/$dir" "$install_dir/"
 done
-mkdir -p "$install_dir/launcher" "$install_dir/mods" "$install_dir/UserData"
+mkdir -p "$install_dir/launcher"
+[[ -n $stage_dir ]] || mkdir -p "$install_dir/mods" "$install_dir/UserData"
 cp -f assets/launcher/*.png "$install_dir/launcher/"
 (( skip_studio )) || cp -f "$studio_build/TextureStudio" "$install_dir/"
 [[ -f ${studio_build/texture-studio/season-studio}/SeasonStudio ]] && cp -f "${studio_build/texture-studio/season-studio}/SeasonStudio" "$install_dir/"
 if (( ! skip_roster )); then   # the launcher's TOOLS > EDIT ROSTER starts it; its database lives in UserData
     rm -rf "$install_dir/powerupplus"
     cp -r "$roster_build" "$install_dir/powerupplus"
+fi
+if [[ -n $stage_dir ]]; then
+    # An update stages the program only; update.sh swaps it in and leaves Data, UserData and mods alone.
+    printf '
+[1mStaged.[0m %s
+' "$install_dir"
+    exit 0
 fi
 touch "$install_dir/portable.txt"   # Config.toml, NAND and caches stay in UserData/ next to the game
 # The game reads the disc files from Data/ next to it, like the Windows install. A hard-link copy
@@ -429,6 +469,22 @@ else:
     text = f'[paths]\n{line}\n\n' + text
 config.write_text(text, encoding='utf-8')
 EOF
+
+if [[ -n $from_kit ]]; then
+    # Marks an install made from a release kit: the launcher updates it in place (tools/linux/update.sh).
+    # A git clone (no --from-kit) writes nothing and is only told that a new version exists.
+    {
+        echo "root=$root"
+        echo "platform=$from_kit"
+        echo "options=${recorded[*]}"
+    } > "$install_dir/kit.txt"
+    # A full install leaves a complete program: what an interrupted update or rollback left is obsolete
+    # (tools/linux/update.sh refuses to run while a .rollback is there).
+    rm -rf -- "$install_dir.rollback" "$install_dir.staging"
+    mkdir -p "$root/local"
+    printf 'version %s
+' "$(tr -d '[:space:]' < "$root/VERSION")" > "$root/local/update-manifest.txt"
+fi
 
 if (( desktop_entry )); then
     applications=${XDG_DATA_HOME:-$HOME/.local/share}/applications

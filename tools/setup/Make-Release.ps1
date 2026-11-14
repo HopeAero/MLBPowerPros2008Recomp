@@ -11,10 +11,14 @@
 # junctions; every one is checked out or verified by commit or hash. Downloaded archives are seeded
 # from the working tree's Launcher\artifacts\downloads when present (the Prepare scripts check their
 # SHA-256).
-param([string]$Ref = 'HEAD', [switch]$Zip)
+#   5. with -Zip, tools\update_manifest.py cuts the payload into per-piece zips and writes update-manifest.txt
+#      (plus the Linux/Steam Deck kit lines when local\release exists: it must then hold both kits of this
+#      version, from tools/linux/make-kits.sh, or the step fails) into local\setup-payload\release.
+param([string]$Ref = 'HEAD', [switch]$Zip, [string]$Discussion, [string]$DiscussionEn)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $clone = Join-Path $root 'local\rc'
+if ($Zip -and -not $Discussion) { throw '-Discussion <url> is required with -Zip (release notes link).' }
 function Invoke-Checked([string]$label) { if ($LASTEXITCODE -ne 0) { throw "$label failed ($LASTEXITCODE)" } }
 
 if (git -C $root status --porcelain) { Write-Warning 'Uncommitted changes are not part of the release.' }
@@ -43,4 +47,20 @@ Write-Host 'Portable tools, dependencies, aurora prebuilt...'
 & "$launcher\Prepare-NativePrebuilt.ps1"
 
 & "$clone\tools\setup\Make-Payload.ps1" -Source $src -Output "$root\local\setup-payload\MLB Power Pros 2008 Setup" -Zip:$Zip
+if ($Zip) {
+    # Python 3: $env:PYTHON (a full path) when set, else `python` on PATH.
+    $python = if ($env:PYTHON) { $env:PYTHON } else { (Get-Command python -ErrorAction Stop).Source }
+    $version = (Get-Content "$clone\VERSION" -TotalCount 1).Trim()
+    $release = "$root\local\setup-payload\release"
+    if (Test-Path $release) { Remove-Item -Recurse -Force $release }
+    $um = @('-I', "$clone\tools\update_manifest.py", 'release', "$root\local\setup-payload\MLB Power Pros 2008 Setup",
+            $release, $version, $Discussion)
+    if ($DiscussionEn) { $um += $DiscussionEn }
+    if (Test-Path "$root\local\release") {
+        $um += '--kits', "$root\local\release", '--containerfile', "$clone\tools\linux\Containerfile"
+    }
+    & $python @um
+    Invoke-Checked 'update_manifest release'
+    Write-Host "Pieces and update-manifest.txt in $release"
+}
 Write-Host "Release payload built from $commit."

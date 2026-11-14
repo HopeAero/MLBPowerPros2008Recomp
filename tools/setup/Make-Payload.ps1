@@ -73,6 +73,9 @@ Invoke-Checked 'translator publish'
 
 Write-Host 'Workspace...'
 Copy-Item "$root\tools\setup\LocalBuild.ps1" $workspace
+Copy-Item "$root\VERSION" "$workspace\VERSION"
+Copy-Item "$root\tools\setup\ProgramItems.ps1" $workspace
+Copy-Item "$root\tools\setup\Update.ps1" $workspace
 Copy-Item "$Source\Launcher\NativeBuildFlags.ps1" $workspace
 Copy-Item "$root\config\wiicompiled\rl8e54.yml", "$root\config\wiicompiled\rl8e54-functions.map" "$workspace\config"
 Copy-Tree "$root\assets\launcher" "$workspace\launcher"
@@ -149,6 +152,15 @@ foreach ($license in 'LICENSE-MIT', 'LICENSE-APACHE') {  # nodtool is MIT OR Apa
     Invoke-WebRequest -UseBasicParsing -OutFile "$Output\licenses\nodtool-$license.txt" `
         "https://raw.githubusercontent.com/encounter/nod/v2.0.0-alpha.10/$license"
 }
+
+Write-Host 'Update manifest (content fingerprints, no zips)...'
+# The Setup installs this as Build\update-manifest.txt; the launcher compares it with the release manifest
+# to download only the pieces that changed. Make-Release.ps1 writes the release one with the zips.
+# Python 3: $env:PYTHON (a full path) when set, else `python` on PATH.
+$python = if ($env:PYTHON) { $env:PYTHON } else { (Get-Command python -ErrorAction Stop).Source }
+$version = (Get-Content "$root\VERSION" -TotalCount 1).Trim()
+& $python -I "$root\tools\update_manifest.py" payload $Output $version
+Invoke-Checked 'update manifest'
 
 Write-Host 'Checking that no game content is in the payload...'
 $bad = Get-ChildItem $Output -Recurse -File | Where-Object {

@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Builds the Linux and Steam Deck release kits from a commit: the repository's tracked files (git
 # archive: nothing from local/, no game data) plus a one-command installer at the top. Each player's
-# machine extracts, translates and compiles their own copy with tools/linux/build.sh.
+# machine extracts, translates and compiles their own copy with tools/linux/build.sh. The installers
+# pass --from-kit, so the install can later be updated in place with tools/linux/update.sh. The
+# manifest's `kit` lines are added by tools/setup/Make-Release.ps1.
 #   tools/linux/make-kits.sh <version> [commit]     -> local/release/*.tar.gz + SHA256SUMS.txt
 set -euo pipefail
 version=${1:?usage: make-kits.sh <version> [commit]}
@@ -10,6 +12,12 @@ commit=${2:-HEAD}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 out=$root/local/release
 mkdir -p "$out"
+# VERSION travels in the kit (git archive): the update compares it and build.sh reads it.
+git -C "$root" cat-file -e "$commit:VERSION" 2>/dev/null || { echo "VERSION is not in $commit" >&2; exit 1; }
+# A kit whose VERSION is older than its name would report the old version, and the launcher would offer
+# the same update again after every update.
+kit_version=$(git -C "$root" show "$commit:VERSION" | tr -d '[:space:]')
+[[ $kit_version == "$version" ]] || { echo "VERSION in $commit is '$kit_version', not '$version'" >&2; exit 1; }
 python3 "$root/tools/check_no_game_data.py" --all >/dev/null || { echo "check_no_game_data failed" >&2; exit 1; }
 
 make_kit() {  # $1 kit name, $2 installer file name, $3 installer body
@@ -19,6 +27,11 @@ make_kit() {  # $1 kit name, $2 installer file name, $3 installer body
     git -c core.autocrlf=false -C "$root" archive --format=tar --prefix="$name/" "$commit" | tar -x -C "$stage"
     printf '%s\n' "$3" > "$stage/$name/$2"
     chmod +x "$stage/$name/$2"
+    # The kit's own files: an in-place update (tools/linux/update.sh) removes only files the previous kit
+    # listed here, never anything else the player keeps in the kit folder.
+    { (cd "$stage/$name" && find . \( -type f -o -type l \) -printf '%P\n'); echo kit-files.txt; } |
+        LC_ALL=C sort -u > "$stage/kit-files.txt"
+    mv "$stage/kit-files.txt" "$stage/$name/kit-files.txt"
     tar -C "$stage" -czf "$out/$name.tar.gz" "$name"
     rm -rf "$stage"
     echo "$out/$name.tar.gz"
@@ -43,7 +56,7 @@ make_kit Linux install.sh "#!/usr/bin/env bash
 #   ./install.sh '/path/to/your copy.rvz' [--install DIR] [other tools/linux/build.sh options]
 # Needs the packages listed in docs/en/linux.md; add --container to use podman/docker instead.
 $common
-exec tools/linux/build.sh --disc \"\$disc\" --desktop-entry \"\$@\""
+exec tools/linux/build.sh --disc \"\$disc\" --desktop-entry --from-kit linux \"\$@\""
 
 make_kit SteamDeck install-steam-deck.sh "#!/usr/bin/env bash
 # Builds and installs MLB Power Pros 2008 on a Steam Deck (Desktop Mode) from your own copy of the
@@ -53,7 +66,7 @@ make_kit SteamDeck install-steam-deck.sh "#!/usr/bin/env bash
 $common
 command -v podman >/dev/null || command -v docker >/dev/null ||
     { echo 'podman was not found (SteamOS 3.5 or later includes it).' >&2; exit 1; }
-tools/linux/build.sh --container --disc \"\$disc\" --desktop-entry \"\$@\"
+tools/linux/build.sh --container --disc \"\$disc\" --desktop-entry --from-kit steamdeck \"\$@\"
 cat <<'EOF'
 
 Next: Steam (Desktop Mode) -> Games -> Add a Non-Steam Game to My Library -> Browse ->

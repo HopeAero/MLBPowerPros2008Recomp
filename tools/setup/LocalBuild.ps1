@@ -10,11 +10,17 @@
 # Progress for the Setup window goes to stdout as "@@ <percent> <message>"; everything else is log.
 # -Lang picks the language of those messages (the Setup passes its own): es (default) or en.
 param(
-    [Parameter(Mandatory)] [string]$Iso,
+    [string]$Iso,
     [Parameter(Mandatory)] [string]$Install,
     [int]$Jobs = [Environment]::ProcessorCount,
     [switch]$KeepWorkspace,
     [switch]$Shortcut,
+    # Rebuild from the workspace the Setup left in <Install>\Build (no disc image needed; the extracted
+    # disc copy in <Install>\Data must still be there).
+    [switch]$Update,
+    # Install the program files into this folder instead of <Install>\Game; UserData, mods, Config.toml,
+    # portable.txt and the shortcuts are not touched.
+    [string]$Stage,
     [ValidateSet('es', 'en')] [string]$Lang = 'es'
 )
 $ErrorActionPreference = 'Stop'
@@ -30,6 +36,7 @@ $translator = Join-Path $toolkit 'Translator\Translator.Cli.exe'
 $llvm = Join-Path $toolkit 'llvm-mingw\bin'
 $cmake = Join-Path $toolkit 'CMake\bin\cmake.exe'
 . (Join-Path $workspace 'NativeBuildFlags.ps1')
+. (Join-Path $workspace 'ProgramItems.ps1')  # Get-ProgramItems, shared with Update.ps1
 $env:PATH = Get-MkwToolchainPath $toolkit
 # The bundled clang must be the only toolchain the build can see.
 foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH', 'VSINSTALLDIR', 'VCToolsInstallDir', 'WindowsSdkDir', 'CC', 'CXX') {
@@ -55,14 +62,27 @@ function Get-Pin([string]$key) {
 
 $Install = [IO.Path]::GetFullPath($Install)
 $data = Join-Path $Install 'Data'
+if ($Stage) {
+    # The stage folder is wiped: it must be separate from the install, never Game, UserData or mods.
+    function Norm([string]$p) { [IO.Path]::GetFullPath($p).TrimEnd([char]92) + [string][char]92 }
+    $s = Norm $Stage; $i = Norm $Install; $g = Norm (Join-Path $Install 'Game')
+    if ($s -ieq $i -or $s.StartsWith($g, 'OrdinalIgnoreCase') -or $g.StartsWith($s, 'OrdinalIgnoreCase')) {
+        throw (T "La carpeta -Stage no puede ser la instalación ni Game ni estar dentro o contenerla: $Stage" `
+                 "The -Stage folder cannot be the install, Game, or inside or contain it: $Stage")
+    }
+}
 New-Item -ItemType Directory -Force $Install | Out-Null
 
+if ($Update -and -not $Stage) { throw (T '-Update necesita -Stage (no se instala sobre Game).' '-Update needs -Stage (it never installs over Game).') }
+if (-not $Update -and -not $Iso) { throw (T 'Falta -Iso (la imagen del disco).' 'Missing -Iso (the disc image).') }
+if (-not $Update) {
 Progress 1 (T 'Revisando la imagen del disco...' 'Checking the disc image...')
 $info = (Invoke-Tool (T 'La lectura de la imagen del disco' 'Reading the disc image') $nodtool @('--no-color', 'info', $Iso) | Out-String)
 if ($info -notmatch 'Game ID:\s*RL8E54') {
     $id = if ($info -match 'Game ID:\s*(\w{6})') { $Matches[1] } else { T 'desconocido' 'unknown' }
     throw (T "Este disco no es MLB Power Pros 2008 para Wii (USA, RL8E54). ID encontrado: $id." `
              "This disc is not MLB Power Pros 2008 for Wii (USA, RL8E54). Found ID: $id.")
+}
 }
 
 $dol = Join-Path $data 'sys\main.dol'
@@ -71,6 +91,9 @@ function Test-Inputs {
     (Test-Path $dol) -and (Test-Path $rel) -and
     (Get-FileHash $dol -Algorithm SHA256).Hash.ToLower() -eq (Get-Pin 'dol') -and
     (Get-FileHash $rel -Algorithm SHA256).Hash.ToLower() -eq (Get-Pin 'rel')
+}
+if ($Update -and -not (Test-Inputs)) {
+    throw (T 'Falta la copia extraída del disco; usa el Setup.' 'The extracted disc copy is missing; use the Setup.')
 }
 if (-not (Test-Inputs)) {
     Progress 3 (T 'Extrayendo los archivos del disco...' 'Extracting the disc files...')
@@ -121,12 +144,15 @@ $build = Join-Path $workspace 'build'
 $dependencies = Join-Path $workspace 'Dependencies'
 # Same flags as Wiicompiled's own LocalBuild.ps1 and Prepare-NativePrebuilt.ps1, so the precompiled
 # aurora/third-party closure in Dependencies\native_prebuilt matches this build.
+# Release version: Make-Payload.ps1 copies the repo's VERSION file to workspace\VERSION.
+$versionFile = Join-Path $workspace 'VERSION'
+$mlbppVersion = if (Test-Path -LiteralPath $versionFile) { (Get-Content -LiteralPath $versionFile -TotalCount 1).Trim() } else { 'dev' }
 $configure = Get-MkwNativeConfigureArguments -SourceDirectory "$src\runtime" -BuildDirectory $build `
     -Ninja (Join-Path $toolkit 'Ninja\ninja.exe') -CCompiler (Join-Path $llvm 'x86_64-w64-mingw32-clang.exe') `
     -CxxCompiler (Join-Path $llvm 'x86_64-w64-mingw32-clang++.exe') `
     -ResourceCompiler (Join-Path $llvm 'x86_64-w64-mingw32-windres.exe') `
     -DependenciesDirectory $dependencies -NativePrebuiltDirectory (Join-Path $dependencies 'native_prebuilt') `
-    -AdditionalArguments @('-DWIICOMPILED_GAME=RL8E54', "-DMKW_TRANSLATED_COMPILE_JOBS=$Jobs")
+    -AdditionalArguments @('-DWIICOMPILED_GAME=RL8E54', "-DMKW_TRANSLATED_COMPILE_JOBS=$Jobs", "-DMLBPP_VERSION=$mlbppVersion")
 Invoke-Tool (T 'La configuración' 'Build configuration') $cmake $configure
 
 Progress 30 (T 'Compilando el juego (esto es lo que más tarda)...' 'Compiling the game (this takes the longest)...')
@@ -140,7 +166,8 @@ Invoke-Tool (T 'La compilación' 'Compilation') $cmake @('--build', $build, '--t
 }
 
 Progress 96 (T 'Instalando...' 'Installing...')
-$game = Join-Path $Install 'Game'
+$game = if ($Stage) { [IO.Path]::GetFullPath($Stage) } else { Join-Path $Install 'Game' }
+if ($Stage -and (Test-Path -LiteralPath $game)) { Remove-Item -Recurse -Force -LiteralPath $game }
 New-Item -ItemType Directory -Force $game | Out-Null
 Copy-Item (Join-Path $build 'WiiCompiled.exe') (Join-Path $game 'MLBPowerPros2008.exe') -Force
 # Runtime files the build places next to the exe; same list as Wiicompiled's LocalBuild.ps1.
@@ -175,6 +202,15 @@ foreach ($name in 'config', 'wii_bootstrap') {
     $dir = Join-Path $build $name
     if (Test-Path $dir) { Copy-Item $dir $game -Recurse -Force }
 }
+[IO.File]::WriteAllText((Join-Path $game 'version.txt'), "$mlbppVersion`n")
+if ($Stage) {
+    # Only the program: every name Get-ProgramItems lists must be here, or the build is incomplete.
+    $missing = @(Get-ProgramItems | Where-Object { -not (Test-Path -LiteralPath (Join-Path $game $_)) })
+    foreach ($name in $missing) { Write-Output "warning: $name is not in the staged program" }
+    if ($missing -contains 'MLBPowerPros2008.exe') { throw (T 'La compilación no produjo el juego.' 'The build did not produce the game.') }
+    Progress 100 (T 'Listo.' 'Done.')
+    return
+}
 New-Item -ItemType File -Force (Join-Path $game 'portable.txt') | Out-Null
 # Player mods live here (the launcher's MODS screen); a reinstall never touches them.
 New-Item -ItemType Directory -Force (Join-Path $game 'mods') | Out-Null
@@ -190,8 +226,10 @@ if (Test-Path $config) {
     $text = "[paths]`r`n$dvdLine`r`n"
 }
 [IO.File]::WriteAllText($config, $text)
+# Game is complete again: an interrupted update's Staging / Rollback.tmp would block the next one.
+Clear-UpdateLeftovers $Install
 
-if (-not $KeepWorkspace) {
+if (-not $KeepWorkspace -and -not $Update) {
     Progress 98 (T 'Limpiando archivos temporales...' 'Cleaning up temporary files...')
     foreach ($dir in $build, $generated) { if (Test-Path $dir) { Remove-Item -Recurse -Force $dir } }
 }

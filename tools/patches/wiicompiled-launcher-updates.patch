@@ -1,0 +1,2199 @@
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index b5e49bf..02da665 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -365,6 +365,12 @@ set(MKW_CPU_BASELINE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/host_cpu_baseline.cpp
+ list(REMOVE_ITEM SOURCES ${MKW_BASE_PRODUCT_SOURCE} ${MKW_RETRO_REWIND_PRODUCT_SOURCE}
+      ${MKW_CPU_BASELINE_SOURCE} ${MKW_PLATFORM_SOURCE})
+ 
++# The release version (repo VERSION file, passed as -DMLBPP_VERSION) lives in one generated
++# translation unit: a compile definition on the product would recompile every translated file.
++set(MLBPP_VERSION "dev" CACHE STRING "Release version shown by the launcher")
++configure_file("${CMAKE_CURRENT_LIST_DIR}/src/mlbpp_version.cpp.in" "${CMAKE_BINARY_DIR}/mlbpp_version.cpp" @ONLY)
++list(APPEND SOURCES "${CMAKE_BINARY_DIR}/mlbpp_version.cpp")
++
+ # This deliberately small library contains host services that are safe to
+ # validate before guest memory and fiber work makes a full runtime build viable.
+ add_library(mkw_platform STATIC "${MKW_PLATFORM_SOURCE}")
+@@ -473,6 +479,11 @@ add_executable(mkw_season_schedule_mlb_tests "${CMAKE_CURRENT_LIST_DIR}/tests/se
+ target_compile_features(mkw_season_schedule_mlb_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_season_schedule_mlb_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+ add_test(NAME mkw_season_schedule_mlb_tests COMMAND mkw_season_schedule_mlb_tests)
++add_executable(mkw_launcher_update_tests "${CMAKE_CURRENT_LIST_DIR}/tests/launcher_update_tests.cpp" "${CMAKE_CURRENT_LIST_DIR}/src/launcher_update.cpp")
++target_compile_features(mkw_launcher_update_tests PRIVATE cxx_std_20)
++target_include_directories(mkw_launcher_update_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
++target_link_libraries(mkw_launcher_update_tests PRIVATE $<$<PLATFORM_ID:Windows>:ws2_32>)  # the test's local server
++add_test(NAME mkw_launcher_update_tests COMMAND mkw_launcher_update_tests)
+ add_executable(mkw_season_pack_tests "${CMAKE_CURRENT_LIST_DIR}/tests/season_pack_tests.cpp")
+ target_compile_features(mkw_season_pack_tests PRIVATE cxx_std_20)
+ target_include_directories(mkw_season_pack_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+diff --git a/runtime/include/launcher_update.h b/runtime/include/launcher_update.h
+new file mode 100644
+index 0000000..65df882
+--- /dev/null
++++ b/runtime/include/launcher_update.h
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Launcher update support. The version comes from the repo's VERSION file (-DMLBPP_VERSION).
++#pragma once
++
++#include <cstdint>
++#include <filesystem>
++#include <functional>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <thread>
++#include <vector>
++
++// "0.1.8", or "dev" when the build was configured without MLBPP_VERSION.
++const char* MlbppVersion();
++
++// Pure update logic (no I/O, no network): manifest parsing and decisions.
++namespace launcher_update {
++
++// "-" in file/sha256 (and bytes 0) = a piece of the payload's own manifest, not yet zipped.
++struct Piece { std::string name, file, sha256; uint64_t bytes = 0; std::string content; };
++struct Kit { std::string platform, file, sha256; uint64_t bytes = 0; std::string containerfile; };  // empty if absent
++struct Manifest { std::string version, discussionEs, discussionEn; std::vector<Piece> pieces; std::vector<Kit> kits; };
++
++// nullopt when the 'version' line is missing. Unknown lines and '#' comments are ignored, and so are
++// piece / kit lines whose file is not a bare file name ('/', '\\', ':' or "..": never a path).
++std::optional<Manifest> ParseManifest(std::string_view text);
++// -1/0/1; accepts a leading "v"; "dev" (or unparsable) sorts below everything else.
++int CompareVersions(std::string_view a, std::string_view b);
++// Pieces of 'latest' whose content hash differs from (or is absent in) 'installed'.
++std::vector<Piece> PiecesToDownload(const Manifest& latest, const Manifest& installed);
++// True when 'latest' is newer than 'installed' and was not already notified.
++bool ShouldPopup(std::string_view latest, std::string_view installed, std::string_view notified);
++// English -> Spanish -> the release page. Only https:// links from the manifest are opened.
++std::string DiscussionUrl(const Manifest& m, bool english);
++// The GitHub release page of a version (where the Setup is downloaded).
++std::string ReleasePage(std::string_view version);
++enum class Mode { None, Notify, Update };  // Notify = no Build/kit: link only
++Mode Decide(const Manifest& latest, std::string_view installed, bool canUpdate);
++// A quick update rebuilds only the program: none of the pieces re-translates the game or changes the
++// toolchain (translator, deps, buildtools, llvm). Empty (nothing to download) is quick too.
++bool QuickUpdate(const std::vector<Piece>& pieces);
++// The string value of key in [section] of a TOML text ("" when absent). Enough for Config.toml's
++// simple 'key = "value"' lines; the full parser lives in runtime_config.h.
++std::string ConfigValue(std::string_view toml, std::string_view section, std::string_view key);
++// "4.2 MB" / "4,2 MB" (MiB, one decimal).
++std::string FormatMegabytes(uint64_t bytes, bool decimalComma);
++
++// ---- The update itself: install layout, processes, downloads -------------------------------------
++// Standard library and OS calls only (no runtime dependency), so the test still links this file.
++
++// Where this copy lives and what it can do.
++//   Windows (Setup install): <Install>\Game\<exe>, <Install>\Build\update-manifest.txt (the installed
++//     pieces), <Install>\Build\workspace\Update.ps1, <Install>\Previous\version.txt after an update.
++//   Linux (kit install): <install>/<exe> with kit.txt (root=, platform=, options=), <kit root>/tools/
++//     linux/update.sh, <install>.previous/version.txt after an update.
++// canUpdate needs the update script too: an install copied to another PC (its kit.txt pointing at the
++// first one's kit folder) or a Build without Update.ps1 only gets the notice.
++struct Install {
++    std::filesystem::path exe;                // this program
++    std::filesystem::path root;               // Windows <Install>; Linux the install dir (the exe's)
++    std::filesystem::path installedManifest;  // Windows only
++    std::filesystem::path script;             // Update.ps1 / update.sh
++    std::filesystem::path downloads;          // Windows <Install>\Update\downloads; Linux <install>.download
++    std::filesystem::path cache;              // UserData\Cache (the fetched manifest)
++    std::filesystem::path log;                // the scripts' output (Windows <Install>\Update\update.log)
++    std::filesystem::path handoffError;       // Windows <Install>\Update\last-error.txt (a failed swap / rollback)
++    std::string kitPlatform, kitRoot;         // Linux, from kit.txt
++    std::vector<std::string> kitOptions;
++    bool canUpdate = false;
++    std::string previousVersion;              // the program kept by the last update ("" = none)
++};
++Install Locate(const std::filesystem::path& exe, const std::filesystem::path& cache);
++// What the detached Update.ps1 left when its swap / rollback failed after the launcher had exited
++// ("<phase>\n<message>"). Read once: the file is deleted. nullopt when there is none.
++struct HandoffError { bool rollback = false; std::string message; };
++std::optional<HandoffError> TakeHandoffError(const Install& install);
++// This program's path (empty where the OS gives no simple way: only Windows and Linux update).
++std::filesystem::path ThisExecutable();
++// MLBPP_UPDATE_URL (tests: file:///...) or the latest GitHub release, ending in '/'.
++std::string BaseUrl();
++
++// What the launcher draws: the check's result and a running update's progress.
++struct Status {
++    enum class State { Idle, Checking, Checked, CheckFailed, Running, Failed, Cancelled, Done };
++    State state = State::Idle;
++    bool rollback = false;           // the running / failed / done job is a rollback
++    bool cancellable = true;         // Running: false once folders move (hand-off, @@COMMIT, rollback)
++    std::optional<Manifest> latest;  // after a check
++    Mode mode = Mode::None;
++    std::vector<Piece> pieces;       // Windows: the zips to download
++    uint64_t downloadBytes = 0;      // the pieces or the kit
++    bool quick = false;              // see QuickUpdate (Windows)
++    bool slowContainer = false;      // Linux: the kit's Containerfile changed, the container is rebuilt
++    int step = 0, steps = 0;         // Running: 1-based
++    bool downloading = false;        // Running: in the download step (downloaded is valid)
++    uint64_t downloaded = 0;         // bytes on disk so far, read from the files' sizes
++    int percent = 0;                 // the script's last "@@ <percent>"
++    std::string message, error;      // the script's last "@@" text / "@@ERROR" text (or ours)
++};
++
++// The check and the update run on a worker thread; Get() is cheap enough for every frame.
++class Updater {
++public:
++    Updater(Install install, std::string installedVersion);
++    ~Updater();
++    Updater(const Updater&) = delete;
++    Updater& operator=(const Updater&) = delete;
++
++    const Install& Where() const { return install_; }
++    // Fetches update-manifest.txt (curl --max-time 10) into the cache. Ignored while busy.
++    void Check(std::string baseUrl);
++    // Windows: download the pieces, Update.ps1 apply and build, then hand the swap to a detached
++    // Update.ps1 -WaitPid <this process> -Relaunch (Done: the launcher must exit). Linux: download the
++    // kit, update.sh (Done: Restart()). Needs a Checked state with Mode::Update. False (nothing
++    // started) while a check or another job runs: the caller keeps its window as it was.
++    bool Update(bool english);
++    // Windows: hands rollback to a detached Update.ps1 (Done at once: exit). Linux: update.sh --rollback.
++    // False (nothing started) while busy or without a previous version.
++    bool Rollback(bool restoreSaves, bool english);
++    // Stops the running download / script (its whole process tree). Ignored once the job committed:
++    // the Windows hand-off is starting, update.sh printed "@@COMMIT", or it is a rollback.
++    void Cancel();
++    Status Get() const;
++    // Linux: replaces this process with the program in the install folder, launcher shown (the old
++    // inode moved away, so by path, not /proc/self/exe). Returns only on failure. Windows: no-op.
++    bool Restart(char** argv);
++
++    struct Stop;  // cancel token of the running child process
++
++private:
++    bool Busy() const;  // with mutex_ held
++    // With mutex_ held: joins the finished worker and runs job on a new one.
++    void Launch(std::function<void()> job);
++    void RunCheck();
++    void RunUpdate(bool english);
++    void RunRollback(bool restoreSaves, bool english);
++    // One hidden script run: "@@" lines go to status_, everything to the log. Returns the exit code.
++    int RunScript(const std::vector<std::string>& args, std::string& error);
++    // Sets a field of status_ under the lock.
++    template <typename F> void Set(F&& f) { std::lock_guard lock(mutex_); f(status_); }
++
++    Install install_;
++    std::string installed_;
++    std::string baseUrl_;
++    mutable std::mutex mutex_;
++    Status status_;
++    std::thread worker_;
++    Stop* stop_;
++};
++
++}  // namespace launcher_update
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index ba945c6..9c6d739 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -7,6 +7,7 @@
+ #include "launcher.h"
+ #include "launcher_controls.h"
+ #include "launcher_visuals.h"
++#include "launcher_update.h"
+ #include <aurora/gfx.h>
+ #include <dolphin/pad.h>
+ #include "mods.h"
+@@ -47,8 +48,10 @@
+ #include <windows.h>
+ #include <shellapi.h>
+ #else
++#include <sys/wait.h>
+ #include <unistd.h>
+ #endif
++#include <optional>
+ 
+ namespace launcher {
+ namespace {
+@@ -95,10 +98,14 @@ char** g_argv = nullptr;
+ // lifts that for the keyboard only, for scripted tests that post keys to an unfocused window.
+ bool g_keyboardEnabled = false;
+ bool g_padEnabled = false;
++// While the update window is open the page under it reads no input (and leaves the key state alone,
++// so the window still sees each press once).
++bool g_inputBlocked = false;
+ 
+ bool KeyPressed(SDL_Scancode key, bool repeat = true) {
+     struct Repeat { double down = -1.0, next = 0.0; };
+     static std::array<Repeat, SDL_SCANCODE_COUNT> state;
++    if (g_inputBlocked) return false;
+     const double now = ImGui::GetTime();
+     Repeat& r = state[key];
+     if (!g_keyboardEnabled || !SDL_GetKeyboardState(nullptr)[key]) {
+@@ -116,6 +123,7 @@ bool KeyPressed(SDL_Scancode key, bool repeat = true) {
+ }
+ 
+ bool Pressed(std::initializer_list<SDL_Scancode> keys, std::initializer_list<ImGuiKey> pad) {
++    if (g_inputBlocked) return false;
+     bool hit = false;
+     for (SDL_Scancode key : keys) hit = KeyPressed(key) || hit;  // poll every key so repeat state stays fresh
+     for (ImGuiKey key : pad) hit = (g_padEnabled && ImGui::IsKeyPressed(key, true)) || hit;
+@@ -133,6 +141,7 @@ bool Right() {
+ }
+ // Accept never repeats either: holding Cross to enter a screen must not also act inside it.
+ bool Accept() {
++    if (g_inputBlocked) return false;
+     bool hit = false;
+     for (SDL_Scancode key : {SDL_SCANCODE_RETURN, SDL_SCANCODE_KP_ENTER, SDL_SCANCODE_SPACE, SDL_SCANCODE_J})
+         hit = KeyPressed(key, false) || hit;
+@@ -141,6 +150,7 @@ bool Accept() {
+ // Back never repeats and only counts the frame the key goes down: the press that
+ // closes a popup or cancels a capture must not also close the page under it.
+ bool Back() {
++    if (g_inputBlocked) return false;
+     return (g_keyboardEnabled && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_Backspace, false) ||
+                                   ImGui::IsKeyPressed(ImGuiKey_K, false))) ||
+            (g_padEnabled && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false));
+@@ -151,6 +161,7 @@ bool Hovered(ImVec2 a, ImVec2 b) {
+     return m.x >= a.x && m.x < b.x && m.y >= a.y && m.y < b.y;
+ }
+ bool MouseMoved() {
++    if (g_inputBlocked) return false;
+     const ImVec2 d = ImGui::GetIO().MouseDelta;
+     return d.x != 0.0f || d.y != 0.0f;
+ }
+@@ -224,6 +235,12 @@ ImTextureID BlurredTexture(const std::vector<unsigned char>& pixels, int w, int
+     return aurora_imgui_add_texture(static_cast<uint32_t>(sw), static_cast<uint32_t>(sh), bytes.data());
+ }
+ 
++// "v0.1.8" for a release build, "dev" for one configured without MLBPP_VERSION.
++std::string VersionLabel() {
++    const std::string v = MlbppVersion();
++    return !v.empty() && v[0] >= '0' && v[0] <= '9' ? "v" + v : v;
++}
++
+ // main.png also has the footer hints painted in. The launcher draws its own (they follow the keyboard
+ // or pad in use), so the painted ones go in both languages: the band takes the background from further
+ // right.
+@@ -300,6 +317,8 @@ constexpr int kOpenSavesFolder = -5;
+ constexpr int kOpenSeasonStudio = -6;
+ constexpr int kOpenCallnameStudio = -7;
+ constexpr int kOpenUniformStudio = -9;
++constexpr int kCheckUpdates = -10;
++constexpr int kRollbackUpdate = -11;
+ constexpr int kModsTab = 5;  // after VIDEO, AUDIO, CONTROLES, INTERFAZ, MEJORAS; HERRAMIENTAS follows it
+ constexpr int kEnhancementsTab = 4;
+ 
+@@ -590,6 +609,456 @@ std::string GameStatusLine(bool& ready) {
+     return std::string("Wii · ") + region + " · " + id;
+ }
+ 
++// ---- Updates -----------------------------------------------------------------------------------
++// launcher_update.cpp checks GitHub's latest release and installs it; this draws the notice, the
++// progress, the «Nueva versión» marker and VOLVER A, in the launcher's own look.
++enum class UpdateView { Closed, Checking, Notice, UpToDate, CheckFailed, Running, Failed, RollbackAsk };
++enum class UpdateAction { Yes, No, Setup, Close, Cancel, Retry, RollbackYes, RollbackNo, Link };
++struct UpdateUi {
++    launcher_update::Updater* updater = nullptr;  // null in developer builds: no check at all
++    UpdateView view = UpdateView::Closed;
++    UpdateView drawn = UpdateView::Closed;  // the view drawn last frame: a new one ignores this frame's input
++    bool forced = false;                    // BUSCAR ACTUALIZACIONES: show the result even if notified
++    bool checkSeen = true;                  // the current check's result was handled
++    bool restoreSaves = false;              // the last rollback's choice (Reintentar repeats it)
++    bool cancelling = false;
++    std::string notified;                   // [update] notified
++    std::string restartError;               // Linux: the new program could not be started
++    std::string handoffError;               // Windows: the last swap / rollback failed after the launcher closed
++    bool handoffRollback = false;
++    int selected = 0;
++};
++UpdateUi g_update;
++
++std::string VersionText(std::string_view v) {
++    return !v.empty() && v[0] >= '0' && v[0] <= '9' ? "v" + std::string(v) : std::string(v);
++}
++
++// After VOLVER A, Previous holds the newer program: going there is a switch forward, not back.
++bool PreviousIsNewer() {
++    return g_update.updater != nullptr && launcher_update::CompareVersions(g_update.updater->Where().previousVersion, MlbppVersion()) > 0;
++}
++
++void OpenUrl(const std::string& url) {
++#if defined(_WIN32)
++    const std::wstring wide(url.begin(), url.end());  // GitHub URLs are ASCII
++    ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++#else
++    if (const pid_t child = fork(); child == 0) {
++        if (fork() == 0) {  // orphaned grandchild: no zombie left behind
++            execlp("xdg-open", "xdg-open", url.c_str(), static_cast<char*>(nullptr));
++        }
++        _exit(0);
++    } else if (child > 0) {
++        waitpid(child, nullptr, 0);
++    }
++#endif
++}
++
++// Once per process (Run() is rebuilt on a language change). Not for developer builds or the probes.
++void StartUpdateCheck() {
++    static bool started = false;
++    if (started) return;
++    started = true;
++    const char* probe = std::getenv("WIICOMPILED_LAUNCHER_PROBE");
++    if (std::string_view(MlbppVersion()) == "dev" || (probe != nullptr && *probe != '\0')) return;
++    const std::filesystem::path exe = launcher_update::ThisExecutable();
++    if (exe.empty()) return;
++    g_update.updater = new launcher_update::Updater(  // lives as long as the process (its thread too)
++        launcher_update::Locate(exe, RuntimeConfigFile::ApplicationDataDirectory() / "Cache"), MlbppVersion());
++    std::ifstream config(RuntimeConfigFile::ResolveConfigPath(), std::ios::binary);
++    const std::string text((std::istreambuf_iterator<char>(config)), std::istreambuf_iterator<char>());
++    g_update.notified = launcher_update::ConfigValue(text, "update", "notified");
++    // Windows: the swap / rollback Update.ps1 ran after the last launcher closed failed; say so once.
++    if (auto failed = launcher_update::TakeHandoffError(g_update.updater->Where())) {
++        RT_LOG(RT_TAG_RUNTIME) << "launcher: the last " << (failed->rollback ? "rollback" : "update") << " failed: " << failed->message << std::endl;
++        g_update.handoffError = failed->message;
++        g_update.handoffRollback = failed->rollback;
++        g_update.view = UpdateView::Failed;
++    }
++    // Closing the launcher stops a running download / update.sh before it commits (Windows: the job does it too).
++    std::atexit([] { if (g_update.updater != nullptr) g_update.updater->Cancel(); });
++    g_update.checkSeen = false;
++    g_update.updater->Check(launcher_update::BaseUrl());
++}
++
++void ForceUpdateCheck() {
++    if (g_update.updater == nullptr) return;
++    g_update.forced = true;
++    g_update.checkSeen = false;
++    g_update.view = UpdateView::Checking;
++    g_update.updater->Check(launcher_update::BaseUrl());
++}
++
++// Every frame: follows the check and a running update. True when the launcher must exit (Windows:
++// Update.ps1 took over the swap or the rollback and starts the program itself).
++bool UpdateTick(launcher_update::Status& s) {
++    UpdateUi& g = g_update;
++    if (g.updater == nullptr) return false;
++    using State = launcher_update::Status::State;
++    s = g.updater->Get();
++    if (!g.checkSeen && (s.state == State::Checked || s.state == State::CheckFailed)) {
++        g.checkSeen = true;
++        if (s.state == State::CheckFailed) {
++            RT_LOG(RT_TAG_RUNTIME) << "launcher: update check failed: " << s.error << std::endl;
++            if (g.forced && g.view == UpdateView::Checking) g.view = UpdateView::CheckFailed;
++        } else {
++            const std::string& latest = s.latest->version;
++            RT_LOG(RT_TAG_RUNTIME) << "launcher: latest release " << latest << ", installed " << MlbppVersion()
++                                   << (s.mode == launcher_update::Mode::Update ? " (can update)"
++                                       : s.mode == launcher_update::Mode::Notify ? " (notice only)" : "") << std::endl;
++            // Only over nothing (or BUSCAR's own «Buscando...»): a late result never replaces an open window.
++            if (g.forced && (g.view == UpdateView::Checking || g.view == UpdateView::Closed))
++                g.view = s.mode == launcher_update::Mode::None ? UpdateView::UpToDate : UpdateView::Notice;
++            else if (!g.forced && g.view == UpdateView::Closed && s.mode != launcher_update::Mode::None &&
++                     launcher_update::ShouldPopup(latest, MlbppVersion(), g.notified))
++                g.view = UpdateView::Notice;
++        }
++        g.forced = false;  // a window it opens picks its own first button (DrawUpdateWindow's «fresh»)
++    }
++    if (g.view != UpdateView::Running) return false;
++    if (s.state == State::Failed) {
++        RT_LOG(RT_TAG_RUNTIME) << "launcher: " << (s.rollback ? "rollback" : "update") << " failed: " << s.error << std::endl;
++        g.view = UpdateView::Failed;
++        g.selected = 0;
++    } else if (s.state == State::Cancelled) {
++        RT_LOG(RT_TAG_RUNTIME) << "launcher: update cancelled" << std::endl;
++        g.view = UpdateView::Closed;
++    } else if (s.state == State::Done) {
++#if defined(_WIN32)
++        RT_LOG(RT_TAG_RUNTIME) << "launcher: Update.ps1 takes over (" << (s.rollback ? "rollback" : "swap")
++                               << "); exiting so it can replace the program" << std::endl;
++        return true;
++#else
++        RT_LOG(RT_TAG_RUNTIME) << "launcher: " << (s.rollback ? "rollback" : "update") << " done; starting the program" << std::endl;
++        g.updater->Restart(g_argv);  // returns only on failure
++        g.restartError = std::string(Tr("No se pudo abrir el programa: ", "Could not start the program: ")) +
++                         RuntimeConfigFile::PathToUtf8(g.updater->Where().exe);
++        g.view = UpdateView::Failed;
++#endif
++    }
++    return false;
++}
++
++void UpdateAct(UpdateAction action, const launcher_update::Status& s) {
++    UpdateUi& g = g_update;
++    const bool english = g_lang == Lang::En;
++    g.selected = 0;
++    // Update() / Rollback() refuse while a check still runs (up to 10 s): the window then stays as it
++    // was and the button works again a moment later, never a «Preparando...» that nothing follows.
++    switch (action) {
++    case UpdateAction::Yes:
++        g.cancelling = false;
++        if (g.updater->Update(english)) g.view = UpdateView::Running;
++        break;
++    case UpdateAction::Setup:
++        if (s.latest) OpenUrl(launcher_update::ReleasePage(s.latest->version));
++        [[fallthrough]];
++    case UpdateAction::No:
++        // Asked once per version: the marker next to the version reopens the window.
++        if (s.latest) {
++            g.notified = s.latest->version;
++            RuntimeConfigFile::WriteSetting("update", "notified", RuntimeConfigFile::FormatString(g.notified));
++        }
++        g.view = UpdateView::Closed;
++        break;
++    case UpdateAction::Close:
++        g.view = UpdateView::Closed;
++        g.handoffError.clear();
++        break;
++    case UpdateAction::Cancel:
++        g.cancelling = true;
++        g.updater->Cancel();
++        break;
++    case UpdateAction::Retry:
++        g.cancelling = false;
++        if (s.rollback ? g.updater->Rollback(g.restoreSaves, english) : g.updater->Update(english)) g.view = UpdateView::Running;
++        break;
++    case UpdateAction::RollbackYes:
++    case UpdateAction::RollbackNo: {
++        g.restoreSaves = action == UpdateAction::RollbackYes;
++        g.cancelling = false;
++        const bool back = !PreviousIsNewer();
++        if (!g.updater->Rollback(g.restoreSaves, english)) break;
++        g.view = UpdateView::Running;
++        // Going back is the player's answer to the version being left: no «Nueva versión» window for it
++        // at the next start (the marker stays).
++        if (back && launcher_update::CompareVersions(MlbppVersion(), g.notified) > 0) {
++            g.notified = MlbppVersion();
++            RuntimeConfigFile::WriteSetting("update", "notified", RuntimeConfigFile::FormatString(g.notified));
++        }
++        break;
++    }
++    case UpdateAction::Link:
++        if (s.latest) OpenUrl(launcher_update::DiscussionUrl(*s.latest, english));
++        break;
++    }
++}
++
++// The «Nueva versión vX.Y.Z» marker, right-aligned at (right, y). True when clicked.
++bool DrawUpdateMarker(ImDrawList* dl, float size, float right, float y, bool click, const launcher_update::Status& s) {
++    if (g_update.updater == nullptr || g_update.view != UpdateView::Closed || !s.latest || s.mode == launcher_update::Mode::None)
++        return false;
++    const std::string text = Tr("Nueva versión ", "New version ") + VersionText(s.latest->version);
++    const ImVec2 ts = TextSize(g_bold, size, text.c_str());
++    const float px = size * 0.6f, py = size * 0.18f;
++    const ImVec2 a(right - ts.x - 2 * px, y - py), b(right, y + ts.y + py);
++    const bool hot = Hovered(a, b);
++    Pill(dl, a, b, hot ? Rgba(255, 220, 120) : Rgba(255, 200, 90), hot ? Rgba(250, 140, 30) : Rgba(242, 118, 18), size / 24.0f);
++    ShadowedText(dl, g_bold, size, ImVec2(a.x + px, y), IM_COL32_WHITE, text.c_str());
++    return click && hot;
++}
++
++// The update window over whatever page is open. Its input comes after the page's, which is blocked.
++void DrawUpdateWindow(const launcher_update::Status& s, float w, float h, float u) {
++    UpdateUi& g = g_update;
++    if (g.updater == nullptr || g.view == UpdateView::Closed) {
++        g.drawn = g.view;
++        return;
++    }
++    using launcher_update::Mode;
++    const bool english = g_lang == Lang::En;
++    const std::string latest = s.latest ? VersionText(s.latest->version) : std::string();
++    const std::string current = VersionText(MlbppVersion());
++    const std::string previous = VersionText(g.updater->Where().previousVersion);
++    const ImU32 plain = IM_COL32_WHITE, soft = Rgba(200, 225, 255), warn = Rgba(255, 224, 110), bad = Rgba(255, 190, 170);
++    std::string title;
++    std::vector<std::pair<std::string, ImU32>> body;
++    std::vector<std::pair<std::string, UpdateAction>> buttons;
++    UpdateAction back = UpdateAction::Close;
++    bool link = false;
++    int bar = -1;  // progress percent; -1 = no bar
++    switch (g.view) {
++    case UpdateView::Closed:
++        break;
++    case UpdateView::Checking:
++    case UpdateView::UpToDate:
++    case UpdateView::CheckFailed:
++        title = Tr("Buscar actualizaciones", "Check for updates");
++        body.push_back({g.view == UpdateView::Checking ? std::string(Tr("Buscando una versión nueva...", "Looking for a new version..."))
++                        : g.view == UpdateView::UpToDate
++                            ? Tr("Ya tienes la última versión (", "You have the latest version (") + current + ")."
++                            : std::string(Tr("No se pudo comprobar si hay una versión nueva. Revisa la conexión a Internet "
++                                             "e inténtalo más tarde.",
++                                             "Could not check for a new version. Check the Internet connection and try "
++                                             "again later.")),
++                        g.view == UpdateView::CheckFailed ? bad : plain});
++        buttons = {{Tr("Cerrar", "Close"), UpdateAction::Close}};
++        break;
++    case UpdateView::Notice:
++        title = Tr("Nueva versión ", "New version ") + latest;
++        link = true;
++        back = UpdateAction::No;
++        if (s.mode == Mode::Update) {
++            body.push_back({Tr("Tienes la ", "You have ") + current + ".", soft});
++            body.push_back({Tr("Descarga: ", "Download: ") + launcher_update::FormatMegabytes(s.downloadBytes, !english) + ".", plain});
++#if defined(_WIN32)
++            body.push_back({s.quick ? Tr("Actualización rápida: se vuelve a traducir el juego y se recompila solo lo que cambió (un par de minutos).",
++                                         "Quick update: the game is translated again and only what changed is recompiled (a couple of minutes).")
++                                    : Tr("Actualización completa: se recompila todo el juego y puede tardar bastante.",
++                                         "Full update: the whole game is rebuilt, which can take a while."),
++                            plain});
++#else
++            body.push_back({Tr("Se recompila lo que cambió; si cambió el traductor tarda como una instalación.",
++                               "Whatever changed is rebuilt; if the translator changed it takes as long as an install."),
++                            plain});
++#endif
++            if (s.slowContainer)
++                body.push_back({Tr("Además se reconstruye el contenedor (unos 1,5 GB): tardará más.",
++                                   "The container is rebuilt too (about 1.5 GB): it will take longer."), warn});
++            body.push_back({Tr("Tus partidas, ajustes y mods se conservan. ¿Actualizar ahora?",
++                               "Your saves, settings and mods are kept. Update now?"), plain});
++            buttons = {{Tr("Sí", "Yes"), UpdateAction::Yes}, {"No", UpdateAction::No}};
++        } else {
++#if defined(_WIN32)
++            body.push_back({Tr("Esta copia no puede actualizarse sola. Descarga el Setup de la versión nueva y reinstala "
++                               "una vez: desde entonces, las versiones nuevas se instalan desde aquí.",
++                               "This copy cannot update itself. Download the new version's Setup and reinstall once: "
++                               "from then on, new versions install from here."), plain});
++            buttons = {{Tr("Descargar el Setup", "Download the Setup"), UpdateAction::Setup}, {"No", UpdateAction::No}};
++#else
++            // No kit.txt (a git clone), a kit folder that is not on this machine (an install copied from
++            // another PC) or a release without this platform's kit.
++            body.push_back({Tr("Esta copia no puede actualizarse sola: hace falta una instalación hecha con el kit en "
++                               "este equipo, con su carpeta del kit. Descarga el kit nuevo o actualízala con git.",
++                               "This copy cannot update itself: that needs an install made with the kit on this "
++                               "machine, with its kit folder. Download the new kit or update it with git."), plain});
++            buttons = {{Tr("Descargar el kit", "Download the kit"), UpdateAction::Setup}, {"No", UpdateAction::No}};
++#endif
++        }
++        break;
++    case UpdateView::Running: {
++        title = s.rollback ? (PreviousIsNewer() ? Tr("Cambiando a ", "Switching to ") : Tr("Volviendo a ", "Going back to ")) + previous
++                           : Tr("Actualizando a ", "Updating to ") + latest;
++        char step[64] = "";
++        if (s.steps > 1) std::snprintf(step, sizeof(step), Tr("Paso %d de %d", "Step %d of %d"), s.step, s.steps);
++        std::string detail;
++        if (s.downloading) {
++            detail = Tr("Descargando ", "Downloading ") + launcher_update::FormatMegabytes(s.downloaded, !english) +
++                     Tr(" de ", " of ") + launcher_update::FormatMegabytes(s.downloadBytes, !english);
++            bar = s.downloadBytes > 0 ? static_cast<int>(s.downloaded * 100 / s.downloadBytes) : 0;
++        } else {
++            detail = s.message.empty() ? std::string(Tr("Preparando...", "Preparing...")) : s.message;
++            bar = s.percent;
++        }
++        if (*step != '\0') body.push_back({step, soft});
++        body.push_back({g.cancelling && s.cancellable ? std::string(Tr("Cancelando...", "Cancelling...")) : detail, plain});
++        if (s.cancellable) {
++            body.push_back({Tr("Al terminar se abre la versión nueva. JUGAR vuelve a funcionar si cancelas.",
++                               "The new version opens when it is done. PLAY works again if you cancel."), soft});
++            buttons = {{Tr("Cancelar", "Cancel"), UpdateAction::Cancel}};
++            back = UpdateAction::Cancel;
++        } else {
++            // The folders are moving (or the swap was handed off): nothing to stop halfway.
++            body.push_back({Tr("Ya no se puede cancelar: el juego se abre solo en unos segundos.",
++                               "It can no longer be cancelled: the game opens by itself in a few seconds."), soft});
++        }
++        break;
++    }
++    case UpdateView::Failed: {
++        if (!g.handoffError.empty()) {
++            // The switch Update.ps1 did after the last launcher closed (it put back the program that was there).
++            title = g.handoffRollback ? std::string(Tr("No se pudo cambiar de versión", "Could not switch versions"))
++                                      : std::string(Tr("La actualización no terminó", "The update did not finish"));
++            body.push_back({g.handoffError, bad});
++            body.push_back({Tr("Sigues en ", "You are still on ") + current + Tr(". Registro: Update\\", ". Log: Update\\") +
++                                (g.handoffRollback ? "rollback.log" : "swap.log"),
++                            soft});
++            buttons.push_back({Tr("Cerrar", "Close"), UpdateAction::Close});
++            break;
++        }
++        title = s.rollback ? (PreviousIsNewer() ? Tr("No se pudo cambiar a ", "Could not switch to ") : Tr("No se pudo volver a ", "Could not go back to ")) + previous
++                           : std::string(Tr("No se pudo actualizar", "The update failed"));
++        const std::string& error = !g.restartError.empty() ? g.restartError : s.error;
++        body.push_back({error.empty() ? std::string(Tr("Error desconocido.", "Unknown error.")) : error, bad});
++        if (g.restartError.empty()) buttons.push_back({Tr("Reintentar", "Retry"), UpdateAction::Retry});
++        buttons.push_back({Tr("Cerrar", "Close"), UpdateAction::Close});
++        break;
++    }
++    case UpdateView::RollbackAsk:
++        if (PreviousIsNewer()) {
++            // After VOLVER A: Previous is the newer program and Backup holds older saves; nothing to ask.
++            title = Tr("Cambiar a ", "Switch to ") + previous;
++            body.push_back({Tr("Vuelves a ", "You go back to ") + previous + Tr(", que sigue instalada.", ", which is still installed."), plain});
++            body.push_back({Tr("Tus partidas se quedan como están.", "Your saves stay as they are."), soft});
++            buttons = {{Tr("Sí", "Yes"), UpdateAction::RollbackNo}, {Tr("Cancelar", "Cancel"), UpdateAction::Close}};
++            break;
++        }
++        title = Tr("Volver a ", "Go back to ") + previous;
++        // Two lines: ImGui's wrap may break a version number at its dots.
++        body.push_back({Tr("¿Recuperar también las partidas de antes de actualizar?",
++                           "Also bring back the saves from before the update?"), plain});
++        body.push_back({Tr("Lo jugado en ", "What you played in ") + current + Tr(" (nueva) se pierde.", " (new) is lost."), plain});
++        body.push_back({Tr("Sí: vuelven las partidas de antes de actualizar. No: sigues con las de ahora.",
++                           "Yes: the saves from before the update come back. No: you keep the current ones."), soft});
++        buttons = {{Tr("Sí", "Yes"), UpdateAction::RollbackYes}, {"No", UpdateAction::RollbackNo},
++                   {Tr("Cancelar", "Cancel"), UpdateAction::Close}};
++        break;
++    }
++
++    // Layout: the info box's panel, centred, as tall as its text.
++    const float pw = std::min(w - 60 * u, 900 * u);
++    const float pad = 38 * u, wrap = pw - 2 * pad;
++    const float titleSize = 42 * u, textSize = 25 * u, gap = 12 * u, buttonH = 54 * u;
++    float ph = pad + titleSize + 24 * u;
++    for (const auto& line : body) ph += g_text->CalcTextSizeA(textSize, FLT_MAX, wrap, line.first.c_str()).y + gap;
++    if (link) ph += 40 * u;
++    if (bar >= 0) ph += 50 * u;
++    ph += (buttons.empty() ? 0 : 14 * u + buttonH) + pad;
++    const ImVec2 a(std::round((w - pw) * 0.5f), std::round((h - ph) * 0.5f));
++    const ImVec2 b(a.x + pw, a.y + ph);
++
++    // A window over the whole launcher: it takes the mouse from the page below.
++    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->Pos);
++    ImGui::SetNextWindowSize(ImVec2(w, h));
++    ImGui::SetNextWindowFocus();
++    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
++    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
++    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
++    ImGui::Begin("##update", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
++                                          ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollWithMouse);
++    ImDrawList* dl = ImGui::GetWindowDrawList();
++    dl->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), Rgba(0, 12, 45, 165));
++    dl->AddRectFilled(ImVec2(a.x, a.y + 6 * u), ImVec2(b.x, b.y + 6 * u), Rgba(0, 20, 70, 110), 16 * u);
++    dl->AddRectFilled(a, b, IM_COL32_WHITE, 16 * u);
++    const int panelStart = dl->VtxBuffer.Size;
++    dl->AddRectFilled(ImVec2(a.x + 4 * u, a.y + 4 * u), ImVec2(b.x - 4 * u, b.y - 4 * u), IM_COL32_WHITE, 13 * u);
++    Shade(dl, panelStart, a.y, b.y, Rgba(40, 120, 220), Rgba(14, 58, 150));
++    dl->AddRect(ImVec2(a.x + 9 * u, a.y + 9 * u), ImVec2(b.x - 9 * u, b.y - 9 * u), Rgba(150, 210, 255, 120), 10 * u, 0, 2 * u);
++
++    float y = a.y + pad;
++    LogoTextCentered(dl, g_title, titleSize, (a.x + b.x) * 0.5f, y, Rgba(255, 250, 190), Rgba(255, 196, 70), title.c_str(),
++                     Rgba(22, 44, 120), Rgba(8, 22, 76));
++    y += titleSize + 24 * u;
++    for (const auto& line : body) {
++        ShadowedText(dl, g_text, textSize, ImVec2(a.x + pad, y), line.second, line.first.c_str(), wrap);
++        y += g_text->CalcTextSizeA(textSize, FLT_MAX, wrap, line.first.c_str()).y + gap;
++    }
++
++    // Focus order: the «Novedades» link (when shown), then the buttons.
++    const int items = (link ? 1 : 0) + static_cast<int>(buttons.size());
++    const bool fresh = g.drawn != g.view;  // the press that opened this view must not act in it
++    g.drawn = g.view;
++    if (fresh) g.selected = link && items > 1 ? 1 : 0;  // the first button (Sí), not the link
++    g.selected = std::clamp(g.selected, 0, std::max(0, items - 1));
++    std::optional<UpdateAction> act;
++    const bool click = ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !fresh;
++    if (link) {
++        const char* label = Tr("Novedades", "What's new");
++        const float ls = 25 * u;
++        const ImVec2 size = TextSize(g_bold, ls, label);
++        const ImVec2 p(a.x + pad, y + 4 * u);
++        const bool hovered = Hovered(p, ImVec2(p.x + size.x, p.y + size.y + 4 * u));
++        if (hovered && MouseMoved()) g.selected = 0;
++        const bool hot = g.selected == 0 || hovered;
++        const ImU32 color = hot ? Rgba(255, 200, 90) : Rgba(255, 236, 150);
++        ShadowedText(dl, g_bold, ls, p, color, label);
++        dl->AddLine(ImVec2(p.x, p.y + size.y + 1 * u), ImVec2(p.x + size.x, p.y + size.y + 1 * u), color, hot ? 3 * u : 1.5f * u);
++        if (click && hovered) act = UpdateAction::Link;
++        y += 40 * u;
++    }
++    if (bar >= 0) {
++        const ImVec2 ta(a.x + pad, y + 6 * u), tb(b.x - pad, y + 36 * u);
++        Pill(dl, ta, tb, Rgba(10, 40, 110), Rgba(5, 25, 80), u);
++        const float fill = (tb.x - ta.x) * static_cast<float>(std::clamp(bar, 0, 100)) / 100.0f;
++        if (fill >= tb.y - ta.y) Pill(dl, ta, ImVec2(ta.x + fill, tb.y), Rgba(255, 200, 90), Rgba(242, 118, 18), u, Rgba(255, 250, 200));
++        const std::string pct = std::to_string(std::clamp(bar, 0, 100)) + " %";
++        const ImVec2 ps = TextSize(g_bold, 20 * u, pct.c_str());
++        ShadowedText(dl, g_bold, 20 * u, ImVec2((ta.x + tb.x - ps.x) * 0.5f, (ta.y + tb.y - ps.y) * 0.5f), IM_COL32_WHITE, pct.c_str());
++        y += 50 * u;
++    }
++    y += 14 * u;
++    ImGui::PushFont(g_menu);
++    ImGui::SetWindowFontScale(1.6f * u);
++    const int n = static_cast<int>(buttons.size());
++    const float bgap = 26 * u;
++    const float bw = std::min(260 * u, (wrap - bgap * static_cast<float>(n - 1)) / static_cast<float>(std::max(1, n)));
++    float bx = (a.x + b.x - (bw * static_cast<float>(n) + bgap * static_cast<float>(n - 1))) * 0.5f;
++    for (int i = 0; i < n; ++i) {
++        const int item = i + (link ? 1 : 0);
++        ImGui::SetCursorScreenPos(ImVec2(bx, y));
++        ImGui::PushID(i);
++        if (launcher_visuals::PillButton(buttons[static_cast<size_t>(i)].first.c_str(), ImVec2(bw, buttonH), g.selected == item) && !fresh)
++            act = buttons[static_cast<size_t>(i)].second;
++        if (ImGui::IsItemHovered() && MouseMoved()) g.selected = item;
++        ImGui::PopID();
++        bx += bw + bgap;
++    }
++    ImGui::SetWindowFontScale(1.0f);
++    ImGui::PopFont();
++    ImGui::End();
++    ImGui::PopStyleColor();
++    ImGui::PopStyleVar(2);
++
++    if (!fresh && !act && items > 0) {
++        if (Left() || Up()) g.selected = (g.selected + items - 1) % items;
++        if (Right() || Down()) g.selected = (g.selected + 1) % items;
++        if (Accept()) act = link && g.selected == 0 ? UpdateAction::Link : buttons[static_cast<size_t>(g.selected - (link ? 1 : 0))].second;
++        else if (Back()) act = back;
++    }
++    if (act && !(*act == UpdateAction::Cancel && g.cancelling)) UpdateAct(*act, s);
++}
++
+ } // namespace
+ 
+ bool Relaunch() {
+@@ -627,6 +1096,7 @@ Result Run(int argc, char** argv) {
+         LoadFonts();  // the in-game password buttons draw in the launcher's style
+         return Result::Play;
+     }
++    StartUpdateCheck();  // in the background: the launcher opens at once and PLAY never waits for it
+ 
+     // Only APIs this build can actually create are offered.
+     size_t availableCount = 0;
+@@ -850,6 +1320,34 @@ Result Run(int argc, char** argv) {
+     toolsTab.options.push_back({Tr("EDITOR DE UNIFORMES", "UNIFORM STUDIO"), kUniformStudioHelp, {Tr("Abrir", "Open")}, 0, false, kOpenUniformStudio});
+     toolsTab.options.push_back({kRosterPlayersLabel, kRosterPlayersHelp, {Tr("Nativos", "Native"), Tr("Como en el editor", "As in the editor")},
+                                 RuntimeConfigFile::NativeRoster(true) ? 0 : 1});
++    // Updates (release builds only): check now, and go back to the program the last update replaced.
++    std::string rollbackLabel;
++    if (g_update.updater != nullptr) {
++        toolsTab.options.push_back({Tr("BUSCAR ACTUALIZACIONES", "CHECK FOR UPDATES"),
++                                    Tr("Busca en GitHub si hay una versión nueva del juego y, si la hay, ofrece instalarla. "
++                                       "Tus partidas, ajustes y mods se conservan.",
++                                       "Looks on GitHub for a new version of the game and, if there is one, offers to "
++                                       "install it. Your saves, settings and mods are kept."),
++                                    {Tr("Buscar", "Check")}, 0, false, kCheckUpdates});
++        if (const std::string& previous = g_update.updater->Where().previousVersion; !previous.empty() && PreviousIsNewer()) {
++            // After VOLVER A the kept program is the newer one.
++            rollbackLabel = Tr("CAMBIAR A ", "SWITCH TO ") + VersionText(previous);
++            toolsTab.options.push_back({rollbackLabel.c_str(),
++                                        Tr("Vuelve a la versión más nueva que dejaste con VOLVER A. Tus partidas se quedan "
++                                           "como están.",
++                                           "Returns to the newer version you left with GO BACK TO. Your saves stay as they "
++                                           "are."),
++                                        {Tr("Cambiar", "Switch")}, 0, false, kRollbackUpdate});
++        } else if (!previous.empty()) {
++            rollbackLabel = Tr("VOLVER A ", "GO BACK TO ") + VersionText(previous);
++            toolsTab.options.push_back({rollbackLabel.c_str(),
++                                        Tr("Vuelve a la versión que tenías antes de la última actualización. Antes pregunta "
++                                           "si quieres recuperar también las partidas de entonces.",
++                                           "Goes back to the version you had before the last update. It first asks whether "
++                                           "to bring back the saves from then too."),
++                                        {Tr("Volver", "Go back")}, 0, false, kRollbackUpdate});
++        }
++    }
+     for (size_t i = 0; i < installedMods.size(); ++i) {
+         const mods::Mod& m = installedMods[i];
+         std::string help = m.description.empty() ? std::string(Tr("Sin descripción.", "No description.")) : m.description;
+@@ -1038,6 +1536,14 @@ Result Run(int argc, char** argv) {
+             OpenSeasonStudio();
+             return;
+         }
++        if (o.mod == kCheckUpdates) {
++            ForceUpdateCheck();
++            return;
++        }
++        if (o.mod == kRollbackUpdate) {
++            g_update.view = UpdateView::RollbackAsk;
++            return;
++        }
+         if (o.mod >= 0) {
+             mods::Mod& m = currentMods[static_cast<size_t>(o.mod)];
+             mods::SetEnabled(m.id, o.value != 0);
+@@ -1158,6 +1664,13 @@ Result Run(int argc, char** argv) {
+     if (testAction != nullptr && std::strcmp(testAction, "season-studio") == 0) OpenSeasonStudio();
+     if (testAction != nullptr && std::strcmp(testAction, "callname-studio") == 0) OpenCallnameStudio();
+     if (testAction != nullptr && std::strcmp(testAction, "uniform-studio") == 0) OpenUniformStudio();
++    // =update-check opens BUSCAR ACTUALIZACIONES' result; =update-no / =update-yes answer the notice
++    // once it shows; =rollback opens VOLVER A's question (=rollback-yes also answers Sí).
++    if (testAction != nullptr && std::strcmp(testAction, "update-check") == 0) ForceUpdateCheck();
++    if (testAction != nullptr && std::strncmp(testAction, "rollback", 8) == 0 && g_update.updater != nullptr &&
++        !g_update.updater->Where().previousVersion.empty())
++        g_update.view = UpdateView::RollbackAsk;
++    bool testAnswered = false;
+     // =language-es / =language-en: switch the language once, as if chosen in INTERFAZ (the launcher is
+     // rebuilt on the same page; the rebuilt one finds the language already set and does nothing).
+     if (testAction != nullptr && std::strncmp(testAction, "language-", 9) == 0) {
+@@ -1209,6 +1722,18 @@ Result Run(int argc, char** argv) {
+         PADBlockInput(false); // no guest is running during the launcher
+         g_padEnabled = SDL_GetKeyboardFocus() != nullptr || navProbe;
+         g_keyboardEnabled = g_padEnabled || unfocusedInput;
++        // The update check / download runs on its own thread; its window covers the page while open.
++        launcher_update::Status updateStatus;
++        if (UpdateTick(updateStatus)) choice = Choice::Quit;  // Windows: Update.ps1 swaps and reopens the game
++        if (testAction != nullptr && !testAnswered && g_update.view != UpdateView::Closed && g_update.drawn == g_update.view) {
++            testAnswered = true;
++            if (g_update.view == UpdateView::Notice && std::strcmp(testAction, "update-no") == 0) UpdateAct(UpdateAction::No, updateStatus);
++            else if (g_update.view == UpdateView::Notice && std::strcmp(testAction, "update-yes") == 0) UpdateAct(UpdateAction::Yes, updateStatus);
++            else if (g_update.view == UpdateView::RollbackAsk && std::strcmp(testAction, "rollback-yes") == 0)
++                UpdateAct(UpdateAction::RollbackYes, updateStatus);
++        }
++        const bool updateOpen = g_update.view != UpdateView::Closed;
++        g_inputBlocked = updateOpen;
+ 
+         const ImVec2 size = ImGui::GetMainViewport()->Size;
+         const float w = size.x;
+@@ -1216,7 +1741,7 @@ Result Run(int argc, char** argv) {
+         const float u = std::min(h, w * 0.75f) / 720.0f;  // layout unit: 1 at 720p
+         const float t = std::chrono::duration<float>(Clock::now() - start).count();
+         ImDrawList* dl = ImGui::GetBackgroundDrawList();
+-        const bool click = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
++        const bool click = ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !updateOpen;
+         if (settingsOpen) {
+ #include "launcher_settings.inc"
+         } else if (art.ok) {
+@@ -1317,10 +1842,12 @@ Result Run(int argc, char** argv) {
+                 } else {
+                     ShadowedText(dl, g_text, 25 * s, at(100, 818), Rgba(255, 170, 150), gameLine.c_str());
+                 }
+-                const std::string version = std::string("WiiCompiled · ") + runningApi;
++                const std::string version = std::string("WiiCompiled · ") + runningApi + " · " + VersionLabel();
+                 const float vw = TextSize(g_text, 22 * s, version.c_str()).x;
+                 ShadowedText(dl, g_text, 22 * s, ImVec2(at(1578, 0).x - vw, at(0, 822).y), Rgba(200, 225, 255),
+                              version.c_str());
++                if (DrawUpdateMarker(dl, 24 * s, at(1578, 0).x - vw - 18 * s, at(0, 821).y, click, updateStatus))
++                    g_update.view = UpdateView::Notice;
+                 if (restart) {
+                     const char* note = Tr("Ajustes cambiados: se aplican al pulsar JUGAR.", "Settings changed: they apply when you press PLAY.");
+                     const float nw = TextSize(g_text, 22 * s, note).x;
+@@ -1425,10 +1952,12 @@ Result Run(int argc, char** argv) {
+             } else if (info.line2 != nullptr) {
+                 ShadowedText(dl, g_text, 26 * u, ImVec2(ix, ia.y + 66 * u), IM_COL32_WHITE, info.line2);
+             }
+-            const std::string version = std::string("WiiCompiled · ") + runningApi;
++            const std::string version = std::string("WiiCompiled · ") + runningApi + " · " + VersionLabel();
+             const ImVec2 vs = TextSize(g_text, 20 * u, version.c_str());
+             ShadowedText(dl, g_text, 20 * u, ImVec2(ib.x - 28 * u - vs.x, ib.y - 40 * u), Rgba(190, 225, 255),
+                          version.c_str());
++            if (DrawUpdateMarker(dl, 18 * u, ib.x - 46 * u - vs.x, ib.y - 39 * u, click, updateStatus))
++                g_update.view = UpdateView::Notice;
+             if (restart) {
+                 const char* note = Tr("Ajustes cambiados: se aplican al pulsar JUGAR.", "Settings changed: they apply when you press PLAY.");
+                 const ImVec2 ns = TextSize(g_text, 20 * u, note);
+@@ -1454,6 +1983,8 @@ Result Run(int argc, char** argv) {
+             }
+         }
+ 
++        g_inputBlocked = false;
++        DrawUpdateWindow(updateStatus, w, h, u);
+         if (launcher_controls::ProbeTick() || (navProbe && navProbeTick())) choice = Choice::Quit;
+         if (languageChanged && choice == Choice::None) choice = Choice::Language;
+         aurora_set_present_schedule(0, 0);
+diff --git a/runtime/src/launcher_update.cpp b/runtime/src/launcher_update.cpp
+new file mode 100644
+index 0000000..0d1b5b1
+--- /dev/null
++++ b/runtime/src/launcher_update.cpp
+@@ -0,0 +1,983 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Launcher updates. First the pure logic (manifest, decisions), then the work itself: the install's
++// layout, hidden processes (curl, Update.ps1 / update.sh) and the hand-off. No dependency on the rest
++// of the runtime, so the test compiles this file standalone; launcher.cpp draws it.
++#include "launcher_update.h"
++
++#include <array>
++#include <cerrno>
++#include <charconv>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <iterator>
++#include <sstream>
++#include <unordered_map>
++
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <signal.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#endif
++
++namespace launcher_update {
++namespace {
++
++std::vector<std::string_view> Split(std::string_view s, char sep) {
++    std::vector<std::string_view> out;
++    size_t pos = 0;
++    while (pos <= s.size()) {
++        size_t e = s.find(sep, pos);
++        if (e == std::string_view::npos) e = s.size();
++        if (e > pos) out.push_back(s.substr(pos, e - pos));
++        pos = e + 1;
++    }
++    return out;
++}
++
++bool ParseU64(std::string_view s, uint64_t& v) {
++    auto r = std::from_chars(s.data(), s.data() + s.size(), v);
++    return r.ec == std::errc() && r.ptr == s.data() + s.size();
++}
++
++// Numeric dotted components; false when the string is not a version ("dev", empty, garbage).
++bool ParseVersion(std::string_view s, std::vector<uint64_t>& out) {
++    if (!s.empty() && (s[0] == 'v' || s[0] == 'V')) s.remove_prefix(1);
++    if (s.empty()) return false;
++    for (std::string_view part : Split(s, '.')) {
++        uint64_t n = 0;
++        if (!ParseU64(part, n)) return false;
++        out.push_back(n);
++    }
++    return !out.empty();
++}
++
++std::string_view Trim(std::string_view s) {
++    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r')) s.remove_prefix(1);
++    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.remove_suffix(1);
++    return s;
++}
++
++// A file of the download folder: a bare name, never a path ("-" is the payload placeholder).
++bool BareFileName(std::string_view name) {
++    return !name.empty() && name != "." && name != ".." && name.find_first_of("/\\:") == std::string_view::npos;
++}
++
++}  // namespace
++
++std::optional<Manifest> ParseManifest(std::string_view text) {
++    Manifest m;
++    bool haveVersion = false;
++    if (text.substr(0, 3) == "\xEF\xBB\xBF") text.remove_prefix(3);  // UTF-8 BOM
++    for (std::string_view line : Split(text, '\n')) {
++        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.remove_suffix(1);
++        if (line.empty() || line[0] == '#') continue;
++        auto f = Split(line, ' ');
++        if (f.empty()) continue;
++        std::string_view key = f[0];
++        if (key == "version" && f.size() >= 2) {
++            m.version = std::string(f[1]);
++            haveVersion = true;
++        } else if (key == "discussion_es" && f.size() >= 2) {
++            m.discussionEs = std::string(f[1]);
++        } else if (key == "discussion_en" && f.size() >= 2) {
++            m.discussionEn = std::string(f[1]);
++        } else if (key == "piece" && f.size() >= 7) {
++            Piece p;
++            p.name = std::string(f[1]);
++            p.file = std::string(f[2]);
++            p.sha256 = std::string(f[3]);
++            if (!ParseU64(f[4], p.bytes) || !BareFileName(p.file)) continue;
++            p.content = std::string(f[5]);
++            m.pieces.push_back(std::move(p));
++        } else if (key == "kit" && f.size() >= 5) {
++            Kit k;
++            k.platform = std::string(f[1]);
++            k.file = std::string(f[2]);
++            k.sha256 = std::string(f[3]);
++            if (!ParseU64(f[4], k.bytes) || !BareFileName(k.file)) continue;
++            if (f.size() >= 6) k.containerfile = std::string(f[5]);
++            m.kits.push_back(std::move(k));
++        }
++    }
++    if (!haveVersion) return std::nullopt;
++    return m;
++}
++
++int CompareVersions(std::string_view a, std::string_view b) {
++    std::vector<uint64_t> va, vb;
++    bool oka = ParseVersion(a, va), okb = ParseVersion(b, vb);
++    if (!oka || !okb) return oka == okb ? 0 : (oka ? 1 : -1);
++    size_t n = va.size() > vb.size() ? va.size() : vb.size();
++    for (size_t i = 0; i < n; ++i) {
++        uint64_t x = i < va.size() ? va[i] : 0, y = i < vb.size() ? vb[i] : 0;
++        if (x != y) return x < y ? -1 : 1;
++    }
++    return 0;
++}
++
++std::vector<Piece> PiecesToDownload(const Manifest& latest, const Manifest& installed) {
++    std::unordered_map<std::string, std::string> have;
++    for (const Piece& p : installed.pieces) have[p.name] = p.content;
++    std::vector<Piece> out;
++    for (const Piece& p : latest.pieces) {
++        auto it = have.find(p.name);
++        if (it == have.end() || it->second != p.content) out.push_back(p);
++    }
++    return out;
++}
++
++bool ShouldPopup(std::string_view latest, std::string_view installed, std::string_view notified) {
++    if (CompareVersions(latest, installed) <= 0) return false;
++    if (!notified.empty() && CompareVersions(latest, notified) <= 0) return false;
++    return true;
++}
++
++std::string ReleasePage(std::string_view version) {
++    std::string v(version);
++    if (v.empty() || (v[0] != 'v' && v[0] != 'V')) v.insert(v.begin(), 'v');
++    return "https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/" + v;
++}
++
++std::string DiscussionUrl(const Manifest& m, bool english) {
++    // The link is handed to ShellExecute / xdg-open: a web page, nothing else.
++    auto web = [](const std::string& url) { return url.rfind("https://", 0) == 0; };
++    if (english && web(m.discussionEn)) return m.discussionEn;
++    if (web(m.discussionEs)) return m.discussionEs;
++    return ReleasePage(m.version);
++}
++
++Mode Decide(const Manifest& latest, std::string_view installed, bool canUpdate) {
++    if (CompareVersions(latest.version, installed) <= 0) return Mode::None;
++    return canUpdate ? Mode::Update : Mode::Notify;
++}
++
++bool QuickUpdate(const std::vector<Piece>& pieces) {
++    // Nothing to download (Build already holds the new sources, e.g. after VOLVER A): only the program rebuilds.
++    for (const Piece& p : pieces) {
++        if (p.name == "translator" || p.name == "deps" || p.name == "buildtools" || p.name == "llvm") return false;
++    }
++    return true;
++}
++
++std::string ConfigValue(std::string_view toml, std::string_view section, std::string_view key) {
++    bool inSection = false;
++    for (std::string_view line : Split(toml, '\n')) {
++        line = Trim(line);
++        if (line.empty() || line[0] == '#') continue;
++        if (line[0] == '[') {
++            const size_t close = line.find(']');
++            inSection = close != std::string_view::npos && Trim(line.substr(1, close - 1)) == section;
++            continue;
++        }
++        const size_t eq = line.find('=');
++        if (!inSection || eq == std::string_view::npos || Trim(line.substr(0, eq)) != key) continue;
++        std::string_view value = Trim(line.substr(eq + 1));
++        if (!value.empty() && (value[0] == '"' || value[0] == '\'')) {
++            const size_t end = value.find(value[0], 1);
++            return std::string(value.substr(1, end == std::string_view::npos ? std::string_view::npos : end - 1));
++        }
++        return std::string(Trim(value.substr(0, value.find('#'))));
++    }
++    return {};
++}
++
++std::string FormatMegabytes(uint64_t bytes, bool decimalComma) {
++    char text[32];
++    std::snprintf(text, sizeof(text), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
++    std::string out = text;
++    if (decimalComma) {
++        for (char& c : out)
++            if (c == '.') c = ',';
++    }
++    return out;
++}
++
++// ==== The update itself ===========================================================================
++namespace fs = std::filesystem;
++
++namespace {
++
++std::string Utf8(const fs::path& p) {
++    const std::u8string s = p.u8string();
++    return std::string(s.begin(), s.end());
++}
++
++std::string ReadText(const fs::path& path) {
++    std::ifstream file(path, std::ios::binary);
++    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++}
++
++}  // namespace
++
++// The running child: Cancel() kills its whole tree (Windows job, POSIX process group).
++// Once committed (folders about to move) a cancel is ignored and the job's own result stands.
++struct Updater::Stop {
++    std::mutex mutex;
++    bool requested = false;
++    bool committed = false;
++#if defined(_WIN32)
++    HANDLE job = nullptr;
++#else
++    pid_t group = 0;
++#endif
++    void Request() {
++        std::lock_guard lock(mutex);
++        if (committed) return;
++        requested = true;
++#if defined(_WIN32)
++        if (job != nullptr) TerminateJobObject(job, 1);
++#else
++        if (group > 0) kill(-group, SIGTERM);
++#endif
++    }
++    bool Requested() {
++        std::lock_guard lock(mutex);
++        return requested;
++    }
++    // Windows hand-off: commits unless a cancel came first.
++    bool TryCommit() {
++        std::lock_guard lock(mutex);
++        if (requested) return false;
++        committed = true;
++        return true;
++    }
++    // update.sh printed "@@COMMIT" (it ignores SIGTERM from there on) / a rollback: commits regardless.
++    void Commit() {
++        std::lock_guard lock(mutex);
++        committed = true;
++    }
++    // The job ended because of «Cancelar» (not after a commit).
++    bool Cancelled() {
++        std::lock_guard lock(mutex);
++        return requested && !committed;
++    }
++};
++
++namespace {
++
++using LineFn = std::function<void(const std::string&)>;
++
++// Splits a byte stream into lines (LF or CRLF) for onLine.
++struct Lines {
++    std::string pending;
++    void Feed(const char* data, size_t size, const LineFn& onLine) {
++        pending.append(data, size);
++        for (size_t nl; (nl = pending.find('\n')) != std::string::npos;) {
++            std::string line = pending.substr(0, nl);
++            pending.erase(0, nl + 1);
++            if (!line.empty() && line.back() == '\r') line.pop_back();
++            onLine(line);
++        }
++    }
++    void Finish(const LineFn& onLine) {
++        if (!pending.empty()) onLine(pending);
++        pending.clear();
++    }
++};
++
++#if defined(_WIN32)
++std::wstring Wide(const std::string& s) {
++    if (s.empty()) return {};
++    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
++    std::wstring out(static_cast<size_t>(n), L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
++    return out;
++}
++
++// CommandLineToArgvW's quoting rules.
++std::wstring QuoteArg(const std::wstring& a) {
++    if (!a.empty() && a.find_first_of(L" \t\"") == std::wstring::npos) return a;
++    std::wstring out = L"\"";
++    size_t backslashes = 0;
++    for (wchar_t c : a) {
++        if (c == L'\\') {
++            ++backslashes;
++            continue;
++        }
++        out.append(c == L'"' ? backslashes * 2 + 1 : backslashes, L'\\');
++        backslashes = 0;
++        out.push_back(c);
++    }
++    out.append(backslashes * 2, L'\\');
++    out.push_back(L'"');
++    return out;
++}
++
++std::wstring CommandLine(const std::vector<std::string>& args) {
++    std::wstring out;
++    for (const std::string& a : args) {
++        if (!out.empty()) out.push_back(L' ');
++        out += QuoteArg(Wide(a));
++    }
++    return out;
++}
++
++// Windows' own curl.exe / powershell.exe by full path: no copy next to the game or in the working
++// folder is picked up instead.
++std::string SystemTool(const wchar_t* relative, const char* fallback) {
++    wchar_t dir[MAX_PATH]{};
++    const UINT n = GetSystemDirectoryW(dir, MAX_PATH);
++    if (n == 0 || n >= MAX_PATH) return fallback;
++    const fs::path tool = fs::path(dir) / relative;
++    std::error_code ec;
++    return fs::is_regular_file(tool, ec) ? Utf8(tool) : fallback;
++}
++std::string Curl() { return SystemTool(L"curl.exe", "curl.exe"); }
++std::string PowerShell() { return SystemTool(L"WindowsPowerShell\\v1.0\\powershell.exe", "powershell.exe"); }
++
++// PROC_THREAD_ATTRIBUTE_JOB_LIST / _HANDLE_LIST, which mingw hides below _WIN32_WINNT 0x0A00.
++constexpr DWORD_PTR kJobListAttribute = 0x0002000D;
++constexpr DWORD_PTR kHandleListAttribute = 0x00020002;
++
++// A hidden child whose stdout and stderr go to onLine. It starts inside its own kill-on-close job
++// (PROC_THREAD_ATTRIBUTE_JOB_LIST, as PowerUp+ in launcher.cpp and the Setup do: never
++// CREATE_SUSPENDED + ResumeThread, which antivirus behaviour rules flag), so Cancel() stops it and
++// everything it started. Only the pipe and NUL are inherited. Returns the exit code, -1 when it could
++// not start, -2 when cancelled before starting.
++int RunHidden(const std::vector<std::string>& args, const LineFn& onLine, Updater::Stop& stop) {
++    std::wstring command = CommandLine(args);
++    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
++    HANDLE readPipe = nullptr, writePipe = nullptr;
++    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) return -1;
++    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
++    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
++    HANDLE job = CreateJobObjectW(nullptr, nullptr);
++    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
++    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
++    if (job != nullptr) SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
++
++    HANDLE inherit[2] = {writePipe, nul};
++    const DWORD inheritCount = nul != INVALID_HANDLE_VALUE ? 2 : 1;
++    SIZE_T attributeSize = 0;
++    InitializeProcThreadAttributeList(nullptr, 2, 0, &attributeSize);
++    std::vector<char> attributes(attributeSize);
++    STARTUPINFOEXW si{};
++    si.StartupInfo.cb = sizeof(si);
++    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
++    si.StartupInfo.hStdOutput = writePipe;
++    si.StartupInfo.hStdError = writePipe;
++    si.StartupInfo.hStdInput = nul != INVALID_HANDLE_VALUE ? nul : nullptr;
++    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
++    InitializeProcThreadAttributeList(si.lpAttributeList, 2, 0, &attributeSize);
++    if (job != nullptr) UpdateProcThreadAttribute(si.lpAttributeList, 0, kJobListAttribute, &job, sizeof(job), nullptr, nullptr);
++    UpdateProcThreadAttribute(si.lpAttributeList, 0, kHandleListAttribute, inherit, inheritCount * sizeof(HANDLE), nullptr, nullptr);
++
++    PROCESS_INFORMATION pi{};
++    bool started = false;
++    {
++        std::lock_guard lock(stop.mutex);
++        if (!stop.requested) {
++            started = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
++                                     CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
++                                     &si.StartupInfo, &pi) != FALSE;
++            if (started) stop.job = job;
++        }
++    }
++    const bool cancelled = !started && stop.Requested();
++    DeleteProcThreadAttributeList(si.lpAttributeList);
++    CloseHandle(writePipe);
++    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
++    if (!started) {
++        CloseHandle(readPipe);
++        if (job != nullptr) CloseHandle(job);
++        return cancelled ? -2 : -1;
++    }
++    CloseHandle(pi.hThread);
++    Lines lines;
++    char buffer[4096];
++    DWORD got = 0;
++    while (ReadFile(readPipe, buffer, sizeof(buffer), &got, nullptr) && got > 0) lines.Feed(buffer, got, onLine);
++    lines.Finish(onLine);
++    CloseHandle(readPipe);
++    WaitForSingleObject(pi.hProcess, INFINITE);
++    DWORD code = 1;
++    GetExitCodeProcess(pi.hProcess, &code);
++    CloseHandle(pi.hProcess);
++    {
++        std::lock_guard lock(stop.mutex);
++        stop.job = nullptr;
++    }
++    if (job != nullptr) CloseHandle(job);  // kills whatever the child left behind
++    return static_cast<int>(code);
++}
++
++// The swap / rollback hand-off: a hidden PowerShell that must outlive the launcher, so it is started
++// outside any job (CREATE_BREAKAWAY_FROM_JOB when this process is in one, e.g. started by the Setup),
++// with its output in a log file.
++bool StartDetached(const std::vector<std::string>& args, const fs::path& log, std::string& error) {
++    std::wstring command = CommandLine(args);
++    std::error_code ec;
++    fs::create_directories(log.parent_path(), ec);
++    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
++    HANDLE out = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS,
++                             FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (out == INVALID_HANDLE_VALUE) {
++        error = "cannot write " + Utf8(log);
++        return false;
++    }
++    SIZE_T attributeSize = 0;
++    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
++    std::vector<char> attributes(attributeSize);
++    STARTUPINFOEXW si{};
++    si.StartupInfo.cb = sizeof(si);
++    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
++    si.StartupInfo.hStdOutput = out;
++    si.StartupInfo.hStdError = out;
++    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
++    InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attributeSize);
++    UpdateProcThreadAttribute(si.lpAttributeList, 0, kHandleListAttribute, &out, sizeof(out), nullptr, nullptr);
++    BOOL inJob = FALSE;
++    IsProcessInJob(GetCurrentProcess(), nullptr, &inJob);
++    const DWORD flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT;
++    PROCESS_INFORMATION pi{};
++    bool started = inJob && CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, flags | CREATE_BREAKAWAY_FROM_JOB,
++                                           nullptr, nullptr, &si.StartupInfo, &pi);
++    // A job that does not allow breaking away: the process still lives on unless that job kills on close.
++    if (!started) started = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, flags, nullptr, nullptr, &si.StartupInfo, &pi);
++    const DWORD code = started ? 0 : GetLastError();
++    DeleteProcThreadAttributeList(si.lpAttributeList);
++    CloseHandle(out);
++    if (!started) {
++        error = "CreateProcess error " + std::to_string(code);
++        return false;
++    }
++    CloseHandle(pi.hThread);
++    CloseHandle(pi.hProcess);
++    return true;
++}
++#else
++std::string Curl() { return "curl"; }
++
++// POSIX counterpart: the child leads its own process group so Cancel() stops what it started.
++int RunHidden(const std::vector<std::string>& args, const LineFn& onLine, Updater::Stop& stop) {
++    std::vector<char*> argv;
++    for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
++    argv.push_back(nullptr);
++    int fds[2];
++    if (pipe(fds) != 0) return -1;
++    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
++    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
++    pid_t pid = -1;
++    {
++        std::lock_guard lock(stop.mutex);
++        if (stop.requested) {
++            close(fds[0]);
++            close(fds[1]);
++            return -2;
++        }
++        pid = fork();
++        if (pid == 0) {
++            setpgid(0, 0);
++            dup2(fds[1], 1);
++            dup2(fds[1], 2);
++            const int nul = open("/dev/null", O_RDONLY);
++            if (nul >= 0) dup2(nul, 0);
++            execvp(argv[0], argv.data());
++            _exit(127);
++        }
++        if (pid > 0) {
++            setpgid(pid, pid);
++            stop.group = pid;
++        }
++    }
++    close(fds[1]);
++    if (pid < 0) {
++        close(fds[0]);
++        return -1;
++    }
++    Lines lines;
++    char buffer[4096];
++    for (ssize_t got; (got = read(fds[0], buffer, sizeof(buffer))) != 0;) {
++        if (got < 0) {
++            if (errno == EINTR) continue;
++            break;
++        }
++        lines.Feed(buffer, static_cast<size_t>(got), onLine);
++    }
++    lines.Finish(onLine);
++    close(fds[0]);
++    int status = 0;
++    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
++    }
++    {
++        std::lock_guard lock(stop.mutex);
++        stop.group = 0;
++    }
++    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
++}
++#endif
++
++void AppendLog(const fs::path& log, const std::string& line) {
++    std::ofstream(log, std::ios::binary | std::ios::app) << line << '\n';
++}
++
++}  // namespace
++
++fs::path ThisExecutable() {
++#if defined(_WIN32)
++    std::wstring buffer(MAX_PATH, L'\0');
++    for (;;) {
++        const DWORD n = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
++        if (n == 0) return {};
++        if (n < buffer.size()) return fs::path(buffer.substr(0, n));
++        buffer.resize(buffer.size() * 2);
++    }
++#elif defined(__linux__)
++    std::error_code ec;
++    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
++    return ec ? fs::path() : exe;
++#else
++    return {};
++#endif
++}
++
++Install Locate(const fs::path& exe, const fs::path& cache) {
++    Install in;
++    in.exe = exe;
++    in.cache = cache;
++    std::error_code ec;
++    const fs::path dir = exe.parent_path();
++    fs::path previous;
++#if defined(_WIN32)
++    in.root = dir.parent_path();
++    in.installedManifest = in.root / "Build" / "update-manifest.txt";
++    in.script = in.root / "Build" / "workspace" / "Update.ps1";
++    in.downloads = in.root / "Update" / "downloads";
++    in.log = in.root / "Update" / "update.log";
++    in.handoffError = in.root / "Update" / "last-error.txt";
++    // Without Update.ps1 the hand-off would close the launcher with nothing to reopen it.
++    in.canUpdate = fs::is_regular_file(in.installedManifest, ec) && fs::is_regular_file(in.script, ec);
++    previous = in.root / "Previous" / "version.txt";
++#else
++    in.root = dir;
++    const fs::path kit = dir / "kit.txt";
++    const std::string kitText = ReadText(kit);  // Split's views point into it: not a temporary
++    for (std::string_view line : Split(kitText, '\n')) {
++        line = Trim(line);
++        if (line.substr(0, 5) == "root=") in.kitRoot = std::string(line.substr(5));
++        else if (line.substr(0, 9) == "platform=") in.kitPlatform = std::string(line.substr(9));
++        else if (line.substr(0, 8) == "options=") {
++            for (std::string_view o : Split(line.substr(8), ' ')) in.kitOptions.emplace_back(o);
++        }
++    }
++    in.script = fs::path(in.kitRoot) / "tools" / "linux" / "update.sh";
++    // kit.txt travels with an install copied to another PC (a Steam Deck) but its root= does not: only
++    // an existing kit folder can rebuild it.
++    in.canUpdate = fs::is_regular_file(kit, ec) && !in.kitRoot.empty() && fs::is_regular_file(in.script, ec);
++    in.downloads = fs::path(dir.native() + ".download");
++    in.log = in.downloads / "update.log";
++    previous = fs::path(dir.native() + ".previous") / "version.txt";
++#endif
++    if (fs::is_regular_file(previous, ec)) {
++        const std::string v(Trim(ReadText(previous)));
++        in.previousVersion = v.empty() ? "?" : v.substr(0, v.find_first_of(" \t\r\n"));
++    }
++    return in;
++}
++
++std::optional<HandoffError> TakeHandoffError(const Install& install) {
++    std::error_code ec;
++    if (install.handoffError.empty() || !fs::is_regular_file(install.handoffError, ec)) return std::nullopt;
++    const std::string text = ReadText(install.handoffError);
++    fs::remove(install.handoffError, ec);  // shown once
++    HandoffError e;
++    const size_t nl = text.find('\n');
++    const std::string_view phase = Trim(std::string_view(text).substr(0, nl));
++    e.rollback = phase == "rollback";
++    e.message = std::string(Trim(nl == std::string::npos ? std::string_view() : std::string_view(text).substr(nl + 1)));
++    while (!e.message.empty() && (e.message.back() == '\n' || e.message.back() == '\r')) e.message.pop_back();
++    if (e.message.empty()) e.message = std::string(phase);
++    return e;
++}
++
++std::string BaseUrl() {
++    std::string url = "https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/latest/download/";
++    if (const char* env = std::getenv("MLBPP_UPDATE_URL"); env != nullptr && *env != '\0') url = env;
++    if (url.back() != '/') url.push_back('/');
++    return url;
++}
++
++Updater::Updater(Install install, std::string installedVersion)
++    : install_(std::move(install)), installed_(std::move(installedVersion)), stop_(new Stop) {}
++
++Updater::~Updater() {
++    stop_->Request();
++    if (worker_.joinable()) worker_.join();
++    delete stop_;
++}
++
++bool Updater::Busy() const {
++    return status_.state == Status::State::Checking || status_.state == Status::State::Running;
++}
++
++void Updater::Launch(std::function<void()> job) {
++    // Not busy: the previous worker already published its last state and is only returning.
++    if (worker_.joinable()) worker_.join();
++    {
++        std::lock_guard lock(stop_->mutex);
++        stop_->requested = false;
++        stop_->committed = false;
++    }
++    worker_ = std::thread(std::move(job));
++}
++
++void Updater::Check(std::string baseUrl) {
++    std::lock_guard lock(mutex_);
++    if (Busy()) return;
++    baseUrl_ = std::move(baseUrl);
++    status_.state = Status::State::Checking;
++    status_.error.clear();
++    Launch([this] { RunCheck(); });
++}
++
++bool Updater::Update(bool english) {
++    std::lock_guard lock(mutex_);
++    if (Busy() || !status_.latest || status_.mode != Mode::Update) return false;
++    status_.state = Status::State::Running;
++    status_.rollback = false;
++    status_.cancellable = true;
++    status_.error.clear();
++    status_.message.clear();
++    status_.percent = 0;
++    status_.step = 1;
++    Launch([this, english] { RunUpdate(english); });
++    return true;
++}
++
++bool Updater::Rollback(bool restoreSaves, bool english) {
++    std::lock_guard lock(mutex_);
++    if (Busy() || install_.previousVersion.empty()) return false;
++    status_.state = Status::State::Running;
++    status_.rollback = true;
++    status_.cancellable = false;  // a rollback only moves folders: never stopped halfway
++    status_.error.clear();
++    status_.message.clear();
++    status_.percent = 0;
++    status_.step = status_.steps = 1;
++    status_.downloading = false;
++    std::error_code ec;
++    if (!fs::is_regular_file(install_.script, ec)) {
++        // Without the script the Windows hand-off would close the launcher with nothing to reopen it:
++        // fail here, with the window still open (Failed, «Cerrar»).
++        status_.state = Status::State::Failed;
++        status_.error = std::string(english ? "The update script is missing: " : "Falta el script de actualización: ") +
++                        Utf8(install_.script) +
++#if defined(_WIN32)
++                        (english ? ". Use REINSTALL." : ". Usa REINSTALAR.");
++#else
++                        (english ? ". Run the kit installer again." : ". Vuelve a ejecutar el instalador del kit.");
++#endif
++        return true;
++    }
++    Launch([this, restoreSaves, english] { RunRollback(restoreSaves, english); });
++    return true;
++}
++
++void Updater::Cancel() { stop_->Request(); }
++
++Status Updater::Get() const {
++    Status s;
++    {
++        std::lock_guard lock(mutex_);
++        s = status_;
++    }
++    if (s.state == Status::State::Running && s.downloading) {
++        // MB done / total: the sizes of the files curl is writing, read every frame.
++        uint64_t done = 0;
++        std::error_code ec;
++        auto add = [&](const std::string& file, uint64_t bytes) {
++            const uintmax_t n = fs::file_size(install_.downloads / file, ec);
++            if (!ec) done += n < bytes ? n : bytes;
++            ec.clear();
++        };
++#if defined(_WIN32)
++        for (const Piece& p : s.pieces) add(p.file, p.bytes);
++#else
++        if (s.latest) {
++            for (const Kit& k : s.latest->kits)
++                if (k.platform == install_.kitPlatform) add(k.file, k.bytes);
++        }
++#endif
++        s.downloaded = done;
++    }
++    return s;
++}
++
++void Updater::RunCheck() {
++    std::error_code ec;
++    fs::create_directories(install_.cache, ec);
++    const fs::path part = install_.cache / "update-manifest.txt.part";
++    const fs::path file = install_.cache / "update-manifest.txt";
++    fs::remove(part, ec);
++    std::string last;
++    const int code = RunHidden({Curl(), "-sSfL", "--max-time", "10", "-o", Utf8(part), baseUrl_ + "update-manifest.txt"},
++                               [&](const std::string& line) { if (!line.empty()) last = line; }, *stop_);
++    auto fail = [&](const std::string& why) {
++        fs::remove(part, ec);
++        Set([&](Status& s) {
++            s.state = Status::State::CheckFailed;
++            s.error = why;
++        });
++    };
++    if (code != 0) return fail("curl exit " + std::to_string(code) + (last.empty() ? "" : ": " + last));
++    std::optional<Manifest> latest = ParseManifest(ReadText(part));
++    if (!latest) return fail("the manifest has no version line");
++    fs::rename(part, file, ec);
++
++    Status r;
++    r.mode = Decide(*latest, installed_, install_.canUpdate);
++#if defined(_WIN32)
++    Manifest installed;
++    if (auto m = ParseManifest(ReadText(install_.installedManifest))) installed = std::move(*m);
++    for (const Piece& p : PiecesToDownload(*latest, installed)) {
++        if (p.file.empty() || p.file == "-") continue;  // a payload placeholder, never downloadable
++        r.pieces.push_back(p);
++        r.downloadBytes += p.bytes;
++    }
++    r.quick = QuickUpdate(r.pieces);
++#else
++    bool container = install_.kitPlatform == "steamdeck";
++    for (const std::string& o : install_.kitOptions) container = container || o == "--container";
++    bool haveKit = false;
++    for (const Kit& k : latest->kits) {
++        if (k.platform != install_.kitPlatform) continue;
++        haveKit = true;
++        r.downloadBytes = k.bytes;
++        if (container && !k.containerfile.empty()) {
++            // update.sh rebuilds the container image when the kit's Containerfile changes.
++            std::string sum;
++            const fs::path cf = fs::path(install_.kitRoot) / "tools" / "linux" / "Containerfile";
++            RunHidden({"sha256sum", Utf8(cf)}, [&](const std::string& line) { if (sum.empty()) sum = line.substr(0, line.find(' ')); }, *stop_);
++            r.slowContainer = sum != k.containerfile;
++        }
++    }
++    // A release without this platform's kit cannot be installed from here: only the notice.
++    if (r.mode == Mode::Update && !haveKit) r.mode = Mode::Notify;
++#endif
++    Set([&](Status& s) {
++        s.state = Status::State::Checked;
++        s.latest = std::move(latest);
++        s.mode = r.mode;
++        s.pieces = std::move(r.pieces);
++        s.downloadBytes = r.downloadBytes;
++        s.quick = r.quick;
++        s.slowContainer = r.slowContainer;
++    });
++}
++
++int Updater::RunScript(const std::vector<std::string>& args, std::string& error) {
++    std::string last;
++    AppendLog(install_.log, "> " + [&] {
++        std::string all;
++        for (const std::string& a : args) all += a + " ";
++        return all;
++    }());
++    const int code = RunHidden(args, [&](const std::string& line) {
++        AppendLog(install_.log, line);
++        if (line == "@@COMMIT") {  // update.sh: folders start moving, SIGTERM is ignored from here on
++            stop_->Commit();
++            Set([](Status& s) { s.cancellable = false; });
++        } else if (line.rfind("@@ERROR ", 0) == 0) {
++            error = line.substr(8);
++        } else if (line.rfind("@@ ", 0) == 0) {
++            const size_t space = line.find(' ', 3);
++            const int percent = std::atoi(line.c_str() + 3);
++            std::string message = space == std::string::npos ? "" : line.substr(space + 1);
++            Set([&](Status& s) {
++                s.percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
++                s.message = std::move(message);
++            });
++        } else if (!line.empty()) {
++            last = line.size() > 200 ? line.substr(0, 200) + "..." : line;
++        }
++    }, *stop_);
++    if (code != 0 && error.empty()) error = last;
++    return code;
++}
++
++void Updater::RunUpdate(bool english) {
++    auto T = [english](const char* es, const char* en) { return std::string(english ? en : es); };
++    const std::string lang = english ? "en" : "es";
++    std::vector<Piece> pieces;
++    Manifest latest;
++    {
++        std::lock_guard lock(mutex_);
++        pieces = status_.pieces;
++        latest = *status_.latest;
++    }
++    auto finish = [&](Status::State state, const std::string& error) {
++        if (state != Status::State::Done && stop_->Cancelled()) state = Status::State::Cancelled;
++        Set([&](Status& s) {
++            s.state = state;
++            s.downloading = false;
++            s.error = error;
++        });
++    };
++    auto fail = [&](const std::string& error) { finish(Status::State::Failed, error); };
++    auto download = [&](const std::string& file, uint64_t bytes) -> bool {
++        std::error_code ec;
++        const fs::path target = install_.downloads / file;
++        if (fs::file_size(target, ec) == bytes && !ec) return true;  // complete from an earlier try
++        std::string last;
++        const int code = RunHidden({Curl(), "-sSfL", "-o", Utf8(target), baseUrl_ + file},
++                                   [&](const std::string& line) { if (!line.empty()) last = line; }, *stop_);
++        if (code == 0) return true;
++        fail(T("No se pudo descargar ", "Could not download ") + file + (last.empty() ? "" : " (" + last + ")"));
++        return false;
++    };
++    std::error_code ec;
++    fs::create_directories(install_.downloads, ec);
++    if (ec) return fail(T("No se pudo crear la carpeta ", "Could not create the folder ") + Utf8(install_.downloads));
++    fs::remove(install_.log, ec);
++
++#if defined(_WIN32)
++    (void)latest;
++    // Zips an earlier try left that this update does not use (another version, a piece already
++    // applied) would stay forever: only this update's pieces (perhaps half downloaded) are kept.
++    for (const fs::directory_entry& e : fs::directory_iterator(install_.downloads, ec)) {
++        const std::string name = Utf8(e.path().filename());
++        bool keep = name == "update-manifest.txt" || !e.is_regular_file(ec);
++        for (const Piece& p : pieces) keep = keep || name == p.file;
++        if (!keep) fs::remove(e.path(), ec);
++    }
++    ec.clear();
++    // The fetched manifest goes with the zips: Update.ps1 apply checks them against it.
++    fs::copy_file(install_.cache / "update-manifest.txt", install_.downloads / "update-manifest.txt",
++                  fs::copy_options::overwrite_existing, ec);
++    if (ec) return fail(T("No se pudo copiar update-manifest.txt a ", "Could not copy update-manifest.txt to ") + Utf8(install_.downloads));
++    Set([&](Status& s) {
++        s.steps = 3;
++        s.step = 1;
++        s.downloading = true;
++    });
++    for (const Piece& p : pieces) {
++        if (stop_->Requested()) return fail("");
++        if (!download(p.file, p.bytes)) return;
++    }
++    const std::array<const char*, 2> phases{"apply", "build"};
++    for (size_t i = 0; i < phases.size(); ++i) {
++        if (stop_->Requested()) return fail("");
++        Set([&](Status& s) {
++            s.step = static_cast<int>(i) + 2;
++            s.downloading = false;
++            s.percent = 0;
++            s.message = i == 0 ? T("Aplicando las piezas nuevas...", "Applying the new pieces...")
++                               : T("Compilando la versión nueva...", "Building the new version...");
++        });
++        std::string error;
++        const int code = RunScript({PowerShell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
++                                    "-File", Utf8(install_.script), "-Install", Utf8(install_.root), "-Phase", phases[i],
++                                    "-Lang", lang}, error);
++        if (code != 0) {
++            // A zip that failed its check would fail again: the next try downloads them anew.
++            if (i == 0) {
++                for (const Piece& p : pieces) fs::remove(install_.downloads / p.file, ec);
++            }
++            return fail(!error.empty() ? error
++                                       : T("Update.ps1 falló (código ", "Update.ps1 failed (code ") + std::to_string(code) +
++                                             T("). Revisa ", "). See ") + Utf8(install_.log));
++        }
++    }
++    // Last point where «Cancelar» stops the update. From the hand-off on the swap is Update.ps1's: a
++    // later cancel is ignored and the launcher exits as planned (Done), never "cancelled" with a
++    // detached swap still waiting for it.
++    if (!stop_->TryCommit()) return fail("");
++    Set([&](Status& s) {
++        s.cancellable = false;
++        s.percent = 100;
++        s.message = T("Cambiando de versión...", "Switching versions...");
++    });
++    // The swap moves Game, where this program runs from: Update.ps1 waits for this process to exit,
++    // swaps and starts the new version, whose launcher opens.
++    std::string error;
++    if (!StartDetached({PowerShell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
++                        Utf8(install_.script), "-Install", Utf8(install_.root), "-Phase", "swap", "-WaitPid",
++                        std::to_string(GetCurrentProcessId()), "-Relaunch", "-Lang", lang},
++                       install_.root / "Update" / "swap.log", error))
++        return fail(T("No se pudo iniciar el cambio de versión: ", "Could not start switching versions: ") + error);  // zips kept for Reintentar
++    for (const Piece& p : pieces) fs::remove(install_.downloads / p.file, ec);  // handed off: the zips are done
++    finish(Status::State::Done, "");
++#else
++    const Kit* kit = nullptr;
++    for (const Kit& k : latest.kits)
++        if (k.platform == install_.kitPlatform) kit = &k;
++    if (kit == nullptr)
++        return fail(T("La versión nueva no trae un kit para ", "The new version has no kit for ") + install_.kitPlatform);
++    Set([&](Status& s) {
++        s.steps = 2;
++        s.step = 1;
++        s.downloading = true;
++    });
++    if (!download(kit->file, kit->bytes)) return;
++    if (stop_->Requested()) return fail("");
++    Set([&](Status& s) {
++        s.step = 2;
++        s.downloading = false;
++        s.percent = 0;
++        s.message = T("Comprobando la descarga...", "Checking the download...");
++    });
++    std::string error;
++    const fs::path tarball = install_.downloads / kit->file;
++    const int code = RunScript({"bash", Utf8(install_.script), "--lang", lang, Utf8(install_.root), Utf8(tarball), kit->sha256}, error);
++    if (code != 0) {
++        fs::remove(tarball, ec);  // a corrupt download would fail again
++        return fail(!error.empty() ? error : T("update.sh falló. Revisa ", "update.sh failed. See ") + Utf8(install_.log));
++    }
++    fs::remove(tarball, ec);
++    finish(Status::State::Done, "");
++#endif
++}
++
++void Updater::RunRollback(bool restoreSaves, bool english) {
++    auto T = [english](const char* es, const char* en) { return std::string(english ? en : es); };
++    const std::string lang = english ? "en" : "es";
++    std::string error;
++    bool ok = false;
++    stop_->Commit();  // never cancelled: the UI offers no «Cancelar» for a rollback
++#if defined(_WIN32)
++    // Same hand-off as the swap: Game is where this program runs from.
++    std::vector<std::string> args{PowerShell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
++                                  "-File", Utf8(install_.script), "-Install", Utf8(install_.root), "-Phase", "rollback"};
++    if (restoreSaves) args.push_back("-RestoreSaves");
++    args.insert(args.end(), {"-WaitPid", std::to_string(GetCurrentProcessId()), "-Relaunch", "-Lang", lang});
++    ok = StartDetached(args, install_.root / "Update" / "rollback.log", error);
++    if (!ok) error = T("No se pudo iniciar la vuelta a la versión anterior: ", "Could not start going back: ") + error;
++#else
++    std::error_code ec;
++    fs::create_directories(install_.downloads, ec);
++    std::vector<std::string> args{"bash", Utf8(install_.script), "--lang", lang, "--rollback"};
++    if (restoreSaves) args.push_back("--restore-saves");
++    args.push_back(Utf8(install_.root));
++    const int code = RunScript(args, error);
++    ok = code == 0;
++    if (!ok && error.empty()) error = T("update.sh falló. Revisa ", "update.sh failed. See ") + Utf8(install_.log);
++#endif
++    const bool cancelled = stop_->Cancelled();
++    Set([&](Status& s) {
++        s.state = ok ? Status::State::Done : cancelled ? Status::State::Cancelled : Status::State::Failed;
++        s.error = ok ? "" : error;
++        if (ok) s.percent = 100;
++    });
++}
++
++bool Updater::Restart(char** argv) {
++#if defined(_WIN32)
++    (void)argv;
++    return false;
++#else
++    // The launcher shows again: the new version opens on it.
++    unsetenv("WIICOMPILED_SKIP_LAUNCHER");
++    const std::string path = Utf8(install_.exe);
++    execv(path.c_str(), argv);
++    return false;
++#endif
++}
++
++}  // namespace launcher_update
+diff --git a/runtime/src/mlbpp_version.cpp.in b/runtime/src/mlbpp_version.cpp.in
+new file mode 100644
+index 0000000..081522d
+--- /dev/null
++++ b/runtime/src/mlbpp_version.cpp.in
+@@ -0,0 +1,6 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Generated by configure_file from src/mlbpp_version.cpp.in. Kept in its own translation unit so a
++// new version recompiles only this file and relinks, not the translated game code.
++#include "launcher_update.h"
++
++const char* MlbppVersion() { return "@MLBPP_VERSION@"; }
+diff --git a/runtime/tests/launcher_update_tests.cpp b/runtime/tests/launcher_update_tests.cpp
+new file mode 100644
+index 0000000..f443f49
+--- /dev/null
++++ b/runtime/tests/launcher_update_tests.cpp
+@@ -0,0 +1,318 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "launcher_update.h"
++
++#include <chrono>
++#include <cstdio>
++#include <fstream>
++#include <initializer_list>
++#include <string>
++
++#if defined(_WIN32)
++#include <winsock2.h>
++#else
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#endif
++
++using namespace launcher_update;
++namespace fs = std::filesystem;
++
++static int g_fail = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++g_fail; } } while (0)
++
++static const char* kManifest =
++    "# update manifest\n"
++    "version 0.1.8\n"
++    "discussion_es https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/11\n"
++    "discussion_en https://github.com/HopeAero/MLBPowerPros2008Recomp/discussions/12\n"
++    "piece core MLBPP-0.1.8-core.zip aa 1234 h_core workspace/LocalBuild.ps1;workspace/config\n"
++    "piece studios MLBPP-0.1.8-studios.zip ab 11 h_studios workspace/TextureStudio.exe\n"
++    "piece translator MLBPP-0.1.8-translator.zip ac 22 h_translator toolkit/Translator\n"
++    "piece deps MLBPP-0.1.8-deps.zip ad 33 h_deps workspace/Dependencies\n"
++    "piece buildtools MLBPP-0.1.8-buildtools.zip ae 44 h_buildtools toolkit/CMake;toolkit/Ninja\n"
++    "piece llvm MLBPP-0.1.8-llvm.zip af 55 h_llvm toolkit/llvm-mingw\n"
++    "piece powerupplus MLBPP-0.1.8-powerupplus.zip ag 66 h_pup workspace/powerupplus\n"
++    "piece uniform MLBPP-0.1.8-uniform.zip ah 77 h_uniform workspace/uniform-studio\n"
++    "piece licenses MLBPP-0.1.8-licenses.zip ai 88 h_licenses licenses\n"
++    "kit linux MLB-Linux-0.1.8.tar.gz bb 999 cf1\n"
++    "kit steamdeck MLB-SteamDeck-0.1.8.tar.gz bc 1000\n"
++    "mystery line that is ignored\n";
++
++static void TestParse() {
++    auto m = ParseManifest(kManifest);
++    CHECK(m.has_value());
++    if (!m) return;
++    CHECK(m->version == "0.1.8");
++    CHECK(m->pieces.size() == 9);
++    CHECK(m->pieces[0].name == "core");
++    CHECK(m->pieces[0].file == "MLBPP-0.1.8-core.zip");
++    CHECK(m->pieces[0].sha256 == "aa");
++    CHECK(m->pieces[0].bytes == 1234);
++    CHECK(m->pieces[0].content == "h_core");
++    CHECK(m->discussionEs.size() && m->discussionEn.back() == '2');
++    CHECK(m->kits.size() == 2);
++    CHECK(m->kits[0].platform == "linux" && m->kits[0].bytes == 999 && m->kits[0].containerfile == "cf1");
++    CHECK(m->kits[1].platform == "steamdeck" && m->kits[1].containerfile.empty());
++    CHECK(!ParseManifest("").has_value());
++    CHECK(!ParseManifest("piece core a b 1 c d\n").has_value());
++    // CRLF tolerated
++    auto c = ParseManifest("version 1.2.3\r\npiece core f s 5 h r\r\n");
++    CHECK(c && c->version == "1.2.3" && c->pieces.size() == 1 && c->pieces[0].content == "h");
++    // payload-style placeholders
++    auto p = ParseManifest("version 0.1.8\npiece core - - 0 abcdef workspace/a;workspace/b\n");
++    CHECK(p && p->pieces.size() == 1);
++    if (p && p->pieces.size() == 1) {
++        CHECK(p->pieces[0].file == "-" && p->pieces[0].sha256 == "-");
++        CHECK(p->pieces[0].bytes == 0 && p->pieces[0].content == "abcdef");
++    }
++    // A leading UTF-8 BOM (Notepad, PowerShell 5.1's Set-Content -Encoding utf8) does not hide 'version'.
++    auto bom = ParseManifest("\xEF\xBB\xBFversion 0.1.9\npiece core f s 5 h r\n");
++    CHECK(bom && bom->version == "0.1.9" && bom->pieces.size() == 1);
++    // Piece and kit files are bare names in the download folder, never paths.
++    auto paths = ParseManifest("version 0.1.9\npiece a ../x.zip s 5 h r\npiece b ..\\x.zip s 5 h r\npiece c C:x.zip s 5 h r\n"
++                               "piece d .. s 5 h r\npiece e ok.zip s 5 h r\nkit linux ../k.tar.gz s 5\nkit steamdeck k.tar.gz s 5\n");
++    CHECK(paths && paths->pieces.size() == 1 && paths->pieces[0].name == "e");
++    CHECK(paths && paths->kits.size() == 1 && paths->kits[0].platform == "steamdeck");
++}
++
++static void TestCompare() {
++    CHECK(CompareVersions("0.1.10", "0.1.9") == 1);
++    CHECK(CompareVersions("0.1.9", "0.1.10") == -1);
++    CHECK(CompareVersions("v0.1.8", "0.1.8") == 0);
++    CHECK(CompareVersions("dev", "0.0.1") == -1);
++    CHECK(CompareVersions("0.0.1", "dev") == 1);
++    CHECK(CompareVersions("dev", "dev") == 0);
++    CHECK(CompareVersions("0.2", "0.1.9") == 1);
++}
++
++static void TestPieces() {
++    auto latest = *ParseManifest(kManifest);
++    auto installed = latest;
++    CHECK(PiecesToDownload(latest, installed).empty());
++    installed.pieces[0].content = "old";
++    auto d = PiecesToDownload(latest, installed);
++    CHECK(d.size() == 1 && d[0].name == "core");
++    installed.pieces.pop_back();  // licenses not installed
++    CHECK(PiecesToDownload(latest, installed).size() == 2);
++}
++
++static void TestPopup() {
++    CHECK(ShouldPopup("0.1.9", "0.1.8", ""));
++    CHECK(!ShouldPopup("0.1.9", "0.1.8", "0.1.9"));
++    CHECK(ShouldPopup("0.1.10", "0.1.8", "0.1.9"));
++    CHECK(!ShouldPopup("0.1.8", "0.1.8", ""));
++    CHECK(!ShouldPopup("0.1.7", "0.1.8", ""));
++}
++
++static void TestDiscussion() {
++    Manifest m;
++    m.version = "0.1.8";
++    CHECK(DiscussionUrl(m, true) == "https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.8");
++    m.discussionEs = "https://es.invalid/d";
++    CHECK(DiscussionUrl(m, true) == "https://es.invalid/d");
++    CHECK(DiscussionUrl(m, false) == "https://es.invalid/d");
++    m.discussionEn = "https://en.invalid/d";
++    CHECK(DiscussionUrl(m, true) == "https://en.invalid/d");
++    CHECK(DiscussionUrl(m, false) == "https://es.invalid/d");
++    CHECK(ReleasePage("0.1.9") == "https://github.com/HopeAero/MLBPowerPros2008Recomp/releases/tag/v0.1.9");
++    CHECK(ReleasePage("v0.1.9") == ReleasePage("0.1.9"));
++    // Only web links reach ShellExecute / xdg-open.
++    Manifest bad;
++    bad.version = "0.1.9";
++    bad.discussionEs = "file:///C:/Windows/System32/calc.exe";
++    bad.discussionEn = "http://example.invalid/x";
++    CHECK(DiscussionUrl(bad, true) == ReleasePage("0.1.9"));
++    CHECK(DiscussionUrl(bad, false) == ReleasePage("0.1.9"));
++    bad.discussionEs = "https://github.com/x";
++    CHECK(DiscussionUrl(bad, true) == "https://github.com/x");
++}
++
++static void TestDecide() {
++    Manifest m;
++    m.version = "0.1.9";
++    CHECK(Decide(m, "0.1.8", false) == Mode::Notify);
++    CHECK(Decide(m, "0.1.8", true) == Mode::Update);
++    CHECK(Decide(m, "0.1.9", true) == Mode::None);
++    CHECK(Decide(m, "0.2.0", false) == Mode::None);
++}
++
++static void TestQuick() {
++    auto pieces = [](std::initializer_list<const char*> names) {
++        std::vector<Piece> out;
++        for (const char* n : names) out.push_back(Piece{n, "", "", 0, ""});
++        return out;
++    };
++    CHECK(QuickUpdate(pieces({"core"})));
++    CHECK(QuickUpdate(pieces({"core", "studios", "licenses", "powerupplus", "uniform"})));
++    CHECK(!QuickUpdate(pieces({"core", "translator"})));
++    CHECK(!QuickUpdate(pieces({"deps"})));
++    CHECK(!QuickUpdate(pieces({"llvm"})));
++    CHECK(!QuickUpdate(pieces({"buildtools"})));
++    // Nothing to download: Build already has the new sources (e.g. after VOLVER A); only the program rebuilds.
++    CHECK(QuickUpdate(pieces({})));
++}
++
++static void TestConfigValue() {
++    const char* toml =
++        "[ui]\nlanguage = \"es\"\n\n[update] # comment\nnotified = \"0.1.9\"\nother = 'x'\n[video]\nnotified = \"no\"\n";
++    CHECK(ConfigValue(toml, "update", "notified") == "0.1.9");
++    CHECK(ConfigValue(toml, "update", "other") == "x");
++    CHECK(ConfigValue(toml, "ui", "language") == "es");
++    CHECK(ConfigValue(toml, "update", "missing").empty());
++    CHECK(ConfigValue("[ui]\nlanguage = \"es\"\n", "update", "notified").empty());
++    CHECK(ConfigValue("[update]\r\nnotified=\"0.2.0\"\r\n", "update", "notified") == "0.2.0");
++}
++
++static void TestBytes() {
++    CHECK(FormatMegabytes(0, false) == "0.0 MB");
++    CHECK(FormatMegabytes(4404019, false) == "4.2 MB");
++    CHECK(FormatMegabytes(4404019, true) == "4,2 MB");
++    CHECK(FormatMegabytes(1288490189, true) == "1228,8 MB");
++}
++
++static fs::path Scratch(const char* name) {
++    const fs::path dir = fs::temp_directory_path() / (std::string("mlbpp-update-tests-") + name);
++    std::error_code ec;
++    fs::remove_all(dir, ec);
++    fs::create_directories(dir);
++    return dir;
++}
++
++static void Touch(const fs::path& p, const std::string& text = "x") {
++    fs::create_directories(p.parent_path());
++    std::ofstream(p, std::ios::binary) << text;
++}
++
++// canUpdate needs the update script: an install copied from another PC (kit.txt pointing at a kit
++// folder that is not here) or a Build without Update.ps1 only gets the notice.
++static void TestLocate() {
++    const fs::path dir = Scratch("locate");
++#if defined(_WIN32)
++    const fs::path exe = dir / "Game" / "MLBPowerPros2008.exe";
++    Touch(dir / "Build" / "update-manifest.txt", "version 0.1.8\n");
++    CHECK(!Locate(exe, dir / "cache").canUpdate);
++    Touch(dir / "Build" / "workspace" / "Update.ps1");
++    CHECK(Locate(exe, dir / "cache").canUpdate);
++    CHECK(Locate(exe, dir / "cache").handoffError == dir / "Update" / "last-error.txt");
++#else
++    const fs::path install = dir / "Game dir";
++    const fs::path exe = install / "MLBPowerPros2008";
++    Touch(install / "kit.txt", "root=" + (dir / "kit").string() + "\nplatform=steamdeck\noptions=--container\n");
++    Install in = Locate(exe, dir / "cache");
++    CHECK(!in.canUpdate && in.kitPlatform == "steamdeck");
++    Touch(dir / "kit" / "tools" / "linux" / "update.sh");
++    CHECK(Locate(exe, dir / "cache").canUpdate);
++#endif
++    std::error_code ec;
++    fs::remove_all(dir, ec);
++}
++
++static void TestHandoffError() {
++    const fs::path dir = Scratch("handoff");
++    Install in;
++    in.handoffError = dir / "Update" / "last-error.txt";
++    CHECK(!TakeHandoffError(in));
++    Touch(in.handoffError, "rollback\r\nCould not move Previous\\launcher: in use\r\n");
++    auto e = TakeHandoffError(in);
++    CHECK(e && e->rollback && e->message == "Could not move Previous\\launcher: in use");
++    CHECK(!fs::exists(in.handoffError));  // shown once
++    CHECK(!TakeHandoffError(in));
++    Touch(in.handoffError, "swap\nThe launcher did not exit within 60 s.\n");
++    e = TakeHandoffError(in);
++    CHECK(e && !e->rollback && e->message == "The launcher did not exit within 60 s.");
++    std::error_code ec;
++    fs::remove_all(dir, ec);
++}
++
++// A local server that accepts and never answers: curl waits (the check stays busy) until it is killed.
++struct SilentServer {
++#if defined(_WIN32)
++    SOCKET s = INVALID_SOCKET;
++    SilentServer() {
++        WSADATA w;
++        WSAStartup(MAKEWORD(2, 2), &w);
++#else
++    int s = -1;
++    SilentServer() {
++#endif
++        s = socket(AF_INET, SOCK_STREAM, 0);
++        sockaddr_in a{};
++        a.sin_family = AF_INET;
++        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++        a.sin_port = 0;
++        bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a));
++        listen(s, 4);
++    }
++    int Port() {
++        sockaddr_in a{};
++#if defined(_WIN32)
++        int n = sizeof(a);
++#else
++        socklen_t n = sizeof(a);
++#endif
++        getsockname(s, reinterpret_cast<sockaddr*>(&a), &n);
++        return ntohs(a.sin_port);
++    }
++    ~SilentServer() {
++#if defined(_WIN32)
++        closesocket(s);
++        WSACleanup();
++#else
++        close(s);
++#endif
++    }
++};
++
++// Sí / VOLVER A during the start-up check: refused (false), nothing starts, the UI keeps its window.
++static void TestBusyRefuses() {
++    const fs::path dir = Scratch("busy");
++    Install in;
++    in.cache = dir / "cache";
++    in.root = dir;
++    in.previousVersion = "0.1.7";
++    in.canUpdate = true;
++    {
++        Updater idle(in, "0.1.8");
++        CHECK(!idle.Update(false));  // no check yet: nothing to install
++    }
++    {
++        Install none = in;
++        none.previousVersion.clear();
++        Updater u(none, "0.1.8");
++        CHECK(!u.Rollback(false, false));  // nothing to go back to
++    }
++    {
++        // VOLVER A without the update script: fails in the window (nothing started, launcher stays).
++        Install noScript = in;
++        noScript.script = dir / "Build" / "workspace" / "Update.ps1";
++        Updater u(noScript, "0.1.8");
++        CHECK(u.Rollback(false, true));
++        const Status s = u.Get();
++        CHECK(s.state == Status::State::Failed && s.rollback && s.error.find("script is missing") != std::string::npos);
++    }
++    SilentServer server;
++    std::chrono::steady_clock::time_point stopping;
++    {
++        Updater u(in, "0.1.8");
++        u.Check("http://127.0.0.1:" + std::to_string(server.Port()) + "/");
++        CHECK(u.Get().state == Status::State::Checking);
++        CHECK(!u.Rollback(false, false));
++        CHECK(!u.Update(false));
++        CHECK(u.Get().state == Status::State::Checking && !u.Get().rollback);
++        stopping = std::chrono::steady_clock::now();
++    }
++    // The destructor stops the check (curl's job / process group): no 10 s wait.
++    CHECK(std::chrono::steady_clock::now() - stopping < std::chrono::seconds(5));
++    std::error_code ec;
++    fs::remove_all(dir, ec);
++}
++
++int main() {
++    TestParse(); TestCompare(); TestPieces(); TestPopup(); TestDiscussion(); TestDecide();
++    TestQuick(); TestConfigValue(); TestBytes(); TestLocate(); TestHandoffError(); TestBusyRefuses();
++    if (g_fail) { std::printf("%d failure(s)\n", g_fail); return 1; }
++    std::printf("launcher_update_tests: all passed\n");
++    return 0;
++}
