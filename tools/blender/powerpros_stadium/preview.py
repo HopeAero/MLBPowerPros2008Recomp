@@ -46,15 +46,48 @@ def environment(mod_dir, pose):
             "WIICOMPILED_STADIUM_VIEWER_CAMERA": ",".join(f"{v:.4f}" for v in pose)}
 
 
+class GameFolderMissing(exporter.ExportFailure):
+    """Neither the collection nor the add-on preferences know where WiiCompiled.exe is: ask the player."""
+
+
+def remembered_game_folder():
+    addon = bpy.context.preferences.addons.get(__package__)
+    return getattr(addon.preferences, "game_folder", "") if addon else ""
+
+
+def game_folder_of(picked):
+    """The game folder (the one with WiiCompiled.exe) from what the player picked: the folder itself, the
+    exe, its build/ subfolder or the folder above. None if none has the exe."""
+    if not picked:
+        return None
+    p = Path(bpy.path.abspath(picked))
+    for c in (p if p.is_dir() else p.parent, p / "build", p.parent):
+        if (c / "WiiCompiled.exe").is_file():
+            return c
+    return None
+
+
+def game_folder(coll):
+    """Where the game is: the collection's own folder, else the one remembered in the preferences."""
+    return game_folder_of(coll.get("pp_game_folder")) or game_folder_of(remembered_game_folder())
+
+
+def remember_game_folder(coll, folder):
+    coll["pp_game_folder"] = str(folder)
+    addon = bpy.context.preferences.addons.get(__package__)
+    if addon is not None and hasattr(addon.preferences, "game_folder"):
+        addon.preferences.game_folder = str(folder)
+
+
 def launch(coll, pose, *, dry_run=False):
     """Export coll as the preview mod and start the game's viewer on it (closing the one this session
     opened before). dry_run: export only, and return what would be launched."""
     global _process
-    game = Path(coll.get("pp_game_folder") or "")
+    game = game_folder(coll)
+    if game is None:
+        raise GameFolderMissing(T("Elige la carpeta del juego (la que tiene WiiCompiled.exe)",
+                                  "Choose the game folder (the one with WiiCompiled.exe)"))
     exe = game / "WiiCompiled.exe"
-    if not coll.get("pp_game_folder") or not exe.is_file():
-        raise exporter.ExportFailure(T(f"No encuentro WiiCompiled.exe en {game}: importa el estadio desde la carpeta del juego",
-                                       f"WiiCompiled.exe not found in {game}: import the stadium from the game folder"))
     shutil.rmtree(preview_folder(), ignore_errors=True)
     bpy.context.view_layer.update()     # matrix_world of what was just moved, when called from a script
     from . import scratch

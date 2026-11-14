@@ -9,7 +9,7 @@ It also **exports**: whatever you change in the pieces and in the collision goes
 ## Install
 
 1. You need **Blender 4.2 or newer** ([blender.org](https://www.blender.org/download/)).
-2. Get the add-on, a zip called `powerpros_stadium-<version>.zip`: the latest, `powerpros_stadium-0.8.2.zip`, is in [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (v0.1.2). To build it from the repository: `python tools/blender/build_addon.py` (it ends up in `local/build/blender/`).
+2. Get the add-on, a zip called `powerpros_stadium-<version>.zip`: the latest released, `powerpros_stadium-0.8.2.zip`, is in [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (v0.1.2); 0.8.3 (Two-sided, Separate stacked layers, Generate field, Add a game piece) is built from the repository for now. To build it from the repository: `python tools/blender/build_addon.py` (it ends up in `local/build/blender/`).
 3. In Blender: **Edit > Preferences > Get Extensions**. In the ⌄ menu at the top right choose **Install from Disk…** and select the zip.
 
 **Language:** in the add-on's preferences (**Edit > Preferences > Add-ons**), **Idioma / Language**: Auto (Blender's interface language), Español or English. It applies without restarting Blender.
@@ -90,9 +90,28 @@ What looks right in Blender may look different in the game. **View in game** (th
 - **Collision (C):** draws the stadium's collision on top, the one the ball and players use, as lines seen through everything, with one colour per surface type: foul and home run invisible walls, outer limit, grass, dirt, mound, fences, stands, roofs, foul poles and backstop. Bottom left, a legend with the triangles of each type and a box to show or hide each (left click), with «All» and «None». The invisible walls (foul, home run and outer limit) start hidden: they are 70 m tall and cover everything. It works with the free camera and the match ones. It shows whether the fences and invisible walls match your model.
 - Pressing the button again closes the game it opened before and opens it with your changes.
 - It uses its own cache (about 400 MB in `UserData/Cache/preview`), so the normal game's cache is not rebuilt. It loads only the stadium you are making: your other mods are not enabled.
-- The stadium must have been imported, or the stadium from scratch created, from the installed game folder (the one with `WiiCompiled.exe`); otherwise the button says so.
+- It needs to know where the game is (the folder with `WiiCompiled.exe`). If you imported the stadium or created the stadium from scratch from the game folder, it already knows; otherwise the first time it opens a chooser for you to pick it (the folder, the `.exe` or the folder above all work) and remembers it in the add-on preferences (**Edit > Preferences > Add-ons > Power Pros > Game folder**), where you can change it (add-on 0.8.3).
 - While the game window is active it gets your keys: if you type somewhere else without switching windows, the camera moves.
 - **What it is for:** seeing what the game does with your model without playing a match. With the Polo Grounds (18 October 2026) it showed three faults Blender did not: textures lost when converting, grey stands and striped towers (see «Piece and texture limits»). All three are fixed in add-on 0.7.3.
+
+## An OOTP ballpark in four steps
+
+Out of the Park Baseball 3D ballparks (a `.zip` or `.rar` with an `.obj`, `.mtl` and textures) go in with nothing done by hand:
+
+1. **New stadium from scratch**, picking the game folder.
+2. **Import OOTP ballpark**, picking the `.zip` or `.rar` as you downloaded it (or its `.obj`). The `.rar` is opened by the `tar` that ships with Windows 10 and 11; elsewhere, extract it and pick the `.obj`.
+3. **View in game** to check it.
+4. **Export stadium mod** and enable it in the launcher's MODS tab. It shows up in Exhibition, after the game's stadiums.
+
+What the button does:
+- Extracts the `.zip` into a folder next to it and keeps its images inside the `.blend`.
+- Turns it so centre field is ahead: it finds the field's axis of symmetry.
+- Splits the ground (grass, dirt, lines) off with the «Ground» role.
+- OOTP seating takes its pictures from OOTP's `attendance` folder, which the zips don't bring. If that folder is next to the park they come from there; otherwise a still picture of the game's people (taken from your `project.bin`) goes over the seat colour. The «The game's crowd on all the seating» box puts it everywhere.
+- Generates the collision from what is near the field, within the game's limit.
+- Deletes nothing of the model: what you see in Blender is what the game shows.
+
+If a park comes out turned too far, turn it in Blender (R Z and the degrees) before exporting.
 
 ## Your own model (SketchUp, glTF, OBJ…)
 
@@ -114,9 +133,28 @@ You can bring a stadium that doesn't exist in the game into it. The add-on write
 1. **Power Pros** panel → **New stadium from scratch**. Pick the game folder (or `files/project.bin`) and a **data stadium**: the new stadium takes its saves, menu, sky and sounds, but none of its pieces.
 2. A collection, «Stadium from scratch», is created that already holds **the game's bases, plate and mound** in their place: fit your model to them.
 3. Put your objects (meshes, curves, texts…) in that collection, already placed.
-4. With an object selected, the panel shows its **role** and the **Hide when batting and from above** box.
+4. With an object selected, the panel shows its **role** and the **Hide when batting and from above**, **Two-sided** and **Separate stacked layers** boxes.
 5. Press **Generate collision** and review it (see «Stadium collision»).
 6. **Export stadium mod** with the collection selected: always as a new stadium, with its code and name. Try it first with **View in game**.
+
+**Generate field** (add-on 0.8.3): if your model has no field, or you want to start from just a field, press **Generate field** with the from-scratch collection selected. It asks for a few measurements, like OOTP's park generator:
+- wall distances in feet: left and right field lines, left-centre, centre and right-centre; the wall runs through those five points on a smooth curve;
+- outfield wall height and colour **per sector** (left, left-centre, right-centre and right; each runs from one distance to the next). A Green Monster like Fenway's: left sector 37 feet and green. Up to 50 feet; the collision takes the whole wall as a wall and the home run invisible wall starts on top of it. Each sector also has a **look**: its colour, or a game stadium's fence (the Metrodome's blue padding, say). It takes that fence's main texture from your `project.bin` and lays it the way that stadium does, in its proportions, scaled whole to your wall's height. The game's grass is not copied that way (at the Metrodome the rings round the mound are its ground's geometry, not a repeated texture) but with **Ground**;
+- **ground**: generated (from these measurements) or **a game stadium's**: its ground pieces as they are (turf, dirt, track, stains and lines), with their transparency and draw mode, as they look in that stadium. Blender shows them as locked references (its view does not draw their transparent layers right; «View in game» does). With **With that stadium's measurements** (on) the five wall distances become that stadium's, measured on its collision, so its warning track meets your wall. The generator only lays a filler grass under it;
+- foul wall height, warning track width, foul ground by first and third, home plate to backstop;
+- surface (grass or turf), infield (grass with a dirt skin, all dirt, or turf with dirt cut-outs), mowing pattern (stripes, checker, diagonal, circles) with its width, and grass, dirt and wall colours;
+- distance signs on the wall (optional);
+- **chalk lines** (optional): foul lines to the poles, batter's, catcher's and coach's boxes, the running lane to first and the on-deck circles, at rule-book sizes. The game's own (`DP_ALP_MIP_line`) are made for each game stadium's distances, so the generator brings its own. They have no collision.
+
+**Reference players** (button under «Generate field»): puts or takes away figures where the pitcher, catcher, the four infielders, three outfielders, umpire, both coaches and the on-deck batter stand, and both dugouts behind the foul wall, to design the stadium around them. It is a usual defence; the game moves the players with each play. They are not exported, have no collision and cannot be selected by accident, except the **dugouts**: move them (and turn or lower them) onto your own dugouts. On export the stadium gets the game's dugout spots (the people on the benches, 6 or 7 a side depending on the base stadium) where your dugouts are, at their floor height; without reference players, where the generator puts the dugouts, at ground level. Every game stadium brings its own; earlier from-scratch stadiums had them empty.
+
+It makes objects with their role already set: ground layers (grass, track, dirt, infield grass, dirt circles, chalk), walls (one per sector), foul poles and signs. Press it again to change the measurements: it remembers the last ones and replaces the previous field (only the objects it made; the rest of the collection is left alone). Generated objects have **Separate stacked layers** off, so the wall and the signs stay where they were put. Then press **Generate collision**: grass and dirt get their surface and the walls come out as walls.
+
+**Add a game piece** (add-on 0.8.3): brings stands, crowd, glass, scoreboards, trees or buildings from any of the game's stadiums, read from your `project.bin`. Pick the stadium and the piece (the list shows each one's role); with **With its whole section** the pieces of the same zone come too (for example `R2`: stand, seated and standing crowd, umbrellas). They arrive where they sit in their stadium with their role already set: move, turn or duplicate them like any object. That way you can join, say, the generated field with one stadium's centre stands and another's right field.
+- Ground, bases and night lights are left out (lights only show at night and by day they would be on).
+- The crowd on those pieces is the game's animated one, as with the Crowd role. The `AudienceC` crowd kind is drawn as upright crowd.
+- The pieces keep their vertex colours (the light the game gave them): the exporter's sun is not applied to them. Their textures are not copied in HD; they are already at the game's size.
+- They are game content: they stay in your `.blend` and your mod, don't share them.
 
 **Roles**
 | Role | What it does in the game |
@@ -131,7 +169,10 @@ You can bring a stadium that doesn't exist in the game into it. The add-on write
 | Additive glow | Adds its colour to what is behind: lights, reflections. |
 
 - **Hide when batting and from above:** the piece is not seen from the batter's view or from high cameras, like the outside buildings of the game's stadiums. For what is far away and would get in the way.
-- Objects with the same role (and the same box) are joined into one piece; past 30 textures it is split. Each flag goes alone.
+- **Two-sided** (add-on 0.8.3): the game hides the back of every stadium face and the pack has no way to ask otherwise. With the box on, each face is exported as it is plus a back copy 3 mm behind, so it shows from both sides. Use it for models from games that draw both sides, like MVP Baseball 2005 (without it the stands show holes with the sky through them), and for thin walls or roofs. It doubles the object's triangles. Flat ground is left as it is.
+- **Vertex colours** (add-on 0.8.3): if the object has vertex colours, they are multiplied by the material's colour or texture and reach the game. They used to be ignored.
+- **Separate stacked layers** (on by default): moves faces lying just in front of a parallel one (windows, signs) up to 25 cm out, because they flicker at a distance. On stepped stands it moves whole rows and opens gaps: turn it off for those objects.
+- Objects with the same role (and the same box) are joined into one piece; past 64 textures it is split. Each flag goes alone.
 - **The game's bases, plate and mound:** «New stadium from scratch» puts them in the collection (the data stadium's `BCL` pieces, locked), so you can fit your model to them: the players always stand there. They are exported as they are, in their place. If your model brings its own, delete your model's (they would overlap the game's) or delete the game piece you do not want: only the ones still in the collection are exported (add-on 0.8.1).
 - **Ground in layers:** the game draws the ground with no depth test, in order. The exporter puts its layers from the bottom up (by the mean height of each material), so the infield dirt, over the grass, shows. Before 0.8.1 the Polo Grounds' dirt was covered by a grass plane 4 cm below it.
 - **Collision:** press **Generate collision** (below, «Stadium collision»), or the exporter generates it if there is none.
@@ -150,7 +191,8 @@ You can bring a stadium that doesn't exist in the game into it. The add-on write
 
 **Piece and texture limits** (also for «Another route»):
 - The collision can have up to 65,535 triangles.
-- Each piece takes up to 30 textures, counting its original ones; that is the most a piece has in the game's stadiums. The exporter splits pieces to stay under it and refuses to write a piece with more. With 82 in one piece the game read past a table, the stadium showed no fences and the match ended up closing.
+- Each piece takes up to 64 textures, counting its original ones: the game copies them into a table of 64 slots without checking how many fit. The exporter splits pieces to stay under it and refuses to write a piece with more. With 82 in one piece the game read past that table, the stadium showed no fences and the match ended up closing.
+- Big meshes and collision (from the recomp version with the `wiicompiled-stadium-limits` patch): a piece can have hundreds of meshes and the collision up to 65,535 triangles, without the old 65,662-entry tree cap. With an older recomp, a stadium past those numbers shows pieces with missing parts or wrong collisions.
 - In the pack, textures become RGB5A3 and powers of 2 up to 256 pixels. With **HD textures**, the game uses the image at its own size (up to 2048 pixels).
 - Textures can repeat as much as needed. Each texture in the pack says how many times it repeats horizontally and vertically. With 1, the game does not repeat it: it stretches the edge. The exporter works those numbers out from your faces' UVs, after taking the spare whole repeats off each face; the picture does not change. Up to version 0.7.2 it copied them from the piece's first texture: the Polo Grounds on AT&T Park came out with grey stands and striped towers, and fine on Coors Field, by luck.
 - The collision generator assumes a normal baseball field: ground at height 0, the center of the field about 45 m in front of home plate and walls around it.
@@ -159,7 +201,8 @@ You can bring a stadium that doesn't exist in the game into it. The add-on write
 
 **Generate collision** (Power Pros panel) creates your stadium's collision, one object per kind. It replaces any there was, also the one made with "Make collision".
 - the ground (grass if it's green, dirt if not) and the mound;
-- the fences, following the wall closest to the field in all directions;
+- the fences: your model's own walls round the field, as they are, with their shape and height (the side walls of bullpens and corners too). A wall is added where the model has none. The invisible walls start at the top edge of the fence;
+- the ground counts even if its faces look down;
 - the invisible walls above the fences, like the game's: in fair territory (1, the home run) and in foul territory (0);
 - the foul poles where the lines cross the fences;
 - the stands, simplified to about 5,000 triangles, and an outer boundary behind the outfield.
@@ -179,7 +222,7 @@ Before version 0.8.0 this was the only way: the model went **inside one of the g
    - Surfaces stuck less than 25 cm from another parallel one, such as windows or signs, are separated up to 25 cm, so they don't flicker.
    - With **Remove original stadium** (**Quitar el estadio original**) (on by default), the base stadium's pieces disappear and only your model remains. Pieces with the `pp_keep` property are kept, for example a crowd piece where you've put your own crowd.
    - The game's bases, plate and mound (`BCL` pieces) always stay: the players stand on them, and a model's own rarely match (a downloaded model's plate was 1.2 m).
-   - Each piece gets at most 30 textures: the model's are spread over the base stadium's stands.
+   - Each piece gets at most 64 textures: the model's are spread over the base stadium's stands.
    - If the model has a texture painted over a plain face, on the same corners (SketchUp does this), the textured face is kept.
    - Converted pieces look in Blender as in the game: texture × vertex colour, unlit. Use the **Material** view (Z > Material Preview).
 4. Press **Generate collision** (see «Stadium collision») and review it.
@@ -218,7 +261,7 @@ What we learned bringing in the Polo Grounds, a downloaded SketchUp model (Octob
 
 **Solved since** (phases 2 and 3, 18-19 October 2026; details in `docs/en/reverse-engineering.md`):
 - The crowd placed in AT&T's crowd pieces did not show because the game animates its crowd only through the stadium's preloaded textures: the **Crowd** roles use them.
-- The placement flags: `0x1600`/`0x1700` are the animated crowd, `0x80000000` (`NOUPCAM`) hides the piece from the batter's view and high cameras, `0x500` are the flags.
+- The placement flags: `0x1600`/`0x1700` are the animated crowd, `0x80000000` (`NOUPCAM`) hides the piece from the batter's view and high cameras, `0x500` are the flags. `0x40000000` ("2F") hides the piece in the play camera (fouls and pop-ups), which goes into the upper deck around home plate: on export, stand, crowd and transparent faces more than 8 m up and less than 60 m from home towards centre field go into a piece with that bit (from scratch) or into the base stadium's 2F piece (converting), so that camera does not end up inside the concrete.
 
 **Not solved yet:**
 - What `0x40000000` (upper stands behind home plate) and `0x20000000` (`EVC`) do: removing them changed nothing from the views tested.
@@ -252,6 +295,9 @@ A stadium from scratch also carries something of the game: the data stadium's ba
   4. imports Coors Field again with collision, raises its fences (surface 9) 3 m, changes a face to foul pole and checks the written table: surfaces, face orientation and both trees.
 - **Own model** (`tools/blender/test_convert.py`, same arguments as the export): builds a test stadium with simple shapes (grass, dirt, a circular fence and stands), converts it into Coors Field pieces, generates its collision, exports it as a new stadium and checks what was written.
 - **Stadium from scratch** (`tools/blender/test_scratch.py <zip> <project.bin> <temp folder>`): roles, grouping, draw order, the game's `BCL` pieces (shown and locked in the collection; only the ones left are exported), ground layers bottom-up, flags, crowd through the preload, collision with curves, menu photo, operators and View in game without opening the game.
+- **Generate field** (`tools/blender/test_field.py <zip> <project.bin> <temp folder>`): wall distances and poles, ground layers, signs in front of the wall, grass/dirt/wall collision, wall sectors (a 37 ft Green Monster with its collision to the top), chalk lines, reference players left out of the mod, fields saved before the sectors, export and regeneration.
+- **Game pieces** (`tools/blender/test_parts.py <zip> <project.bin> <temp folder>`): Yankee Stadium's piece list and roles, a whole section, vertex colours reaching the export, no HD copies, export.
+- **OOTP ballpark** (`tools/blender/test_ootp.py <zip> <project.bin> <park .zip/.rar/.obj> <degrees> <temp folder>`): as a player uses it, with a downloaded park (they are not in the repository): turn against the one checked in game (Astrodome 45, Cargill Mill 0, Polo Grounds 45, Montaner 45, Chuckchansi Park 45 from .rar), ground, images kept in the .blend, collision and export.
 - **Collision by kind** (`tools/blender/test_collision.py <zip> <project.bin> <temp folder>`): one object per surface, named and coloured, show or hide by kind, Make collision, export joining the objects (and no rewrite when nothing changed).
 - **View in game** (`tools/blender/test_preview.py`): the preview export and the game launch, without opening windows.
 - **Runtime viewer:** `WIICOMPILED_STADIUM_VIEWER=<mod folder>`, `WIICOMPILED_STADIUM_VIEWER_CODE=<code>`, `WIICOMPILED_STADIUM_VIEWER_CAMERA=x,y,z,yaw,pitch,fov`, `WIICOMPILED_STADIUM_VIEWER_COLLISION=1` (start with the collision shown) `WIICOMPILED_STADIUM_VIEWER_SPIN=<rad/s>` (the free camera turns by itself, to check that the collision lines do not slide) and `WIICOMPILED_STADIUM_VIEWER_TOUR="t,x,y,z,yaw,pitch,fov,collision;..."` (the free camera follows those keys, with the collision on or off at each, and the help is hidden: for recording videos; units as in `..._CAMERA`, decimetres).

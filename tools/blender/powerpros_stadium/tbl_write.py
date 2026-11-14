@@ -4,7 +4,9 @@
 Both trees (docs/ingenieria-inversa.md) are binary space partitions of 0x1C-byte nodes in preorder:
 plane nx ny nz d (f32), then per side u16 child, u16 list start, u8 list count (H side at +0x10,
 +0x14, +0x18; L side at +0x12, +0x16, +0x19). A side with child 0 is a leaf: `count` u16 entries
-of the tree's list from `start` (the game reads `count` as a signed byte: at most 127). H holds
+of the tree's list from `start` (the game reads `count` as a signed byte: at most 127). `start` is a
+u16 in the game; the recomp's walker (hle/mlb/collision_tree.cpp) takes +0x1A (H) and +0x1B (L), always
+0 in the game, as its high byte, so a list can pass 65535 entries (big collision meshes). H holds
 what reaches n.p + d < 0, L what reaches > 0; anything crossing the plane is in both. Tree A
 partitions the placements (by their box), tree B the collision triangles. The game walks them
 recursively and marks every listed index in a flag array (0x80C860E4, 0x80C862EC): no fixed-size
@@ -22,7 +24,7 @@ from .i18n import T
 P = 0x40000000
 NODE_SIZE = 0x1C
 MAX_LEAF = 127              # the game reads the leaf count as a signed byte (0x80C860E4)
-MAX_LIST = 0xFFFF + MAX_LEAF          # u16 start + u8 count
+MAX_LIST = 0xFFFFFF + MAX_LEAF        # u16 start + its high byte at +0x1A/+0x1B (runtime 0x80C860E4) + count
 
 
 class TreeError(ValueError):
@@ -96,7 +98,7 @@ def build_tree(boxes, leaf=8):
 def pack_tree(nodes, entries):
     blob = bytearray()
     for plane, (hc, hs, hk), (lc, ls, lk) in nodes:
-        blob += struct.pack(">4f4HBBH", *plane, hc, lc, hs, ls, hk, lk, 0)
+        blob += struct.pack(">4f4H4B", *plane, hc, lc, hs & 0xFFFF, ls & 0xFFFF, hk, lk, hs >> 16, ls >> 16)
     return bytes(blob), struct.pack(f">{len(entries)}H", *entries)
 
 

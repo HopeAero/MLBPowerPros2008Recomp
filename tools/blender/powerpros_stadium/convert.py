@@ -24,7 +24,7 @@ TARGET = ("stand", "fence", "ground", "turf")
 SKIP = ("ALP", "ADD", "EVC", "NOUPCAM", "FLG", "Audience", "lumine", "LIGHT", "BCL", "ANT", "ZTEST",
         "score", "aurora", "board")
 SUN = Vector((0.35, -0.45, 0.82)).normalized()
-MAX_TEXMAPS = 30        # most textures one stadium piece has in the game; 82 overran a game table and crashed
+MAX_TEXMAPS = 64        # the game copies a piece's texture table into 64 fixed slots, unchecked (0x8005326C)
 FIELD = Vector((0.0, 45.0))                          # a point of every field (home at the origin)
 
 
@@ -52,6 +52,96 @@ def flags(obj):
         return int(obj.get("pp_placement_flags", "0"), 16)
     except ValueError:
         return 0
+
+
+# «2F»: the game hides pieces with this flag in its play camera (fouls, pop-ups), which goes inside the
+# upper deck around home; model faces left there in other pieces block that camera.
+UPPER_DECK = 0x40000000
+UPPER_MIN_HEIGHT, UPPER_MAX_FORWARD = 8.0, 60.0     # metres up; metres from home towards centre field
+
+
+def is_upper_deck(p):
+    """A face centre (Blender metres, Z up, centre field towards +Y) where the game would have a 2F piece.
+    ponytail: one fixed box from the game's own 2F pieces (35 MLB parks: from 0-15 m up, from 100 m behind
+    home to 100 m down the lines); a per-object switch if some park needs another."""
+    return p.z > UPPER_MIN_HEIGHT and p.y < UPPER_MAX_FORWARD
+
+
+def _deck_piece(coll):
+    """The imported stadium's 2F stand piece: its object, or a new one for that game model when it was deleted."""
+    for o in coll.all_objects:
+        if (o.get("pp_kind") == "model" and o.type == "MESH" and "stand" in o.name.lower()
+                and flags(o) & UPPER_DECK and not any(s in o.name for s in SKIP)):
+            return o
+    from . import game_parts, pj7m
+    gfx, placements = game_parts._stadium(coll.get("pp_project_bin", ""), coll.get("pp_stadium", ""))
+    for pl in placements:
+        model = pj7m.parse_model(gfx, pl.model) if gfx else None
+        name = model.name if model else ""
+        if pl.flags & UPPER_DECK and "stand" in name.lower() and not any(s in name for s in SKIP):
+            obj = bpy.data.objects.new(name, bpy.data.meshes.new(name))       # as importer.py makes them
+            coll.objects.link(obj)
+            obj["pp_kind"], obj["pp_model_offset"], obj["pp_node"] = "model", pl.model, model.node_name
+            obj["pp_wmodel"], obj["pp_placement_flags"] = model.wname, f"0x{pl.flags:08X}"
+            return obj
+    return None
+
+
+def split_upper_decks(coll):
+    """Move the faces of plain stand pieces that are high up around home plate (is_upper_deck) into the
+    stadium's 2F piece. Returns the number of faces moved (0 when the base stadium has no 2F piece)."""
+    sources = [o for o in coll.all_objects if o.get("pp_kind") == "model" and o.type == "MESH"
+               and "stand" in o.name.lower() and not any(s in o.name for s in SKIP) and flags(o) == 0]
+    picked = {}
+    for o in sources:
+        mw = o.matrix_world
+        idx = [p.index for p in o.data.polygons if is_upper_deck(mw @ p.center)]
+        if idx:
+            picked[o] = set(idx)
+    if not picked:
+        return 0
+    deck = _deck_piece(coll)
+    if deck is None:
+        return 0
+    dst = bmesh.new()
+    dst.from_mesh(deck.data)
+    to_deck, moved = deck.matrix_world.inverted(), 0
+    for o, idx in picked.items():
+        bm = bmesh.new()
+        bm.from_mesh(o.data)
+        bm.faces.index_update()
+        part = bm.copy()
+        part.faces.index_update()                        # same order as the mesh's polygons
+        bmesh.ops.delete(part, geom=[f for f in part.faces if f.index not in idx], context="FACES")
+        part.transform(to_deck @ o.matrix_world)
+        used = sorted({f.material_index for f in part.faces})
+        slots = [m.name for m in deck.data.materials]
+        remap = {}
+        for i in used:
+            mat = o.data.materials[i] if i < len(o.data.materials) else None
+            if mat is not None and mat.name in slots:
+                remap[i] = slots.index(mat.name)
+            else:
+                deck.data.materials.append(mat)
+                slots.append(mat.name if mat else "")
+                remap[i] = len(slots) - 1
+        for f in part.faces:
+            f.material_index = remap[f.material_index]
+        _append(dst, part, 0)
+        moved += len(part.faces)
+        part.free()
+        bmesh.ops.delete(bm, geom=[f for f in bm.faces if f.index in idx], context="FACES")
+        bm.to_mesh(o.data)
+        bm.free()
+    dst.to_mesh(deck.data)
+    dst.free()
+    deck.data.color_attributes.active_color_name = "Color"
+    if len(deck.data.materials) > MAX_TEXMAPS:
+        raise ConvertFailure(T(f"La pieza {deck.name} tendría {len(deck.data.materials)} texturas y el juego admite "
+                               f"{MAX_TEXMAPS}: junta texturas del modelo",
+                               f"Piece {deck.name} would have {len(deck.data.materials)} textures and the game takes "
+                               f"{MAX_TEXMAPS}: merge some of the model's textures"))
+    return moved
 
 
 def camera_dependent(obj):
@@ -84,51 +174,103 @@ def box_centre(o):
     return sum(pts, Vector()) / 8
 
 
-def face_copies(sources, bake_light=True):
+BACK_GAP = 0.003       # metres between a two-sided face and its back copy
+
+
+def face_copies(sources, bake_light=True, single=False):
     """Each face of `sources` (mesh objects in the game's frame) as the game will get it: yields
-    (image or None, flat ground face, corners, UVs, vertex colour). One copy per face, turned to the
-    field: two coplanar faces (a two-sided face drawn twice, or the front and back faces SketchUp
+    (image or None, flat ground face, corners, UVs, corner colours, fixed). One copy per face, turned to
+    the field: two coplanar faces (a two-sided face drawn twice, or the front and back faces SketchUp
     exporters write) fight in the game, and the one facing away can win (the stadium showed the green
-    backs of its stands). The material colour and a soft sun go into the vertex colour."""
+    backs of its stands). The material colour, the model's own vertex colours and a soft sun go into the
+    vertex colours. A model that brings its own vertex colours (game pieces, MVP Baseball parks) has its
+    light baked into them: they go as they are, with no sun on top (the sun twice made MVP parks dark).
+
+    Objects marked «Dos caras» (powerpros_two_sided) keep each face as it is and get a back copy BACK_GAP
+    behind it: the game hides the back of every stadium face, so this is how a model from a game that
+    draws both sides (MVP Baseball) keeps no holes. `fixed` faces are left where they are by
+    separate_layers: back copies, and objects with «Separar capas superpuestas» off."""
     info = {}
     for src in sources:
         me = src.data
         mw = src.matrix_world
         normal_mw = mw.to_3x3().inverted().transposed()
         uv = me.uv_layers.active
+        two_sided = bool(getattr(src, "powerpros_two_sided", False))
+        keep_layers = not getattr(src, "powerpros_separate_layers", True)
+        game_part = src.get("pp_part") is not None
+        vcol = me.color_attributes.active_color if me.color_attributes else None
+        if vcol is not None:      # the game's own values as they are (importer); sRGB like the material colour otherwise
+            vcols = [tuple(d.color if game_part else d.color_srgb) for d in vcol.data]
+            per_corner = vcol.domain == "CORNER"
+            if vcols and max(max(c[:3]) for c in vcols) < 0.02:
+                vcol = None       # all black: a layer the model does not use for light (MVP Valencia's dirt went black)
+        # Blender's own triangles: a face that is not flat is a different surface for each way of
+        # splitting it, and a concave n-gon split as a fan from its first corner grows triangles outside
+        # itself (OOTP walls stuck out over the outfield wall).
+        me.calc_loop_triangles()
+        tris = [[] for _ in me.polygons]
+        for lt in me.loop_triangles:
+            tris[lt.polygon_index].append(lt.loops)
         for p in me.polygons:
             mat = src.material_slots[p.material_index].material if p.material_index < len(src.material_slots) else None
             if mat not in info:
                 info[mat] = material_info(mat)
             img, colour = info[mat]
-            vs = [mw @ me.vertices[i].co for i in p.vertices]
+            loops = list(p.loop_indices)
+            vs = [mw @ me.vertices[me.loops[li].vertex_index].co for li in loops]
             c = sum(vs, Vector()) / len(vs)
             n = (normal_mw @ p.normal).normalized()
+            pieces = [[loops.index(li) for li in t] for t in tris[p.index]]
             flat = abs(n.z) > 0.95 and c.z < 1.0 and c.xy.length < 160
             uvs = [tuple(uv.data[li].uv) for li in p.loop_indices] if uv else [(0.0, 0.0)] * len(vs)
+            if vcol is not None:
+                own = [vcols[li if per_corner else me.loops[li].vertex_index] for li in p.loop_indices]
+            else:
+                own = [(1.0, 1.0, 1.0, 1.0)] * len(vs)
             double = mat is not None and not mat.use_backface_culling
             towards = (n.z > 0) if flat else (n.xy.dot(FIELD - c.xy) > 0)
-            sides = [not towards] if double else ([False] if towards or not flat else [])
+            # Blender shows both sides of a face unless its material culls the back: so does the export.
+            # (Guessing the one side that faces the field left holes: roofs seen from below, slopes.)
+            both = (two_sided or double) and not flat and not single
+            if both:
+                sides = [False, True]
+            else:
+                sides = [not towards] if double else ([False] if towards or not flat else [])
             for flip in sides:
                 normal = -n if flip else n
-                light = 0.55 + 0.45 * max(0.0, normal.dot(SUN)) if bake_light else 1.0
-                col = (*(min(1.0, v * light) for v in colour), 1.0)
-                order = list(range(len(vs)))[::-1] if flip else list(range(len(vs)))
-                yield img, flat, [vs[i] for i in order], [uvs[i] for i in order], col
+                # Both sides of a face get the light of its brighter side: one surface, one shade.
+                lit = max(0.0, abs(n.dot(SUN)) if both else normal.dot(SUN))
+                light = 0.55 + 0.45 * lit if bake_light and vcol is None else 1.0
+                for piece in pieces:
+                    order = piece[::-1] if flip else piece
+                    cols = [(*(min(1.0, colour[k] * own[i][k] * light) for k in range(3)), own[i][3]) for i in order]
+                    corners = [vs[i] for i in order]
+                    back = both and flip
+                    if back:
+                        corners = [v - n * BACK_GAP for v in corners]
+                    yield img, flat, corners, [uvs[i] for i in order], cols, keep_layers or back
 
 
-def _add_face(bm, corners, uvs, col, material_index):
+def _add_face(bm, corners, uvs, cols, material_index, fixed=False):
+    # (a new layer invalidates existing face references: make it before the face)
+    layer = (bm.faces.layers.int.get(FIXED) or bm.faces.layers.int.new(FIXED)) if fixed else None
     try:
         f = bm.faces.new([bm.verts.new(v) for v in corners])
     except ValueError:
         return
     f.material_index = material_index
-    for loop, uv in zip(f.loops, uvs):
+    for loop, uv, col in zip(f.loops, uvs, cols):
         loop[bm.loops.layers.uv["UVMap"]].uv = uv
         loop[bm.loops.layers.float_color["Color"]] = col
+    if layer is not None:
+        f[layer] = 1
 
 
-def prepare(sources, bake_light=True, separate=True):
+FIXED = "pp_fixed"     # face layer: separate_layers leaves these faces where they are
+
+
+def prepare(sources, bake_light=True, separate=True, single=False):
     """The faces of `sources` in one bmesh, ready for the game (face_copies), with twins dropped (a
     textured face wins over a plain one with the same corners) and, with `separate`, stacked layers
     pulled apart. Returns (bmesh, images): face.material_index indexes images (None: untextured)."""
@@ -136,10 +278,10 @@ def prepare(sources, bake_light=True, separate=True):
     bm.loops.layers.uv.new("UVMap")
     bm.loops.layers.float_color.new("Color")
     images = []
-    for img, _, corners, uvs, col in face_copies(sources, bake_light):
+    for img, _, corners, uvs, cols, fixed in face_copies(sources, bake_light, single):
         if img not in images:
             images.append(img)
-        _add_face(bm, corners, uvs, col, images.index(img))
+        _add_face(bm, corners, uvs, cols, images.index(img), fixed)
     drop_back_twins(bm, {i for i, img in enumerate(images) if img is not None})
     if separate:
         separate_layers(bm)
@@ -194,13 +336,13 @@ def convert(coll, sources, replace=True, bake_light=True):
             tex_mats[img.name] = m
         return tex_mats[img.name]
 
-    for img, flat, corners, uvs, col in face_copies(sources, bake_light):
+    for img, flat, corners, uvs, cols, fixed in face_copies(sources, bake_light):
         gm = game_material(img)
         name = piece_for(gm, flat)
         bm = bucket(name)
         if gm not in slots[name]:
             slots[name].append(gm)
-        _add_face(bm, corners, uvs, col, slots[name].index(gm))
+        _add_face(bm, corners, uvs, cols, slots[name].index(gm), fixed)
     if not buckets:
         raise ConvertFailure(T("Los objetos elegidos no tienen caras", "The selected objects have no faces"))
 
@@ -239,6 +381,10 @@ def convert(coll, sources, replace=True, bake_light=True):
             old.free()
         bm.free()
         result[name] = len(obj.data.polygons)
+    if split_upper_decks(coll):
+        for o in coll.all_objects:
+            if o.get("pp_kind") == "model" and o.type == "MESH" and (o.name in result or flags(o) & UPPER_DECK):
+                result[o.name] = len(o.data.polygons)
     for src in sources:
         bpy.data.objects.remove(src)
     return result
@@ -277,6 +423,7 @@ def separate_layers(bm, gap=0.25, reach=0.25):
     (z-fighting; Blender can). Move the front face out to `gap` from the one behind it."""
     import collections
     planes = collections.defaultdict(list)
+    fixed = bm.faces.layers.int.get(FIXED)
     for f in bm.faces:
         if f.calc_area() < 1e-4:
             continue
@@ -297,7 +444,7 @@ def separate_layers(bm, gap=0.25, reach=0.25):
                         for k in range(3)):
                     continue
                 push = gap - (d1 - d0)
-                if push > 0:
+                if push > 0 and not (fixed is not None and f1[fixed]):
                     for v in f1.verts:
                         v.co += n1 * push
                     moved += 1

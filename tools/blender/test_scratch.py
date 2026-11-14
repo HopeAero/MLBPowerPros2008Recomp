@@ -184,8 +184,8 @@ for k in range(300):
     mesh_object(big, f"cubo{k}", *box(-100 + (k % 30) * 7, 140 + (k // 30) * 7, 0, 5, 5, 5),
                 material(f"m{k}", (1, 1, 1), imgs[k % 40]), "stand")
 st3, _, w3 = scratch.build_stadium(big, game_bases=False)
-check(len(st3.placements) < 127 and all(len(m.texmaps) <= 30 for m in st3.models),
-      f"300 boxes with 40 textures: {len(st3.placements)} pieces of at most 30 texmaps")
+check(len(st3.placements) < 127 and all(len(m.textures) <= 64 for m in st3.models),
+      f"300 boxes with 40 textures: {len(st3.placements)} pieces of at most 64 textures")
 
 # ---- Final review fixes ----------------------------------------------------------------------------
 curved = scratch_collection("Valla curva")
@@ -252,6 +252,32 @@ heights = [round(sum(me.positions[c[1]][1] for c in cs[i:i + 3]) / 3, 3)
            for me in g.meshes for op, cs in me.draws for i in range(0, len(cs), 3)]
 check(len(set(heights)) == 2 and heights == sorted(heights),
       f"ground layers drawn from the bottom up (the ground layer has no depth test): {heights}")
+
+deck = scratch_collection("Grada alta")
+mesh_object(deck, "campo7", [(-60, -20, 0), (60, -20, 0), (60, 130, 0), (-60, 130, 0)], [(0, 1, 2, 3)], grass)
+mesh_object(deck, "valla7", fence_v, [(k, (k + 1) % n, n + (k + 1) % n, n + k) for k in range(n)], grey, "fence")
+mesh_object(deck, "grada7", [(-10, -20, 0), (10, -20, 0), (10, -25, 5), (-10, -25, 5),          # low, behind home
+                             (-10, -30, 15), (10, -30, 15), (10, -35, 25), (-10, -35, 25),      # high, behind home
+                             (-10, 120, 15), (10, 120, 15), (10, 125, 25), (-10, 125, 25)],     # high, centre field
+            [(0, 1, 2, 3), (4, 5, 6, 7), (8, 9, 10, 11)], grey, "stand")
+mesh_object(deck, "aparcamiento7", [(-80, -60, -35), (80, -60, -35), (80, 150, -35), (-80, 150, -35)], [(0, 1, 2, 3)],
+            grey, "stand")                                           # a lot 35 m under the field, facing up
+st_d, _, _ = scratch.build_stadium(deck, game_bases=False)
+ground_y = {round(pos[1]) for m in st_d.models if m.name.startswith("DP_ground_") for me in m.meshes for pos in me.positions}
+stand_y = {round(pos[1]) for m in st_d.models if m.name.startswith("DP_stand_") for me in m.meshes for pos in me.positions}
+check(-350 in ground_y and min(stand_y) > -50,
+      f"a stand floor under the field goes to the ground layer, drawn before the field: ground {sorted(ground_y)[:3]}")
+g = next(m for m in st_d.models if m.name.startswith("DP_ground_"))
+heights = [min(me.positions[c[1]][1] for op, cs in me.draws for c in cs) for me in g.meshes]
+check(heights and heights[0] == min(heights), f"the sunken floor is the first ground layer drawn: {heights}")
+stands = [(st_d.models[p.model], p.flags) for p in st_d.placements if st_d.models[p.model].name.startswith("DP_stand_")]
+up = [m for m, f in stands if f & scratch.UPPER_DECK]
+low = [m for m, f in stands if not f & scratch.UPPER_DECK]
+ys = sorted({round(pos[1]) for m in up for me in m.meshes for pos in me.positions})
+check(len(up) == 1 and ys == [150, 250] and all(pos[2] > 0 for me in up[0].meshes for pos in me.positions),
+      f"the high stand behind home is a 2F piece (0x40000000) the play camera hides: heights {ys}")
+check(low and all(pos[1] < 80 or pos[2] < -600 for m in low for me in m.meshes for pos in me.positions),
+      "the low stand behind home and the high one in centre field keep the plain stand piece")
 
 # ---- Task 3: operators, export, View in game ----------------------------------------------------
 exporter = importlib.import_module(pkg + ".exporter")

@@ -73,7 +73,8 @@ def parse_tree(d, nodes_off, lists_off):
     for o in range(nodes_off, lists_off - NODE_SIZE + 1, NODE_SIZE):
         plane = struct.unpack_from(">4f", d, o)
         hc, lc, hs, ls = struct.unpack_from(">4H", d, o + 0x10)
-        hk, lk = struct.unpack_from(">BB", d, o + 0x18)
+        hk, lk, hh, lh = struct.unpack_from(">4B", d, o + 0x18)     # +0x1A/+0x1B: high bytes of the starts
+        hs, ls = hs | hh << 16, ls | lh << 16
         out.append((plane, (hc, hs, hk), (lc, ls, lk)))
     return out
 

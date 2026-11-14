@@ -69,14 +69,21 @@ check(list((game / "mods").iterdir()) == [], "the game's mods folder is untouche
 next(o for o in coll.all_objects if o.name == "DP_score").location.z += 20.0     # moved from a script
 check(preview.launch(coll, pose, dry_run=True)["stats"]["moved"] == 1, "a piece moved just before is exported")
 
-# 3. No game executable: the error names the folder.
+# 3. No game executable (and none remembered in the preferences): launch asks for the game folder, which the
+# button turns into a folder chooser; picking the folder (or the exe) remembers it.
 (game / "WiiCompiled.exe").unlink()
+prefs = bpy.context.preferences.addons[pkg].preferences
+prefs.game_folder = ""
 try:
     preview.launch(coll, pose, dry_run=True)
-    check(False, "missing WiiCompiled.exe is reported")
-except exporter.ExportFailure as e:
-    check(str(game) in str(e), f"missing WiiCompiled.exe is reported: {e}")
+    check(False, "missing WiiCompiled.exe asks for the game folder")
+except preview.GameFolderMissing as e:
+    check("WiiCompiled.exe" in str(e), f"missing WiiCompiled.exe asks for the game folder: {e}")
 (game / "WiiCompiled.exe").write_bytes(b"")
+check(preview.game_folder_of(str(game / "WiiCompiled.exe")) == game, "picking the exe finds its folder")
+del coll["pp_game_folder"]
+preview.remember_game_folder(coll, game)
+check(prefs.game_folder == str(game) and preview.game_folder(coll) == game, "the picked folder is remembered")
 
 # The button: with no 3D view it uses the view from behind the plate; an empty WiiCompiled.exe cannot start,
 # which it reports instead of failing.
@@ -87,12 +94,12 @@ except RuntimeError as e:
     reported = "193" in str(e)
 check(reported, "button reports a game that cannot start")
 
-# 4. A piece the game cannot take (31 textures): the exporter's error, nothing launched.
+# 4. A piece the game cannot take (65 textures): the exporter's error, nothing launched.
 ground = next(o for o in coll.all_objects if o.name == "DP_ground")
 me = ground.data
-for k in range(31):
+for k in range(65):
     img = bpy.data.images.new(f"extra{k}", 8, 8)
-    img.pixels.foreach_set([k / 31.0, 0.5, 0.2, 1.0] * 64)
+    img.pixels.foreach_set([k / 65.0, 0.5, 0.2, 1.0] * 64)
     mat = bpy.data.materials.new(f"extra{k}")
     mat.use_nodes = True
     node = mat.node_tree.nodes.new("ShaderNodeTexImage")
@@ -101,9 +108,9 @@ for k in range(31):
     me.polygons[k].material_index = len(me.materials) - 1
 try:
     preview.launch(coll, pose, dry_run=True)
-    check(False, "a piece with 31 textures stops the preview")
+    check(False, "a piece with 65 textures stops the preview")
 except exporter.ExportFailure as e:
-    check("30" in str(e), f"a piece with 31 textures stops the preview: {e}")
+    check("64" in str(e), f"a piece with 65 textures stops the preview: {e}")
 
 print("RESULT: " + ("FAIL" if failures else "PASS"))
 sys.exit(1 if failures else 0)

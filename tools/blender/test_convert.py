@@ -72,8 +72,8 @@ def test_prepare_and_image_texture():
         objs.append(o)
     bm, images = convert.prepare(objs)
     faces = list(bm.faces)
-    check(len(faces) == 1 and images[faces[0].material_index] is img,
-          f"prepare: twins over two objects keep the textured face ({len(bm.faces)} faces, images {images})")
+    check(len(faces) == 4 and all(images[f.material_index] is img for f in faces),     # a quad = Blender's 2 triangles
+          f"prepare: twins over two objects keep the textured face, front and back ({len(bm.faces)} faces, images {images})")
     check("Color" in bm.loops.layers.float_color and "UVMap" in bm.loops.layers.uv, "prepare: colour and UV layers")
     bm.free()
     tex, hd_name, hd_rgba = exporter.image_texture(img, True)
@@ -85,6 +85,77 @@ def test_prepare_and_image_texture():
 
 
 test_prepare_and_image_texture()
+
+
+def test_two_sided_and_kept_layers():
+    """«Dos caras»: a raised face facing away from the field is kept as it is plus a back copy 3 mm behind it;
+    both stay put in separate_layers. Off, the same face keeps one copy. «Separar capas» off: a face 5 mm in
+    front of a parallel one is not pushed out."""
+    mat = bpy.data.materials.new("two_mat")
+    mat.use_nodes = True
+    away = [(-5.0, 80.0, 6.0), (-5.0, 80.0, 9.0), (5.0, 80.0, 9.0), (5.0, 80.0, 6.0)]   # faces +Y, away from home
+    me = bpy.data.meshes.new("two")
+    me.from_pydata(away, [], [(0, 1, 2, 3)])
+    me.materials.append(mat)
+    o = bpy.data.objects.new("two", me)
+    bpy.context.scene.collection.objects.link(o)
+    o.powerpros_two_sided = True
+    bm, _ = convert.prepare([o])
+    bm.normal_update()
+    ys = sorted((round(f.calc_center_median().y, 4), round(f.normal.y, 3)) for f in bm.faces)
+    check(sorted(set(ys)) == [(79.997, -1.0), (80.0, 1.0)] and len(ys) == 4, f"two-sided: the face as it is plus a back copy 3 mm behind ({ys})")
+    bm.free()
+    o.powerpros_two_sided = False
+    bm, _ = convert.prepare([o])
+    check(len(bm.faces) == 4, f"a material that shows both sides in Blender: both exported ({len(bm.faces)} triangles)")
+    bm.free()
+    for m in me.materials:
+        m.use_backface_culling = True
+    bm, _ = convert.prepare([o])
+    check(len(bm.faces) == 2, f"one-sided (Backface Culling on): one copy ({len(bm.faces)} triangles)")
+    bm.free()
+    wall = [(-5.0, 80.0, 0.0), (5.0, 80.0, 0.0), (5.0, 80.0, 5.0), (-5.0, 80.0, 5.0)]       # faces -Y, towards home
+    sign = [(x, y - 0.005, z) for x, y, z in [(-1.0, 80.0, 1.0), (1.0, 80.0, 1.0), (1.0, 80.0, 2.0), (-1.0, 80.0, 2.0)]]
+    me2 = bpy.data.meshes.new("layers")
+    me2.from_pydata(wall + sign, [], [(0, 1, 2, 3), (4, 5, 6, 7)])
+    me2.materials.append(mat)
+    o2 = bpy.data.objects.new("layers", me2)
+    bpy.context.scene.collection.objects.link(o2)
+    for keep, expect in ((True, 79.75), (False, 79.995)):
+        o2.powerpros_separate_layers = keep
+        bm, _ = convert.prepare([o2])
+        front = min(round(f.calc_center_median().y, 3) for f in bm.faces)
+        check(abs(front - expect) < 1e-3, f"separate layers {'on' if keep else 'off'}: sign at y={front} (expected {expect})")
+        bm.free()
+    for obj in (o, o2):
+        bpy.data.objects.remove(obj)
+
+
+test_two_sided_and_kept_layers()
+
+
+def test_vertex_colours():
+    """A model's own vertex colours are its baked light (MVP Baseball parks); a layer all black is one
+    it does not use for light (MVP Valencia's dirt came out black) and is left out."""
+    mat = bpy.data.materials.new("vc_mat")
+    mat.use_nodes = True
+    me = bpy.data.meshes.new("vc")
+    me.from_pydata([(-5.0, 20.0, 0.0), (5.0, 20.0, 0.0), (5.0, 30.0, 0.0), (-5.0, 30.0, 0.0)], [], [(0, 1, 2, 3)])
+    me.materials.append(mat)
+    o = bpy.data.objects.new("vc", me)
+    bpy.context.scene.collection.objects.link(o)
+    layer = me.color_attributes.new("Color", "FLOAT_COLOR", "POINT")
+    seen = {}
+    for name, value in (("black", 0.0), ("half", 0.5)):
+        for d in layer.data:
+            d.color_srgb = (value, value, value, 1.0)
+        seen[name] = max(max(c[:3]) for *_, cols, _ in convert.face_copies([o]) for c in cols)
+    check(seen["black"] > 0.5 and 0.4 < seen["half"] < 0.5,          # 0.5 times the material colour, no sun
+          f"vertex colours: all black left out, real ones kept as they are ({seen})")
+    bpy.data.objects.remove(o)
+
+
+test_vertex_colours()
 
 
 # A texture drawn over a plain face (SketchUp exports both): the textured one stays, facing the field.
@@ -137,7 +208,14 @@ check(bpy.ops.object.powerpros_convert(replace=True, bake_light=True) == {"FINIS
 kept = [o.name for o in stadium.all_objects if o.get("pp_kind") == "model" and "BCL" in o.name]
 pieces = [o for o in stadium.all_objects if o.get("pp_kind") == "model" and "BCL" not in o.name]
 check(not any(n in bpy.data.objects for n in ("campo", "tierra", "valla", "gradas")), "source objects removed")
-check(len(pieces) == 2, f"the model is two pieces, field and the rest: {[o.name for o in pieces]}")
+deck = [o for o in pieces if convert.flags(o) & convert.UPPER_DECK]
+check(len(pieces) == 3 and len(deck) == 1,
+      f"the model is three pieces, field, the rest and the high stands around home (2F): {[o.name for o in pieces]}")
+centres = [deck[0].matrix_world @ p.center for p in deck[0].data.polygons] if deck else []
+check(centres and all(convert.is_upper_deck(c) for c in centres),
+      f"the 2F piece (hidden in the foul and pop-up camera) only has faces high up around home: {len(centres)}")
+rest = [o.matrix_world @ p.center for o in pieces if o not in deck for p in o.data.polygons]
+check(not any(convert.is_upper_deck(c) for c in rest), "no high faces around home left in the plain pieces")
 check(len(kept) == 3, f"the game's bases, plate and mound stay: {kept}")
 ground = next((o for o in pieces if all(abs(v.co.z) < 0.1 for v in o.data.vertices)), None)
 check(ground is not None, "the field went to its own (ground) piece")
@@ -187,6 +265,7 @@ for tree, lists, count in (("planes_a", "lists_a", len(table.placements)), ("pla
     leaves = [s[2] for _, h, l in nodes for s in (h, l) if s[0] == 0]
     check(reached == set(range(count)) and max(leaves) <= 127, f"{tree}: reaches all {count}, leaves <= 127 ({max(leaves)})")
 models = [pj7m.parse_model(gfx, off) for off in pj7m.find_models(gfx)]
-check(sum(1 for m in models if m.meshes and "BCL" not in m.name) == len(pieces), f"{len(pieces)} pieces with geometry in the pack (plus the kept BCL ones)")
+with_geometry = [m.name for m in models if m.meshes and "BCL" not in m.name]
+check(len(with_geometry) == len(pieces), f"{len(pieces)} pieces with geometry in the pack (plus the kept BCL ones): {with_geometry}")
 print("RESULT:", "FAIL" if failures else "PASS")
 sys.exit(1 if failures else 0)

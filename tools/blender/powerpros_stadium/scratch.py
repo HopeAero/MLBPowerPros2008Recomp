@@ -14,9 +14,10 @@ import struct
 from contextlib import contextmanager
 from pathlib import Path
 
+import bmesh
 import bpy
 import numpy as np
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 from . import collision_gen, convert, exporter, pj7m_write, stadium_read, surfaces
 from .i18n import T
@@ -42,6 +43,8 @@ CROWD_SLOTS = {"crowd_upright": 4, "crowd_lying": 6}   # preload slot whose text
 CROWD_SIZE = (128, 64)                  # what every game crowd texmap declares (over 8 x 8 textures in two stadiums)
 DRAW_ORDER = ["ground", "fence", "stand", "crowd_lying", "crowd_upright", "flags", "transparent", "additive"]
 HIDE_ABOVE = 0x80000000                 # NOUPCAM: hidden from the batter's view and high cameras
+UPPER_DECK = convert.UPPER_DECK         # «2F»: hidden in the play camera (convert.is_upper_deck)
+UPPER_ROLES = ("stand", "crowd_lying", "crowd_upright", "transparent", "additive")
 MAX_TEXMAPS = exporter.MAX_TEXMAPS
 MAX_PIECES = 127                        # one-leaf tree A, which keeps the draw order
 # Undecoded fields at their most common value in the game's stadiums (as tools/stadium_minimal.py).
@@ -72,11 +75,29 @@ def register_properties():
         description=T("No se ve desde la vista del bateador ni desde las cámaras altas, como los edificios de fuera "
                       "del juego (bit NOUPCAM)", "Not seen from the batter's view or from high cameras, like the "
                       "game's outside buildings (NOUPCAM bit)"))
+    bpy.types.Object.powerpros_two_sided = bpy.props.BoolProperty(
+        name=T("Dos caras", "Two-sided"), default=False,
+        description=T("Se ve por los dos lados aunque su material oculte la cara trasera en Blender («Backface "
+                      "Culling»): cada cara se exporta con una copia trasera 3 mm detrás. Los materiales sin esa "
+                      "opción ya se exportan por los dos lados, como se ven en Blender",
+                      "Seen from both sides even when its material hides the back in Blender (Backface Culling): "
+                      "each face is exported plus a back copy 3 mm behind. Materials without that option are "
+                      "already exported on both sides, as Blender shows them"))
+    bpy.types.Object.powerpros_separate_layers = bpy.props.BoolProperty(
+        name=T("Separar capas superpuestas", "Separate stacked layers"), default=False,
+        description=T("Aparta hasta 25 cm las caras pegadas delante de otra paralela (ventanas, carteles). Actívalo "
+                      "solo si esas caras parpadean en el juego: en gradas escalonadas mueve filas enteras y abre "
+                      "rendijas, y el modelo deja de verse como en Blender",
+                      "Moves faces lying just in front of a parallel one (windows, signs) up to 25 cm out. Turn it on "
+                      "only if those faces flicker in the game: on stepped stands it moves whole rows and opens "
+                      "gaps, and the model no longer looks as it does in Blender"))
 
 
 def unregister_properties():
     del bpy.types.Object.powerpros_role
     del bpy.types.Object.powerpros_hide_above
+    del bpy.types.Object.powerpros_two_sided
+    del bpy.types.Object.powerpros_separate_layers
 
 
 def is_scratch(coll):
@@ -116,6 +137,11 @@ def evaluated(objects):
                 continue
             tmp = bpy.data.objects.new("pp_tmp_" + o.name, me)
             tmp.matrix_world = o.matrix_world.copy()
+            for prop in ("powerpros_two_sided", "powerpros_separate_layers"):    # read by convert.face_copies
+                if hasattr(o, prop):
+                    setattr(tmp, prop, getattr(o, prop))
+            if "pp_part" in o:                       # a piece taken from the game: its vertex colours as they are
+                tmp["pp_part"] = o["pp_part"]
             out.append(tmp)
         yield out
     finally:
@@ -149,41 +175,140 @@ def add_game_base_objects(coll):
     coll["pp_game_bases"] = 1                    # from now on, only the ones left are exported
 
 
-def _layer_heights(bm):
-    """Area-weighted mean height of the faces of each material."""
+GAME_GROUND = 0x04000000      # placement flag of the ground pieces (turf, dirt, stains, lines; game_parts.GROUND)
+
+
+def add_game_ground_objects(coll, code):
+    """A game stadium's ground (every ground piece but the bases, plate and mound) as locked reference
+    objects (pp_kind game_ground): build_stadium copies those pieces as they are, models, textures and
+    draw flags, so the field looks exactly as in that stadium. Replaces the ones there were."""
+    from . import importer, pj7m, stadium_tbl
+    remove_game_ground(coll)
+    archive = projectbin.Archive(coll["pp_project_bin"])
+    gfx, tbl = archive.read(f"stadium_{code}.pack"), archive.read(f"stadium_{code}tbl.pack")
+    if gfx is None or tbl is None:
+        raise ScratchFailure(T(f"project.bin no tiene el estadio «{code}»", f"project.bin has no stadium '{code}'"))
+    images, materials, made = {}, {}, []
+    for pl in stadium_tbl.parse_table(tbl).placements:
+        model = pj7m.parse_model(gfx, pl.model)
+        if not pl.flags & GAME_GROUND or "BCL" in model.name:
+            continue
+        obj = bpy.data.objects.new(f"{code} · {model.name}", importer.build_mesh(gfx, model, images, materials))
+        obj.matrix_world = importer.placement_matrix(pl)
+        obj["pp_kind"] = "game_ground"
+        obj["pp_model"] = model.name
+        obj.lock_location = obj.lock_rotation = obj.lock_scale = (True, True, True)
+        obj.hide_select = True
+        coll.objects.link(obj)
+        made.append(obj)
+    coll["pp_game_ground"] = code
+    return made
+
+
+def remove_game_ground(coll):
+    for obj in [o for o in coll.all_objects if o.get("pp_kind") == "game_ground"]:
+        data = obj.data
+        bpy.data.objects.remove(obj)
+        if data is not None and data.users == 0:
+            bpy.data.meshes.remove(data)
+    if "pp_game_ground" in coll:
+        del coll["pp_game_ground"]
+
+
+def _add_game_ground(st, coll, project_bin):
+    """The pieces of add_game_ground_objects still in the collection, copied from their stadium as they are."""
+    code = coll.get("pp_game_ground")
+    keep = {o.get("pp_model") for o in coll.all_objects if o.get("pp_kind") == "game_ground"}
+    if not code or not keep:
+        return set()
+    src, maps = _data_stadium(project_bin, code), ({}, {})
+    names = set()
+    for p in src.placements:
+        m = src.models[p.model]
+        if not p.flags & GAME_GROUND or "BCL" in m.name or m.name not in keep:
+            continue
+        m.textures = [(*_copy_texture(st, src, t, pal, maps), level) for t, pal, level in m.textures]
+        st.models.append(m)
+        p.model = len(st.models) - 1
+        st.placements.append(p)
+        names.add(m.name)
+    return names
+
+
+LAYER_STEP = 0.03      # ground layers closer in height than this are ordered by area
+
+
+def _layer_order(bm):
+    """Draw order key of each material of the ground: (height group, -area). Layers clearly apart go from
+    the bottom up; layers within LAYER_STEP of the one below them (an OOTP field modelled millimetres
+    apart on a slight slope, a satellite map at the field's height) are one group, where the big surfaces
+    (map, grass, dirt) go first and the small ones (lines, bases) on top of them."""
     acc = {}
     for f in bm.faces:
         a, z = f.calc_area(), f.calc_center_median().z
         s = acc.setdefault(f.material_index, [0.0, 0.0])
         s[0], s[1] = s[0] + a * z, s[1] + a
-    return {i: s[0] / s[1] if s[1] else 0.0 for i, s in acc.items()}
+    heights = sorted((s[0] / s[1] if s[1] else 0.0, i, s[1]) for i, s in acc.items())
+    order, group, last = {}, 0, None
+    for z, i, area in heights:
+        if last is not None and z - last > LAYER_STEP:
+            group += 1
+        last = z
+        order[i] = (group, -area)
+    return order
 
 
 def solid_objects(coll):
     """The objects of a from-scratch collection that the collision and the menu photo take."""
-    return [o for o in coll.all_objects if o.type in GEOMETRY and o.get("pp_kind") != "collision"
+    return [o for o in coll.all_objects if o.type in GEOMETRY and o.get("pp_kind") not in ("collision", "reference")
             and role_of(o) not in NOT_SOLID]
 
 
-def _meshes(bm, indices):
+def _upper_deck(f):
+    return convert.is_upper_deck(f.calc_center_median())
+
+
+def _below_upper_deck(f):
+    return not _upper_deck(f)
+
+
+SUNKEN_DEPTH = 0.5      # metres under the field
+
+
+def _sunken(f):
+    """A floor of the stands under the field level (a lot 35 m down in OOTP's Chukchansi Park, sunken
+    dugouts). The game draws the ground layer without depth test or writes, so such a floor drawn with
+    the stands covers the field wherever it falls on screen; in the ground layer, drawn from the bottom
+    up, the field goes over it."""
+    return f.normal.z > 0.9 and f.calc_center_median().z < -SUNKEN_DEPTH
+
+
+def _keep_faces(bm, keep):
+    bm.normal_update()
+    bmesh.ops.delete(bm, geom=[f for f in bm.faces if not keep(f)], context="FACES")
+
+
+def _meshes(bm, indices, keep=None):
     """Mesh descriptions (split by the exporter's limits) for the faces of `bm` with a material in
-    `indices` (position in `indices` = the piece's material)."""
+    `indices` (position in `indices` = the piece's material) and, with `keep`, for which keep(face) holds."""
     uv_layer, col_layer = bm.loops.layers.uv["UVMap"], bm.loops.layers.float_color["Color"]
     groups = {}
     for f in bm.faces:
-        if f.material_index not in indices:
+        if f.material_index not in indices or (keep is not None and not keep(f)):
             continue
         g = groups.setdefault(indices.index(f.material_index), {"pos": {}, "nrm": {}, "clr": {}, "uv": {}, "corners": []})
         loops = list(f.loops)
         uvs = [l[uv_layer].uv for l in loops]
-        du, dv = math.floor(min(u.x for u in uvs)), math.floor(min(u.y for u in uvs))   # whole repeats off
+        # Whole repeats off, so both coordinates start at 0: the game repeats a texture up to the texmap's
+        # count and stretches its edge outside that (a negative v smeared the crowd over OOTP stands).
+        du, dv = math.floor(min(u.x for u in uvs)), math.ceil(max(u.y for u in uvs) - 1e-6)
         n = f32(*exporter.to_game_dir(f.normal))
         for k in range(1, len(loops) - 1):
             for l, uv in ((loops[0], uvs[0]), (loops[k + 1], uvs[k + 1]), (loops[k], uvs[k])):   # GX clockwise
                 p = g["pos"].setdefault(f32(*exporter.to_game(l.vert.co)), len(g["pos"]))
                 nn = g["nrm"].setdefault(n, len(g["nrm"]))
                 c = g["clr"].setdefault(tuple(int(x * 255 + 0.5) for x in l[col_layer]), len(g["clr"]))
-                t = g["uv"].setdefault(f32(uv.x - du, 1.0 - (uv.y - dv)), len(g["uv"]))
+                t = g["uv"].setdefault(f32(uv.x - du, dv - uv.y), len(g["uv"]))
                 g["corners"].append((p, nn, c, t))
     out = []
     for mi, g in sorted(groups.items()):
@@ -209,7 +334,8 @@ def _placement(model_index, meshes, flags):
 def _texture(st, img, image_index, hd_images):
     """Index into st.textures of a Blender image, added once."""
     if img.name not in image_index:
-        tex, hd_name, hd_rgba = exporter.image_texture(img, True)
+        game = "pp_texture_offset" in img        # a game texture (game_parts) is already at the game's size
+        tex, hd_name, hd_rgba = exporter.image_texture(img, not game)
         image_index[img.name] = len(st.textures)
         st.textures.append(tex)
         if hd_name:
@@ -223,7 +349,8 @@ def _flag_pieces(st, objects, hide, bake_light, image_index, hd_images):
     flags = ROLES["flags"][0] | (HIDE_ABOVE if hide else 0)
     for obj in objects:
         with evaluated([obj]) as temps:
-            bm, images = convert.prepare(temps, bake_light) if temps else (None, [])
+            # (single: a flag is the game's one cloth plane, never a face and its back copy)
+            bm, images = convert.prepare(temps, bake_light, single=True) if temps else (None, [])
         pts = [exporter.to_game(v.co) for v in bm.verts] if bm else []
         colour = (255, 255, 255, 255)
         if bm is not None and bm.faces:
@@ -305,18 +432,54 @@ def _collision(coll):
     return surfaces.gather(objects, exporter.to_game)
 
 
+def bench_spots(coll, base):
+    """unk_24 of the stadium: the data stadium's dugout spots (people on the benches; each stadium of the
+    game brings its own, docs/ingenieria-inversa.md), moved with their spacing and facing onto this
+    stadium's dugouts: the reference ones (field_gen.toggle_players) where the player left them, floor
+    height included, else where field_gen puts them, at ground level. List 0 is first base's."""
+    from . import field_gen                   # imports bpy objects of its own; only needed here
+    moved = {int(o["pp_bench"]): o for o in coll.all_objects if "pp_bench" in o}
+    params = field_gen.FieldParams.from_json(coll.get("pp_field", ""))
+    defaults = dict(zip((1, -1), field_gen.benches(params)))
+    out = []
+    for k, side in enumerate((1, -1)):
+        spots = base.unk_24[k] if k < len(base.unk_24) else []
+        if not spots:
+            out.append([])
+            continue
+        if side in moved:
+            m = moved[side].matrix_world
+            centre, along, floor = m.translation.xy, (m.to_3x3() @ Vector((1.0, 0.0, 0.0))).xy, m.translation.z
+        else:
+            _, centre, along = defaults[side]
+            floor = 0.0
+        along = along.normalized()
+        if along.dot(centre) < 0:               # the base's spots run from home outwards
+            along = -along
+        pts = [Vector((s[0] / 10, -s[2] / 10)) for s in spots]      # game decimetres to Blender metres
+        c0 = sum(pts, Vector((0.0, 0.0))) / len(pts)
+        a0 = pts[-1] - pts[0]
+        turn = math.atan2(along.y, along.x) - (math.atan2(a0.y, a0.x) if a0.length > 1e-6 else math.atan2(c0.y, c0.x))
+        rot = Matrix.Rotation(turn, 2)
+        out.append([f32(q.x * 10, floor * 10, -q.y * 10, *s[3:6], s[6] + turn)
+                    for s, q in ((s, Vector(centre) + rot @ (p - c0)) for s, p in zip(spots, pts))])
+    return out
+
+
 def build_stadium(coll, game_bases=True, bake_light=True):
     """(Stadium, HD images {file name: image}, warnings) for a from-scratch collection."""
     project_bin = coll.get("pp_project_bin")
     if not project_bin or not Path(project_bin).is_file():
         raise ScratchFailure(T("Esta colección no tiene el project.bin del juego: créala con «Nuevo estadio desde cero»",
                                "This collection has no game project.bin: create it with «New stadium from scratch»"))
-    objects = [o for o in coll.all_objects if o.type in GEOMETRY and o.get("pp_kind") not in ("collision", "game_base")]
+    objects = [o for o in coll.all_objects if o.type in GEOMETRY
+               and o.get("pp_kind") not in ("collision", "game_base", "game_ground", "reference")]
     groups = {}
     for o in objects:
         groups.setdefault((role_of(o), bool(getattr(o, "powerpros_hide_above", False))), []).append(o)
     st = Stadium(unk_20=[], unk_24=[[], []])
     base, maps = _data_stadium(project_bin, coll.get("pp_stadium", "col")), ({}, {})
+    st.unk_24 = bench_spots(coll, base)
     hd_images, warnings, image_index = {}, [], {}
     keys = sorted(groups, key=lambda k: (DRAW_ORDER.index(k[0]), k[1]))
     for key in keys:
@@ -328,16 +491,29 @@ def build_stadium(coll, game_bases=True, bake_light=True):
             if not temps:
                 continue
             bm, images = convert.prepare(temps, bake_light, separate=role != "ground")
+        if role == "ground":                    # stand floors below the field join the ground layer
+            stands = [o for k in groups if k[0] == "stand" for o in groups[k]]
+            with evaluated(stands) as temps:
+                if temps:
+                    sunk, sunk_images = convert.prepare(temps, bake_light, separate=False)
+                    _keep_faces(sunk, _sunken)
+                    convert._append(bm, sunk, len(images))
+                    images += sunk_images
+                    sunk.free()
+        elif role == "stand" and any(k[0] == "ground" for k in groups):
+            _keep_faces(bm, lambda f: not _sunken(f))
         textured = [i for i, img in enumerate(images) if img is not None]
         plain = [i for i, img in enumerate(images) if img is None]
         order = None
         if role == "ground":
             # The ground layer is drawn without depth test: its layers (base grass, infield dirt over
             # it) must go from the bottom up, in material and in face order.
-            heights = _layer_heights(bm)
-            order = lambda i: heights.get(i, 0.0)
+            layers = _layer_order(bm)
+            order = lambda i: layers.get(i, (0, 0.0))
             textured.sort(key=order)
-            bm.faces.sort(key=lambda f: f.calc_center_median().z)
+            rank = {i: k for k, i in enumerate(sorted(layers, key=layers.get))}     # bmesh sorts by numbers only
+            # then bottom-up within a material (one material can make two layers)
+            bm.faces.sort(key=lambda f: rank.get(f.material_index, 0) * 1e6 + f.calc_center_median().z)
         chunks = [textured[i:i + MAX_TEXMAPS] for i in range(0, len(textured), MAX_TEXMAPS)] or [[]]
         chunks[0] = chunks[0] + plain
         if order is not None:
@@ -346,8 +522,9 @@ def build_stadium(coll, game_bases=True, bake_light=True):
         crowd = base.preload[slot] if slot is not None and slot < len(base.preload) else None
         if crowd is not None and crowd.texture is None:
             crowd = None
-        for n, chunk in enumerate(chunks):
-            meshes = _meshes(bm, chunk)
+        parts = ((False, _below_upper_deck), (True, _upper_deck)) if role in UPPER_ROLES else ((False, None),)
+        for (n, chunk), (upper, keep) in ((c, p) for c in enumerate(chunks) for p in parts):
+            meshes = _meshes(bm, chunk, keep)
             if not meshes:
                 continue
             textures, texmaps, materials = [], [], []
@@ -369,19 +546,22 @@ def build_stadium(coll, game_bases=True, bake_light=True):
                 size = CROWD_SIZE if crowd is not None and (tex.width, tex.height) != CROWD_SIZE else (0, 0)
                 texmaps.append(TexMap(textures.index(entry), *reach, *size))
                 materials.append(Material(KIND, COLORS, [len(texmaps) - 1], UNK_32))
-            name = f"DP_{role}_{n}" + ("_up" if hide else "")
+            name = f"DP_{role}_{n}" + ("_up" if hide else "") + ("_2F" if upper else "")
             st.models.append(Model(name, "_Wmodel_" + name, "p" + name[3:], textures, texmaps, materials, meshes))
-            flags = ROLES[role][0] | (HIDE_ABOVE if hide else 0)
+            flags = ROLES[role][0] | (HIDE_ABOVE if hide else 0) | (UPPER_DECK if upper else 0)
             st.placements.append(_placement(len(st.models) - 1, meshes, flags))
         bm.free()
     if not st.models:
         raise ScratchFailure(T("La colección no tiene objetos con caras", "The collection has no objects with faces"))
+    copied = _add_game_ground(st, coll, project_bin)
     if game_bases:
         keep = {o.get("pp_model") for o in coll.all_objects if o.get("pp_kind") == "game_base"}             if coll.get("pp_game_bases") else None        # older collections: all of them
         _add_game_bases(st, base, maps, keep)
-        # Tree A keeps the placement order as the draw order: the bases' marks right after the ground.
-        rank = lambda p: 0 if st.models[p.model].name.startswith("DP_ground_") else 1 if "BCL" in st.models[p.model].name else 2
-        st.placements.sort(key=rank)
+    # Tree A keeps the placement order as the draw order: our ground, a game stadium's ground over it
+    # (in its own order), the bases' marks, the rest.
+    rank = lambda p: (0 if st.models[p.model].name.startswith("DP_ground_") else 0.5 if st.models[p.model].name in copied
+                      else 1 if "BCL" in st.models[p.model].name else 2)
+    st.placements.sort(key=rank)
     _add_preload(st, base, maps)                 # after the models: textures in the order the reader numbers them
     st.collision_vertices, st.collision_triangles = _collision(coll)
     st.collision_vertices = [f32(*v) for v in st.collision_vertices]

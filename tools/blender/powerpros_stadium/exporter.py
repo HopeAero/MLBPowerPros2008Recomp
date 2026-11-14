@@ -54,7 +54,7 @@ def image_of(mat):
 
 
 MAX_TEXTURE = 256      # the game's stadium textures are 32-256 px: bigger ones (no mipmaps) shimmer far away
-MAX_TEXMAPS = 30       # most texmaps one piece has in the game's stadiums; 82 overran a game table (probe with a downloaded model)
+MAX_TEXMAPS = 64       # the game copies a piece's texture table into 64 fixed slots, unchecked (0x8005326C): 82 crashed
 
 
 def pow2(n):

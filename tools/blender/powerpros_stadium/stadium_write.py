@@ -161,7 +161,7 @@ def write_graphics(st):
 
 # ---- table ---------------------------------------------------------------------------------------
 
-MAX_TEXMAPS = 30            # most texmaps one piece has in the game; 82 overran a game table and crashed
+MAX_TEXTURES = 64           # 0x8005326C copies a piece's texture table into 64 slots of 0x78 bytes, unchecked: 82 crashed
 MAX_PLACEMENTS = 0xFFF      # the runtime finds the root by a placement count below 0x1000
 MAX_COLLISION = 0xFFFF      # u16 counts
 
@@ -261,8 +261,8 @@ def validate(st):
     for m in st.models:
         for text, what in ((m.name, "model name"), (m.wname, f"{m.name}: wname"), (m.node_name, f"{m.name}: node name")):
             _ascii(text, what)
-        if len(m.texmaps) > MAX_TEXMAPS:
-            raise E(f"{m.name}: {len(m.texmaps)} texmaps, the game takes {MAX_TEXMAPS}")
+        if len(m.textures) > MAX_TEXTURES:
+            raise E(f"{m.name}: {len(m.textures)} textures, the game takes {MAX_TEXTURES}")
         for t, p, level in m.textures:
             if not 0 <= t < len(st.textures) or (p is not None and not 0 <= p < len(st.palettes)):
                 raise E(f"{m.name}: texture {t} / palette {p} not in the stadium")

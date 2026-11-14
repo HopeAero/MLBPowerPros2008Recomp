@@ -6,6 +6,7 @@ blender --background --factory-startup --python tools/blender/test_collision.py 
 Exits 1 on failure.
 """
 import importlib
+import math
 import sys
 from pathlib import Path
 
@@ -94,6 +95,34 @@ collision_gen = importlib.import_module(pkg + ".collision_gen")
 made = collision_gen.generate(stadium)
 check(made and all(o.get("pp_kind") == "collision" and len({p.material_index for p in o.data.polygons}) == 1 for o in made)
       and len({o["pp_surface"] for o in made}) == len(made), f"generated collision, one object per kind: {[o.name for o in made]}")
+
+
+def wall_angles(sid):
+    return [math.degrees(math.atan2(abs(w.x), w.y)) for o in made if o.get("pp_surface") == sid
+            for w in (o.matrix_world @ v.co for v in o.data.vertices) if w.y > 5]
+
+
+fair_a, foul_a = wall_angles(1), wall_angles(0)
+check(fair_a and foul_a and max(fair_a) < 45.05 and min(foul_a) > 44.95,
+      f"invisible walls meet at the foul lines (home run up to {max(fair_a or [0]):.2f}°, foul from {min(foul_a or [0]):.2f}°)")
+
+# A curved wall made of short faces (0.3 m, like Marlins Park's) is the wall, not the one behind it;
+# a lone thin pole in front of it is not.
+from mathutils import Vector  # noqa: E402
+
+
+def wall(r, n):
+    pts = [Vector((r * math.sin(a), 45 + r * math.cos(a))) for a in (2 * math.pi * k / n for k in range(n))]
+    out = []
+    for a, b in zip(pts, pts[1:] + pts[:1]):
+        out += [[a.to_3d(), b.to_3d(), b.to_3d() + Vector((0, 0, 3))], [a.to_3d(), b.to_3d() + Vector((0, 0, 3)), a.to_3d() + Vector((0, 0, 3))]]
+    return out
+
+
+pole = [[Vector((0.1, 80, 0)), Vector((0.3, 80, 0)), Vector((0.3, 80, 3))], [Vector((0.3, 80, 0)), Vector((0.1, 80, 0)), Vector((0.2, 80, 3))]]
+outline = collision_gen.field_outline(wall(60, int(2 * math.pi * 60 / 0.3)) + wall(70, 64) + pole)
+radii = [round((p.xy - Vector((0, 45))).length, 1) for p in outline]
+check(outline and max(radii) < 60.5 and min(radii) > 59.5, f"curved wall of short faces followed (radii {min(radii)}-{max(radii)} m, wall at 60)")
 
 print("RESULT: " + ("FAIL" if failures else "PASS"))
 sys.exit(1 if failures else 0)

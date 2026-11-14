@@ -270,7 +270,7 @@ def test_write_limits():
     from powerpros_stadium.stadium_write import StadiumWriteError, write_stadium
     cases = []
     st = table_stadium()
-    st.models[0].texmaps = [TexMap(0, 1, 1)] * 31
+    st.models[0].textures = [st.models[0].textures[0]] * 65
     cases.append((st, "DP_test_a"))
     st = table_stadium()
     st.collision_triangles = [(0, 1, 2, 5)] * 65536

@@ -44,6 +44,8 @@ def gather(objects):
         me.calc_loop_triangles()
         col = me.color_attributes.get("Color")
         mw = o.matrix_world
+        if any(m is not None and m.name.startswith("pp_field_lines") for m in me.materials):
+            continue                                      # chalk: paint, a 4 cm step for the ball otherwise
         for lt in me.loop_triangles:
             vs = [mw @ me.vertices[i].co for i in lt.vertices]
             u, v = vs[1] - vs[0], vs[2] - vs[0]
@@ -52,6 +54,8 @@ def gather(objects):
                 continue
             n.normalize()
             c = (vs[0] + vs[1] + vs[2]) / 3
+            if n.z < -0.95 and abs(c.z) < 0.1:            # ground modelled facing down (half of Marlins Park's infield)
+                vs, n = [vs[0], vs[2], vs[1]], -n
             if n.z > 0.95 and c.z < 1.0 and c.xy.length < 160 and lt.area > 0.05:
                 mat = o.material_slots[lt.material_index].material if lt.material_index < len(o.material_slots) else None
                 img = _image(mat)
@@ -73,15 +77,35 @@ def gather(objects):
 def field_outline(rest, height=0.6, step=1.0):
     """The nearest wall in every direction from a point of the field, cut at `height` (a model's
     floor usually goes on under its stands, so the floor's own outline is not the field's)."""
-    segs = []
+    raw = []
     for vs in rest:
         pts = []
         for a, b in zip(vs, vs[1:] + vs[:1]):
             if (a.z - height) * (b.z - height) < 0:
                 t = (height - a.z) / (b.z - a.z)
                 pts.append((a + (b - a) * t).xy)
-        if len(pts) == 2 and (pts[0] - pts[1]).length > 0.6:       # thin poles and flags do not count
-            segs.append((pts[0], pts[1]))
+        if len(pts) == 2 and (pts[0] - pts[1]).length > 1e-4:
+            raw.append((pts[0], pts[1]))
+    # thin poles and flags do not count: drop the runs of the cut spanning under 0.6 m. A curved wall
+    # is many short segments (Marlins Park), so the length of each one says nothing.
+    parent = {}
+
+    def root(p):
+        k = (round(p.x, 2), round(p.y, 2))
+        while parent.setdefault(k, k) != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+    for a, b in raw:
+        parent[root(a)] = root(b)
+    span = {}
+    for a, b in raw:
+        r = root(a)
+        lo, hi = span.get(r, (a.copy(), a.copy()))
+        for p in (a, b):
+            lo, hi = Vector((min(lo.x, p.x), min(lo.y, p.y))), Vector((max(hi.x, p.x), max(hi.y, p.y)))
+        span[r] = (lo, hi)
+    segs = [(a, b) for a, b in raw if (span[root(a)][1] - span[root(a)][0]).length > 0.6]
     dists = []
     for k in range(int(360 / step)):
         th = math.radians(k * step)
@@ -142,14 +166,45 @@ def box(out, centre, half, height, sid):
     out += [((top[0], top[1], top[2]), sid), ((top[0], top[2], top[3]), sid)]
 
 
-def _near(v, walls, dist):
-    p = v.xy
-    for a, b, _ in walls:
-        e = (b - a).xy
-        t = max(0.0, min(1.0, (p - a.xy).dot(e) / e.length_squared))
-        if (a.xy + e * t - p).length < dist:
-            return True
-    return False
+def _fences(rest, outline, tris):
+    """The model's own low walls along the outline go in as they are (surface 9, 15 behind the plate),
+    facing the field: the real shape and height of the fence. Returns their indices in `rest` and,
+    per outline segment they cover, the top of the highest."""
+    A = np.array([(p.x, p.y) for p in outline])
+    E = np.roll(A, -1, axis=0) - A
+    L = np.maximum((E * E).sum(axis=1), 1e-12)
+    used, top = set(), {}
+    for k, vs in enumerate(rest):
+        zs = [v.z for v in vs]
+        if max(zs) >= 16.0 or (max(zs) >= 6.0 and min(zs) > 0.5):
+            continue                                   # a tall wall (a Green Monster) only from the ground up
+        nrm = (vs[1] - vs[0]).cross(vs[2] - vs[0]).normalized()
+        if abs(nrm.z) > 0.7:
+            continue
+        pts = []
+        for a, b in zip(vs, vs[1:] + vs[:1]):          # points along its edges, a metre apart
+            steps = int((b - a).xy.length) + 1
+            pts += [a.lerp(b, i / steps).xy[:] for i in range(steps)]
+        W = np.array(pts)[:, None, :] - A[None]
+        t = np.clip((W * E[None]).sum(axis=2) / L[None], 0.0, 1.0)
+        near = np.linalg.norm(W - t[..., None] * E[None], axis=2) < 0.8
+        if not near.any():
+            continue
+        c = (vs[0] + vs[1] + vs[2]) / 3
+        d = nrm.xy.normalized()
+        front, back = _inside(c.xy + d * 0.4, outline), _inside(c.xy - d * 0.4, outline)
+        if not front and not back:
+            front = d.dot(FIELD_POINT - c.xy) > 0
+            back = not front
+        sid = 15 if (c.y < 0 and abs(c.x) < 25) else 9
+        if front:
+            tris.append((tuple(vs), sid))
+        if back:
+            tris.append(((vs[0], vs[2], vs[1]), sid))
+        used.add(k)
+        for j in np.nonzero(near.any(axis=0))[0].tolist():
+            top[j] = max(top.get(j, 0.0), max(zs))
+    return used, top
 
 
 def _inside(v, poly):
@@ -191,14 +246,25 @@ def build(objects, stand_target=5000):
             (2 * math.pi * k / 16 for k in range(16))]
     for a, b in zip(ring, ring[1:] + ring[:1]):
         tris.append(((MOUND + Vector((0, 0, 0.01)), b, a), 8))
+    split = []                                     # cut the outline on the foul lines: fair and foul
+    for a, b in zip(outline, outline[1:] + outline[:1]):           # invisible walls meet at the pole
+        split.append(a)
+        for side in (-1, 1):
+            d = Vector((side * math.sqrt(0.5), math.sqrt(0.5)))
+            sa, sb = d.x * a.y - d.y * a.x, d.x * b.y - d.y * b.x
+            if sa * sb < 0 and a.xy.dot(d) > 0 and b.xy.dot(d) > 0:
+                split.append(a.lerp(b, sa / (sa - sb)))
+    outline = split
+    used, top = _fences(rest, outline, tris)
     walls = []
-    for a, b in zip(outline, outline[1:] + outline[:1]):           # walls, invisible walls over them
-        if (b - a).xy.length < 1e-3:
+    for j, (a, b) in enumerate(zip(outline, outline[1:] + outline[:1])):   # invisible walls over the walls,
+        if (b - a).xy.length < 1e-3:                               # and a wall where the model has none
             continue
         mid = (a + b) / 2
-        h = wall_height(mid, rest)
+        h = max(1.0, top[j]) if j in top else wall_height(mid, rest)   # the invisible wall starts on the real one
         fair = abs(angle(mid)) <= 45.0 and mid.y > 0
-        quad(tris, a, b, 0.0, h, 15 if (mid.y < 0 and abs(mid.x) < 25) else 9)
+        if j not in top:
+            quad(tris, a, b, 0.0, h, 15 if (mid.y < 0 and abs(mid.x) < 25) else 9)
         quad(tris, a, b, h, TOP, 1 if fair else 0)
         walls.append((a, b, h))
     for side in (-1, 1):                           # foul poles where the foul lines meet the walls
@@ -216,9 +282,9 @@ def build(objects, stand_target=5000):
         if best is not None:
             box(tris, d * (best + 0.3), 0.2, 25.0, 14)
     bm = bmesh.new()                               # stands: everything else, simplified
-    for vs in rest:
-        if max(v.z for v in vs) < 6.0 and any(_near(v, walls, 0.8) for v in vs):
-            continue                               # the model's own field walls: replaced by the ones above
+    for k, vs in enumerate(rest):
+        if k in used:
+            continue                               # the field walls, already in as they are
         if max(v.z for v in vs) < 1.0 and all(_inside(v, outline) for v in vs):
             continue                               # bases, plate, mound slopes: the floor covers them
         try:

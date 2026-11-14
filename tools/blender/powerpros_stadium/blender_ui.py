@@ -7,10 +7,10 @@ apply_language() before registering, and the classes are registered again when t
 from pathlib import Path
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
-from . import collision_gen, convert, exporter, importer, names, preview, scratch, surfaces
+from . import collision_gen, convert, exporter, field_gen, game_parts, importer, names, ootp_park, preview, scratch, surfaces
 from .i18n import CONTEXT, T
 
 
@@ -50,6 +50,8 @@ class PP_OT_import_stadium(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         try:
             coll, objects, images = importer.import_stadium(context, self.filepath, self.stadium, self.collision)
+            if preview.game_folder_of(coll.get("pp_game_folder")) is not None:
+                preview.remember_game_folder(coll, coll["pp_game_folder"])
         except importer.ImportFailure as e:
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
@@ -123,8 +125,9 @@ class PP_OT_export_stadium(bpy.types.Operator):
 
     def invoke(self, context, event):
         coll = stadium_collection(context)
-        if not self.mods_folder and coll.get("pp_game_folder"):
-            self.mods_folder = str(Path(coll["pp_game_folder"]) / "mods")
+        game = preview.game_folder(coll)
+        if not self.mods_folder and game is not None:
+            self.mods_folder = str(game / "mods")
         return context.window_manager.invoke_props_dialog(self, width=420)
 
     def draw(self, context):
@@ -243,7 +246,7 @@ class PP_OT_new_scratch(bpy.types.Operator, ImportHelper):
         coll["pp_stadium"] = self.stadium
         coll["pp_project_bin"] = str(project_bin)
         if game_folder is not None:
-            coll["pp_game_folder"] = str(game_folder)
+            preview.remember_game_folder(coll, game_folder)
         context.scene.collection.children.link(coll)
         try:
             scratch.add_game_base_objects(coll)
@@ -269,20 +272,46 @@ class PP_OT_preview_in_game(bpy.types.Operator):
                                "Open the game straight in this stadium, with a free camera where this view is "
                                "(WASD, Q/E, right mouse button to look). Your mods are left alone")
 
+    # Where the game is, when neither the stadium nor the preferences know it: a folder chooser asks.
+    directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN", "SKIP_SAVE"})
+    filepath: StringProperty(subtype="FILE_PATH", options={"HIDDEN", "SKIP_SAVE"})
+    pose: FloatVectorProperty(size=6, options={"HIDDEN", "SKIP_SAVE"})
+    has_pose: BoolProperty(default=False, options={"HIDDEN", "SKIP_SAVE"})
+
     @classmethod
     def poll(cls, context):
         return stadium_collection(context) is not None
 
-    def execute(self, context):
+    def view_pose(self, context):
         space = context.space_data
         if space is not None and space.type == "VIEW_3D":
             window = next((r for r in context.area.regions if r.type == "WINDOW"), None)
             aspect = window.width / max(window.height, 1) if window is not None else 16 / 9
-            pose = preview.camera_pose(space.region_3d.view_matrix, space.lens, aspect=aspect)
-        else:
-            pose = (0.0, 150.0, 600.0, 0.0, -0.2, 45.0)     # behind home plate
+            return preview.camera_pose(space.region_3d.view_matrix, space.lens, aspect=aspect)
+        return (0.0, 150.0, 600.0, 0.0, -0.2, 45.0)     # behind home plate
+
+    def invoke(self, context, event):
+        self.pose, self.has_pose = self.view_pose(context), True     # the file browser has no 3D view
+        if preview.game_folder(stadium_collection(context)) is None:
+            self.report({"INFO"}, T("Elige la carpeta del juego (la que tiene WiiCompiled.exe)",
+                                    "Choose the game folder (the one with WiiCompiled.exe)"))
+            context.window_manager.fileselect_add(self)
+            return {"RUNNING_MODAL"}
+        return self.execute(context)
+
+    def execute(self, context):
+        coll = stadium_collection(context)
+        picked = self.filepath or self.directory
+        if picked:
+            folder = preview.game_folder_of(picked)
+            if folder is None:
+                self.report({"ERROR"}, T(f"No hay WiiCompiled.exe en {picked}: elige la carpeta donde está el juego",
+                                         f"No WiiCompiled.exe in {picked}: choose the folder the game is in"))
+                return {"CANCELLED"}
+            preview.remember_game_folder(coll, folder)
+        pose = tuple(self.pose) if self.has_pose else self.view_pose(context)
         try:
-            preview.launch(stadium_collection(context), pose)
+            preview.launch(coll, pose)
         except (exporter.ExportFailure, OSError) as e:
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
@@ -377,6 +406,263 @@ class PP_OT_generate_collision(bpy.types.Operator):
         return {"FINISHED"}
 
 
+NONE = "NONE"      # Blender enums have no empty item: the "" of FieldParams (colour, generated ground)
+
+
+class PP_OT_generate_field(bpy.types.Operator):
+    bl_idname = "object.powerpros_generate_field"
+    bl_options = {"REGISTER", "UNDO"}
+    bl_translation_context = CONTEXT
+
+    FIELDS = ("lf", "lcf", "cf", "rcf", "rf", "wall_l", "wall_lc", "wall_rc", "wall_r", "color_l", "color_lc",
+              "color_rc", "color_r", "style_l", "style_lc", "style_rc", "style_r", "ground", "foul_wall", "track", "foul", "backstop", "surface", "infield", "pattern",
+              "stripe", "grass_color", "dirt_color", "signs", "lines")
+
+    @classmethod
+    def relabel(cls):
+        cls.bl_label = T("Generar campo", "Generate field")
+        cls.bl_description = T("Crea el campo del estadio desde cero con unas medidas: césped o turf, tierra, pista de "
+                               "aviso, vallas, postes de foul y carteles de distancia. Vuelve a pulsarlo para cambiarlo",
+                               "Build the stadium's field from a few measurements: grass or turf, dirt, warning "
+                               "track, walls, foul poles and distance signs. Press it again to change it")
+        d = field_gen.FieldParams()
+        feet = lambda es, en, v, lo, hi: FloatProperty(name=T(es, en), default=v, min=lo, max=hi, precision=0,
+                                                       translation_context=CONTEXT)
+        looks = [(NONE, T("Color", "Colour"), T("El color de abajo", "The colour below"))] + [
+            (code, T(f"Valla de {name}", f"{name}'s fence"),
+             T("Su textura principal, en su proporción, a la altura de esta valla",
+               "Its main texture, in its proportions, at this wall's height")) for code, name in names.stadiums()]
+        look = lambda es, en: EnumProperty(name=T(es, en), items=looks, translation_context=CONTEXT)
+        colour = lambda es, en, v: FloatVectorProperty(name=T(es, en), subtype="COLOR", default=v, min=0, max=1,
+                                                       translation_context=CONTEXT)
+        set_props(cls,
+                  lf=feet("Jardín izquierdo (línea, pies)", "Left field line (feet)", d.lf, 250, 450),
+                  lcf=feet("Izquierdo-central (pies)", "Left-centre (feet)", d.lcf, 280, 480),
+                  cf=feet("Central (pies)", "Centre field (feet)", d.cf, 300, 500),
+                  rcf=feet("Derecho-central (pies)", "Right-centre (feet)", d.rcf, 280, 480),
+                  rf=feet("Jardín derecho (línea, pies)", "Right field line (feet)", d.rf, 250, 450),
+                  wall_l=feet("Valla: altura del sector izquierdo (pies)", "Wall: left sector height (feet)",
+                              d.wall_l, 3, 50),
+                  wall_lc=feet("Valla: altura del sector izquierdo-central (pies)",
+                               "Wall: left-centre sector height (feet)", d.wall_lc, 3, 50),
+                  wall_rc=feet("Valla: altura del sector derecho-central (pies)",
+                               "Wall: right-centre sector height (feet)", d.wall_rc, 3, 50),
+                  wall_r=feet("Valla: altura del sector derecho (pies)", "Wall: right sector height (feet)",
+                              d.wall_r, 3, 50),
+                  color_l=colour("Valla: color del sector izquierdo", "Wall: left sector colour", d.color_l),
+                  color_lc=colour("Valla: color del sector izquierdo-central", "Wall: left-centre sector colour",
+                                  d.color_lc),
+                  color_rc=colour("Valla: color del sector derecho-central", "Wall: right-centre sector colour",
+                                  d.color_rc),
+                  color_r=colour("Valla: color del sector derecho", "Wall: right sector colour", d.color_r),
+                  ground=EnumProperty(
+                      name=T("Suelo", "Ground"), translation_context=CONTEXT,
+                      items=[(NONE, T("Generado", "Generated"), T("Césped, tierra, pista y líneas de estas medidas",
+                                                                "Grass, dirt, track and lines of these measurements"))]
+                      + [(code, T(f"El de {name}", f"{name}'s"),
+                          T("Sus piezas de suelo tal cual: turf, tierra, manchas y líneas como en el juego",
+                            "Its ground pieces as they are: turf, dirt, stains and lines as in the game"))
+                         for code, name in names.stadiums()]),
+                  ground_sizes=BoolProperty(
+                      name=T("Con las medidas de ese estadio", "With that stadium's measurements"), default=True,
+                      translation_context=CONTEXT,
+                      description=T("Pone las cinco distancias de la valla donde están en ese estadio, para que su "
+                                    "pista de aviso y su césped casen con tu valla",
+                                    "Puts the five wall distances where that stadium has them, so its warning "
+                                    "track and grass meet your wall")),
+                  style_l=look("Valla: estilo del sector izquierdo", "Wall: left sector look"),
+                  style_lc=look("Valla: estilo del sector izquierdo-central", "Wall: left-centre sector look"),
+                  style_rc=look("Valla: estilo del sector derecho-central", "Wall: right-centre sector look"),
+                  style_r=look("Valla: estilo del sector derecho", "Wall: right sector look"),
+                  foul_wall=feet("Altura de la valla de foul (pies)", "Foul wall height (feet)", d.foul_wall, 2, 15),
+                  track=feet("Pista de aviso (pies)", "Warning track (feet)", d.track, 0, 30),
+                  foul=feet("Territorio de foul junto a 1ª y 3ª (pies)", "Foul ground by 1st and 3rd (feet)",
+                            d.foul, 10, 120),
+                  backstop=feet("Del plato al backstop (pies)", "Home plate to backstop (feet)", d.backstop, 35, 120),
+                  surface=EnumProperty(name=T("Superficie", "Surface"), default=d.surface, translation_context=CONTEXT,
+                                       items=[("grass", T("Césped", "Grass"), ""), ("turf", T("Turf", "Turf"), "")]),
+                  infield=EnumProperty(name=T("Cuadro", "Infield"), default=d.infield, translation_context=CONTEXT,
+                                       items=[("grass", T("Césped con tierra", "Grass with a dirt skin"), ""),
+                                              ("dirt", T("Todo tierra", "All dirt"), ""),
+                                              ("turf", T("Turf con recortes de tierra", "Turf with dirt cut-outs"), "")]),
+                  pattern=EnumProperty(name=T("Corte del césped", "Mowing pattern"), default=d.pattern,
+                                       translation_context=CONTEXT,
+                                       items=[("none", T("Ninguno", "None"), ""), ("stripes", T("Franjas", "Stripes"), ""),
+                                              ("checker", T("Cuadros", "Checker"), ""),
+                                              ("diagonal", T("Diagonal", "Diagonal"), ""),
+                                              ("circles", T("Círculos", "Circles"), "")]),
+                  stripe=feet("Ancho de franja (pies)", "Stripe width (feet)", d.stripe, 5, 40),
+                  grass_color=FloatVectorProperty(name=T("Color del césped", "Grass colour"), subtype="COLOR",
+                                                  default=d.grass_color, min=0, max=1, translation_context=CONTEXT),
+                  dirt_color=FloatVectorProperty(name=T("Color de la tierra", "Dirt colour"), subtype="COLOR",
+                                                 default=d.dirt_color, min=0, max=1, translation_context=CONTEXT),
+                  signs=BoolProperty(name=T("Carteles de distancia", "Distance signs"), default=True,
+                                     translation_context=CONTEXT),
+                  lines=BoolProperty(name=T("Líneas de cal", "Chalk lines"), default=True, translation_context=CONTEXT,
+                                     description=T("Líneas de foul, cajas de bateo, del catcher y de los coaches, "
+                                                   "carril a primera y círculos de espera",
+                                                   "Foul lines, batter's, catcher's and coach's boxes, the running "
+                                                   "lane and the on-deck circles")))
+
+    @classmethod
+    def poll(cls, context):
+        return scratch.is_scratch(stadium_collection(context))
+
+    def invoke(self, context, event):
+        saved = field_gen.FieldParams.from_json(stadium_collection(context).get("pp_field", ""))
+        for k in self.FIELDS:
+            setattr(self, k, getattr(saved, k) if getattr(saved, k) != "" else NONE)   # "" is no enum item
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def execute(self, context):
+        values = {k: "" if getattr(self, k) == NONE else getattr(self, k) for k in self.FIELDS}
+        for k in field_gen.FieldParams.COLORS:
+            values[k] = tuple(values[k])
+        if values["ground"] and self.ground_sizes:
+            found = field_gen.game_distances(stadium_collection(context)["pp_project_bin"], values["ground"])
+            for k, feet in zip(("lf", "lcf", "cf", "rcf", "rf"), found):
+                if feet:
+                    values[k] = feet
+        made = field_gen.generate(stadium_collection(context), field_gen.FieldParams(**values))
+        self.report({"INFO"}, T(f"Campo nuevo: {len(made)} objetos. Pulsa «Generar colisión» para la pelota",
+                                f"New field: {len(made)} objects. Press «Generate collision» for the ball"))
+        return {"FINISHED"}
+
+
+class PP_OT_toggle_players(bpy.types.Operator):
+    bl_idname = "object.powerpros_toggle_players"
+    bl_options = {"REGISTER", "UNDO"}
+    bl_translation_context = CONTEXT
+
+    @classmethod
+    def relabel(cls):
+        cls.bl_label = T("Jugadores de referencia", "Reference players")
+        cls.bl_description = T("Pone o quita figuras donde se colocan los jugadores, el árbitro, los coaches, el "
+                               "bateador en espera y las bancas, para diseñar el estadio a su alrededor. No se "
+                               "exportan ni tienen colisión",
+                               "Put or take away figures where the fielders, umpire, coaches, on-deck batter and "
+                               "dugouts are, to design the stadium around them. They are not exported and have no "
+                               "collision")
+
+    @classmethod
+    def poll(cls, context):
+        return scratch.is_scratch(stadium_collection(context))
+
+    def execute(self, context):
+        shown = field_gen.toggle_players(stadium_collection(context))
+        self.report({"INFO"}, T("Jugadores de referencia puestos" if shown else "Jugadores de referencia quitados",
+                                "Reference players shown" if shown else "Reference players removed"))
+        return {"FINISHED"}
+
+
+_part_items = []      # Blender needs the dynamic enum's strings kept alive
+
+
+def part_items(self, context):
+    coll = stadium_collection(context)
+    try:
+        found = game_parts.parts(coll["pp_project_bin"], self.stadium) if coll is not None else ()
+    except (OSError, KeyError, ValueError):
+        found = ()
+    _part_items[:] = [(str(i), f"{n} — {T(*scratch.ROLES[r][1:])}" + (T(" · oculta desde arriba", " · hidden from above")
+                                                                      if h else ""), "") for i, n, r, h in found]
+    return _part_items or [("-1", T("(sin piezas)", "(no pieces)"), "")]
+
+
+class PP_OT_import_ootp(bpy.types.Operator, ImportHelper):
+    bl_idname = "import_scene.powerpros_ootp_park"
+    bl_options = {"REGISTER", "UNDO"}
+    bl_translation_context = CONTEXT
+
+    filename_ext = ""
+    filter_glob: StringProperty(default="*.zip;*.rar;*.7z;*.obj", options={"HIDDEN"})
+
+    @classmethod
+    def relabel(cls):
+        cls.bl_label = T("Importar parque OOTP", "Import OOTP ballpark")
+        cls.bl_description = T("Mete un parque de Out of the Park Baseball (su .zip o .rar tal cual, o su .obj) en este estadio "
+                               "desde cero: lo gira, separa el suelo, pone el público y genera la colisión. Después, "
+                               "«Ver en el juego» y «Exportar mod de estadio»",
+                               "Put an Out of the Park Baseball ballpark (its .zip or .rar as downloaded, or its .obj) into this "
+                               "from-scratch stadium: it turns it, splits the ground, sets the crowd and generates the "
+                               "collision. Then «View in game» and «Export stadium mod»")
+        set_props(cls, game_crowd=BoolProperty(
+            name=T("Público del juego en todas las gradas", "The game's crowd on all the seating"), default=False,
+            translation_context=CONTEXT,
+            description=T("Pone a la gente del juego también en las gradas que traen su propia imagen. Sin marcar, solo "
+                          "en las que no la traen (OOTP la saca de su carpeta «attendance»)",
+                          "Puts the game's people also on the seating that brings its own picture. Unticked, only on "
+                          "the seating without one (OOTP takes it from its «attendance» folder)")))
+
+    @classmethod
+    def poll(cls, context):
+        return scratch.is_scratch(stadium_collection(context))
+
+    def execute(self, context):
+        coll = stadium_collection(context)
+        try:
+            r = ootp_park.import_park(context, coll, self.filepath, self.game_crowd)
+        except (ootp_park.OotpFailure, scratch.ScratchFailure, OSError) as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        msg = T(f"Parque importado: girado {r['turned']}°, {r['ground']} caras de suelo, {r['crowd']} de público, "
+                f"{r['collision']} triángulos de colisión",
+                f"Ballpark imported: turned {r['turned']}°, {r['ground']} ground faces, {r['crowd']} crowd faces, "
+                f"{r['collision']} collision triangles")
+        if r["missing"]:
+            msg += T(f". Sin imagen (quedan de color liso): {', '.join(r['missing'][:6])}",
+                     f". No image (left plain colour): {', '.join(r['missing'][:6])}")
+        self.report({"WARNING"} if r["missing"] else {"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class PP_OT_add_game_part(bpy.types.Operator):
+    bl_idname = "object.powerpros_add_game_part"
+    bl_options = {"REGISTER", "UNDO"}
+    bl_translation_context = CONTEXT
+
+    @classmethod
+    def relabel(cls):
+        cls.bl_label = T("Añadir pieza del juego", "Add a game piece")
+        cls.bl_description = T("Trae una grada, público, cristales, marcador o edificio de un estadio del juego (de tu "
+                               "project.bin), en su sitio y con su papel; muévela, gírala o cópiala como quieras",
+                               "Bring a stand, crowd, glass, scoreboard or building from one of the game's stadiums "
+                               "(from your project.bin), in its place and with its role; move, turn or copy it as you like")
+        set_props(cls,
+                  stadium=EnumProperty(name=T("Estadio", "Stadium"), items=[(c, n, "") for c, n in names.stadiums()],
+                                       default="nyy", translation_context=CONTEXT),
+                  part=EnumProperty(name=T("Pieza", "Piece"), items=part_items, translation_context=CONTEXT),
+                  whole_zone=BoolProperty(name=T("Con toda su sección (grada, público, cristales)",
+                                                 "With its whole section (stand, crowd, glass)"),
+                                          default=True, translation_context=CONTEXT))
+
+    @classmethod
+    def poll(cls, context):
+        return scratch.is_scratch(stadium_collection(context))
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=560)
+
+    def execute(self, context):
+        coll = stadium_collection(context)
+        index = int(self.part) if self.part.lstrip("-").isdigit() else -1
+        if index < 0:
+            self.report({"ERROR"}, T("Ese estadio no tiene piezas que añadir", "That stadium has no pieces to add"))
+            return {"CANCELLED"}
+        project_bin = coll["pp_project_bin"]
+        indices = game_parts.with_zone(project_bin, self.stadium, index) if self.whole_zone else [index]
+        made = game_parts.insert(coll, self.stadium, indices)
+        for o in context.selected_objects:
+            o.select_set(False)
+        for o in made:
+            o.select_set(True)
+        if made:
+            context.view_layer.objects.active = made[0]
+        self.report({"INFO"}, T(f"{len(made)} piezas de {names.name(self.stadium)}",
+                                f"{len(made)} pieces from {names.name(self.stadium)}"))
+        return {"FINISHED"}
+
+
 class PP_OT_collision_visibility(bpy.types.Operator):
     bl_idname = "object.powerpros_collision_visibility"
     bl_options = {"REGISTER", "UNDO"}
@@ -446,6 +732,12 @@ class PP_PT_info(bpy.types.Panel):
         layout.operator(PP_OT_export_stadium.bl_idname, icon="EXPORT")
         layout.operator(PP_OT_preview_in_game.bl_idname, icon="PLAY")
         layout.operator(PP_OT_convert_objects.bl_idname, icon="MESH_DATA")
+        if scratch.is_scratch(stadium_collection(context)):
+            layout.operator(PP_OT_import_ootp.bl_idname, icon="IMPORT")
+            layout.operator(PP_OT_generate_field.bl_idname, icon="MESH_GRID")
+            shown = field_gen.players_collection(stadium_collection(context)) is not None
+            layout.operator(PP_OT_toggle_players.bl_idname, icon="HIDE_OFF" if shown else "HIDE_ON", depress=shown)
+            layout.operator(PP_OT_add_game_part.bl_idname, icon="HOME")
         layout.operator(PP_OT_generate_collision.bl_idname, icon="MOD_PHYSICS")
         obj = context.active_object
         coll = stadium_collection(context)
@@ -465,6 +757,8 @@ class PP_PT_info(bpy.types.Panel):
                 role = scratch.role_of(obj)
                 box.label(text=T("Ahora: ", "Now: ") + T(scratch.ROLES[role][1], scratch.ROLES[role][2]), translate=False)
             box.prop(obj, "powerpros_hide_above")
+            box.prop(obj, "powerpros_two_sided")
+            box.prop(obj, "powerpros_separate_layers")
             return
         if obj is None or "pp_kind" not in obj:
             layout.label(text=T("Selecciona una pieza de un estadio importado", "Select a piece of an imported stadium"),
@@ -522,7 +816,7 @@ def menu_export(self, context):
 
 
 CLASSES = (PP_OT_import_stadium, PP_OT_new_scratch, PP_OT_export_stadium, PP_OT_preview_in_game,
-           PP_OT_convert_objects, PP_OT_generate_collision, PP_OT_collision_visibility, PP_OT_make_collision, PP_PT_info)
+           PP_OT_convert_objects, PP_OT_import_ootp, PP_OT_generate_field, PP_OT_toggle_players, PP_OT_add_game_part, PP_OT_generate_collision, PP_OT_collision_visibility, PP_OT_make_collision, PP_PT_info)
 
 
 def apply_language():
@@ -562,8 +856,16 @@ class PP_preferences(bpy.types.AddonPreferences):
                ("EN", "English", "")],
         default="AUTO", update=language_changed, translation_context=CONTEXT)
 
+    game_folder: StringProperty(
+        name=T("Carpeta del juego", "Game folder"), subtype="DIR_PATH",
+        description=T("La carpeta donde está WiiCompiled.exe. «Ver en el juego» la pregunta la primera vez y la "
+                      "recuerda aquí; también es donde se exportan los mods por defecto",
+                      "The folder WiiCompiled.exe is in. «View in game» asks for it the first time and remembers it "
+                      "here; mods are exported there by default"))
+
     def draw(self, context):
         self.layout.prop(self, "language")
+        self.layout.prop(self, "game_folder")
 
 
 _msgbus_owner = object()
