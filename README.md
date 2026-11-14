@@ -45,14 +45,16 @@ A **static recompilation** of *MLB Power Pros 2008* (Wii, USA, `RL8E54`) into a 
 
 ## Install and play
 
-Requirements: Windows 10/11 64-bit, a GPU with Direct3D 12 or Vulkan, your copy of *MLB Power Pros 2008* for Wii (USA, `RL8E54`) and about 2.5 GB free (900 MB for the Setup, 1.5 GB for the installed game).
+Requirements: Windows 10/11 64-bit, a GPU with Direct3D 12 or Vulkan, your copy of *MLB Power Pros 2008* for Wii (USA, `RL8E54`) and about 5 GB free (1 GB for the Setup; the installed game takes 1.5 GB, plus about 2 GB from v0.1.8 on so it can update itself from the launcher).
 
 1. Download `MLB-Power-Pros-2008-Setup-v0.1.6.zip` from [Releases](https://github.com/HopeAero/MLBPowerPros2008Recomp/releases) (latest: `v0.1.6` beta) and unzip it into a folder of yours (not Program Files).
 2. Open `MLBPowerPros2008-Setup.exe`, press **CHOOSE DISC** and pick your copy (ISO, NKit, RVZ, WBFS, WIA, GCZ or CISO).
 3. Press **INSTALL**. The Setup checks that it is a clean `RL8E54` dump, extracts it, translates the code and compiles it on your PC.
 4. Press **PLAY** or use the desktop shortcut. The launcher opens before each session: graphics API, display, resolution, audio, controls, mods and tools.
 
-To update, unzip the new Setup and press **REINSTALL**; the installed game is only replaced at the end, so an interrupted update leaves the previous version playable. The Setup is not code-signed, so Windows Defender may block or quarantine it while it compiles. If that happens, restore it from *Windows Security > Protection history* and [report it](https://github.com/HopeAero/MLBPowerPros2008Recomp/issues) with the detection name.
+**Updating (from v0.1.8).** When a new version is out, the launcher says so once: *New version vX.Y.Z*, the download size, whether it is a quick update (the game is translated again and only what changed is recompiled) or a full one, and a **What's new** link. **Yes** downloads only what changed, builds the new version next to yours and opens the game in it by itself; saves, settings and mods stay. **No** leaves a *New version* marker next to the version number (click it, or **TOOLS > CHECK FOR UPDATES**, to open the notice again). **Cancel**, closing the launcher or a failed build leave your version playable. After an update, **TOOLS > GO BACK TO vX.Y.Z** returns to the previous version and asks whether to also bring back the saves from before the update. The ~2 GB that make this possible are the installation's `Build` folder and the copy of the previous version. **v0.1.7 and older** cannot update themselves: install v0.1.8 once with its Setup (**REINSTALL** keeps your saves and mods). Details: [docs/en/launcher-controls.md](docs/en/launcher-controls.md#updates-from-v018).
+
+With the Setup, unzip the new one and press **REINSTALL**; the installed game is only replaced at the end, so an interrupted reinstall leaves the previous version playable. The Setup is not code-signed, so Windows Defender may block or quarantine it while it compiles. If that happens, restore it from *Windows Security > Protection history* and [report it](https://github.com/HopeAero/MLBPowerPros2008Recomp/issues) with the detection name.
 
 ![The Setup: choose your disc; no game files included](docs/media/setup-en.jpg)
 
@@ -135,7 +137,7 @@ For developers. Requirements: PowerShell 5.1, Git, the .NET 8 SDK and Python 3.1
 .\tools\wiicompiled-bench.ps1 -Api vulkan               # frame time in the title demo
 ```
 
-- **Release:** `tools/setup/Make-Release.ps1 -Zip` builds the Setup package from a clean clone, using only what is in git (about 20 minutes). `tools/setup/LocalBuild.ps1` is what the Setup runs on the player's PC.
+- **Release:** `tools/setup/Make-Release.ps1 -Zip -Discussion <url> [-DiscussionEn <url>]` builds the Setup package from a clean clone, using only what is in git (about 20 minutes), and cuts it into the update pieces plus `update-manifest.txt` in `local/setup-payload/release/`; every file there goes up to the GitHub release (steps in `docs/traspaso.md`). `tools/setup/LocalBuild.ps1` is what the Setup runs on the player's PC; `tools/setup/Update.ps1` is what the launcher runs to update.
 - **Content guard:** `python tools/check_no_game_data.py --install-hook` installs the pre-commit hook that rejects game files, binary content, large files and data dumps.
 
 ## Documentation

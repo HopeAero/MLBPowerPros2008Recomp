@@ -98,6 +98,20 @@ tools/linux/build.sh --container --disc '/run/media/<tarjeta SD>/MLB Power Pros 
 
 Una NAND creada por una compilación anterior tiene un `setting.txt` europeo (ver abajo); se puede guardar igual, pero apartar `UserData/NAND` antes del primer inicio da una nueva, de EE. UU.
 
+## Actualizar (desde v0.1.8)
+
+Una instalación hecha con un **kit** del release (`MLB-Power-Pros-2008-Linux-<versión>.tar.gz` con `./install.sh`, o `…-SteamDeck-<versión>.tar.gz` con `./install-steam-deck.sh`) se actualiza desde el launcher, igual que en Windows (`docs/launcher-controles.md`, «Actualizaciones»): aviso una vez por versión, **Sí** / **No**, la marca junto a la versión, **HERRAMIENTAS > BUSCAR ACTUALIZACIONES** y **VOLVER A vX.Y.Z**.
+
+- El instalador del kit deja `kit.txt` junto al ejecutable (`root=` la carpeta del kit, `platform=`, `options=`). **No borres la carpeta del kit** después de instalar: la actualización la sincroniza y recompila desde ahí.
+- La instalación (`--install`) no puede estar dentro de la carpeta del kit: el instalador y `update.sh` lo rechazan. Lo que guardes tú en la carpeta del kit (la imagen del disco, notas) se queda: una actualización solo cambia o borra los archivos que trae o traía el kit (su lista es `kit-files.txt`).
+- Una instalación **copiada a otro equipo** (por ejemplo, el kit instalado en un PC y la carpeta copiada a la Deck) no se actualiza desde el launcher de ese equipo, porque su `kit.txt` apunta a la carpeta del kit del primero: el aviso ofrece **Descargar el kit**. Actualiza en el PC y vuelve a copiar, o instala el kit en la Deck.
+- Al decir **Sí**, el launcher descarga el kit nuevo, comprueba su SHA-256 y ejecuta `tools/linux/update.sh`: sincroniza la carpeta del kit (salvo `local/`, donde quedan la compilación y el código generado), compila la versión nueva con `build.sh --stage <instalación>.staging`, copia las partidas a `<instalación>.backup` y cambia el programa (`<instalación>` → `<instalación>.previous`). Después el juego se vuelve a abrir solo. `UserData`, `Data` y `mods` no se mueven.
+- En la Steam Deck (o con `--container`), si cambió `tools/linux/Containerfile` el aviso dice que la actualización tardará más: se rehace el contenedor.
+- **VOLVER A** ejecuta `update.sh --rollback` (con `--restore-saves` si eliges recuperar las partidas de antes). Si un cambio de versión se cortó a medias queda `<instalación>.rollback` y las actualizaciones se niegan a seguir: vuelve a ejecutar el instalador del kit, que deja el juego completo y lo borra.
+- Registros: `<instalación>.download/update.log` (lo que hizo `update.sh`) y `<kit>/local/analysis/update-build.log` (la compilación).
+- Un clon de git compilado con `build.sh` (sin kit) solo recibe el aviso, con **Descargar el kit**; se actualiza con `git pull` y `build.sh` como siempre.
+- **Sin probar todavía de punta a punta:** una actualización real en Linux y en la Steam Deck (kit descargado, compilación real, contenedor). La lógica está probada con `tools/linux/test_update.sh` (compilación simulada) y con el launcher contra `update.sh` en WSL.
+
 ## Qué cambió para Linux
 
 - `tools/patches/wiicompiled-linux.patch` (se aplica después de los demás):

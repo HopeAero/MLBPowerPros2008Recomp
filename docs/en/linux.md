@@ -98,6 +98,20 @@ tools/linux/build.sh --container --disc '/run/media/<SD card>/MLB Power Pros 200
 
 A NAND made by an earlier build has a European `setting.txt` (see below); saving works either way, but moving `UserData/NAND` aside before the first start gives a fresh, USA one.
 
+## Updating (from v0.1.8)
+
+An install made from a release **kit** (`MLB-Power-Pros-2008-Linux-<version>.tar.gz` with `./install.sh`, or `…-SteamDeck-<version>.tar.gz` with `./install-steam-deck.sh`) updates from the launcher, as on Windows (`docs/en/launcher-controls.md`, «Updates»): a notice once per version, **Yes** / **No**, the marker next to the version, **TOOLS > CHECK FOR UPDATES** and **GO BACK TO vX.Y.Z**.
+
+- The kit installer leaves `kit.txt` next to the executable (`root=` the kit folder, `platform=`, `options=`). **Do not delete the kit folder** after installing: the update syncs it and rebuilds from there.
+- The install (`--install`) cannot be inside the kit folder: the installer and `update.sh` refuse it. Whatever you keep in the kit folder yourself (the disc image, notes) stays: an update only changes or removes files the kit ships or shipped (its list is `kit-files.txt`).
+- An install **copied to another machine** (for example the kit installed on a PC and the folder copied to the Deck) does not update from that machine's launcher, because its `kit.txt` points at the first machine's kit folder: the notice offers **Download the kit**. Update on the PC and copy again, or install the kit on the Deck.
+- On **Yes**, the launcher downloads the new kit, checks its SHA-256 and runs `tools/linux/update.sh`: it syncs the kit folder (except `local/`, which keeps the build and the generated code), builds the new version with `build.sh --stage <install>.staging`, copies the saves to `<install>.backup` and swaps the program (`<install>` → `<install>.previous`). The game then opens again by itself. `UserData`, `Data` and `mods` are not moved.
+- On the Steam Deck (or with `--container`), if `tools/linux/Containerfile` changed the notice says the update will take longer: the container is rebuilt.
+- **GO BACK TO** runs `update.sh --rollback` (with `--restore-saves` if you choose to bring back the saves from before). If a version switch was cut off halfway, `<install>.rollback` is left and updates refuse to go on: run the kit installer again, which makes the game whole and removes it.
+- Logs: `<install>.download/update.log` (what `update.sh` did) and `<kit>/local/analysis/update-build.log` (the build).
+- A git clone built with `build.sh` (no kit) only gets the notice, with **Download the kit**; it updates with `git pull` and `build.sh` as before.
+- **Not yet tested end to end:** a real update on Linux and on the Steam Deck (downloaded kit, real build, container). The logic is tested with `tools/linux/test_update.sh` (simulated build) and with the launcher against `update.sh` in WSL.
+
 ## What changed for Linux
 
 - `tools/patches/wiicompiled-linux.patch` (applied after the others):
