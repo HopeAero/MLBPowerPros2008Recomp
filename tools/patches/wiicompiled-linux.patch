@@ -103,10 +103,10 @@ index bb2abe0..f94d5b8 100644
                  if (at_ < s_.size() && s_[at_] == ',') { ++at_; continue; }
                  if (at_ < s_.size() && s_[at_] == '}') return ++at_, true;
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
-index 0238edd..2c2101a 100644
+index 9c6d739..82fba20 100644
 --- a/runtime/src/launcher.cpp
 +++ b/runtime/src/launcher.cpp
-@@ -32,6 +32,7 @@
+@@ -33,6 +33,7 @@
  #include <algorithm>
  #include <array>
  #include <chrono>
@@ -114,20 +114,20 @@ index 0238edd..2c2101a 100644
  #include <cmath>
  #include <cstdlib>
  #include <cstring>
-@@ -47,7 +48,12 @@
+@@ -48,8 +49,12 @@
  #include <windows.h>
  #include <shellapi.h>
  #else
 +#include <signal.h>
 +#include <spawn.h>
 +#include <sys/prctl.h>
-+#include <sys/wait.h>
+ #include <sys/wait.h>
  #include <unistd.h>
 +extern char** environ;
  #endif
+ #include <optional>
  
- namespace launcher {
-@@ -422,6 +428,30 @@ constexpr const char* kRosterEditorPage =
+@@ -452,6 +457,30 @@ constexpr const char* kRosterEditorPage =
  
  #if defined(_WIN32)
  std::wstring Quoted(const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; }
@@ -158,7 +158,7 @@ index 0238edd..2c2101a 100644
  #endif
  
  // PowerUp+ ships next to the game in powerupplus/ (tools/powerupplus.ps1 -Publish). It runs in its
-@@ -476,6 +506,71 @@ void OpenRosterEditor() {
+@@ -521,6 +550,71 @@ void OpenRosterEditor() {
      const fs::path page = data / "abrir.html";
      std::ofstream(page, std::ios::binary | std::ios::trunc) << kRosterEditorPage;
      ShellExecuteW(nullptr, L"open", page.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -230,7 +230,7 @@ index 0238edd..2c2101a 100644
  #endif
  }
  
-@@ -499,7 +594,20 @@ void OpenStudio(const wchar_t* exe) {
+@@ -544,7 +638,20 @@ void OpenStudio(const wchar_t* exe) {
                                mods::Directory().wstring() + L"\" --game \"" + std::wstring(self) + L"\"";
      ShellExecuteW(nullptr, L"open", studio.wstring().c_str(), args.c_str(), exeDir->wstring().c_str(), SW_SHOWNORMAL);
  #else
@@ -252,7 +252,7 @@ index 0238edd..2c2101a 100644
  #endif
  }
  void OpenTextureStudio() { OpenStudio(L"TextureStudio.exe"); }
-@@ -514,6 +622,8 @@ void OpenSavesFolder(const std::vector<mods::Mod>& all) {
+@@ -561,6 +668,8 @@ void OpenSavesFolder(const std::vector<mods::Mod>& all) {
      std::filesystem::create_directories(dir, ec);
  #if defined(_WIN32)
      ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -261,7 +261,7 @@ index 0238edd..2c2101a 100644
  #endif
  }
  
-@@ -525,6 +635,8 @@ void OpenModsFolder() {
+@@ -572,6 +681,8 @@ void OpenModsFolder() {
      if (!std::filesystem::exists(readme, ec)) std::ofstream(readme, std::ios::binary) << kModsReadme;
  #if defined(_WIN32)
      ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -270,7 +270,7 @@ index 0238edd..2c2101a 100644
  #endif
  }
  
-@@ -773,10 +885,15 @@ Result Run(int argc, char** argv) {
+@@ -1289,10 +1400,15 @@ Result Run(int argc, char** argv) {
      std::vector<std::string> modHelp;
      modHelp.reserve(installedMods.size());
      Tab modsTab{"MODS", {}, installedMods.empty()
@@ -290,7 +290,7 @@ index 0238edd..2c2101a 100644
                                  : nullptr};
      // The first row says whose saves the game will use; it follows the roster mods switched on here.
      std::vector<mods::Mod> currentMods = installedMods;
-@@ -797,7 +914,9 @@ Result Run(int argc, char** argv) {
+@@ -1313,7 +1429,9 @@ Result Run(int argc, char** argv) {
                                 {saveSet()}, 0, false, kOpenSavesFolder});
      Tab toolsTab{Tr("HERRAMIENTAS", "TOOLS"), {}};
      toolsTab.options.push_back({Tr("ABRIR CARPETA DE MODS", "OPEN MODS FOLDER"), kModsHelp, {Tr("Abrir", "Open")}, 0, false, kOpenModsFolder});
