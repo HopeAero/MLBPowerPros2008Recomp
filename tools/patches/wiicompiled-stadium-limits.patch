@@ -1,0 +1,183 @@
+diff --git a/aurora-main/lib/gfx/common.hpp b/aurora-main/lib/gfx/common.hpp
+index e89a430..b1102ab 100644
+--- a/aurora-main/lib/gfx/common.hpp
++++ b/aurora-main/lib/gfx/common.hpp
+@@ -229,9 +229,9 @@ private:
+ namespace aurora::gfx {
+ inline constexpr bool UseTextureBuffer = false;
+ inline constexpr uint64_t UniformBufferSize = 8388608;   // 8mb (measured peak ~1mb, 2.9mb at 180 FPS interpolation)
+-inline constexpr uint64_t VertexBufferSize = 3145728;    // 3mb
+-inline constexpr uint64_t IndexBufferSize = 2097152;     // 2mb
+-inline constexpr uint64_t StorageBufferSize = 8388608;   // 8mb
++inline constexpr uint64_t VertexBufferSize = 16777216;   // 16mb: was 3mb; a 426-mesh stadium piece needed 7.7mb, and the split path lost draws
++inline constexpr uint64_t IndexBufferSize = 4194304;     // 4mb (was 2mb; same piece: 1.9mb)
++inline constexpr uint64_t StorageBufferSize = 16777216;  // 16mb (was 8mb; same piece: 5.1mb)
+ inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
+ 
+ extern AuroraStats g_stats;
+diff --git a/runtime/src/hle/mlb/collision_tree.cpp b/runtime/src/hle/mlb/collision_tree.cpp
+new file mode 100644
+index 0000000..39828f1
+--- /dev/null
++++ b/runtime/src/hle/mlb/collision_tree.cpp
+@@ -0,0 +1,160 @@
++// MLB Power Pros 2008 (RL8E54) game-specific native: the stadium plane-tree walkers at 0x80C860E4
++// and 0x80C862EC (ovl_main fn_1_710A90 / fn_1_710C98: a volume against tree A or B) and 0x80C700A4
++// (fn_1_6FAA50: a segment, the ball's move, against tree B).
++//
++// A stadium tbl has two trees of 0x1C-byte plane nodes (docs/ingenieria-inversa.md, «Árboles A y
++// B»): A sorts the placements, B the collision triangles. Each side of a node is a child (u16 at
++// +0x10 H / +0x12 L) or a leaf: a run of the tree's u16 list from a u16 start (+0x14 / +0x16), with
++// a signed-byte count (+0x18 / +0x19). The walkers test the query volume against the plane
++// (0x80CCB438: >0 L side, <0 H side, 0 both) and set flags[index] = 1 for every listed index. The
++// segment walker takes the L side when both ends are at n.p + d >= 0, the H side when both are <= 0,
++// and both otherwise.
++//
++// The u16 start caps a tree's list at 65535 + 127 entries. Triangles that cross a plane are listed
++// on both sides, so a big collision mesh (a converted OOTP park) needed twice as many entries as it
++// has triangles and could not be written. The u16 at +0x1A is 0 in every node of the game's 47
++// stadiums: here its bytes are the high byte of the H and L starts, so a list can hold up to 2^24
++// entries. With +0x1A at 0 this walks exactly like the original.
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "abi_bridge.h"
++#include "hle_stubs.h"
++#include "memory.h"
++
++namespace mlb_collision_tree {
++
++constexpr uint32_t kNodeSize = 0x1C;
++constexpr uint32_t kPlaneSide = 0x80CCB438;  // (volume, plane) -> 1 / -1 / 0
++
++// WIICOMPILED_DEBUG_COLLTREE=1: every 600 walks, how many marks came from leaves past the u16 start.
++const bool kDebug = std::getenv("WIICOMPILED_DEBUG_COLLTREE") != nullptr;
++uint64_t g_walks = 0, g_marks = 0, g_highMarks = 0;
++uint32_t g_maxStart = 0;
++
++int32_t PlaneSide(CpuContext* cpu, uint32_t volume, uint32_t plane) {
++    cpu->gpr[3] = volume;
++    cpu->gpr[4] = plane;
++    InvokeIndirectCpu(kPlaneSide, cpu);
++    return static_cast<int32_t>(cpu->gpr[3]);
++}
++
++uint32_t g_segWalks = 0;
++
++void MarkLeaf(uint32_t node, bool lowSide, uint32_t list, uint32_t flags) {
++    const uint32_t start = Memory::Read16(node + (lowSide ? 0x16 : 0x14)) |
++                           (static_cast<uint32_t>(Memory::Read8(node + (lowSide ? 0x1B : 0x1A))) << 16);
++    const int32_t count = static_cast<int8_t>(Memory::Read8(node + (lowSide ? 0x19 : 0x18)));
++    for (int32_t i = 0; i < count; ++i)
++        Memory::Write8(flags + Memory::Read16(list + 2 * (start + i)), 1);
++    if (kDebug && count > 0) {
++        g_marks += count;
++        if (start > 0xFFFF) g_highMarks += count;
++        if (start > g_maxStart) g_maxStart = start;
++    }
++}
++
++// ctx: the walker's state, {+0 nodes, +4 list, +8 flags}.
++void Walk(CpuContext* cpu, uint32_t state, uint32_t index, uint32_t volume) {
++    const uint32_t node = Memory::Read32(state) + index * kNodeSize;
++    const int32_t side = PlaneSide(cpu, volume, node);  // the original passes a stack copy of the plane
++    const auto visit = [&](bool lowSide) {
++        const uint32_t child = Memory::Read16(node + (lowSide ? 0x12 : 0x10));
++        if (child != 0)
++            Walk(cpu, state, child, volume);
++        else
++            MarkLeaf(node, lowSide, Memory::Read32(state + 4), Memory::Read32(state + 8));
++    };
++    if (side > 0) {
++        visit(true);
++    } else if (side < 0) {
++        visit(false);
++    } else {
++        visit(true);
++        visit(false);
++    }
++}
++
++void Enter(CpuContext* cpu, uint32_t state, uint32_t index, uint32_t volume) {
++    const uint32_t savedSp = cpu->gpr[1];
++    cpu->gpr[1] = (savedSp - 0x30) & ~0xFu;  // the original's aligned frame, for the plane test's own
++    Memory::Write32(cpu->gpr[1], savedSp);
++    Walk(cpu, state, index, volume);
++    cpu->gpr[1] = savedSp;
++    if (kDebug && ++g_walks % 600 == 0)
++        std::fprintf(stderr, "[colltree] %llu walks, %llu marks, %llu from starts past 65535, max start %u\n",
++                     (unsigned long long)g_walks, (unsigned long long)g_marks, (unsigned long long)g_highMarks, g_maxStart);
++}
++
++// state: {+8 nodes, +0xC list, +0x18 flags}; p0, p1: the segment's ends (xyz f32).
++void WalkSegment(uint32_t state, uint32_t index, const float p0[3], const float p1[3]) {
++    const uint32_t node = Memory::Read32(state + 8) + index * kNodeSize;
++    float plane[4];
++    for (int k = 0; k < 4; ++k) {
++        const uint32_t bits = Memory::Read32(node + 4 * k);
++        std::memcpy(&plane[k], &bits, 4);
++    }
++    // The game's fmuls/fadds one at a time (x + y, then z, then d): separate statements, so the
++    // compiler can't fuse them into FMAs that round differently.
++    const auto side = [&](const float p[3]) {
++        const float x = plane[0] * p[0];
++        const float y = plane[1] * p[1];
++        const float z = plane[2] * p[2];
++        const float xy = x + y;
++        const float xyz = z + xy;
++        return plane[3] + xyz;
++    };
++    const float v0 = side(p0);
++    const float v1 = side(p1);
++    const auto visit = [&](bool lowSide) {
++        const uint32_t child = Memory::Read16(node + (lowSide ? 0x12 : 0x10));
++        if (child != 0)
++            WalkSegment(state, child, p0, p1);
++        else
++            MarkLeaf(node, lowSide, Memory::Read32(state + 0xC), Memory::Read32(state + 0x18));
++    };
++    if (v0 >= 0.0f && v1 >= 0.0f) {
++        visit(true);
++    } else if (v0 <= 0.0f && v1 <= 0.0f) {
++        visit(false);
++    } else {
++        visit(true);
++        visit(false);
++    }
++}
++
++void ReadPoint(uint32_t at, float out[3]) {
++    for (int k = 0; k < 3; ++k) {
++        const uint32_t bits = Memory::Read32(at + 4 * k);
++        std::memcpy(&out[k], &bits, 4);
++    }
++}
++
++}  // namespace mlb_collision_tree
++
++// (state, node index, volume)
++extern "C" void MLB_TreeWalk_80C860E4(CpuContext* ctx) {
++    mlb_collision_tree::Enter(ctx, ctx->gpr[3], ctx->gpr[4], ctx->gpr[5]);
++}
++PPC_NATIVE_OVERRIDE_VOID(80C860E4, MLB_TreeWalk_80C860E4, (CpuContext* ctx), (ctx));
++
++// (state, node index): the volume is in state +0x10
++extern "C" void MLB_TreeWalkB_80C862EC(CpuContext* ctx) {
++    mlb_collision_tree::Enter(ctx, ctx->gpr[3], ctx->gpr[4], Memory::Read32(ctx->gpr[3] + 0x10));
++}
++PPC_NATIVE_OVERRIDE_VOID(80C862EC, MLB_TreeWalkB_80C862EC, (CpuContext* ctx), (ctx));
++
++// (state, node index, segment start, segment end)
++extern "C" void MLB_TreeWalkSegment_80C700A4(CpuContext* ctx) {
++    float p0[3], p1[3];
++    mlb_collision_tree::ReadPoint(ctx->gpr[5], p0);
++    mlb_collision_tree::ReadPoint(ctx->gpr[6], p1);
++    mlb_collision_tree::WalkSegment(ctx->gpr[3], ctx->gpr[4], p0, p1);
++    if (mlb_collision_tree::kDebug && ++mlb_collision_tree::g_segWalks % 600 == 0)
++        std::fprintf(stderr, "[colltree] %u segment walks; marks %llu, %llu from starts past 65535, max start %u\n",
++                     mlb_collision_tree::g_segWalks, (unsigned long long)mlb_collision_tree::g_marks,
++                     (unsigned long long)mlb_collision_tree::g_highMarks, mlb_collision_tree::g_maxStart);
++}
++PPC_NATIVE_OVERRIDE_VOID(80C700A4, MLB_TreeWalkSegment_80C700A4, (CpuContext* ctx), (ctx));

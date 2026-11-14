@@ -16,9 +16,10 @@ harness = r'''
 struct CpuContext { uint32_t gpr[32]{}; uint32_t lr = 0; };
 namespace two_way {
 bool creating, enabled = true, batter = true, g_creationBatter = false;
-uint32_t position = 1, second = 9;
+uint32_t position = 1, second = 9, pAptitude = 0;
 constexpr uint32_t kDrillListAsk = 0x80A37330;
-bool g_inPractice, g_drillOpen, g_practiceBatter;
+constexpr uint8_t kPitcher = 1;
+bool g_inPractice, g_drillOpen, g_practiceBatter, g_practiceSet;
 uint32_t g_drillList;
 namespace Memory { uint8_t Read8(uint32_t) { return creating; } }
 template<uint32_t address> void InvokeDirectCpu(CpuContext* ctx) {
@@ -31,6 +32,19 @@ void Call(CpuContext* ctx, uint32_t, void (*f)(CpuContext*)) { f(ctx); }
 bool LifeMode() { return enabled; }
 uint32_t LifeRecord(CpuContext*) { return 0x81234560; }
 uint32_t SecondPosition(CpuContext*, uint32_t) { return second; }
+struct LifeTwo {
+    uint32_t main = 0, bat = 0;
+    bool pitch = false;
+    bool TwoWay() const { return pitch && bat != 0; }
+    bool Hitter() const { return main != kPitcher; }
+};
+LifeTwo LifeAbility(CpuContext*) {   // a pitcher bats at `second`; a hitter at his position, pitching with P aptitude 3+
+    LifeTwo a;
+    a.main = position;
+    a.pitch = position == 1 || pAptitude >= 3;
+    a.bat = position == 1 ? second : position;
+    return a;
+}
 bool Batter() { return batter; }
 }
 '''
@@ -66,6 +80,15 @@ int main() {
     ctx.lr = kDrillListAsk; ctx.gpr[31] = 0x81234000;
     if (!check(false, 1, 9, true, true, 0)) return 1;
     if (!g_inPractice || !g_drillOpen || g_drillList != 0x81234000) return 1;
+    // A two-way hitter (RF, P aptitude 3): batter drills to start with, then his role decides.
+    g_practiceSet = false, g_practiceBatter = false, pAptitude = 3;
+    if (!check(false, 9, 0, true, true, 0)) return 1;
+    if (!g_practiceBatter) return 1;
+    ctx.lr = 0x809E022C;
+    if (!check(false, 9, 0, false, true, 1)) return 1;         // a day he pitched
+    if (!check(false, 9, 0, true, true, 0)) return 1;          // a day he only hit
+    pAptitude = 2;                                             // no arm: always the hitter he is
+    if (!check(false, 9, 0, false, true, 0)) return 1;
 }
 '''
 compiler = shutil.which("clang++") or str(

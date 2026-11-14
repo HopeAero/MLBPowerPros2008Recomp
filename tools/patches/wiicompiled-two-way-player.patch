@@ -39,7 +39,7 @@ new file mode 100644
 index 0000000..83faaac
 --- /dev/null
 +++ b/runtime/src/hle/mlb/two_way.cpp
-@@ -0,0 +1,1383 @@
+@@ -0,0 +1,1517 @@
 +// The two-way player rule ("Ohtani rule", MLB since 2022), behind [season] two_way_player: with the DH,
 +// a starting pitcher can also be the DH and keep batting after he leaves the mound.
 +//
@@ -88,6 +88,9 @@ index 0000000..83faaac
 +void LifeMenuSwitch(CpuContext* ctx, uint32_t pad, uint32_t lr, uint32_t self);
 +void LifeDrillPicked();
 +bool LifePitcherOnly(uint32_t players, uint8_t index);
++int LifeTwoWay(uint32_t players, uint8_t index);  // -1: not the MLB Life player
++void BenchLifeHitter(uint32_t entries, uint32_t players, uint32_t count);
++uint32_t BenchFielder(uint32_t entries, uint32_t players, uint32_t count, uint8_t position, uint16_t skip);
 +
 +constexpr uint32_t kLineups = 0x8103D090u;
 +constexpr uint32_t kEntry = 6, kCapacity = 44;
@@ -595,11 +598,30 @@ index 0000000..83faaac
 +
 +bool TwoWay(uint32_t players, uint8_t index) {
 +    const uint32_t record = Memory::Read32(players + index * 0x2Cu + 0xC);
-+    if (!record || Memory::Read8(record + 0x62) != 1) return false;
++    if (!record) return false;
++    if (const int life = LifeTwoWay(players, index); life >= 0) return life != 0;  // the MLB Life player's own rule
++    if (Memory::Read8(record + 0x62) != 1) return false;
 +    for (uint32_t p = 1; p < 9; ++p)
 +        if (Memory::Read8(record + 0x64 + p - 1) >= 4) return true;
 +    // ponytail: rosters' Ohtani (PowerUp+ 2025: P only, contact 9, power 238); hitters start at 3 / 124.
 +    return Memory::Read8(record + 0x72) >= 5 && Memory::Read8(record + 0x73) >= 100;
++}
++
++// The bench entry (on the roster, out of the lineup) of the hitter with the best aptitude for
++// `position` (2 C .. 9 RF; any other: the first one), not the player `skip`; 0 when there is none.
++uint32_t BenchFielder(uint32_t entries, uint32_t players, uint32_t count, uint8_t position, uint16_t skip) {
++    uint32_t best = 0;
++    int bestAptitude = -1;
++    for (uint32_t i = 0; i < count; ++i) {
++        const uint32_t e = entries + i * kEntry, player = players + Memory::Read8(e + 1) * 0x2Cu;
++        const uint32_t record = Memory::Read32(player + 0xC);
++        if (!Memory::Read8(e + kOnRoster) || Memory::Read8(e + kInLineup) || !record || Memory::Read16(player) == skip ||
++            Memory::Read8(record + 0x51) == 0 || Memory::Read8(record + 0x62) == kPitcher)
++            continue;
++        const int aptitude = position >= 2 && position <= 9 ? Memory::Read8(record + 0x62 + position) : 0;
++        if (aptitude > bestAptitude) best = e, bestAptitude = aptitude;
++    }
++    return best;
 +}
 +
 +void ApplyTwoWay(uint32_t entries, uint32_t players, uint32_t count) {
@@ -684,7 +706,18 @@ index 0000000..83faaac
 +            const uint8_t pitcher = Memory::Read8(p + 1);
 +            Memory::Write8(p + 1, Memory::Read8(his + 1));
 +            Memory::Write8(his + 1, pitcher);
++        } else if (his && his != p && Memory::Read8(his + kPosition) != kPitcher) {
++            // A hitter (main position in the field) already plays there: he takes the P's entry, the
++            // best bench fielder for his position his, and the P the bench one.
++            if (const uint32_t bench = BenchFielder(entries, players, count, Memory::Read8(his + kPosition), id)) {
++                const uint8_t pitcher = Memory::Read8(p + 1);
++                Memory::Write8(p + 1, Memory::Read8(his + 1));
++                Memory::Write8(his + 1, Memory::Read8(bench + 1));
++                Memory::Write8(bench + 1, pitcher);
++            }
 +        }
++    } else if (RuntimeConfigFile::TwoWayPlayer(false)) {
++        BenchLifeHitter(entries, players, count);  // a hitter who only pitches: not in the field on other days
 +    }
 +    if (twoWay) ApplyTwoWay(entries, players, count);
 +    for (uint32_t slot = 0; slot < 9; ++slot) {
@@ -737,6 +770,7 @@ index 0000000..83faaac
 +constexpr uint32_t kButtonX = 8;                  // 0x805EEB70's button index (A 4, B 5)
 +
 +bool g_practiceBatter = false, g_inPractice = false, g_pitched = false, g_drillOpen = false;
++bool g_practiceSet = false;  // the drills start as his main position's (a hitter: batter drills)
 +uint32_t g_drillList = 0;
 +
 +bool LifeMode() { return RuntimeConfigFile::TwoWayPlayer(false) && Memory::Read16(kLifeModeId) == 9001; }
@@ -749,15 +783,61 @@ index 0000000..83faaac
 +    return ctx->gpr[3];
 +}
 +
-+// His best fielding position (2 C .. 9 RF) with an aptitude of 4 or more; 0 when he has none.
++// The MLB Life player can bat (so be two-way) with an aptitude of kLifeAptitude or more somewhere in
++// the field, or without one with some bat: contact kLifeContact or power kLifePower (an ordinary
++// pitcher has 1 and 16, all G). Easier than the roster rule (TwoWay), on purpose: players brought
++// from Success came with second positions of 3 and were never asked.
++constexpr uint32_t kLifeAptitude = 3, kLifeContact = 4, kLifePower = 60;
++
++// 0x80862314 (id): the player's unpacked record, from the record tables by id range (9001.. the MLB
++// Life ones); the format a game's players point to at +0xC (+0x72 contact, +0x73 power).
++uint32_t LifeUnpacked(CpuContext* ctx) {
++    ctx->gpr[3] = LifeId();
++    Call(ctx, 0x80862314u, InvokeDirectCpu<0x80862314u>);
++    return ctx->gpr[3];
++}
++
++// The position he bats at as a two-way player (2 C .. 9 RF): his best in the field with an aptitude of
++// kLifeAptitude or more; with none but some bat, his best one anyway (he is the DH: it only tells the
++// mode he is a hitter that day); 0 when he cannot bat.
 +uint32_t SecondPosition(CpuContext* ctx, uint32_t record) {
-+    uint32_t best = 0, bestAptitude = 3;
++    uint32_t best = 0, bestAptitude = 0;
 +    for (uint32_t position = 2; position <= 9; ++position) {
 +        ctx->gpr[3] = record, ctx->gpr[4] = position;
 +        Call(ctx, 0x80A5B160u, InvokeDirectCpu<0x80A5B160u>);
 +        if (ctx->gpr[3] > bestAptitude) best = position, bestAptitude = ctx->gpr[3];
 +    }
-+    return best;
++    if (bestAptitude >= kLifeAptitude) return best;
++    const uint32_t unpacked = LifeUnpacked(ctx);
++    if (!Memory::Contains(unpacked, 0x80)) return 0;
++    const bool bat = Memory::Read8(unpacked + 0x72) >= kLifeContact || Memory::Read8(unpacked + 0x73) >= kLifePower;
++    return bat ? (best ? best : 9) : 0;
++}
++
++// The MLB Life player as a two-way player, from his packed record: his main position (1 P .. 9 RF),
++// where he bats (a pitcher: SecondPosition; a hitter: his main position) and whether he pitches (a
++// pitcher; a hitter with a P aptitude of kLifeAptitude or more, which only Success or an editor give:
++// the game's own table, 0x80A233E8, gives every hitter 0 at P).
++struct LifeTwo {
++    uint32_t main = 0, bat = 0;
++    bool pitch = false;
++    bool TwoWay() const { return pitch && bat != 0; }
++    bool Hitter() const { return main != kPitcher; }
++};
++
++LifeTwo LifeAbility(CpuContext* ctx) {
++    LifeTwo a;
++    const uint32_t record = LifeRecord(ctx);
++    if (!Memory::Contains(record, 0x80)) return a;
++    a.main = (Memory::Read32(record + 0x5C) >> 6) & 0xF;
++    if (a.main == kPitcher) {
++        a.pitch = true, a.bat = SecondPosition(ctx, record);
++    } else {
++        ctx->gpr[3] = record, ctx->gpr[4] = kPitcher;
++        Call(ctx, 0x80A5B160u, InvokeDirectCpu<0x80A5B160u>);
++        a.pitch = ctx->gpr[3] >= kLifeAptitude, a.bat = a.main;
++    }
++    return a;
 +}
 +
 +// The role the MLB Life player chose with the manager (see the talk below): two-way (the default), batter
@@ -870,6 +950,39 @@ index 0000000..83faaac
 +    return LifeMode() && LifeRole() == Role::Pitcher && Memory::Read16(players + index * 0x2Cu) == LifeId();
 +}
 +
++// A two-way hitter (main position in the field) who chose to only pitch plays only on his turns (then
++// he is the P): on the other days the best bench fielder takes his place in the lineup.
++void BenchLifeHitter(uint32_t entries, uint32_t players, uint32_t count) {
++    if (!LifeMode() || LifeRole() != Role::Pitcher) return;
++    const uint16_t id = LifeId();
++    for (uint32_t i = 0; i < count; ++i) {
++        const uint32_t e = entries + i * kEntry;
++        const uint8_t index = Memory::Read8(e + 1);
++        const uint32_t record = Memory::Read32(players + index * 0x2Cu + 0xC);
++        if (Memory::Read16(players + index * 0x2Cu) != id || !Memory::Read8(e + kInLineup) || !record ||
++            Memory::Read8(record + 0x62) == kPitcher || Memory::Read8(e + kPosition) == kPitcher || LifeTwoWay(players, index) != 1)
++            continue;
++        if (const uint32_t bench = BenchFielder(entries, players, count, Memory::Read8(e + kPosition), id)) {
++            Memory::Write8(e + 1, Memory::Read8(bench + 1));
++            Memory::Write8(bench + 1, index);
++            std::fprintf(stderr, "[two-way] MLB Life hitter on the bench: pitcher only, not his turn\n");
++        }
++        return;
++    }
++}
++
++// For the MLB Life player in a lineup: 1 when he is two-way (LifeAbility's rule, on the record the
++// game's player points to: a pitcher who bats, or a hitter with a P aptitude), 0 when not; -1 for
++// anyone else (the roster rule).
++int LifeTwoWay(uint32_t players, uint8_t index) {
++    if (!LifeMode() || Memory::Read16(players + index * 0x2Cu) != LifeId()) return -1;
++    const uint32_t record = Memory::Read32(players + index * 0x2Cu + 0xC);
++    if (Memory::Read8(record + 0x62) != kPitcher) return Memory::Read8(record + 0x63) >= kLifeAptitude ? 1 : 0;
++    for (uint32_t p = 1; p < 9; ++p)
++        if (Memory::Read8(record + 0x64 + p - 1) >= kLifeAptitude) return 1;
++    return Memory::Read8(record + 0x72) >= kLifeContact || Memory::Read8(record + 0x73) >= kLifePower ? 1 : 0;
++}
++
 +// The manager talk (FREE > CHAT > FRIENDS > the manager) is MLB Life event script 249 or 250 of bank 1
 +// (mylife_event2.pack; 0x809EE598 / 0x809EE5A8 queue them): "What is it? You want to talk to me about
 +// something?", then I need some advice / (I want to retire) / Nothing at all. The scripts run on an
@@ -883,7 +996,8 @@ index 0000000..83faaac
 +// 4 period, 8 question mark, 0x1D hyphen, 0x26 apostrophe, 0xD000 new line, 0xFFFF end).
 +constexpr uint32_t kTalkArea = 0x97FFF000u, kTalkTexts = kTalkArea + 0x400;
 +constexpr uint32_t kTextBase = 30001;  // private text ids, only for the copies
-+enum TalkText : uint32_t { kTxLabel, kTxQuestion, kTxTwoWay, kTxBatter, kTxPitcher, kTxAckTwoWay, kTxAckBatter, kTxAckPitcher, kTexts };
++enum TalkText : uint32_t { kTxLabel, kTxQuestion, kTxTwoWay, kTxBatter, kTxPitcher, kTxAckTwoWay, kTxAckBatter, kTxAckPitcher,
++                          kTxNotYet, kTxNotYetArm, kTexts };
 +const char* const kTalkStrings[kTexts] = {
 +    "    About my two-way role.",
 +    "Your two-way role, eh?|How do you want to play|for us now?",
@@ -893,6 +1007,8 @@ index 0000000..83faaac
 +    "Alright, two-way it is.|You pitch every fifth game|and hit in the others.",
 +    "Ok, just hitting then.|No pitching for now.|Tell me if that changes.",
 +    "Ok, just pitching then.|You won't bat for now.|Tell me if that changes.",
++    "Two-way, eh? Not with that|bat yet. Work on your|hitting and ask me again.",
++    "Two-way, eh? I've never seen|you on a mound. Learn to|pitch and ask me again.",
 +};
 +
 +struct TalkCopy {
@@ -927,7 +1043,9 @@ index 0000000..83faaac
 +}
 +
 +// The copy of the manager's script at `code` (the original, parsed until its end) into slot `slot`.
-+uint32_t MakeTalk(uint32_t code, uint32_t script, size_t slot) {
++// `lacking`: kTexts when he is two-way (he picks a role), else the text of what he lacks (a pitcher's
++// bat, a hitter's arm).
++uint32_t MakeTalk(uint32_t code, uint32_t script, size_t slot, uint32_t lacking) {
 +    std::vector<uint32_t> w;
 +    for (uint32_t pc = 0; pc < 256;) {
 +        const uint32_t op = Memory::Read32(code + pc * 4), n = Operands(op);
@@ -953,13 +1071,18 @@ index 0000000..83faaac
 +    w.resize(r, 29);
 +    // The question: rows whose branches jump to their answers, then the end as "Nothing at all" ends.
 +    const uint32_t a1 = r + 25, a2 = a1 + 6, a3 = a2 + 6, end = a3 + 6;
-+    const uint32_t question[] = {19, 1, kTextBase + kTxQuestion, 24, 3, 0, 1, 34, 8,
++    uint32_t question[] = {19, 1, kTextBase + kTxQuestion, 24, 3, 0, 1, 34, 8,
 +                                 36, kTextBase + kTxTwoWay, 33, a1, 36, kTextBase + kTxBatter, 33, a2,
 +                                 36, kTextBase + kTxPitcher, 33, a3, 35, 25, 33, end,
 +                                 19, 1, kTextBase + kTxAckTwoWay, 24, 33, end,
 +                                 19, 1, kTextBase + kTxAckBatter, 24, 33, end,
 +                                 19, 1, kTextBase + kTxAckPitcher, 24, 33, end,
 +                                 10, 41, 13, 29};
++    if (lacking != kTexts) {  // same layout, no list: what he lacks, then the end (the answers go unreached)
++        const uint32_t notYet[] = {19, 1, kTextBase + lacking, 24, 33, end};
++        std::fill(std::begin(question), std::begin(question) + 25, 29u);
++        std::copy(std::begin(notYet), std::end(notYet), std::begin(question));
++    }
 +    w.insert(w.end(), std::begin(question), std::end(question));
 +    TalkCopy& t = g_talks[slot];
 +    t.script = script, t.code = kTalkArea + static_cast<uint32_t>(slot) * 0x200;
@@ -1030,7 +1153,7 @@ index 0000000..83faaac
 +
 +void LifeMenuSwitch(CpuContext* ctx, uint32_t pad, uint32_t lr, uint32_t self) {
 +    if (lr != kMenuAsk || self != g_lifeMenu || !g_lifeMenu || !LifeMode()) return;
-+    if (SecondPosition(ctx, LifeRecord(ctx)) == 0 || LifeRole() != Role::TwoWay) return;
++    if (!LifeAbility(ctx).TwoWay() || LifeRole() != Role::TwoWay) return;
 +    ++g_menuTick;
 +    ctx->gpr[3] = pad, ctx->gpr[4] = kButtonX;
 +    Call(ctx, 0x805EEB70u, InvokeDirectCpu<0x805EEB70u>);
@@ -1061,10 +1184,13 @@ index 0000000..83faaac
 +    Call(ctx, 0x8000BBFCu, InvokeDirectCpu<0x8000BBFCu>);
 +    uint32_t code = ctx->gpr[3];
 +    ctx->lr = lr;
++    // Every MLB Life player gets the row: the role question when he is two-way, else what he lacks.
 +    if (Memory::Read32(vm) == 0x80E732D0u && Memory::Read32(vm + 0x54) == 1 && (script == 249 || script == 250) &&
-+        LifeMode() && SecondPosition(ctx, LifeRecord(ctx)) != 0) {
++        LifeMode()) {
 +        WriteTalkTexts();
-+        if (const uint32_t copy = MakeTalk(code, script, script == 249 ? 0 : 1)) {
++        const LifeTwo a = LifeAbility(ctx);
++        const uint32_t lacking = a.TwoWay() ? kTexts : a.Hitter() ? kTxNotYetArm : kTxNotYet;
++        if (const uint32_t copy = MakeTalk(code, script, script == 249 ? 0 : 1, lacking)) {
 +            code = copy;
 +            std::fprintf(stderr, "[two-way] MLB Life manager talk %u with the role question\n", script);
 +        }
@@ -1127,11 +1253,14 @@ index 0000000..83faaac
 +        ctx->gpr[3] = g_creationBatter ? 0 : pitcher;
 +        return;
 +    }
-+    if (pitcher == 0 || !LifeMode() || SecondPosition(ctx, LifeRecord(ctx)) == 0) {
++    // A two-way pitcher, or a two-way hitter (main position in the field, a P aptitude): his role decides.
++    const LifeTwo a = LifeMode() ? LifeAbility(ctx) : LifeTwo{};
++    if (!a.TwoWay()) {
 +        ctx->gpr[3] = pitcher;
 +        return;
 +    }
 +    if (lr == kDrillListAsk) {
++        if (!g_practiceSet) g_practiceBatter = a.Hitter(), g_practiceSet = true;
 +        g_inPractice = true, g_drillOpen = true, g_drillList = list;
 +        std::fprintf(stderr, "[two-way] MLB Life practice: %s drills (X switches)%c", g_practiceBatter ? "batter" : "pitcher", 10);
 +    }
@@ -1148,8 +1277,9 @@ index 0000000..83faaac
 +    Call(ctx, 0x8085E988u, InvokeDirectCpu<0x8085E988u>);
 +    const bool pitcher = (ctx->gpr[3] & 0xFF) == 1;
 +    ctx->gpr[3] = pitcher;
-+    if (lr != 0x8098B994u || !pitcher || !g_inPractice || !LifeMode() || id != LifeId()) return;
-+    ctx->gpr[3] = SecondPosition(ctx, LifeRecord(ctx)) != 0 && g_practiceBatter ? 0 : 1;
++    if (lr != 0x8098B994u || !g_inPractice || !LifeMode() || id != LifeId()) return;
++    const bool twoWay = LifeAbility(ctx).TwoWay();   // (clobbers r3)
++    ctx->gpr[3] = twoWay ? (Batter() ? 0 : 1) : pitcher;
 +}
 +PPC_NATIVE_OVERRIDE_VOID(80B06888, MLB_IsPitcherById_80B06888, (CpuContext* ctx), (ctx));
 +
@@ -1163,21 +1293,25 @@ index 0000000..83faaac
 +        ctx->gpr[3] = g_second;
 +        return;
 +    }
-+    if (value != kPitcher || !LifeMode()) return;
++    if (!LifeMode()) return;
 +    const bool site = std::find(std::begin(kLifeRoleSites), std::end(kLifeRoleSites), lr) != std::end(kLifeRoleSites);
 +    if (!site || LifeRecord(ctx) != record) {
 +        ctx->gpr[3] = value;
 +        return;
 +    }
-+    const uint32_t second = SecondPosition(ctx, record);
++    const LifeTwo a = LifeAbility(ctx);  // a two-way pitcher or hitter: the day's role
++    if (!a.TwoWay()) {
++        ctx->gpr[3] = value;
++        return;
++    }
 +    bool batter = Batter();
 +    if (lr == kMenuStatsAsk) {  // the menu being built: the day's role, or what X picked that day
 +        g_lifeMenu = ctx->gpr[27];
-+        if (LifeDay() != g_menuDay) g_menuBatter = second != 0 && batter, g_menuDay = -1;
++        if (LifeDay() != g_menuDay) g_menuBatter = batter, g_menuDay = -1;
 +        batter = g_menuBatter;
 +        std::fprintf(stderr, "[two-way] MLB Life menu, day %d\n", LifeDay());  // a mark for probes
 +    }
-+    ctx->gpr[3] = second != 0 && batter ? second : value;
++    ctx->gpr[3] = batter ? a.bat : kPitcher;
 +}
 +PPC_NATIVE_OVERRIDE_VOID(8057BD3C, MLB_MainPosition_8057BD3C, (CpuContext* ctx), (ctx));
 +
@@ -1423,7 +1557,6 @@ index 0000000..83faaac
 +                 ImVec2(56 / 128.0f, 132 / 512.0f));
 +}
 +}  // namespace two_way
-
 diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
 index d9976c9..0238edd 100644
 --- a/runtime/src/launcher.cpp
